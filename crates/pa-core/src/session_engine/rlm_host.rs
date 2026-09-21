@@ -805,6 +805,7 @@ mod tests {
                 model_registry: Some(Arc::clone(&registry)),
                 subagent_host: host,
             },
+            None,
         )
     }
 

@@ -31,6 +31,10 @@ pub struct GoalDriver {
     accounting_started_at: Option<AccountingStartedAt>,
     /// Ids of assistant messages already counted (double-counting guard).
     accounted_messages: std::collections::HashSet<String>,
+    /// TS `_goalContinuationAwaitsRlmWork`: a continuation is owed behind
+    /// unsettled RLM descendant work. In-memory only (never persisted,
+    /// never rehydrated): descendant quiescence is a live-session fact.
+    owed_continuation_for_rlm_work: bool,
 }
 
 fn now_millis() -> u64 {
@@ -46,6 +50,7 @@ impl GoalDriver {
             state: empty_goal_state(),
             accounting_started_at: None,
             accounted_messages: Default::default(),
+            owed_continuation_for_rlm_work: false,
         }
     }
 
@@ -137,6 +142,8 @@ impl GoalDriver {
         };
         self.accounting_started_at = Some(AccountingStartedAt(now));
         self.accounted_messages.clear();
+        // TS `_startGoal`: a fresh goal starts with no owed continuation.
+        self.owed_continuation_for_rlm_work = false;
         self.set_state(session, goal);
         Ok(self.state.clone())
     }
@@ -145,6 +152,9 @@ impl GoalDriver {
     pub fn clear(&mut self, session: &mut SessionManager) {
         self.set_state(session, empty_goal_state());
         self.accounting_started_at = None;
+        // TS `_clearGoal` routes through `_clearQueuedGoalContexts`, which
+        // drops any owed continuation with the queued contexts.
+        self.owed_continuation_for_rlm_work = false;
     }
 
     /// Time-used attribution: fold wall-clock time since accounting started.
@@ -228,6 +238,9 @@ impl GoalDriver {
         if self.state.status != GoalStatus::Active {
             return;
         }
+        // TS `_pauseGoal` routes through `_clearQueuedGoalContexts`, which
+        // drops any owed continuation with the queued contexts.
+        self.owed_continuation_for_rlm_work = false;
         let goal = self.with_accounted_wall_clock();
         self.set_state(
             session,
@@ -351,6 +364,54 @@ impl GoalDriver {
             },
         );
         create_goal_context_message(&self.state, GoalContextKind::Continuation).ok()
+    }
+
+    /// TS `_getGoalContinuationMessages`'s quiescence arm: the natural
+    /// turn end defers the continuation while descendant RLM work is
+    /// unsettled. The mint consumes nothing while it waits; descendant
+    /// settlement delivers it (`take_owed_continuation`).
+    pub fn mark_continuation_owed(&mut self) {
+        self.owed_continuation_for_rlm_work = true;
+    }
+
+    /// Whether a continuation is currently owed behind descendant work
+    /// (TS `_goalContinuationAwaitsRlmWork`).
+    pub fn owes_continuation(&self) -> bool {
+        self.owed_continuation_for_rlm_work
+    }
+
+    /// TS `_maybeResumeGoalContinuationAfterRlmWork`: deliver the owed
+    /// continuation once, consuming one slot. Always clears the flag —
+    /// an inactive goal drops the deferral (minting nothing), a live
+    /// one mints. `None` when no continuation was owed or the goal
+    /// cannot mint.
+    pub fn take_owed_continuation(
+        &mut self,
+        session: &mut SessionManager,
+    ) -> Option<CustomMessage> {
+        let owed = self.owed_continuation_for_rlm_work;
+        self.owed_continuation_for_rlm_work = false;
+        if !owed {
+            return None;
+        }
+        self.next_continuation_message(session)
+    }
+
+    /// Roll back one just-minted continuation (TS `_getContinuationMessages`
+    /// restores the goal snapshot when new session input arrived during the
+    /// mint; the threshold-cancel rollback decrements the same way): the
+    /// next boundary re-mints instead of double-counting.
+    pub fn rollback_continuation_mint(&mut self, session: &mut SessionManager) {
+        if self.state.continuations_used == 0 {
+            return;
+        }
+        self.set_state(
+            session,
+            GoalState {
+                continuations_used: self.state.continuations_used - 1,
+                ..self.state.clone()
+            },
+        );
     }
 
     /// Whether the goal drives session wake-ups.
@@ -524,6 +585,73 @@ mod tests {
         assert_eq!(driver.state().continuations_used, 1);
         let reloaded = GoalDriver::load_persisted(&session);
         assert_eq!(reloaded.state().continuations_used, 1);
+    }
+
+    /// TS `_getGoalContinuationMessages`'s quiescence arm and
+    /// `_maybeResumeGoalContinuationAfterRlmWork`: the owed continuation
+    /// waits without consuming a slot, delivers exactly once when taken,
+    /// and drops for an inactive goal instead of minting.
+    #[test]
+    fn owed_continuation_defers_and_delivers_once() {
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut session, "work", None).unwrap();
+        // Deferral: no slot consumed while the continuation waits.
+        assert!(!driver.owes_continuation());
+        driver.mark_continuation_owed();
+        assert!(driver.owes_continuation());
+        assert_eq!(driver.state().continuations_used, 0);
+        // Delivery: one slot consumed, the flag clears.
+        let delivered = driver.take_owed_continuation(&mut session).unwrap();
+        let UserContent::Text(text) = &delivered.content else {
+            panic!("expected text content");
+        };
+        assert!(text.starts_with("[goal: continuation]"));
+        assert_eq!(driver.state().continuations_used, 1);
+        assert!(!driver.owes_continuation());
+        // A second take (a racing settle site) delivers nothing.
+        assert!(driver.take_owed_continuation(&mut session).is_none());
+        assert_eq!(driver.state().continuations_used, 1);
+        // An inactive goal drops the deferral without minting (TS:
+        // "drops the deferral for inactive goals").
+        driver.mark_continuation_owed();
+        driver.pause(&mut session, "Paused by user");
+        assert!(driver.take_owed_continuation(&mut session).is_none());
+        assert_eq!(driver.state().continuations_used, 1);
+        assert!(!driver.owes_continuation());
+        // Pause/clear/start reset the flag with the queued contexts.
+        driver.mark_continuation_owed();
+        driver.clear(&mut session);
+        assert!(!driver.owes_continuation());
+        driver.start(&mut session, "again", None).unwrap();
+        driver.mark_continuation_owed();
+        driver.start(&mut session, "once more", None).unwrap();
+        assert!(!driver.owes_continuation());
+    }
+
+    /// The mint rollback (TS `_getContinuationMessages`'s arrival-epoch
+    /// restore): a rolled-back mint decrements the slot so the next
+    /// boundary re-mints without double-counting.
+    #[test]
+    fn rollback_continuation_mint_restores_the_count() {
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut session, "work", None).unwrap();
+        driver.next_continuation_message(&mut session).unwrap();
+        assert_eq!(driver.state().continuations_used, 1);
+        driver.rollback_continuation_mint(&mut session);
+        assert_eq!(driver.state().continuations_used, 0);
+        // The rollback persists: the reloaded branch sees the restored
+        // count (TS `_setGoalState` re-persists the snapshot).
+        assert_eq!(
+            GoalDriver::load_persisted(&session)
+                .state()
+                .continuations_used,
+            0
+        );
+        // The next mint counts from the restored slot.
+        driver.next_continuation_message(&mut session).unwrap();
+        assert_eq!(driver.state().continuations_used, 1);
     }
 
     /// TS `_resumeGoal` semantics: resume continues the same goal (same

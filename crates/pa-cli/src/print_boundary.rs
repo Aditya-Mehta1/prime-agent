@@ -1099,6 +1099,7 @@ mod tests {
             cli_extension_sources: Vec::new(),
             extension_tool_allow_list: None,
             prewarm_ipython_kernel: None,
+            queued_goal_context_purge: None,
         })
         .await
         .expect("the faux session assembles");

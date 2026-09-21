@@ -76,6 +76,11 @@ pub struct SessionEngineConfig {
     /// Session telemetry wiring (PostHog client + execution mode). `None`
     /// (opt-out) installs nothing; non-depth-0 sessions never install.
     pub telemetry: Option<super::telemetry::TelemetryWiring>,
+    /// The embedding's queued-goal-context purge (TS
+    /// `_clearQueuedGoalContexts`, invoked at the pause/clear/start command
+    /// sites and after a kernel `goal.complete` settles the goal): the
+    /// daemon worker's queue purge.
+    pub queued_goal_context_purge: Option<super::runtime::QueuedGoalContextPurge>,
     /// Boot the session's kernel in the background at creation (TS
     /// `prewarmIpythonKernel` from `createDefaultRuntimeFactory`): a main
     /// session (depth 0, the engine's gate like the TS `rlmDepth === 0`
@@ -105,6 +110,12 @@ pub struct SessionEngine {
     /// host handlers reach, so `/goal` and `goal.complete()` in the kernel
     /// observe one state machine.
     pub goal_driver: std::sync::Arc<tokio::sync::Mutex<super::goal_driver::GoalDriver>>,
+    /// The embedding's queued-goal-context purge (TS
+    /// `_clearQueuedGoalContexts`): the session-command surfaces
+    /// (`/goal` pause/clear/start) and the kernel's `goal.complete`
+    /// withdraw queued goal-context turns through it. `None` when the
+    /// embedding owns no queue (the in-session engines).
+    pub queued_goal_context_purge: Option<super::runtime::QueuedGoalContextPurge>,
     /// The session's MCP manager: host-side auth gating and the source the
     /// `mcp.*` kernel host handlers (config/refresh) resolve against. The
     /// daemon's `replace_acp_mcp_servers` wire command reaches it through
@@ -200,6 +211,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             model_registry: None,
             subagent_host: config.rlm_subagent_host.clone(),
         },
+        config.queued_goal_context_purge.clone(),
     );
 
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
@@ -636,6 +648,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         agents_files: resources.agents_files,
         system_prompt,
         goal_driver,
+        queued_goal_context_purge: config.queued_goal_context_purge.clone(),
         mcp_manager,
         extension_runner,
         extension_diagnostics,
@@ -646,6 +659,18 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
 }
 
 impl SessionEngine {
+    /// Withdraw the queued goal-context turns (TS `_clearQueuedGoalContexts`
+    /// at the `_pauseGoal`/`_clearGoal`/`_startGoal` command sites): a
+    /// minted continuation waiting in the embedding's queue never runs
+    /// behind a paused/cleared/replaced goal. The daemon worker owns the
+    /// queue lanes; embeddings without one (in-session engines) have no
+    /// queued goal contexts and installed no seam.
+    pub fn purge_queued_goal_contexts(&self) {
+        if let Some(purge) = &self.queued_goal_context_purge {
+            purge();
+        }
+    }
+
     /// Prompt the session (delegates to AgentSession::prompt).
     pub async fn prompt(
         &self,
@@ -746,6 +771,7 @@ mod tests {
             cli_extension_sources: vec![],
             extension_tool_allow_list: None,
             prewarm_ipython_kernel: None,
+            queued_goal_context_purge: None,
         })
         .await
         .unwrap();
@@ -850,6 +876,7 @@ mod tests {
                 cli_extension_sources: vec![],
                 extension_tool_allow_list: None,
                 prewarm_ipython_kernel: None,
+                queued_goal_context_purge: None,
             }
         }
 

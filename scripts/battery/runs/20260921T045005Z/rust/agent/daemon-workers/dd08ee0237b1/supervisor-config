@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/home/ubuntu/lane-worktrees/eager-abort/scripts/battery/runs/20260921T045005Z/rust/daemon.sock",
-  "defaultSessionDir": "/home/ubuntu/lane-worktrees/eager-abort/scripts/battery/runs/20260921T045005Z/rust/agent/sessions"
-}

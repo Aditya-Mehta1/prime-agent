@@ -188,8 +188,14 @@ impl Worker {
             .release(pause_id, &owner_client_id, &active_session_id)
         {
             ReleaseOutcome::Released => {
-                // The gate lifted: queued input admits again.
+                // The gate lifted: queued input admits again, and the
+                // release is a TS `_maybeResumeGoalContinuationAfterRlmWork`
+                // site (the deferral held while the pause owned admission
+                // re-evaluates).
                 self.work_notify.notify_one();
+                if let Some(engine) = self.agent_engine.as_ref() {
+                    engine.retry_owed_goal_continuation();
+                }
                 response_success(None, "release_session_input_pause", None)
             }
             ReleaseOutcome::Unknown => response_success(None, "release_session_input_pause", None),

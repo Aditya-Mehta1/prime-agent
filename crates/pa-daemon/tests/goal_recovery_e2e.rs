@@ -205,7 +205,7 @@ fn setup(name: &str) -> Harness {
         .to_string(),
     )
     .expect("write settings");
-    let responses: Vec<Value> = (0..12)
+    let responses: Vec<Value> = (0..16)
         .map(|index| json!({ "text": format!("scripted reply {index}") }))
         .collect();
     let script = dir.path().join("faux.json");
@@ -301,6 +301,24 @@ impl Harness {
         self.client.drain_events(Duration::from_secs(1));
     }
 
+    /// The f18-battery prompt form: send and wait for the response without
+    /// the quiet drain. The goal-continuation loop keeps the session
+    /// churning (the socket never goes quiet while it runs), so a prompt
+    /// racing the loop (the pause right after a phase that starts turns)
+    /// must not settle first — the drain would block for the whole churn.
+    fn prompt_racing_the_loop(&mut self, id: &str, message: &str) {
+        self.client.send_command(
+            id,
+            json!({
+                "type": "prompt_and_wait",
+                "activeSessionId": self.session_id,
+                "message": message,
+            }),
+        );
+        let done = self.client.request(id);
+        assert_eq!(done["success"], true, "prompt {id} failed: {done}");
+    }
+
     /// The last goal_update announcement's `continuationsUsed`.
     fn announced_continuations(&self) -> Vec<u64> {
         self.client
@@ -315,30 +333,73 @@ impl Harness {
 /// The mid-goal worker kill + recovery: the goal must survive the rebuild
 /// with its durable counts, and a post-recovery compact continues the
 /// continuation count from where the durable rows left it.
+///
+/// The goal-continuation loop (TS `_getGoalContinuationMessages`) keeps
+/// prompting an active goal at every natural turn end, so like the f18
+/// battery the flow pauses the goal right after each phase that starts
+/// turns: the pause (TS `_pauseGoal` -> `_clearQueuedGoalContexts`)
+/// withdraws the minted continuation waiting in the queue, and everything
+/// between the phases runs against a quiet (paused) goal driver.
 #[test]
 fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
     let mut harness = setup("goal-recovery");
 
     // A started goal persists: the session file carries the
-    // `thread_goal_state` custom row (TS one-store durability).
-    harness.prompt("g1", &format!("/goal {OBJECTIVE}"));
+    // `thread_goal_state` custom row (TS one-store durability). The start
+    // turn's natural end mints the goal loop's next continuation (the
+    // ported hook), so the durable count is at least 1 by the time the
+    // prompt settles.
+    harness.prompt_racing_the_loop("g1", &format!("/goal {OBJECTIVE}"));
+    // Pause immediately (the f18 battery pattern): the purge withdraws the
+    // queued continuation and the loop goes quiet; everything else runs
+    // against the paused driver.
+    harness.prompt_racing_the_loop("g2", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
     let goal = harness.latest_goal_row();
-    assert_eq!(goal["status"], "active", "durable goal row: {goal}");
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
     assert_eq!(goal["objective"], OBJECTIVE);
-    assert_eq!(goal["continuationsUsed"], 0);
+    let pre_seed_count = goal["continuationsUsed"].as_u64().unwrap();
+    assert!(
+        pre_seed_count >= 1,
+        "the start turn never minted a continuation: {goal}"
+    );
 
-    // Seed work turns so the manual compact has a cut to make.
+    // Seed work turns so the manual compact has a cut to make (the goal
+    // is paused: no turn mints a continuation).
     harness.prompt("s1", "first work turn for the cut");
     harness.prompt("s2", "second work turn for the cut");
+    let goal = harness.latest_goal_row();
+    assert_eq!(
+        goal["continuationsUsed"].as_u64().unwrap(),
+        pre_seed_count,
+        "a paused goal consumed continuation slots: {goal}"
+    );
 
-    // The compact mints the owed continuation: `continuationsUsed` bumps
-    // to 1 and the change is durable before the announcement.
+    // Resume, then pause again before the loop churns: the resumed driver
+    // runs its continuation turn and the pause keeps the queue quiet.
+    harness.prompt_racing_the_loop("r0", "/goal resume");
+    harness.prompt_racing_the_loop("r0p", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
+    let goal = harness.latest_goal_row();
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
+    let pre_compact_count = goal["continuationsUsed"].as_u64().unwrap();
+    assert!(
+        pre_compact_count > pre_seed_count,
+        "the resume never minted: {goal}"
+    );
+
+    // The compact mints the owed continuation on the reactivated goal:
+    // resume for the compact, compact, then pause again — the count the
+    // compact minted (and everything after) is durable.
+    harness.prompt_racing_the_loop("r1", "/goal resume");
     harness.client.send_command(
         "c2",
         json!({ "type": "compact", "activeSessionId": harness.session_id }),
     );
     let compact = harness.client.request("c2");
     assert_eq!(compact["success"], true, "compact failed: {compact}");
+    harness.prompt_racing_the_loop("p3", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
     harness.client.send_command(
         "w2",
         json!({ "type": "wait_for_idle", "activeSessionId": harness.session_id }),
@@ -347,13 +408,20 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
     assert_eq!(idle["success"], true, "never went idle: {idle}");
     harness.client.drain_events(Duration::from_secs(1));
     assert!(
-        harness.announced_continuations().contains(&1),
-        "the compact mint never announced continuationsUsed 1: {:?}",
+        harness
+            .announced_continuations()
+            .iter()
+            .any(|count| *count > pre_compact_count),
+        "the compact mint never announced a higher count: {:?}",
         harness.client.events
     );
     let goal = harness.latest_goal_row();
-    assert_eq!(goal["continuationsUsed"], 1, "durable goal row: {goal}");
-    assert_eq!(goal["status"], "active");
+    let pre_kill_count = goal["continuationsUsed"].as_u64().unwrap();
+    assert!(
+        pre_kill_count > pre_compact_count,
+        "the compact never minted a durable continuation: {goal}"
+    );
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
 
     // The daemon's own session summary names the live worker pid.
     harness.client.send_command(
@@ -374,19 +442,20 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
 
     // The supervisor respawns the worker; the recovered prompt completes.
     // Early attempts may race the respawn backoff, so the prompt retries
-    // until the new worker serves it.
+    // until the new worker serves it. The goal was paused before the
+    // kill, so the recovery runs against a quiet driver.
     let deadline = Instant::now() + Duration::from_secs(180);
     let recovered = loop {
         assert!(Instant::now() < deadline, "the session never recovered");
         harness.client.send_command(
-            "r1",
+            "rp",
             json!({
                 "type": "prompt_and_wait",
                 "activeSessionId": harness.session_id,
                 "message": "keep working after the crash",
             }),
         );
-        let done = harness.client.request("r1");
+        let done = harness.client.request("rp");
         if done["success"] == true {
             break done;
         }
@@ -402,7 +471,7 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
     // and the durable continuation count, not a fresh engine's empty
     // state. The recovery turn's usage accounting announces from the
     // rehydrated base (TS `_accountGoalUsageForAssistantMessage` ->
-    // `_emitGoalUpdate`): continuationsUsed stays 1.
+    // `_emitGoalUpdate`): the rehydrated count never resets.
     harness.client.send_command(
         "st2",
         json!({
@@ -417,12 +486,13 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
     );
     let goal = &connection["data"]["goal"];
     assert_eq!(
-        goal["status"], "active",
+        goal["status"], "paused",
         "connection state goal: {connection}"
     );
     assert_eq!(goal["objective"], OBJECTIVE);
     assert_eq!(
-        goal["continuationsUsed"], 1,
+        goal["continuationsUsed"].as_u64().unwrap(),
+        pre_kill_count,
         "connection state goal: {connection}"
     );
     let recovery_announcements: Vec<u64> = harness.client.events[pre_kill_events..]
@@ -431,30 +501,32 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
         .filter_map(|event| event["goal"]["continuationsUsed"].as_u64())
         .collect();
     assert!(
-        recovery_announcements.iter().all(|count| *count >= 1),
+        recovery_announcements
+            .iter()
+            .all(|count| *count >= pre_kill_count),
         "a post-recovery announcement reset the count: {recovery_announcements:?}"
     );
 
+    // The rebuilt session keeps using the goal: a resumed turn's usage
+    // accounting continues from the rehydrated base — the durable rows
+    // keep growing with the objective and count intact (the rehydrated
+    // mint's count continuation is pinned by the
+    // `recovery_rebuild_rehydrates_the_goal_from_the_session_file` unit).
+    harness.prompt_racing_the_loop("rr", "/goal resume");
+    harness.prompt_racing_the_loop("rrp", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
     // The recovery mirrored the post-recovery accounting rows durably: the
     // file's goal rows only grew.
     assert!(
         harness.goal_state_rows().len() > pre_kill_rows,
         "the recovery wrote no new durable goal rows"
     );
-
-    // The rebuilt session keeps using the goal: another turn's usage
-    // accounting continues from the rehydrated base — the durable rows
-    // keep growing with the objective and count intact (the continuation
-    // count itself is only minted by the compact branch, so the
-    // rehydrated mint's count continuation is pinned by the
-    // `recovery_rebuild_rehydrates_the_goal_from_the_session_file` unit).
-    harness.prompt("r2", "another work turn after the recovery");
     let goal = harness.latest_goal_row();
-    assert_eq!(
-        goal["continuationsUsed"], 1,
+    assert!(
+        goal["continuationsUsed"].as_u64().unwrap() >= pre_kill_count,
         "a post-recovery turn reset the durable count: {goal}"
     );
-    assert_eq!(goal["status"], "active", "durable goal row: {goal}");
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
     assert_eq!(goal["objective"], OBJECTIVE);
     assert!(
         goal["tokensUsed"].as_u64().unwrap() > 0,
@@ -462,10 +534,17 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
     );
 
     // The post-recovery compact runs over the durable history (TS
-    // one-store recovery: the respawned session's branch is rebuilt from
-    // the store, so the compaction walk sees the pre-crash conversation —
-    // never the fresh engine's empty branch that skips "Session is too
-    // short to compact").
+    // one-store recovery, #243): the respawned session's branch is
+    // rebuilt from the store, so the compaction walk sees the pre-crash
+    // conversation — never the fresh engine's empty branch that skips
+    // "Session is too short to compact". The pause-gated union keeps the
+    // loop quiet around it: resume for the compact (an active goal's
+    // compact mints the owed continuation), compact, pause again, then
+    // let the session settle.
+    let pre_final_count = harness.latest_goal_row()["continuationsUsed"]
+        .as_u64()
+        .unwrap();
+    harness.prompt_racing_the_loop("rf", "/goal resume");
     harness.client.send_command(
         "c3",
         json!({ "type": "compact", "activeSessionId": harness.session_id }),
@@ -475,6 +554,7 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
         compact["success"], true,
         "the post-recovery compact skipped on an empty branch: {compact}"
     );
+    harness.prompt_racing_the_loop("rfp", "/goal pause");
     harness.client.send_command(
         "w3",
         json!({ "type": "wait_for_idle", "activeSessionId": harness.session_id }),
@@ -485,8 +565,8 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
 
     // The compaction walk saw the durable history: the durable file holds
     // a second compaction entry, and the compact minted the owed
-    // continuation off the rehydrated goal (continuationsUsed 2, durable
-    // and announced).
+    // continuation off the rehydrated goal (the count grew past the
+    // pre-compact value, durable and announced).
     let compaction_rows = std::fs::read_to_string(harness.session_file())
         .expect("session file readable")
         .lines()
@@ -498,15 +578,18 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
         "the post-recovery compact never persisted a second compaction entry"
     );
     let goal = harness.latest_goal_row();
-    assert_eq!(
-        goal["continuationsUsed"], 2,
-        "the post-recovery compact minted off the rehydrated count: {goal}"
+    let post_final_count = goal["continuationsUsed"].as_u64().unwrap();
+    assert!(
+        post_final_count > pre_final_count,
+        "the post-recovery compact never minted off the rehydrated count: {goal}"
     );
-    assert_eq!(goal["status"], "active", "durable goal row: {goal}");
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
     assert_eq!(goal["objective"], OBJECTIVE);
     assert!(
-        harness.announced_continuations().contains(&2),
-        "the post-recovery mint never announced continuationsUsed 2: {:?}",
+        harness
+            .announced_continuations()
+            .contains(&post_final_count),
+        "the post-recovery mint never announced continuationsUsed {post_final_count}: {:?}",
         harness.client.events
     );
 }

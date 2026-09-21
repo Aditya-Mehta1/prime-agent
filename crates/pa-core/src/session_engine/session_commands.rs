@@ -312,8 +312,17 @@ async fn execute_goal(
         let mut session = session.lock().await;
         match goal {
             GoalCommand::Status => {}
-            GoalCommand::Clear => driver.clear(&mut session),
-            GoalCommand::Pause => driver.pause(&mut session, "Paused by user"),
+            // TS `_clearGoal`/`_pauseGoal`/`_startGoal` route through
+            // `_clearQueuedGoalContexts` first: a minted continuation
+            // waiting in the queue never runs behind the state change.
+            GoalCommand::Clear => {
+                engine.purge_queued_goal_contexts();
+                driver.clear(&mut session);
+            }
+            GoalCommand::Pause => {
+                engine.purge_queued_goal_contexts();
+                driver.pause(&mut session, "Paused by user");
+            }
             GoalCommand::Resume => {
                 context_message = driver.resume(&mut session);
             }
@@ -321,6 +330,7 @@ async fn execute_goal(
                 objective,
                 token_budget,
             } => {
+                engine.purge_queued_goal_contexts();
                 let state = driver
                     .start(&mut session, &objective, token_budget)
                     .map_err(|error| format!("{error:#}"))?;

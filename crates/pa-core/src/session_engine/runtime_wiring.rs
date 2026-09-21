@@ -9,6 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use super::runtime::QueuedGoalContextPurge;
 use crate::cron::store::AgentCronJobStore;
 use crate::kernel::bootstrap::KernelPythonSkill;
 use crate::kernel::provisioner::{
@@ -50,10 +51,13 @@ pub struct SessionKernelWiring {
 
 /// Build the session runtime and register the `goal.*`, `rlm_heartbeat.*`,
 /// and `rlm.*` host handlers the kernel reaches through its registry.
+/// `goal_complete_purge` is the embedding's queued-goal-context purge (TS
+/// `_completeGoalFromHost` -> `_clearQueuedGoalContexts`).
 pub fn wire_session_runtime(
     session: SessionManager,
     agent_dir: &std::path::Path,
     rlm: RlmWiring,
+    goal_complete_purge: Option<QueuedGoalContextPurge>,
 ) -> SessionKernelWiring {
     let binding = SessionBinding {
         session_id: session.get_session_id().to_string(),
@@ -65,12 +69,11 @@ pub fn wire_session_runtime(
     };
     let active_session_id = session.get_session_id().to_string();
     let cron_store = Arc::new(AgentCronJobStore::new(agent_dir.join("cron-jobs.json")));
-    let runtime = Arc::new(SessionRuntime::new(
-        &session,
-        cron_store,
-        active_session_id,
-        binding,
-    ));
+    let mut runtime = SessionRuntime::new(&session, cron_store, active_session_id, binding);
+    if let Some(purge) = goal_complete_purge {
+        runtime.set_goal_complete_purge(purge);
+    }
+    let runtime = Arc::new(runtime);
     let session = Arc::new(tokio::sync::Mutex::new(session));
     let mut handlers = HostRequestHandlers::default();
     runtime.register_host_handlers(session.clone(), &mut handlers);

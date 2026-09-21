@@ -754,6 +754,38 @@ impl Worker {
                     }
                 }
             };
+            // The goal continuation seam (TS `getContinuationMessages`):
+            // the worker owns the queue and the suspension gates, the
+            // engine owns the goal mint — the probe exposes the queue
+            // state to the mint's deferral rules, the sink admits minted
+            // follow-ups through the queue lanes, and the children
+            // registry's settle hook (registered inside) delivers a
+            // continuation owed behind descendant work.
+            if let Some(concrete) = agent_engine.as_ref() {
+                let probe_core = Arc::clone(&core);
+                let probe: crate::engine::SessionInputProbe = Arc::new(move || {
+                    let core = probe_core.lock().unwrap();
+                    core.queued_input_suspended
+                        || !core.steering.is_empty()
+                        || !core.follow_up.is_empty()
+                });
+                let sink_core = Arc::clone(&core);
+                let sink_events = events.clone();
+                let sink_notify = Arc::clone(&work_notify);
+                let sink: crate::engine::GoalAdmissionSink = Arc::new(move |work| {
+                    admit_goal_follow_up(&sink_core, &sink_events, &sink_notify, work);
+                });
+                // TS `_clearQueuedGoalContexts`: withdraw queued minted
+                // goal-context turns (the pause/clear/start commands and
+                // the kernel's `goal.complete`).
+                let purge_core = Arc::clone(&core);
+                let queue_purge: std::sync::Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let mut core = purge_core.lock().unwrap();
+                    core.steering.retain(|item| !is_goal_context_item(item));
+                    core.follow_up.retain(|item| !is_goal_context_item(item));
+                });
+                concrete.set_goal_admission(probe, sink, queue_purge);
+            }
             let runner = TurnRunner {
                 recovery: Arc::clone(&recovery),
                 core: Arc::clone(&core),
@@ -2649,16 +2681,20 @@ impl Worker {
 
     /// Clear the queued-input suspension (TS `_resumeSessionInputAdmission`,
     /// reached through `resumeQueuedWork()` and the resume sites) and wake
-    /// the turn runner so parked lanes drain.
+    /// the turn runner so parked lanes drain. Every resume site also runs
+    /// the goal arm of TS `resumeQueuedWork()`: a continuation owed behind
+    /// the suspension or descendant work re-evaluates here.
     pub(crate) fn resume_queued_input(&self) {
         {
             let mut core = self.core.lock().unwrap();
-            if !core.queued_input_suspended {
-                return;
+            if core.queued_input_suspended {
+                core.queued_input_suspended = false;
             }
-            core.queued_input_suspended = false;
         }
         self.work_notify.notify_one();
+        if let Some(engine) = self.agent_engine.as_ref() {
+            engine.retry_owed_goal_continuation();
+        }
     }
 
     fn handle_abort(&self) -> DaemonResponse {
@@ -3283,25 +3319,7 @@ impl Worker {
     /// Sequence and broadcast one `session_event` frame at the worker
     /// level (the TS `_emit` backing for switch notifications).
     pub(crate) fn emit_worker_event(&self, event: Value) {
-        let mut core = self.core.lock().unwrap();
-        let sequence = core.last_event_sequence + 1;
-        core.last_event_sequence = sequence;
-        let meta = create_daemon_event_meta(
-            &core.active_session_id,
-            sequence,
-            None,
-            Some(&core.generation),
-        );
-        let active_session_id = core.active_session_id.clone();
-        let outbound = DaemonOutbound::SessionEvent {
-            active_session_id,
-            event,
-            meta: Some(meta),
-            rest: Default::default(),
-        };
-        let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-        drop(core);
-        self.events.send(OutboundFrame::session_event(payload));
+        emit_worker_event_with(&self.core, &self.events, event);
     }
 
     /// Record one durable custom row and broadcast its
@@ -3562,6 +3580,99 @@ fn restore_queue_snapshot(
 
 /// The turn runner: drains the queue one turn at a time, running the session
 /// engine and emitting the agent-loop event lifecycle.
+/// Sequence and broadcast one `session_event` frame at the worker
+/// level: sequence + meta under the core lock, then one broadcast (the
+/// free-standing form of `Worker::emit_worker_event`, shared with the
+/// goal admission sink).
+pub(crate) fn emit_worker_event_with(
+    core: &Arc<Mutex<SessionCore>>,
+    events: &Arc<EventPump>,
+    event: Value,
+) {
+    let mut core = core.lock().unwrap();
+    let sequence = core.last_event_sequence + 1;
+    core.last_event_sequence = sequence;
+    let meta = create_daemon_event_meta(
+        &core.active_session_id,
+        sequence,
+        None,
+        Some(&core.generation),
+    );
+    let active_session_id = core.active_session_id.clone();
+    let outbound = DaemonOutbound::SessionEvent {
+        active_session_id,
+        event,
+        meta: Some(meta),
+        rest: Default::default(),
+    };
+    let payload = serde_json::to_vec(&outbound).unwrap_or_default();
+    drop(core);
+    events.send(OutboundFrame::session_event(payload));
+}
+
+/// Admit one engine-minted goal follow-up (TS `_queuePreparedPrompt`'s
+/// steer arm and the queued `followUp` admission behind
+/// `_getGoalContinuationMessages` / `_maybeResumeGoalContinuationAfterRlmWork`):
+/// the mint's `goal_update` surfaces at the moment the state changed
+/// (durable `thread_goal_state` entry first, then the broadcast), the
+/// minted turn queues into its lane (the steering lane for the
+/// budget-limit wrap-up steer, the follow-up lane for the continuation),
+/// and the runner wakes (`resumeIfIdle`).
+pub(crate) fn admit_goal_follow_up(
+    core: &Arc<Mutex<SessionCore>>,
+    events: &Arc<EventPump>,
+    work_notify: &Arc<Notify>,
+    work: crate::engine::GoalTurnEndWork,
+) {
+    let (lane, follow_up) = match work {
+        crate::engine::GoalTurnEndWork::BudgetLimitSteer(follow_up) => (Lane::Steering, follow_up),
+        crate::engine::GoalTurnEndWork::Continuation(follow_up) => (Lane::FollowUp, follow_up),
+    };
+    if let Some(goal) = &follow_up.goal_update {
+        {
+            let mut guard = core.lock().unwrap();
+            if let Some(store) = guard.store.as_mut() {
+                let _ = store.persist_entry(
+                    "custom",
+                    json!({
+                        "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                        "data": goal,
+                    }),
+                );
+            }
+        }
+        emit_worker_event_with(core, events, json!({ "type": "goal_update", "goal": goal }));
+    }
+    {
+        let mut core = core.lock().unwrap();
+        let item = QueuedItem {
+            message: follow_up.request.message,
+            custom_message: follow_up.request.custom_message,
+            agent_message: None,
+            queue_key: None,
+            admission_id: None,
+            images: follow_up.request.images,
+            done: None,
+        };
+        match lane {
+            Lane::Steering => core.steering.push_back(item),
+            Lane::FollowUp => core.follow_up.push_back(item),
+        }
+    }
+    // `resumeIfIdle`: the runner re-checks the queue at its loop head, so
+    // the minted turn runs as the next admitted turn.
+    work_notify.notify_one();
+}
+
+/// Whether one queued item is a minted goal-context turn (TS's
+/// `_clearQueuedGoalContexts` predicate on the injected custom row).
+fn is_goal_context_item(item: &QueuedItem) -> bool {
+    item.custom_message.as_ref().is_some_and(|row| {
+        row.get("customType").and_then(Value::as_str)
+            == Some(pa_core::goals::GOAL_CONTEXT_CUSTOM_TYPE)
+    })
+}
+
 struct TurnRunner {
     pub(crate) core: Arc<Mutex<SessionCore>>,
     /// The input-pause table (the admission gate holds queued input).
@@ -5071,6 +5182,207 @@ mod tests {
                 .iter()
                 .any(|event| event.get("type").and_then(Value::as_str) == Some("goal_update")),
             "a paused goal minted a continuation: {events:?}"
+        );
+    }
+
+    /// The goal continuation loop at the natural turn end (TS
+    /// `_getGoalContinuationMessages` + `_getContinuationMessages`): a
+    /// multi-continuation goal session driven to completion end to end
+    /// through the worker. The turn runner's queue drives each minted
+    /// continuation (the engine consults at every settled boundary, the
+    /// admission sink queues the follow-up, the runner wakes), the
+    /// budget-free loop keeps prompting until the kernel's
+    /// `goal.complete()` (the scripted ipython tool call, the f18
+    /// completion surface) settles the goal, and the completion's
+    /// boundary mints nothing more.
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    #[tokio::test]
+    async fn goal_turn_end_loop_runs_to_completion() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-goal-loop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "goal-loop-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [
+                    "first pursuit turn",
+                    "second pursuit turn",
+                    { "content": [
+                        { "type": "toolCall", "name": "ipython",
+                          "arguments": { "code": "import goal; await goal.complete()" } },
+                    ] },
+                    "wrap-up after the completion",
+                    "after the loop settled",
+                ],
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "goal-loop" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let mut subscription = worker.events.subscribe();
+        let start = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({
+                    "activeSessionId": "goal-loop-session",
+                    "message": "/goal drive the loop to completion",
+                }),
+            )
+            .await;
+        assert!(start.success, "the goal start failed: {start:?}");
+        // The loop owns the session until the goal settles: the idle wait
+        // returns only when the completion turn's boundary minted nothing.
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "the goal loop never settled: {idle:?}");
+        let events = session_events_since(&mut subscription);
+        // Each minted continuation ran as a queued follow-up turn: the
+        // start row plus two continuation rows (the completion turn is the
+        // second continuation's turn).
+        let goal_rows: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_start")
+                    && event["message"]["customType"] == "goal_context"
+            })
+            .collect();
+        assert_eq!(goal_rows.len(), 3, "events: {events:?}");
+        assert_eq!(goal_rows[0]["message"]["details"]["kind"], "continuation");
+        assert_eq!(goal_rows[1]["message"]["details"]["continuationsUsed"], 1);
+        assert_eq!(goal_rows[2]["message"]["details"]["continuationsUsed"], 2);
+        // The model turns all settled: the start turn, two continuation
+        // turns, and the completing tool-call turn's own assistant
+        // segments ride the wire as assistant rows.
+        let assistant_rows = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_end")
+                    && event["message"]["role"] == "assistant"
+            })
+            .count();
+        assert!(assistant_rows >= 4, "events: {events:?}");
+        // The goal state settled complete (the kernel completion through
+        // the worker's host handlers), with the loop's counts on the books.
+        let complete_update = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("goal_update")
+                    && event["goal"]["status"] == "complete"
+            })
+            .expect("the completion surfaced as a goal_update");
+        assert_eq!(
+            complete_update["goal"]["objective"],
+            "drive the loop to completion"
+        );
+        assert_eq!(complete_update["goal"]["continuationsUsed"], 2);
+        assert!(
+            complete_update["goal"]["tokensUsed"].as_u64().unwrap_or(0) > 0,
+            "usage accounting ran: {complete_update:?}"
+        );
+        // The completion's boundary mints nothing: the queue is empty and
+        // a plain prompt is admitted again.
+        let queue = worker
+            .dispatch(
+                "get_queue",
+                &json!({ "activeSessionId": "goal-loop-session" }),
+            )
+            .await;
+        assert!(queue.success, "queue read failed: {queue:?}");
+        let plain = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({
+                    "activeSessionId": "goal-loop-session",
+                    "message": "after the loop",
+                }),
+            )
+            .await;
+        assert!(plain.success, "a post-goal prompt failed: {plain:?}");
+    }
+
+    /// The pause withdraws the queued minted continuation (TS
+    /// `_pauseGoal` -> `_clearQueuedGoalContexts`): a prompt arriving right
+    /// after the goal start runs within a turn or two of the loop, the
+    /// pause purges the queued goal-context turn, and the loop goes quiet
+    /// (the f18 battery's pause pattern).
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    #[tokio::test]
+    async fn goal_pause_withdraws_the_queued_continuation() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-goal-pause-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "goal-pause-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [
+                    "start turn",
+                    "one continuation turn at most",
+                ],
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "goal-pause" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let start = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({
+                    "activeSessionId": "goal-pause-session",
+                    "message": "/goal pause right after the start",
+                }),
+            )
+            .await;
+        assert!(start.success, "the goal start failed: {start:?}");
+        let pause = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "goal-pause-session", "message": "/goal pause" }),
+            )
+            .await;
+        assert!(pause.success, "the pause never ran: {pause:?}");
+        // The loop is quiet: the idle wait settles without consuming
+        // further turns (a live continuation would starve it).
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "the loop never went quiet: {idle:?}");
+        let goal = worker.engine.goal_state_value();
+        assert_eq!(goal["status"], "paused", "goal state: {goal}");
+        // A settled paused goal consumed at most the start turn and one
+        // continuation turn's worth of slots.
+        assert!(
+            goal["continuationsUsed"].as_u64().unwrap_or(0) <= 2,
+            "the pause never withdrew the loop: {goal}"
         );
     }
 

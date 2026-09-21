@@ -18,12 +18,23 @@ use super::host_requests::{
     handle_goal_host_request, handle_rlm_heartbeat_host_request, SessionBinding,
 };
 
+/// The host-side purge of queued goal-context turns (TS
+/// `_clearQueuedGoalContexts` at the `_completeGoalFromHost` site): the
+/// queue lanes live in the daemon worker, so the completing kernel host
+/// request invokes this seam instead — dropping a continuation queued
+/// while the goal was completing.
+pub type QueuedGoalContextPurge = Arc<dyn Fn() + Send + Sync>;
+
 /// Session-scoped runtime state the kernel bridge reaches.
 pub struct SessionRuntime {
     goal_driver: Arc<Mutex<GoalDriver>>,
     cron_store: Arc<AgentCronJobStore>,
     active_session_id: String,
     binding: SessionBinding,
+    /// Invoked after a kernel `goal.complete` settles the goal (TS
+    /// `_completeGoalFromHost` -> `_clearQueuedGoalContexts`); `None` when
+    /// the embedding owns no queued goal contexts.
+    goal_complete_purge: Option<QueuedGoalContextPurge>,
 }
 
 impl SessionRuntime {
@@ -39,7 +50,14 @@ impl SessionRuntime {
             cron_store,
             active_session_id,
             binding,
+            goal_complete_purge: None,
         }
+    }
+
+    /// Set the post-completion purge seam (the daemon worker's queue
+    /// purge).
+    pub fn set_goal_complete_purge(&mut self, purge: QueuedGoalContextPurge) {
+        self.goal_complete_purge = Some(purge);
     }
 
     pub fn goal_driver(&self) -> &Arc<Mutex<GoalDriver>> {
@@ -102,20 +120,30 @@ impl SessionRuntime {
         );
         let driver = self.goal_driver.clone();
         let goal_session = session.clone();
+        // TS `_completeGoalFromHost` clears the queued goal contexts: a
+        // continuation queued behind the completing turn (e.g. an owed
+        // continuation delivered mid-turn) never runs post-completion.
+        let goal_complete_purge = self.goal_complete_purge.clone();
         handlers.register(
             "goal.complete",
             host_handler(move |payload| {
                 let driver = driver.clone();
                 let session = goal_session.clone();
+                let purge = goal_complete_purge.clone();
                 Box::pin(async move {
-                    let mut driver = driver.lock().await;
-                    let mut session = session.lock().await;
-                    let response = handle_goal_host_request(
-                        "goal.complete",
-                        &payload.data,
-                        &mut driver,
-                        &mut session,
-                    )?;
+                    let response = {
+                        let mut driver = driver.lock().await;
+                        let mut session = session.lock().await;
+                        handle_goal_host_request(
+                            "goal.complete",
+                            &payload.data,
+                            &mut driver,
+                            &mut session,
+                        )?
+                    };
+                    if let Some(purge) = purge {
+                        purge();
+                    }
                     host_ok(&response)
                 })
             }),

@@ -188,6 +188,9 @@ struct SupervisorChildSessionsInner {
     /// response recorded) before the child's first model turn starts — the
     /// deterministic ordering TS gets from its single-threaded event loop.
     turn_done: tokio::sync::watch::Sender<u64>,
+    /// The parent engine's child-settle hook (goal continuation resume);
+    /// `None` until the engine wires it.
+    settle_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Clone for SupervisorChildSessions {
@@ -213,6 +216,7 @@ impl SupervisorChildSessions {
                 identity: std::sync::Mutex::new(ParentIdentity::with_default_depth()),
                 children: Mutex::new(Vec::new()),
                 turn_done: tokio::sync::watch::Sender::new(0),
+                settle_hook: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -221,6 +225,28 @@ impl SupervisorChildSessions {
     /// on the boundary (called once per `EngineEvent::Done`).
     pub fn notify_turn_done(&self) {
         self.inner.turn_done.send_modify(|value| *value += 1);
+    }
+
+    /// Register the child-settle hook (TS
+    /// `_maybeResumeGoalContinuationAfterRlmWork`'s settle sites): fired
+    /// once per settled child run — the natural settle watcher, the
+    /// cancel walk, and the delete path — so a goal continuation owed
+    /// behind descendant work re-evaluates when descendants settle.
+    pub fn set_settle_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.settle_hook.lock().expect("settle hook lock") = Some(hook);
+    }
+
+    /// Whether any tracked child run is still unsettled (TS
+    /// `_hasUnsettledRlmQuiescenceWork`'s child-run arm: a record without
+    /// a terminal state).
+    pub async fn any_running(&self) -> bool {
+        let children = self.inner.children.lock().await;
+        for record in children.iter() {
+            if record.lock().await.settled_status.is_none() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Replace the parent identity (the worker session sets it once its own
@@ -416,6 +442,14 @@ impl SupervisorChildSessions {
 }
 
 impl SupervisorChildSessionsInner {
+    /// Fire the settle hook off-thread (the settle sites run inside
+    /// watcher tasks; the hook owns its own scheduling).
+    pub(crate) fn fire_settle_hook(&self) {
+        let hook = self.settle_hook.lock().expect("settle hook lock").clone();
+        if let Some(hook) = hook {
+            std::thread::spawn(move || hook());
+        }
+    }
     /// Wait for the parent turn that spawned a task to complete (generation
     /// strictly greater than the one captured at spawn admission). Bounded:
     /// a turn that never settles releases the child anyway.
@@ -779,6 +813,10 @@ impl SupervisorChildSessionsInner {
                 }
                 self.refresh_record(record).await;
                 self.deliver_settle_notice(record).await;
+                // A settled child releases an owed goal continuation (TS
+                // `_maybeResumeGoalContinuationAfterRlmWork` at the child
+                // settle sites).
+                self.fire_settle_hook();
                 return;
             }
             // Still running (a timed-out slice or a re-queued continuation):
@@ -900,6 +938,9 @@ impl SupervisorChildSessionsInner {
                 .command(&abort, KILL_TIMEOUT_MS)
                 .await
                 .with_context(|| format!("abort RLM child session {active_session_id}"));
+            // The settled/cancelled child releases an owed goal
+            // continuation.
+            self.fire_settle_hook();
             return true;
         }
         false
@@ -945,6 +986,9 @@ impl SupervisorChildSessionsInner {
                 .lock()
                 .await
                 .retain(|candidate| !Arc::ptr_eq(candidate, record));
+            // The deleted child is a TS resume site for the owed goal
+            // continuation (`_finishRlmRunDeletion`).
+            self.fire_settle_hook();
             return Ok("deleted");
         }
         Ok("not_found")

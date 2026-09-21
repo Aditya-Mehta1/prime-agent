@@ -225,6 +225,7 @@ mod tests {
                 // The settings default (no prewarm); the ACP autorefine
                 // tests do not exercise kernel boot paths.
                 prewarm_ipython_kernel: None,
+                queued_goal_context_purge: None,
             })
             .await
             .unwrap(),

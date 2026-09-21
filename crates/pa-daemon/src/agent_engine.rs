@@ -36,6 +36,7 @@ use crate::engine::{
     CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection, PromptRequest,
     SessionEngine, SideQuestionOutcome, SideQuestionRequest,
 };
+use crate::goal_continuation::GoalBoundary;
 use crate::rlm_children::{ParentIdentity, SupervisorChildSessions, DEFAULT_RLM_MAX_DEPTH};
 
 /// Configuration for the real engine.
@@ -83,9 +84,11 @@ pub struct SupervisorLinkConfig {
 /// The goal driver and session-manager handles mirrored from the core
 /// session (see `AgentSessionEngine::goal_runtime`).
 #[derive(Clone)]
-struct GoalRuntimeHandles {
-    driver: std::sync::Arc<tokio::sync::Mutex<pa_core::session_engine::goal_driver::GoalDriver>>,
-    session: std::sync::Arc<tokio::sync::Mutex<pa_core::session::manager::SessionManager>>,
+pub(crate) struct GoalRuntimeHandles {
+    pub(crate) driver:
+        std::sync::Arc<tokio::sync::Mutex<pa_core::session_engine::goal_driver::GoalDriver>>,
+    pub(crate) session:
+        std::sync::Arc<tokio::sync::Mutex<pa_core::session::manager::SessionManager>>,
 }
 
 /// A [`SessionEngine`] running real agent turns.
@@ -99,12 +102,30 @@ pub struct AgentSessionEngine {
     /// The last goal state emitted as a `goal_update` event: the TS session
     /// emits on state change, so unchanged states (e.g. `/goal status`)
     /// stay silent.
-    published_goal: std::sync::Mutex<Option<pa_core::goals::GoalState>>,
+    pub(crate) published_goal: std::sync::Mutex<Option<pa_core::goals::GoalState>>,
     /// The session's goal driver and session-manager handles, mirrored from
     /// the core session at build time: the core session's own mutex is held
     /// across a turn's admission, so goal checks inside emit callbacks
     /// (which may run in async context) must not lock it.
-    goal_runtime: std::sync::Mutex<Option<GoalRuntimeHandles>>,
+    pub(crate) goal_runtime: std::sync::Mutex<Option<GoalRuntimeHandles>>,
+    /// Whether this run's usage accounting crossed the goal's token budget
+    /// (TS `_accountGoalUsageForAssistantMessage` returning `true` at the
+    /// message_end hook): the natural boundary mints the budget-limit
+    /// wrap-up steer and ends the run. Shared with the agent-loop
+    /// subscription (a plain field cannot cross the 'static handler).
+    pub(crate) goal_budget_crossed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The worker's session-input probe (TS `queuedActionCount > 0` plus
+    /// the queued-input suspension): the goal continuation mint defers
+    /// while it reports queued work.
+    pub(crate) goal_input_probe: std::sync::Mutex<Option<crate::engine::SessionInputProbe>>,
+    /// The worker's goal admission sink: minted goal follow-ups admit
+    /// through the turn runner's queue lanes (steering for the budget
+    /// steer, follow-up for the continuation).
+    pub(crate) goal_admission_sink: std::sync::Mutex<Option<crate::engine::GoalAdmissionSink>>,
+    /// The worker's queued-goal-context purge (TS
+    /// `_clearQueuedGoalContexts`): invoked by the pause/clear/start
+    /// session commands and the kernel `goal.complete` host request.
+    pub(crate) goal_queue_purge: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     /// The session's live agent handle (TS `AgentSession.agent`): the eager
     /// turn-abort funnel's target. Mirrored from the core session at build
     /// time for the same reason as the goal runtime handles — a running
@@ -147,7 +168,7 @@ pub struct AgentSessionEngine {
     /// the first request; standalone workers never use it.
     link: Arc<crate::supervisor_link::SupervisorLink>,
     /// Supervisor-backed RLM children; `None` for standalone workers.
-    children: Option<Arc<SupervisorChildSessions>>,
+    pub(crate) children: Option<Arc<SupervisorChildSessions>>,
     /// This worker's own session summary (worker-pushed at create/rename),
     /// read by the kernel messaging controller to render sender identity.
     own_summary: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
@@ -305,6 +326,10 @@ impl AgentSessionEngine {
             mcp,
             published_goal: std::sync::Mutex::new(None),
             goal_runtime: std::sync::Mutex::new(None),
+            goal_budget_crossed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            goal_input_probe: std::sync::Mutex::new(None),
+            goal_admission_sink: std::sync::Mutex::new(None),
+            goal_queue_purge: std::sync::Mutex::new(None),
             turn_agent: std::sync::Mutex::new(None),
             session_file,
             selection: std::sync::RwLock::new(selection),
@@ -732,6 +757,13 @@ impl AgentSessionEngine {
                 now: None,
             }
         });
+        // Bound before the awaited build: the purge-clone binding must not
+        // hold the lock guard across the await.
+        let queued_goal_context_purge = self
+            .goal_queue_purge
+            .lock()
+            .expect("goal queue purge lock")
+            .clone();
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
             telemetry,
             cwd,
@@ -769,6 +801,11 @@ impl AgentSessionEngine {
             // the lazy first-call start, exactly like the TS session's
             // `rlmDepth === 0` check.
             prewarm_ipython_kernel: Some(true),
+            // TS `_clearQueuedGoalContexts` (the session-command sites and
+            // the kernel's `goal.complete`): the worker-installed queue
+            // purge, so the session engine's surfaces withdraw queued
+            // minted continuations.
+            queued_goal_context_purge,
         })
         .await
     }
@@ -999,6 +1036,20 @@ impl AgentSessionEngine {
 }
 
 impl SessionEngine for AgentSessionEngine {
+    /// TS `_clearQueuedGoalContexts`: the worker-installed purge withdraws
+    /// the queued minted goal-context turns (pause/clear/start must not
+    /// leave a stale continuation to run after the state change).
+    fn purge_queued_goal_contexts(&self) {
+        let purge = self
+            .goal_queue_purge
+            .lock()
+            .expect("goal queue purge lock")
+            .clone();
+        if let Some(purge) = purge {
+            purge();
+        }
+    }
+
     fn goal_state_value(&self) -> Value {
         if let Some(goal) = self.current_goal_state() {
             return serde_json::to_value(&goal).unwrap_or(Value::Null);
@@ -1027,35 +1078,33 @@ impl SessionEngine for AgentSessionEngine {
             .clone()?;
         let continuation = self.runtime.block_on(async {
             let mut driver = handles.driver.lock().await;
+            // TS `resumeQueuedWork()`'s quiescence arm: unsettled RLM
+            // descendant work defers the mint (the continuation is owed,
+            // not consumed; the settle sites deliver it).
+            if self.has_unsettled_rlm_work().await {
+                driver.mark_continuation_owed();
+                return None;
+            }
             let mut session = handles.session.lock().await;
             // The mint persists the `thread_goal_state` entry (TS
             // `_setGoalState`) and consumes one continuation slot; an
             // inactive or objective-less goal mints nothing.
             let message = driver.next_continuation_message(&mut session)?;
-            Some(crate::engine::PromptRequest {
-                message: message.content.text().to_string(),
-                images: Vec::new(),
-                source: "user".to_string(),
-                agent_message_id: None,
-                custom_message: Some(crate::session_commands::custom_message_value(&message)),
-            })
+            let goal_update = self.publish_goal_state(driver.state());
+            Some((
+                crate::engine::PromptRequest {
+                    message: message.content.text().to_string(),
+                    images: Vec::new(),
+                    source: "user".to_string(),
+                    agent_message_id: None,
+                    custom_message: Some(crate::session_commands::custom_message_value(&message)),
+                },
+                goal_update,
+            ))
         })?;
-        // TS `_setGoalState` emits `goal_update` on every state change:
-        // the mint moved `continuationsUsed`, so the state changed unless
-        // the published baseline already matches (impossible for a fresh
-        // count, but the comparison keeps the dedupe contract).
-        let goal = self.current_goal_state()?;
-        let goal_update = {
-            let mut published = self.published_goal.lock().expect("published goal lock");
-            if published.as_ref() == Some(&goal) {
-                None
-            } else {
-                *published = Some(goal.clone());
-                Some(serde_json::to_value(&goal).unwrap_or(Value::Null))
-            }
-        };
+        let (request, goal_update) = continuation;
         Some(crate::engine::GoalContinuation {
-            request: continuation,
+            request,
             goal_update,
         })
     }
@@ -2510,6 +2559,7 @@ impl AgentSessionEngine {
             consumed
         };
         let mut stopped_for_compaction = false;
+        let mut compacted = false;
         match consumption.compaction {
             Some(Ok(pa_core::session_engine::compact_session::CompactOutcome::Ran(run))) => {
                 // The post-compaction kernel notice goes out before the
@@ -2548,6 +2598,7 @@ impl AgentSessionEngine {
                     return BoundaryRun::Cancelled;
                 }
                 stopped_for_compaction = true;
+                compacted = true;
             }
             // A skip consumed the request (the Rust `/compact` contract):
             // the durable disclosure row goes out with its message pair,
@@ -2621,7 +2672,7 @@ impl AgentSessionEngine {
             None => {}
         }
         if stopped_for_compaction {
-            BoundaryRun::StoppedForCompaction
+            BoundaryRun::StoppedForCompaction { compacted }
         } else {
             BoundaryRun::Proceed
         }
@@ -2706,6 +2757,11 @@ impl AgentSessionEngine {
                         OverflowArmRun::NotApplicable | OverflowArmRun::Finished => {}
                         OverflowArmRun::Cancelled => return,
                     }
+                    // TS `_stopGoalContinuationForTerminalMessage`: an
+                    // error assistant message fails an active goal (the
+                    // state change surfaces with the trailing `Done`
+                    // through the tracking wrapper).
+                    self.finish_goal_for_terminal_error(&error);
                     emit(EngineEvent::Done(Err(error)));
                     return;
                 }
@@ -2716,7 +2772,7 @@ impl AgentSessionEngine {
             // during this turn run now, between turns.
             match self.run_turn_boundary(emit) {
                 BoundaryRun::Cancelled => return,
-                BoundaryRun::StoppedForCompaction => {
+                BoundaryRun::StoppedForCompaction { compacted } => {
                     // The requested compaction armed the trigger; the run
                     // stops here, so the round services it before the
                     // `Done` reaches attached clients (TS agent_end's
@@ -2724,6 +2780,20 @@ impl AgentSessionEngine {
                     // boundary).
                     if !self.run_compact_auto_refine(emit) {
                         return;
+                    }
+                    // TS `compact()`'s `didCompact` + active-goal branch:
+                    // a compaction that ran re-consults the goal at the
+                    // post-compaction boundary (`_goalContinuationAwaitsRlmWork
+                    // ||= !hasQueuedMessages(); resumeQueuedWork()`); a
+                    // skip or failure stays stopped like the TS catch arm.
+                    if compacted && !aborted() {
+                        match self.goal_turn_end_boundary() {
+                            GoalBoundary::End => {
+                                emit(EngineEvent::Done(Ok(())));
+                                return;
+                            }
+                            GoalBoundary::Proceed => {}
+                        }
                     }
                     emit(EngineEvent::Done(Ok(())));
                     return;
@@ -2747,6 +2817,21 @@ impl AgentSessionEngine {
             // autonomous decision may queue a continuation.
             if !self.run_compact_auto_refine(emit) {
                 return;
+            }
+            // TS `_getContinuationMessages` at the agent loop's natural
+            // turn end: the goal continuation takes exclusive priority
+            // over autonomous continuation, so the goal arm runs first
+            // and an active goal ends the boundary either way (a minted
+            // follow-up, or a deferral behind queued input / unsettled
+            // RLM descendant work). `signal?.aborted` gates the hook.
+            if !aborted() {
+                match self.goal_turn_end_boundary() {
+                    GoalBoundary::End => {
+                        emit(EngineEvent::Done(Ok(())));
+                        return;
+                    }
+                    GoalBoundary::Proceed => {}
+                }
             }
             match self.autonomous_follow_up(&assistant) {
                 AutonomousFollowUp::Inactive => {
@@ -2878,6 +2963,7 @@ impl AgentSessionEngine {
         // `goal_update`. The handles come from the engine mirror: the core
         // session's own mutex is held across the turn's admission.
         let goal_runtime = self.goal_runtime.lock().expect("goal runtime lock").clone();
+        let goal_budget_crossed = std::sync::Arc::clone(&self.goal_budget_crossed);
         let subscription = {
             let tx = tx.clone();
             // Per-message usage accounting runs on every settled assistant
@@ -2897,6 +2983,7 @@ impl AgentSessionEngine {
                     let autonomous_state = std::sync::Arc::clone(&autonomous_state);
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
                     let goal_runtime = goal_runtime.clone();
+                    let goal_budget_crossed = goal_budget_crossed.clone();
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
                         if let AgentEvent::MessageEnd {
@@ -2927,11 +3014,25 @@ impl AgentSessionEngine {
                                         // ids in-process; the timestamp is
                                         // the double-counting guard identity.
                                         let message_id = format!("a-{}", message.timestamp);
-                                        driver.record_assistant_usage(
+                                        // TS `_accountGoalUsageForAssistantMessage`
+                                        // returning true: the budget crossing
+                                        // moves the goal to `budget_limited`
+                                        // (the tracking wrapper publishes the
+                                        // `goal_update` with the next emit),
+                                        // and the natural boundary mints the
+                                        // budget-limit wrap-up steer.
+                                        if driver.record_assistant_usage(
                                             &mut session,
                                             &message_id,
                                             &message.usage,
-                                        );
+                                        ) == pa_core::session_engine::goal_driver::UsageOutcome::BudgetReached
+                                        {
+                                            // TS `_shouldStopAfterTurn`'s budget
+                                            // arm arms the wrap-up steer: the
+                                            // natural boundary reads it.
+                                            goal_budget_crossed
+                                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                                        }
                                     }
                                 }
                             }
@@ -3200,8 +3301,10 @@ enum BoundaryRun {
     /// Nothing pending, or requests consumed without stopping the run.
     Proceed,
     /// A consumed compaction stops the loop (TS: requested compaction
-    /// stops the run on purpose).
-    StoppedForCompaction,
+    /// stops the run on purpose). `compacted` marks the runs that
+    /// actually compacted (TS `didCompact`), the only arm whose
+    /// post-compaction goal-continuation consult mints.
+    StoppedForCompaction { compacted: bool },
     /// The emitter asked to stop.
     Cancelled,
 }
@@ -3300,6 +3403,8 @@ pub(crate) static FAUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    pub(crate) use super::FAUX_TEST_LOCK;
 
     /// A models.json custom provider (name has no env-key mapping), with an
     /// apiKey the registry must resolve for request auth (the env-key map
@@ -3427,6 +3532,23 @@ pub(crate) mod tests {
         (engine, dir)
     }
 
+    /// The goal-admission collector: installs the turn-end seam (a probe
+    /// reporting no queued input plus a sink capturing minted work) on an
+    /// engine built without a worker.
+    pub(crate) fn goal_admission_collector(
+        engine: &std::sync::Arc<AgentSessionEngine>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<crate::engine::GoalTurnEndWork>>> {
+        let collected: std::sync::Arc<std::sync::Mutex<Vec<crate::engine::GoalTurnEndWork>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&collected);
+        engine.set_goal_admission(
+            std::sync::Arc::new(|| false),
+            std::sync::Arc::new(move |work| sink.lock().unwrap().push(work)),
+            std::sync::Arc::new(|| {}),
+        );
+        collected
+    }
+
     /// Admit one prompt through the engine, collecting its events.
     pub(crate) fn admit(
         engine: &AgentSessionEngine,
@@ -3493,20 +3615,25 @@ pub(crate) mod tests {
             }),
         );
         store.rewrite().expect("write session file");
-        let engine = AgentSessionEngine::new(AgentEngineConfig {
-            cwd: dir.path().to_path_buf(),
-            agent_dir,
-            provider: None,
-            model: None,
-            api_key: None,
-            thinking: None,
-            session_dir: None,
-            session_file: Some(session_path),
-            faux_script: Some(r#"{"responses": [{"text": "recovery reply"}]}"#.to_string()),
-            supervisor_link: None,
-            telemetry_disabled: None,
-        })
-        .unwrap();
+        let engine = std::sync::Arc::new(
+            AgentSessionEngine::new(AgentEngineConfig {
+                cwd: dir.path().to_path_buf(),
+                agent_dir,
+                provider: None,
+                model: None,
+                api_key: None,
+                thinking: None,
+                session_dir: None,
+                session_file: Some(session_path),
+                faux_script: Some(r#"{"responses": [{"text": "recovery reply"}]}"#.to_string()),
+                supervisor_link: None,
+                telemetry_disabled: None,
+            })
+            .unwrap(),
+        );
+        // The turn-end seam: the engine has no worker, so a collector
+        // stands in for the queue-lane admission sink.
+        let goal_work = goal_admission_collector(&engine);
         // The first turn builds the session; the adoption rehydrates the
         // driver from the session file.
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -3515,11 +3642,15 @@ pub(crate) mod tests {
         assert_eq!(goal["status"], "active");
         assert_eq!(goal["objective"], "ship the port");
         assert_eq!(goal["goalId"], "goal-1");
-        assert_eq!(goal["continuationsUsed"], 2);
+        // The rehydrated count continues the pursuit: the turn's natural
+        // end minted the next continuation (the TS goal loop).
+        assert_eq!(goal["continuationsUsed"], 3);
         assert!(goal["tokensUsed"].as_u64().unwrap() >= 340);
         // Usage accounting announced from the rehydrated base (TS
         // `_accountGoalUsageForAssistantMessage` -> `_emitGoalUpdate`): one
-        // `goal_update`, carrying the continued objective and count.
+        // `goal_update` through the run's emit, carrying the continued
+        // objective and the rehydrated count (the turn-end mint's update
+        // surfaces through the admission sink, not the run's emit).
         let goal_updates: Vec<&EngineEvent> = events
             .iter()
             .filter(|event| matches!(event, EngineEvent::GoalUpdate { .. }))
@@ -3530,13 +3661,28 @@ pub(crate) mod tests {
         };
         assert_eq!(goal["objective"], "ship the port");
         assert_eq!(goal["continuationsUsed"], 2);
-        // A mint continues the persisted continuation count.
+        // The turn-end continuation minted at the natural boundary: one
+        // admitted follow-up whose `goal_update` continues the count.
+        let work = goal_work.lock().unwrap();
+        let [crate::engine::GoalTurnEndWork::Continuation(minted)] = work.as_slice() else {
+            panic!("unexpected goal work: {work:?}");
+        };
+        assert!(minted.request.message.contains("[goal: continuation]"));
+        assert_eq!(
+            minted
+                .goal_update
+                .as_ref()
+                .expect("the mint moved the state")["continuationsUsed"],
+            3
+        );
+        drop(work);
+        // A post-compaction mint continues the pursuit's count further.
         let minted = engine
             .mint_post_compaction_goal_continuation()
             .expect("the rehydrated goal mints");
         assert_eq!(
             minted.goal_update.expect("mint moved the state")["continuationsUsed"],
-            3
+            4
         );
     }
 
@@ -3677,6 +3823,10 @@ pub(crate) mod tests {
             serde_json::json!({ "responses": [{"text": "goal turn reply"}] }),
             1,
         );
+        let engine = std::sync::Arc::new(engine);
+        // The turn-end seam: the engine has no worker, so a collector
+        // stands in for the queue-lane admission sink.
+        let goal_work = goal_admission_collector(&engine);
         let mut events: Vec<EngineEvent> = Vec::new();
         admit(
             &engine,
@@ -3684,10 +3834,21 @@ pub(crate) mod tests {
             &mut events,
         );
         // The goal-start continuation turn ran (TS `/goal` start does not
-        // consume a continuation slot — only driver mints do), the goal
-        // active.
+        // consume a continuation slot), the goal active; the turn's
+        // natural end then minted the goal loop's next continuation (the
+        // TS `_getGoalContinuationMessages` hook).
         assert_eq!(engine.goal_state_value()["status"], "active");
-        assert_eq!(engine.goal_state_value()["continuationsUsed"], 0);
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
+        let work = goal_work.lock().unwrap();
+        let [crate::engine::GoalTurnEndWork::Continuation(turn_end)] = work.as_slice() else {
+            panic!("unexpected goal work: {work:?}");
+        };
+        assert!(turn_end.request.message.contains("[goal: continuation]"));
+        assert_eq!(
+            turn_end.goal_update.as_ref().expect("mint moved the state")["continuationsUsed"],
+            1
+        );
+        drop(work);
         let minted = engine
             .mint_post_compaction_goal_continuation()
             .expect("active goal mints the continuation");
@@ -3708,14 +3869,14 @@ pub(crate) mod tests {
         assert_eq!(row["role"], "custom");
         assert_eq!(row["content"], json!(message));
         assert_eq!(row["details"]["kind"], "continuation");
-        assert_eq!(row["details"]["continuationsUsed"], 1);
+        assert_eq!(row["details"]["continuationsUsed"], 2);
         // The state change persisted (TS `_setGoalState`): the wire state
         // read reflects the mint, and the `goal_update` payload carries
         // the same state.
-        assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 2);
         let goal_update = minted.goal_update.expect("the mint moved the state");
         assert_eq!(goal_update["status"], "active");
-        assert_eq!(goal_update["continuationsUsed"], 1);
+        assert_eq!(goal_update["continuationsUsed"], 2);
         // A mint over a paused goal produces nothing (TS checks the
         // active status at the resume site).
         let mut pause_events: Vec<EngineEvent> = Vec::new();
@@ -3725,6 +3886,403 @@ pub(crate) mod tests {
             engine.mint_post_compaction_goal_continuation().is_none(),
             "a paused goal minted a continuation"
         );
+    }
+
+    /// Admit one full turn request (the minted continuation's injected
+    /// goal-context row), collecting its events.
+    pub(crate) fn admit_request(
+        engine: &AgentSessionEngine,
+        request: crate::engine::PromptRequest,
+        events: &mut Vec<EngineEvent>,
+    ) {
+        engine.run_prompt(0, request, &|| false, &mut |event| {
+            events.push(event);
+            true
+        });
+    }
+
+    /// TS `_getGoalContinuationMessages` at the natural turn end: an
+    /// active goal mints one continuation per settled turn, the minted
+    /// follow-up carries the continuation context (objective, count, and
+    /// the durable goal-context row), and a completed goal stops the loop
+    /// (no mint at the boundary after the completion).
+    #[test]
+    fn goal_turn_end_mints_the_loop_until_the_goal_completes() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = std::sync::Arc::new(
+            AgentSessionEngine::new(AgentEngineConfig {
+                cwd: dir.path().to_path_buf(),
+                agent_dir: dir.path().join("agent"),
+                provider: None,
+                model: None,
+                api_key: None,
+                thinking: None,
+                session_dir: None,
+                session_file: None,
+                faux_script: Some(
+                    serde_json::json!({ "responses": [
+                        {"text": "first turn"},
+                        {"text": "second turn"},
+                        {"text": "third turn"},
+                        {"text": "final turn"},
+                    ]})
+                    .to_string(),
+                ),
+                supervisor_link: None,
+                telemetry_disabled: None,
+            })
+            .unwrap(),
+        );
+        let goal_work = goal_admission_collector(&engine);
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "/goal ship the goal loop".to_string(), &mut events);
+        // The goal-start turn's natural end minted the first continuation.
+        assert_eq!(engine.goal_state_value()["status"], "active");
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
+        // The worker queue would drive the minted turn: admit it like the
+        // runner does, twice — each settled turn mints the next
+        // continuation (the TS loop keeps prompting the model), the minted
+        // row carrying the incremented count.
+        let mut request = {
+            let mut work = goal_work.lock().unwrap();
+            let crate::engine::GoalTurnEndWork::Continuation(follow_up) =
+                work.pop().expect("the start turn minted one continuation")
+            else {
+                panic!("expected a continuation");
+            };
+            assert!(follow_up.request.message.contains("[goal: continuation]"));
+            assert!(follow_up.request.message.contains("ship the goal loop"));
+            follow_up.request
+        };
+        for expected_count in [2u64, 3] {
+            let mut turn_events: Vec<EngineEvent> = Vec::new();
+            admit_request(&engine, request, &mut turn_events);
+            request = {
+                let mut work = goal_work.lock().unwrap();
+                assert_eq!(work.len(), 1, "unexpected goal work: {work:?}");
+                let crate::engine::GoalTurnEndWork::Continuation(follow_up) = work
+                    .pop()
+                    .expect("the settled turn minted the next continuation")
+                else {
+                    panic!("expected a continuation");
+                };
+                let row = follow_up
+                    .request
+                    .custom_message
+                    .as_ref()
+                    .expect("the row rides");
+                assert_eq!(row["customType"], "goal_context");
+                assert_eq!(row["details"]["kind"], "continuation");
+                assert_eq!(
+                    row["details"]["continuationsUsed"],
+                    serde_json::json!(expected_count)
+                );
+                assert_eq!(
+                    follow_up.goal_update.expect("mint moved the state")["continuationsUsed"],
+                    serde_json::json!(expected_count)
+                );
+                follow_up.request
+            };
+            assert_eq!(
+                engine.goal_state_value()["continuationsUsed"],
+                serde_json::json!(expected_count)
+            );
+        }
+        // The goal completes (the kernel host request's driver path):
+        // the queued continuation's boundary mints nothing more.
+        let handles = engine
+            .goal_runtime
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("goal runtime");
+        engine.runtime.block_on(async {
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            driver.complete(&mut session);
+        });
+        let mut turn_events: Vec<EngineEvent> = Vec::new();
+        admit_request(&engine, request, &mut turn_events);
+        assert_eq!(engine.goal_state_value()["status"], "complete");
+        assert_eq!(
+            engine.goal_state_value()["continuationsUsed"],
+            3,
+            "a completed goal mints no continuation at the boundary"
+        );
+        assert!(goal_work.lock().unwrap().is_empty());
+    }
+
+    /// The TS gate ladder's inactive arms: a paused goal (and a cleared
+    /// one) mints nothing at the natural turn end, and no continuation
+    /// slot is consumed.
+    #[test]
+    fn paused_goal_mints_no_turn_end_continuation() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, _engine_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [
+                {"text": "start turn reply"},
+                {"text": "paused turn reply"},
+            ]}),
+            1,
+        );
+        let engine = std::sync::Arc::new(engine);
+        let goal_work = goal_admission_collector(&engine);
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "/goal ship while paused".to_string(), &mut events);
+        // The start turn's boundary minted one continuation; pause the
+        // goal, then drive that minted turn: its boundary mints nothing.
+        let request = {
+            let mut work = goal_work.lock().unwrap();
+            let crate::engine::GoalTurnEndWork::Continuation(follow_up) =
+                work.pop().expect("the start turn minted")
+            else {
+                panic!("expected a continuation");
+            };
+            follow_up.request
+        };
+        let count_before = engine.goal_state_value()["continuationsUsed"].clone();
+        let mut pause_events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "/goal pause".to_string(), &mut pause_events);
+        assert_eq!(engine.goal_state_value()["status"], "paused");
+        let mut turn_events: Vec<EngineEvent> = Vec::new();
+        admit_request(&engine, request, &mut turn_events);
+        // No mint: the paused goal consumed no slot at the boundary.
+        assert!(goal_work.lock().unwrap().is_empty());
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], count_before);
+        assert_eq!(turn_events.last(), Some(&EngineEvent::Done(Ok(()))));
+        // A cleared goal behaves the same.
+        admit(&engine, "/goal clear".to_string(), &mut Vec::new());
+        let mut after_clear: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "plain turn".to_string(), &mut after_clear);
+        assert!(goal_work.lock().unwrap().is_empty());
+        assert_eq!(engine.goal_state_value()["status"], "idle");
+    }
+
+    /// The budget-exhausted gate (TS `_accountGoalUsageForAssistantMessage`
+    /// returning true -> the `budget_limit` context steer): the crossing
+    /// turn ends the run, the wrap-up steer queues on the steering surface,
+    /// the goal moves to `budget_limited` with the TS reason, and no
+    /// continuation mints at that boundary.
+    #[test]
+    fn budget_exhausted_stops_with_the_ts_budget_steer() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, _engine_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "crossing turn reply"}] }),
+            1,
+        );
+        let engine = std::sync::Arc::new(engine);
+        let goal_work = goal_admission_collector(&engine);
+        let mut events: Vec<EngineEvent> = Vec::new();
+        // A tiny budget: the goal-start turn's usage crosses it (the faux
+        // provider estimates usage from the context).
+        admit(
+            &engine,
+            "/goal --budget 10 budget the runaway turn".to_string(),
+            &mut events,
+        );
+        let goal = engine.goal_state_value();
+        assert_eq!(goal["status"], "budget_limited");
+        assert_eq!(
+            goal["lastReason"],
+            serde_json::json!("Reached 10 token goal budget")
+        );
+        // The crossing turn's boundary minted the budget-limit steer, not
+        // a continuation.
+        let work = goal_work.lock().unwrap();
+        let [crate::engine::GoalTurnEndWork::BudgetLimitSteer(steer)] = work.as_slice() else {
+            panic!("expected exactly the budget steer: {work:?}");
+        };
+        let steer_text = &steer.request.message;
+        assert!(
+            steer_text.starts_with("[goal: budget-limit]"),
+            "text: {steer_text}"
+        );
+        assert!(steer_text.contains("budget the runaway turn"));
+        assert!(steer_text.contains("status: budget_limited"));
+        assert!(steer_text.contains("Do not start new substantive work"));
+        let row = steer
+            .request
+            .custom_message
+            .as_ref()
+            .expect("the row rides");
+        assert_eq!(row["customType"], "goal_context");
+        assert_eq!(row["details"]["kind"], "budget_limit");
+        // The steer carries no goal_update: the budget transition was
+        // announced through the run's own `goal_update` event.
+        assert!(steer.goal_update.is_none());
+        drop(work);
+        let goal_updates: Vec<&EngineEvent> = events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::GoalUpdate { .. }))
+            .collect();
+        assert!(
+            goal_updates
+                .iter()
+                .any(|event| matches!(event, EngineEvent::GoalUpdate { goal }
+                    if goal["status"] == serde_json::json!("budget_limited"))),
+            "the budget transition never announced: {events:?}"
+        );
+        // The run stopped at the crossing turn (TS: queued steer owns the
+        // next turn, `resumeIfIdle`).
+        assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
+    }
+
+    /// The queued-input gate (TS `queuedActionCount > 0`): queued session
+    /// input owns the turn boundary, the mint defers without consuming a
+    /// slot, and the boundary after the queued work drains re-mints.
+    #[test]
+    fn queued_input_defers_the_turn_end_mint() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, _engine_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "first"}, {"text": "second"}] }),
+            1,
+        );
+        let engine = std::sync::Arc::new(engine);
+        // A probe that reports queued input while the flag is set: the
+        // test flips it to simulate the queue draining.
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe_queued = std::sync::Arc::clone(&queued);
+        let goal_work: std::sync::Arc<std::sync::Mutex<Vec<crate::engine::GoalTurnEndWork>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&goal_work);
+        engine.set_goal_admission(
+            std::sync::Arc::new(move || probe_queued.load(std::sync::atomic::Ordering::SeqCst)),
+            std::sync::Arc::new(move |work| sink.lock().unwrap().push(work)),
+            std::sync::Arc::new(|| {}),
+        );
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(
+            &engine,
+            "/goal ship past the queue".to_string(),
+            &mut events,
+        );
+        // Queued input owns the boundary: no mint, no slot consumed.
+        assert!(goal_work.lock().unwrap().is_empty());
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 0);
+        assert_eq!(engine.goal_state_value()["status"], "active");
+        // The queue drains: the next boundary mints the continuation.
+        queued.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut after_drain: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "the queued work ran".to_string(), &mut after_drain);
+        let work = goal_work.lock().unwrap();
+        let [crate::engine::GoalTurnEndWork::Continuation(follow_up)] = work.as_slice() else {
+            panic!("expected exactly one continuation: {work:?}");
+        };
+        assert_eq!(
+            follow_up.request.custom_message.as_ref().unwrap()["details"]["continuationsUsed"],
+            serde_json::json!(1)
+        );
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
+    }
+
+    /// The quiescence gate (TS `_getGoalContinuationMessages`'s
+    /// `_hasUnsettledRlmQuiescenceWork` arm and
+    /// `_maybeResumeGoalContinuationAfterRlmWork`): the natural turn end
+    /// defers the continuation behind a running child (owed, not
+    /// consumed), and the child's settle delivers it once through the
+    /// admission sink.
+    #[test]
+    fn running_children_owe_the_continuation_and_settle_delivers_it() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = std::sync::Arc::new(
+            AgentSessionEngine::new(AgentEngineConfig {
+                cwd: dir.path().to_path_buf(),
+                agent_dir: dir.path().join("agent"),
+                provider: None,
+                model: None,
+                api_key: None,
+                thinking: None,
+                session_dir: None,
+                session_file: None,
+                faux_script: Some(
+                    serde_json::json!({ "responses": [{"text": "parent turn reply"}] }).to_string(),
+                ),
+                supervisor_link: Some(crate::agent_engine::SupervisorLinkConfig {
+                    socket_path: dir.path().join("dead.sock"),
+                    active_session_id: "parent-session".to_string(),
+                    worker_token: "token".to_string(),
+                }),
+                telemetry_disabled: None,
+            })
+            .unwrap(),
+        );
+        let goal_work = goal_admission_collector(&engine);
+        let children = engine.children.clone().expect("children registry");
+        // A running child (the test seam): the quiescence gate holds.
+        engine.runtime.block_on(async {
+            children
+                .push_test_child(crate::rlm_children::RlmChildIdentity {
+                    rlm_child_id: "child-1".to_string(),
+                    active_session_id: "child-session".to_string(),
+                    session_id: None,
+                    session_name: "worker-1".to_string(),
+                })
+                .await;
+        });
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(
+            &engine,
+            "/goal ship behind the children".to_string(),
+            &mut events,
+        );
+        // No mint while the child runs; the deferral is owed, not consumed,
+        // and the run still settles normally (the TS goal holds the
+        // continuation instead of re-prompting a waiting parent).
+        assert!(goal_work.lock().unwrap().is_empty(), "events: {events:?}");
+        assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
+        assert_eq!(engine.goal_state_value()["status"], "active");
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 0);
+        let handles = engine
+            .goal_runtime
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("goal runtime");
+        assert!(engine
+            .runtime
+            .block_on(async { handles.driver.lock().await.owes_continuation() }));
+        // The child settles (the cancel walk): the settle hook delivers the
+        // owed continuation exactly once through the admission sink.
+        engine
+            .runtime
+            .block_on(async { children.cancel_child_run("child-1").await });
+        for _ in 0..200 {
+            if !goal_work.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let work = goal_work.lock().unwrap();
+        let [crate::engine::GoalTurnEndWork::Continuation(follow_up)] = work.as_slice() else {
+            panic!("expected exactly the owed continuation: {work:?}");
+        };
+        assert!(follow_up.request.message.contains("[goal: continuation]"));
+        assert!(follow_up
+            .request
+            .message
+            .contains("ship behind the children"));
+        assert_eq!(
+            follow_up.request.custom_message.as_ref().unwrap()["details"]["continuationsUsed"],
+            serde_json::json!(1)
+        );
+        drop(work);
+        // The deferral cleared and the slot was consumed exactly once.
+        assert!(!engine
+            .runtime
+            .block_on(async { handles.driver.lock().await.owes_continuation() }));
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
     }
 
     /// The engine session's entries as their persisted wire shapes.

@@ -141,6 +141,34 @@ pub struct GoalContinuation {
     pub goal_update: Option<Value>,
 }
 
+/// The goal-driven work a settled run boundary owes: TS
+/// `_shouldStopAfterTurn`'s budget arm and `_getGoalContinuationMessages`
+/// at the agent loop's natural turn end. Each variant carries the minted
+/// turn as a [`GoalContinuation`] (the request plus the `goal_update`
+/// payload for the mint's state change).
+#[derive(Debug, Clone)]
+pub enum GoalTurnEndWork {
+    /// The token budget was crossed this run: the budget-limit wrap-up
+    /// steer (TS queues it on the steering schedule with
+    /// `resumeIfIdle: true`, so the run ends and the steer drives the
+    /// wrap-up turn).
+    BudgetLimitSteer(GoalContinuation),
+    /// The continuation context turn for an active goal (TS's queued
+    /// `followUp` admission, the follow-up lane).
+    Continuation(GoalContinuation),
+}
+
+/// The worker's session-input probe (TS `queuedActionCount > 0` plus the
+/// queued-input suspension): `true` while queued user work or a held
+/// suspension owns the next turn boundary, so the goal mint defers.
+pub type SessionInputProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The worker's goal admission sink: the turn runner's queue lanes admit
+/// a minted goal follow-up (the steering lane for the budget steer, the
+/// follow-up lane for the continuation), the `goal_update` surfaces at
+/// the moment the state changed, and the runner wakes.
+pub type GoalAdmissionSink = std::sync::Arc<dyn Fn(GoalTurnEndWork) + Send + Sync>;
+
 /// RLM recursion identity carried by a session's create command: the
 /// session's depth in the recursion tree, its bound, its working directory
 /// and persistence ids, and the default thinking level children inherit.
@@ -175,6 +203,12 @@ pub trait SessionEngine: Send + Sync {
     fn goal_state_value(&self) -> Value {
         serde_json::to_value(pa_core::goals::empty_goal_state()).unwrap_or(Value::Null)
     }
+
+    /// Purge the queued goal-context turns (TS `_clearQueuedGoalContexts`
+    /// at the `_pauseGoal`/`_clearGoal`/`_startGoal` command sites): the
+    /// embedding that owns the queue lanes withdraws minted continuations
+    /// waiting to run; engines without a queue do nothing.
+    fn purge_queued_goal_contexts(&self) {}
 
     /// Mint the owed post-compaction goal continuation (TS `compact()`'s
     /// `didCompact` + active-goal branch: `resumeQueuedWork()`'s
