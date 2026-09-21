@@ -434,6 +434,7 @@ mod tests {
             faux_script: Some(script.to_string()),
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         (engine, dir)

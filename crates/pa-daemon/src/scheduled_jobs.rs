@@ -164,9 +164,19 @@ impl ScheduledJobs {
         core: Arc<Mutex<SessionCore>>,
         work_notify: Arc<Notify>,
         user_bash: Arc<crate::user_bash::UserBash>,
+        events: Arc<crate::worker::EventPump>,
     ) -> Self {
+        let mut store = AgentCronJobStore::for_session_artifacts();
+        // TS daemon-mode's `cronStore.onHeartbeatChange` →
+        // `broadcastGlobal({ type: "heartbeats_changed" })`: any heartbeat
+        // catalog change (user set/manage, agent `rlm_heartbeat` CRUD, a
+        // fire's bookkeeping) broadcasts to the clients and the supervisor
+        // re-broadcasts daemon-wide.
+        store.on_heartbeat_change(Box::new(move || {
+            events.send(crate::worker::OutboundFrame::heartbeats_changed());
+        }));
         ScheduledJobs {
-            store: Arc::new(AgentCronJobStore::for_session_artifacts()),
+            store: Arc::new(store),
             hooks: Arc::new(QueueHooks {
                 core,
                 work_notify,

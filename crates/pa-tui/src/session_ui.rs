@@ -18,6 +18,10 @@ use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::effort_picker::{self, EffortPickerAction};
 use crate::export_share::{self, GhAuthStatus, GistOutcome};
 use crate::goal_surface::{format_goal_status, tray_goal_label, GoalView};
+use crate::heartbeats_picker::{
+    parse_heartbeats, scope_heartbeats, sort_heartbeats, HeartbeatAction, HeartbeatEntry,
+    HeartbeatsPicker, HeartbeatsPickerAction,
+};
 use crate::image_load::LoadedImage;
 use crate::image_markers::{
     collect_marked_images, evict_images_to_budget, format_image_marker, image_marker_ids,
@@ -83,6 +87,14 @@ pub(crate) type ShareNote = Result<GistOutcome, String>;
 /// The `/reload` task's report: the daemon reloaded the session's live
 /// inputs, or the failure message (TS `handleReloadCommand`'s outcome).
 pub(crate) type ReloadNote = Result<(), String>;
+
+/// A landed heartbeat-catalog refresh for the `/heartbeats` view (TS
+/// `refreshHeartbeatCatalog`'s fetch result): the scoped, sorted rows or
+/// the fetch error that replaces them.
+pub(crate) struct HeartbeatsUpdate {
+    pub heartbeats: Vec<HeartbeatEntry>,
+    pub fetch_error: Option<String>,
+}
 
 /// A landed `get_model_catalog` refresh: the full catalog and the providers
 /// with configured auth (TS `AgentConnectionModelCatalog`).
@@ -208,6 +220,9 @@ pub(crate) struct SessionUi {
     /// Where the background catalog refresh delivers `get_model_catalog`
     /// responses (the run loop folds them into the picker catalog).
     catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
+    /// Where background heartbeat-catalog refreshes deliver their fetches
+    /// (the run loop folds them into an open `/heartbeats` view).
+    heartbeat_updates: mpsc::UnboundedSender<HeartbeatsUpdate>,
     /// Snapshot chat entries to fold into the view on the next rebuild.
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
@@ -264,6 +279,10 @@ pub(crate) struct SessionUi {
     /// The live agent roster (the session view's `roster_subscribe`
     /// subscription, TS `rosterBar`): drives the subagent summary counts.
     roster: Vec<Value>,
+    /// The scoped heartbeat catalog (TS `heartbeatCatalog` over
+    /// `getScopedHeartbeats`): drives the tray heartbeat label and seeds
+    /// the `/heartbeats` view; refreshed by `heartbeats_changed`.
+    heartbeat_catalog: Vec<HeartbeatEntry>,
     /// The subagent summary line holds keyboard focus.
     subagents_focused: bool,
     /// The last computed descendant counts (selectability reads them between
@@ -370,6 +389,7 @@ impl SessionUi {
         share_notes: mpsc::UnboundedSender<ShareNote>,
         reload_notes: mpsc::UnboundedSender<ReloadNote>,
         catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
+        heartbeat_updates: mpsc::UnboundedSender<HeartbeatsUpdate>,
     ) -> Result<SessionUi> {
         let active_session_id = match &options.session {
             SessionSelection::New => create_session(&client, options, None).await?,
@@ -393,6 +413,7 @@ impl SessionUi {
             default_thinking_level: options.default_thinking_level.clone(),
             models_fetched_at: None,
             catalog_updates,
+            heartbeat_updates,
             telemetry_disabled: options.telemetry_disabled,
             code_block_indent: options.code_block_indent.clone(),
             tree_filter_mode: crate::tree_list::filter_mode_from_str(&options.tree_filter_mode),
@@ -438,6 +459,7 @@ impl SessionUi {
             open_agents_view: false,
             scoped_agents_view: None,
             roster: Vec::new(),
+            heartbeat_catalog: Vec::new(),
             subagents_focused: false,
             subagent_counts: crate::subagents::SubagentCounts::default(),
             session_file: None,
@@ -602,6 +624,11 @@ impl SessionUi {
         self.roster.clear();
         self.subagents_focused = false;
         self.subscribe_roster().await;
+        // The heartbeat catalog is scoped to the session: drop the old
+        // session's rows and fetch fresh ones in the background (TS
+        // refreshes the catalog on every chat open).
+        self.heartbeat_catalog.clear();
+        self.spawn_heartbeat_refresh();
         self.pending_model = reconstructed.model_id;
         self.last_assistant_text = reconstructed
             .chat
@@ -800,6 +827,7 @@ impl SessionUi {
         // the goal state itself carries over (seeded at attach).
         self.goal_view.reset_row_tracking();
         self.sync_goal_tray(view);
+        self.sync_heartbeat_tray(view);
         // The rebuilt chat follows the session's live state: an attached
         // turn that survived the re-attach keeps its loader (TS
         // `renderResyncedSession`), and no stale loader survives a rebuild.
@@ -2375,6 +2403,21 @@ impl SessionUi {
                     return Ok(());
                 }
                 self.handle_reload_command(view).await?;
+            }
+            // `/heartbeats` (TS `showHeartbeatManager`): the inline
+            // management view over the session-scoped heartbeat catalog —
+            // this session's and its RLM children's user and agent
+            // heartbeats. An argument is the TS usage error (the text
+            // stays in the editor).
+            "heartbeats" => {
+                if !resolved.args.is_empty() {
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /heartbeats", view);
+                    return Ok(());
+                }
+                self.track_command_used("heartbeats");
+                self.open_heartbeats_view(view).await;
             }
             other => {
                 self.note(
@@ -4471,6 +4514,7 @@ impl SessionUi {
         // TS overlays.
         let overlay_focused = view.model_picker.is_some()
             || view.effort_picker.is_some()
+            || view.heartbeats_picker.is_some()
             || view.tree_selector.is_some()
             || view.fork_selector.is_some()
             || view.share_loader.is_some()
@@ -4664,6 +4708,255 @@ impl SessionUi {
             None => {}
         }
         Ok(())
+    }
+
+    /// One key press while the `/heartbeats` view is open: Esc/Ctrl+C/close
+    /// binding close it; Enter on the list opens the selected heartbeat's
+    /// action pane; Enter on an action runs the management request.
+    async fn handle_heartbeats_picker_key(
+        &mut self,
+        key: KeyEvent,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        // The view consumes Ctrl+C (close, not exit): report the handled
+        // press so the force-quit guard can disarm once the whole pair was
+        // consumed with TS semantics.
+        if id == "ctrl+c" {
+            self.exit_guard.note_ctrl_c_handled();
+        }
+        let action = view
+            .heartbeats_picker
+            .as_mut()
+            .map(|picker| picker.handle_key(&id, view.editor.keybindings()));
+        match action {
+            Some(HeartbeatsPickerAction::None) => {
+                self.dirty = true;
+            }
+            Some(HeartbeatsPickerAction::Close) => {
+                view.heartbeats_picker = None;
+                self.dirty = true;
+            }
+            Some(HeartbeatsPickerAction::Manage {
+                active_session_id,
+                job_id,
+                action,
+            }) => {
+                self.run_heartbeat_manage(active_session_id, job_id, action, view)
+                    .await;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Run one heartbeat management request (TS `manageHeartbeat` →
+    /// `agentConnection.manageHeartbeat`): the daemon owns the job; the
+    /// updated job (or the stop's removal) patches the open view locally,
+    /// a background refresh reconciles the catalog, and a failure
+    /// surfaces as the view's error row.
+    async fn run_heartbeat_manage(
+        &mut self,
+        active_session_id: String,
+        job_id: String,
+        action: HeartbeatAction,
+        view: &mut AgentView,
+    ) {
+        let request = DaemonCommand::HeartbeatManage {
+            id: None,
+            active_session_id,
+            job_id,
+            action: Value::String(action.as_wire().to_string()),
+            rest: Default::default(),
+        };
+        match self
+            .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), request)
+            .await
+        {
+            Ok(data) => {
+                // The daemon returns the updated job (a stop keeps the
+                // cancelled row's identity); a patch that cannot parse still
+                // leaves the actions pane, and the refresh reconciles.
+                match data
+                    .get("heartbeat")
+                    .and_then(crate::heartbeats_picker::parse_heartbeat_job)
+                {
+                    Some(job) => {
+                        let stopped = action == HeartbeatAction::Stop;
+                        let job_id = job.id.clone();
+                        if let Some(picker) = view.heartbeats_picker.as_mut() {
+                            picker.apply_managed_job(job.clone(), stopped);
+                        }
+                        // The tray label follows the same patch the manager
+                        // view applied (TS `manageHeartbeat` rewrites the
+                        // catalog entry, not just the open manager).
+                        if stopped {
+                            self.heartbeat_catalog
+                                .retain(|entry| entry.job.id != job_id);
+                        } else if let Some(entry) = self
+                            .heartbeat_catalog
+                            .iter_mut()
+                            .find(|entry| entry.job.id == job_id)
+                        {
+                            entry.job = job;
+                        }
+                    }
+                    None => {
+                        if let Some(picker) = view.heartbeats_picker.as_mut() {
+                            picker.back_to_list();
+                        }
+                    }
+                }
+                self.sync_heartbeat_tray(view);
+                self.spawn_heartbeat_refresh();
+                self.dirty = true;
+            }
+            Err(error) => {
+                if let Some(picker) = view.heartbeats_picker.as_mut() {
+                    picker.set_action_error(format!("{error:#}"));
+                }
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Fetch the session-scoped heartbeat catalog (TS
+    /// `refreshHeartbeatCatalog`'s fetch + `getScopedHeartbeats`): the
+    /// selector-less supervisor catalog, scoped to this session and its
+    /// live RLM children, sorted, or the fetch error that replaces it.
+    async fn fetch_scoped_heartbeats(&self) -> (Vec<HeartbeatEntry>, Option<String>) {
+        let request = DaemonCommand::HeartbeatsList {
+            id: None,
+            active_session_id: None,
+            rest: Default::default(),
+        };
+        match self
+            .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), request)
+            .await
+        {
+            Ok(data) => {
+                let mut heartbeats = self.scope_heartbeats(parse_heartbeats(&data));
+                sort_heartbeats(&mut heartbeats);
+                (heartbeats, None)
+            }
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        }
+    }
+
+    /// Scope a fetched catalog to this session and its roster descendants
+    /// (TS `scopeHeartbeatsToSession` over the RLM child snapshots).
+    fn scope_heartbeats(&self, heartbeats: Vec<HeartbeatEntry>) -> Vec<HeartbeatEntry> {
+        let identity = crate::subagents::SessionIdentity::new(
+            (!self.active_session_id.is_empty()).then(|| self.active_session_id.clone()),
+            (!self.session_id.is_empty()).then(|| self.session_id.clone()),
+            self.session_file.clone(),
+        );
+        let summaries: Vec<&Value> = self.roster.iter().collect();
+        let child_active_session_ids: Vec<String> =
+            crate::subagents::descendant_positions(&summaries, &identity)
+                .into_iter()
+                .filter_map(|position| {
+                    summaries[position]
+                        .get("activeSessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+        scope_heartbeats(
+            heartbeats,
+            identity.active_session_id.as_deref(),
+            identity.session_id.as_deref(),
+            &child_active_session_ids,
+        )
+    }
+
+    /// Fire a background heartbeat-catalog refresh (TS
+    /// `refreshHeartbeatCatalog`): the fetch lands through the run loop's
+    /// channel into the open view; failures clear nothing — the next
+    /// `heartbeats_changed` event retries.
+    pub(crate) fn spawn_heartbeat_refresh(&self) {
+        let updates = self.heartbeat_updates.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let request = DaemonCommand::HeartbeatsList {
+                id: None,
+                active_session_id: None,
+                rest: Default::default(),
+            };
+            let fetched = tokio::time::timeout(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                client.request_ok(request),
+            )
+            .await;
+            match fetched {
+                Ok(Ok(data)) => {
+                    let _ = updates.send(HeartbeatsUpdate {
+                        heartbeats: parse_heartbeats(&data),
+                        fetch_error: None,
+                    });
+                }
+                Ok(Err(error)) => {
+                    let _ = updates.send(HeartbeatsUpdate {
+                        heartbeats: Vec::new(),
+                        fetch_error: Some(format!("{error:#}")),
+                    });
+                }
+                Err(_) => {
+                    let _ = updates.send(HeartbeatsUpdate {
+                        heartbeats: Vec::new(),
+                        fetch_error: Some(
+                            "timed out waiting for the Prime Agent daemon response".to_string(),
+                        ),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Fold a landed heartbeat-catalog refresh into the session: re-scope
+    /// and re-sort, keep the open view's selection, surface the fetch
+    /// error, and re-sync the tray label (TS `applyHeartbeatCatalog` over
+    /// both the manager and the tray's `getTrayHeartbeatLabel`).
+    pub(crate) fn apply_heartbeat_update(
+        &mut self,
+        update: HeartbeatsUpdate,
+        view: &mut AgentView,
+    ) {
+        let mut heartbeats = self.scope_heartbeats(update.heartbeats);
+        sort_heartbeats(&mut heartbeats);
+        self.heartbeat_catalog = heartbeats.clone();
+        if let Some(picker) = view.heartbeats_picker.as_mut() {
+            picker.apply_catalog(heartbeats, update.fetch_error);
+        }
+        self.sync_heartbeat_tray(view);
+        self.dirty = true;
+    }
+
+    /// Fetch the scoped catalog and open the `/heartbeats` view over it
+    /// (TS `showHeartbeatManager`): the fetch error replaces an empty
+    /// list, and the tray label follows the landed catalog.
+    async fn open_heartbeats_view(&mut self, view: &mut AgentView) {
+        let (heartbeats, fetch_error) = self.fetch_scoped_heartbeats().await;
+        self.heartbeat_catalog = heartbeats.clone();
+        view.heartbeats_picker = Some(HeartbeatsPicker::new(
+            heartbeats,
+            fetch_error,
+            picker_viewport_rows(view.terminal_rows()),
+        ));
+        self.sync_heartbeat_tray(view);
+        self.dirty = true;
+    }
+
+    /// The tray heartbeat label follows the scoped catalog (TS
+    /// `getTrayHeartbeatLabel`): `N heartbeats · M paused (Ctrl+R)`.
+    pub(crate) fn sync_heartbeat_tray(&mut self, view: &mut AgentView) {
+        let label = tray_heartbeat_label(&self.heartbeat_catalog, &self.keybindings);
+        if view.chrome.heartbeat_label != label {
+            view.chrome.heartbeat_label = label;
+            self.dirty = true;
+        }
     }
 
     /// The session's current model, matched against the picker catalog (the
@@ -5088,6 +5381,10 @@ impl SessionUi {
         if view.mcp_view.is_some() {
             return self.handle_mcp_view_key(key, view).await;
         }
+        // The `/heartbeats` view owns the frame the same way.
+        if view.heartbeats_picker.is_some() {
+            return self.handle_heartbeats_picker_key(key, view).await;
+        }
         // The `/tree` and `/fork` selectors own the frame the same way.
         if view.tree_selector.is_some() {
             return self.handle_tree_selector_key(key, view).await;
@@ -5207,6 +5504,17 @@ impl SessionUi {
             .matches(&id, "app.clipboard.pasteImage")
         {
             self.handle_clipboard_image_paste(view).await;
+            return Ok(());
+        }
+        // The heartbeats-open action (default ctrl+r, TS the editor's
+        // `app.heartbeats.open` registration): open the `/heartbeats`
+        // management view from anywhere in the session.
+        if view
+            .editor
+            .keybindings()
+            .matches(&id, "app.heartbeats.open")
+        {
+            self.open_heartbeats_view(view).await;
             return Ok(());
         }
         if view.editor.keybindings().matches(&id, "app.input.clear") {
@@ -5728,6 +6036,15 @@ impl SessionUi {
                 self.update_subagent_summary(view);
                 self.dirty = true;
             }
+            // A heartbeat catalog change anywhere in the daemon (TS
+            // `broadcastGlobal`): an open `/heartbeats` view refreshes in
+            // the background through the update channel (TS
+            // `refreshHeartbeatCatalog`).
+            DaemonClientEvent::HeartbeatsChanged => {
+                if view.heartbeats_picker.is_some() {
+                    self.spawn_heartbeat_refresh();
+                }
+            }
             // Saved-session list frames belong to the agents-view UI; the
             // session view only reads its own session.
             DaemonClientEvent::SessionListItem { .. }
@@ -6219,6 +6536,31 @@ pub(crate) fn resume_hint_from_stats(stats: &Value) -> Option<String> {
 /// The picker's viewport row budget (TS `showConfigurationMenu` passes
 /// `min(20, rows - 3)` and `ConfigurationMenuComponent` subtracts one more
 /// row for its hint).
+/// TS `getTrayHeartbeatLabel`: `N heartbeats[ · M paused] (Ctrl+R)` over
+/// the scoped catalog; `None` when no heartbeat is in scope.
+fn tray_heartbeat_label(
+    heartbeats: &[HeartbeatEntry],
+    kb: &crate::keybindings::KeybindingsManager,
+) -> Option<String> {
+    if heartbeats.is_empty() {
+        return None;
+    }
+    let paused = heartbeats
+        .iter()
+        .filter(|entry| entry.job.status == "paused")
+        .count();
+    let plural = if heartbeats.len() == 1 { "" } else { "s" };
+    let mut label = format!("{} heartbeat{plural}", heartbeats.len());
+    if paused > 0 {
+        label.push_str(&format!(" \u{b7} {paused} paused"));
+    }
+    if let Some(key) = kb.first_key("app.heartbeats.open") {
+        let key = crate::keybindings::format_key_text(&key);
+        label.push_str(&format!(" ({key})"));
+    }
+    Some(label)
+}
+
 fn picker_viewport_rows(terminal_rows: u16) -> usize {
     let terminal_rows = terminal_rows as usize;
     let menu_rows = 20.min(terminal_rows.saturating_sub(3).max(1));
@@ -6256,6 +6598,51 @@ async fn create_session(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| anyhow!("the daemon did not report a session id for the new session"))
+}
+
+#[cfg(test)]
+mod tray_heartbeat_label_tests {
+    use super::{tray_heartbeat_label, HeartbeatEntry};
+    use crate::heartbeats_picker::parse_heartbeat_job;
+    use crate::keybindings::KeybindingsManager;
+
+    fn entry(job_json: serde_json::Value) -> HeartbeatEntry {
+        HeartbeatEntry {
+            job: parse_heartbeat_job(&job_json).expect("job parses"),
+            session_name: None,
+            first_message: None,
+        }
+    }
+
+    fn job(id: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "status": status,
+            "source": "heartbeat",
+            "activeSessionId": "live-1",
+            "sessionId": "sess-1",
+            "schedule": {"kind": "interval", "expression": "every 30m"},
+        })
+    }
+
+    /// TS `getTrayHeartbeatLabel`: no heartbeat in scope renders no label,
+    /// counts carry the plural and the paused suffix, and the open-shortcut
+    /// hint trails the default binding.
+    #[test]
+    fn label_counts_heartbeats_and_the_paused_suffix() {
+        let kb = KeybindingsManager::new();
+        assert_eq!(tray_heartbeat_label(&[], &kb), None);
+        let active = entry(job("a", "active"));
+        assert_eq!(
+            tray_heartbeat_label(std::slice::from_ref(&active), &kb).as_deref(),
+            Some("1 heartbeat (Ctrl+R)")
+        );
+        let paused = entry(job("b", "paused"));
+        assert_eq!(
+            tray_heartbeat_label(&[active, paused], &kb).as_deref(),
+            Some("2 heartbeats · 1 paused (Ctrl+R)")
+        );
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ mod exit_guard;
 pub mod export_share;
 pub mod fuzzy;
 pub mod goal_surface;
+pub mod heartbeats_picker;
 pub mod hotkeys;
 pub mod hyperlinks;
 mod image_component;

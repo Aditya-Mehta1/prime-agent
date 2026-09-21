@@ -174,6 +174,7 @@ async fn prewarmed_kernel_lands_compaction_notice_without_tool_use() {
         "the compaction summary".to_string(),
     ]);
     let engine = create_session(SessionEngineConfig {
+        cron_store: None,
         cwd: cwd.clone(),
         agent_dir: agent_dir.clone(),
         model: Some(agent_model(&faux.model)),
@@ -264,6 +265,7 @@ async fn subagent_sessions_stay_lazy_despite_the_prewarm_flag() {
 
     let faux = faux_session(vec!["ok".to_string()]);
     let engine = create_session(SessionEngineConfig {
+        cron_store: None,
         cwd: cwd.clone(),
         agent_dir: agent_dir.clone(),
         model: Some(agent_model(&faux.model)),

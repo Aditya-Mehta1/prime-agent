@@ -94,6 +94,15 @@ pub struct SessionEngineConfig {
     /// servers reach the prompt's MCP gating through the same store the
     /// `replace_acp_mcp_servers` command writes.
     pub mcp_manager: Option<std::sync::Arc<std::sync::Mutex<crate::mcp::McpManager>>>,
+    /// The embedding's kernel cron wiring (the daemon worker's
+    /// scheduled-jobs store plus its session identity): the kernel's
+    /// `rlm_heartbeat.*` host requests write and read that store instead
+    /// of the engine-private `cron-jobs.json`, binding the embedding's
+    /// live/durable session identity, so agent-created heartbeats reach
+    /// the same catalog the daemon's `heartbeats_list` reads and the
+    /// scheduler fires (TS daemon-mode wires
+    /// `AgentCronJobStore.forSessionArtifacts()` into both).
+    pub cron_store: Option<super::runtime_wiring::KernelCronWiring>,
 }
 
 /// An assembled, running session.
@@ -212,6 +221,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             subagent_host: config.rlm_subagent_host.clone(),
         },
         config.queued_goal_context_purge.clone(),
+        config.cron_store.clone(),
     );
 
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
@@ -811,6 +821,7 @@ mod tests {
         let cwd = tmp.path().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
         let engine = create_session(SessionEngineConfig {
+            cron_store: None,
             cwd: cwd.clone(),
             agent_dir: tmp.path().join("agent"),
             mcp_manager: None,
@@ -916,6 +927,7 @@ mod tests {
             stream_fn: pa_agent::stream::StreamFn,
         ) -> SessionEngineConfig {
             SessionEngineConfig {
+                cron_store: None,
                 cwd: cwd.to_path_buf(),
                 agent_dir: agent_dir.to_path_buf(),
                 mcp_manager: None,
@@ -1040,6 +1052,7 @@ async fn create_session_registers_goal_and_heartbeat_handlers() {
     let agent_model = crate::session_engine::provider_adapter::json_round_trip(&model).unwrap();
     let stream_fn = crate::session_engine::provider_adapter::real_stream_fn(None, model.clone());
     let engine = create_session(SessionEngineConfig {
+        cron_store: None,
         cwd: dir.path().to_path_buf(),
         agent_dir: dir.path().to_path_buf(),
         model: Some(agent_model),

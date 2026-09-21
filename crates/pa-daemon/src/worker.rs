@@ -430,6 +430,17 @@ impl OutboundFrame {
             seq: 0,
         }
     }
+
+    /// `heartbeats_changed` (TS daemon-mode `broadcastGlobal`): the store's
+    /// heartbeat-catalog-change notification, re-broadcast daemon-wide by
+    /// the supervisor.
+    pub(crate) fn heartbeats_changed() -> Self {
+        OutboundFrame {
+            payload: br#"{"type":"heartbeats_changed"}"#.to_vec(),
+            outbound_type: "heartbeats_changed",
+            seq: 0,
+        }
+    }
 }
 
 /// The worker's outbound event pump: one sequence-stamped broadcast stream
@@ -702,6 +713,19 @@ impl Worker {
         // The worker's prompt-admission registry: shared with the turn
         // runner (the commit happens at turn start).
         let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
+        // The user-bash slot and the scheduled-jobs catalog: created before
+        // the session engine so the engine's kernel `rlm_heartbeat.*` host
+        // requests write the worker's shared cron store (agent-created
+        // heartbeats reach the `heartbeats_list` catalog and the scheduler;
+        // TS daemon-mode wires the same `forSessionArtifacts()` store into
+        // the session runtime).
+        let user_bash = std::sync::Arc::new(crate::user_bash::UserBash::new());
+        let scheduled = std::sync::Arc::new(crate::scheduled_jobs::ScheduledJobs::new(
+            Arc::clone(&core),
+            Arc::clone(&work_notify),
+            std::sync::Arc::clone(&user_bash),
+            Arc::clone(&events),
+        ));
         // The turn runner runs for the whole process lifetime. The command
         // dispatcher keeps the engine handle too (model metadata for the
         // stats commands).
@@ -733,6 +757,12 @@ impl Worker {
                         faux_script: Some(script.to_string()),
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
+                        cron_store: Some(
+                            pa_core::session_engine::runtime_wiring::KernelCronWiring {
+                                store: std::sync::Arc::clone(scheduled.store()),
+                                binding: None,
+                            },
+                        ),
                     }) {
                         Ok(engine) => {
                             let concrete = std::sync::Arc::new(engine);
@@ -761,6 +791,12 @@ impl Worker {
                         faux_script: None,
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
+                        cron_store: Some(
+                            pa_core::session_engine::runtime_wiring::KernelCronWiring {
+                                store: std::sync::Arc::clone(scheduled.store()),
+                                binding: None,
+                            },
+                        ),
                     }) {
                         Ok(engine) => {
                             let concrete = std::sync::Arc::new(engine);
@@ -886,12 +922,6 @@ impl Worker {
             begin_login: None,
         });
         let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
-        let user_bash = std::sync::Arc::new(crate::user_bash::UserBash::new());
-        let scheduled = std::sync::Arc::new(crate::scheduled_jobs::ScheduledJobs::new(
-            Arc::clone(&core),
-            Arc::clone(&work_notify),
-            std::sync::Arc::clone(&user_bash),
-        ));
         let navigation = crate::session_navigation::SessionNavigation::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),

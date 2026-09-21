@@ -806,6 +806,7 @@ mod tests {
                 subagent_host: host,
             },
             None,
+            None,
         )
     }
 

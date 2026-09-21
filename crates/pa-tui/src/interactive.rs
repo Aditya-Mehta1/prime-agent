@@ -591,12 +591,25 @@ pub async fn run_interactive(
     // here; the loop folds it into the picker catalog and any open picker.
     let (catalog_tx, mut catalog_rx) =
         mpsc::unbounded_channel::<crate::session_ui::ModelCatalogUpdate>();
+    // Background heartbeat-catalog refreshes (`heartbeats_list` for an
+    // open `/heartbeats` view) report here; the loop folds them into the
+    // open view.
+    let (heartbeats_tx, mut heartbeats_rx) =
+        mpsc::unbounded_channel::<crate::session_ui::HeartbeatsUpdate>();
     // The double-Ctrl+C force-quit guard: the terminal reader observes the
     // pair even while this loop is wedged in a daemon request, and a plain
     // std-thread watchdog enforces the exit deadline without the runtime.
     let exit_guard = ExitGuard::new();
-    let mut session =
-        SessionUi::open(client, &options, notes_tx, share_tx, reload_tx, catalog_tx).await?;
+    let mut session = SessionUi::open(
+        client,
+        &options,
+        notes_tx,
+        share_tx,
+        reload_tx,
+        catalog_tx,
+        heartbeats_tx,
+    )
+    .await?;
     session.exit_guard = exit_guard.clone();
 
     let theme = crate::app::load_theme(&options.theme);
@@ -620,6 +633,9 @@ pub async fn run_interactive(
     // `getConnectionAvailableModels`): failures stay silent and the
     // composition-root snapshot keeps serving the picker.
     session.spawn_model_catalog_refresh();
+    // The scoped heartbeat catalog seeds the tray heartbeat label (TS
+    // refreshes the catalog on chat open; failures stay silent).
+    session.spawn_heartbeat_refresh();
     session.rebuild_view(&mut view);
     if let Some(notice) = check_tmux_keyboard_setup().await {
         view.push_entry(crate::chat::ChatEntry::Status {
@@ -993,6 +1009,11 @@ pub async fn run_interactive(
                     session.apply_model_catalog(update, &mut view);
                 }
             }
+            maybe_heartbeats = heartbeats_rx.recv() => {
+                if let Some(update) = maybe_heartbeats {
+                    session.apply_heartbeat_update(update, &mut view);
+                }
+            }
             _reconnect_tick = async {
                 match reconnect.as_ref() {
                     Some(state) => tokio::time::sleep_until(state.next_attempt).await,
@@ -1092,6 +1113,9 @@ pub async fn run_interactive(
                         );
                         session.reconnection_failed = None;
                         session_reconnect = None;
+                        // TS refreshes the heartbeat catalog on the
+                        // `connection_status: "connected"` event.
+                        session.spawn_heartbeat_refresh();
                         session.dirty = true;
                     }
                     Ok(Err(error)) => {

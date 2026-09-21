@@ -250,6 +250,7 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
     });
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
+            cron_store: None,
             telemetry,
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
@@ -1128,6 +1129,7 @@ async fn build_faux_engine_parts(
     };
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
+            cron_store: None,
             // Faux verification harness: no product telemetry.
             telemetry: None,
             cwd: config.cwd.clone(),

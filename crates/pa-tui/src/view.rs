@@ -116,6 +116,10 @@ pub struct AgentView {
     /// MCP Connections tab): while set, it owns the editor dock like the
     /// model picker.
     pub mcp_view: Option<crate::mcp_view::McpView>,
+    /// The `/heartbeats` inline management view (TS
+    /// `HeartbeatManagerComponent`, inline-picker style): while set, it
+    /// owns the editor dock like the `/model` and `/effort` pickers.
+    pub heartbeats_picker: Option<crate::heartbeats_picker::HeartbeatsPicker>,
     /// A `/share` gist upload in flight (TS `BorderedLoader`): while set,
     /// it replaces the editor with the cancellable loader rows.
     pub share_loader: Option<ShareLoader>,
@@ -206,6 +210,7 @@ impl AgentView {
             fork_selector: None,
             effort_picker: None,
             mcp_view: None,
+            heartbeats_picker: None,
             share_loader: None,
             reload_box: None,
             side_pane: None,
@@ -1093,6 +1098,10 @@ impl AgentView {
             let mut dock = prompt_context;
             dock.extend(mcp_view.render(&self.theme, width, self.editor.keybindings()));
             Some(dock)
+        } else if let Some(picker) = &self.heartbeats_picker {
+            let mut dock = prompt_context;
+            dock.extend(picker.render(&self.theme, width, self.editor.keybindings()));
+            Some(dock)
         } else {
             None
         };
@@ -1261,6 +1270,7 @@ impl AgentView {
         if self.onboarding.is_some()
             || self.model_picker.is_some()
             || self.effort_picker.is_some()
+            || self.heartbeats_picker.is_some()
             || self.tree_selector.is_some()
             || self.fork_selector.is_some()
             || self.share_loader.is_some()

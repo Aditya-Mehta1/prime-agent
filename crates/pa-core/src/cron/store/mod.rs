@@ -73,6 +73,14 @@ pub(crate) fn iso_from_millis(millis: u64) -> String {
     crate::session::manager::format_iso(millis as i64)
 }
 
+/// Opaque debug form (the store holds change listeners that have no debug
+/// representation); config dumps carry it as an unread marker.
+impl std::fmt::Debug for AgentCronJobStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentCronJobStore").finish_non_exhaustive()
+    }
+}
+
 impl AgentCronJobStore {
     /// Store backed by a single file.
     pub fn new(file_path: PathBuf) -> Self {

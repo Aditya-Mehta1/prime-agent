@@ -1075,6 +1075,7 @@ mod tests {
             })
             .expect("a session manager");
         let engine = create_session(SessionEngineConfig {
+            cron_store: None,
             telemetry,
             cwd: dir.path().to_path_buf(),
             agent_dir,

@@ -728,6 +728,7 @@ mod tests {
         let stream_fn = real_stream_fn(None, model.clone());
         let engine = std::sync::Arc::new(
             create_session(SessionEngineConfig {
+                cron_store: None,
                 telemetry: None,
                 cwd: dir.path().to_path_buf(),
                 agent_dir: agent_dir.clone(),

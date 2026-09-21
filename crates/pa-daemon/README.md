@@ -253,7 +253,12 @@ boot), re-arms scheduled work (a boot scan of `scheduled-jobs.json`;
 due active jobs of sessionless files are woken once, never archived), and
 reports the pass over `update_restore_status` while `hello.update_resume`
 carries the settle state; client attaches to a not-yet-restored roster row
-queue behind the pass instead of failing.
+queue behind the pass instead of failing. The heartbeat-catalog change
+broadcast owns its surface here too (the worker's cron-store
+`on_heartbeat_change` listener emits a `heartbeats_changed` outbound frame
+— TS daemon-mode's `broadcastGlobal` — and the supervisor re-broadcasts it
+to every client, so any heartbeat mutation anywhere in the daemon reaches
+attached UIs daemon-wide).
 
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.

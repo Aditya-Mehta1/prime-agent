@@ -801,6 +801,11 @@ impl Supervisor {
                             })
                             .unwrap_or(ClientRouting::Broadcast);
                         let _ = events.send((routing, payload));
+                    } else if outbound_type == "heartbeats_changed" {
+                        // A worker's heartbeat catalog changed (TS
+                        // `broadcastHeartbeatsChanged` re-broadcast): every
+                        // client re-reads the catalog.
+                        let _ = events.send((ClientRouting::Broadcast, payload));
                     }
                 }
             });

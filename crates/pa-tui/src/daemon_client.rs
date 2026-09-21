@@ -91,6 +91,10 @@ pub enum DaemonClientEvent {
         removed: Vec<String>,
         resync: bool,
     },
+    /// `heartbeats_changed`: the daemon-global broadcast every client sees
+    /// when the heartbeat catalog changes (TS `broadcastGlobal`). The
+    /// session view refreshes its open `/heartbeats` picker on it.
+    HeartbeatsChanged,
 }
 
 /// One non-response frame, parsed from a supervisor JSONL line or a direct
@@ -181,6 +185,7 @@ pub(crate) fn client_event_from_value(value: &Value) -> Option<DaemonClientEvent
                 .unwrap_or_default(),
             resync: value.get("resync") == Some(&Value::Bool(true)),
         }),
+        "heartbeats_changed" => Some(DaemonClientEvent::HeartbeatsChanged),
         _ => None,
     }
 }

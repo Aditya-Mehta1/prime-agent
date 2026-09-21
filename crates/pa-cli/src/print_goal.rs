@@ -869,6 +869,7 @@ mod tests {
         let engine = Arc::new(
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
+                    cron_store: None,
                     telemetry: None,
                     cwd: dir.path().to_path_buf(),
                     agent_dir,
@@ -1414,6 +1415,7 @@ mod tests {
         let engine = Arc::new(
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
+                    cron_store: None,
                     telemetry: None,
                     cwd: dir.path().to_path_buf(),
                     agent_dir,

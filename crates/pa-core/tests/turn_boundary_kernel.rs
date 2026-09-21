@@ -218,6 +218,7 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
     provider.push_text_turn("boundary reached");
 
     let engine = create_session(SessionEngineConfig {
+        cron_store: None,
         cwd: cwd.clone(),
         agent_dir,
         model: Some(model),

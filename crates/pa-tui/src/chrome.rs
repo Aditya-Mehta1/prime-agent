@@ -72,6 +72,10 @@ pub struct ChromeState {
     /// while active, `Goal paused (0s)`, ...); `None` for idle/complete/error
     /// goals. Joins the tray context label first, before the model.
     pub goal_label: Option<String>,
+    /// The tray's heartbeat label (TS `getTrayHeartbeatLabel`):
+    /// `N heartbeats · M paused (Ctrl+R)` over the session-scoped catalog;
+    /// `None` when no heartbeat is in scope. Joins between goal and model.
+    pub heartbeat_label: Option<String>,
     /// Tray override label (TS `getTrayOverrideLabel`): while the Ctrl+C
     /// exit hint is armed, it replaces the tray's location label.
     pub tray_override: Option<String>,
@@ -397,6 +401,12 @@ pub fn render_tray(state: &ChromeState, theme: &Theme, width: usize) -> Line {
     if let Some(goal) = &state.goal_label {
         right.push(Span::styled(goal.clone(), dim));
     }
+    if let Some(heartbeats) = &state.heartbeat_label {
+        if !right.is_empty() {
+            right.push(Span::styled(" \u{00b7} ".to_string(), dim));
+        }
+        right.push(Span::styled(heartbeats.clone(), dim));
+    }
     if let Some(model) = &state.model_id {
         let mut label = model.clone();
         if let Some(suffix) = &state.thinking_suffix {
@@ -706,6 +716,30 @@ mod tests {
         let line = render_tray(&state, &theme(), 120);
         let text = line.iter().map(|s| s.content.as_str()).collect::<String>();
         assert!(text.contains("Pursuing goal (0s) \u{b7} mock-1 \u{b7} 190 (0%)"));
+        assert_eq!(str_width(&text), 120);
+    }
+
+    /// The tray's heartbeat label joins between goal and model (TS
+    /// `getTrayContextLabel`:
+    /// `[goalLabel, heartbeatLabel, modelContextLabel]`).
+    #[test]
+    fn tray_heartbeat_label_joins_between_goal_and_model() {
+        let state = ChromeState {
+            show_manage: true,
+            model_id: Some("mock-1".to_string()),
+            context: Some(ContextUsage {
+                tokens: 190,
+                context_window: 128_000,
+            }),
+            goal_label: Some("Pursuing goal (0s)".to_string()),
+            heartbeat_label: Some("2 heartbeats · 1 paused (Ctrl+R)".to_string()),
+            ..Default::default()
+        };
+        let line = render_tray(&state, &theme(), 120);
+        let text = line.iter().map(|s| s.content.as_str()).collect::<String>();
+        assert!(text.contains(
+            "Pursuing goal (0s) \u{b7} 2 heartbeats \u{b7} 1 paused (Ctrl+R) \u{b7} mock-1 \u{b7} 190 (0%)"
+        ));
         assert_eq!(str_width(&text), 120);
     }
 

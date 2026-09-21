@@ -66,6 +66,14 @@ pub struct AgentEngineConfig {
     /// Telemetry opt-out from the create command (Some(true) installs no
     /// telemetry; None/Some(false) resolve the configured sinks).
     pub telemetry_disabled: Option<bool>,
+    /// The worker's kernel cron wiring (TS daemon-mode wires its
+    /// `AgentCronJobStore.forSessionArtifacts()` into the session runtime):
+    /// the shared scheduled-jobs store kernel `rlm_heartbeat.*` host
+    /// requests read and write, so agent-created heartbeats reach the same
+    /// catalog the `heartbeats_list` command reads and the scheduler fires.
+    /// The binding is enriched per build from the worker's live/durable
+    /// session identity.
+    pub cron_store: Option<pa_core::session_engine::runtime_wiring::KernelCronWiring>,
 }
 
 /// Supervisor-link coordinates for a daemon worker.
@@ -783,6 +791,39 @@ impl AgentSessionEngine {
         Some(handlers)
     }
 
+    /// The configured kernel cron wiring (the worker's shared store).
+    fn cron_wiring(&self) -> Option<pa_core::session_engine::runtime_wiring::KernelCronWiring> {
+        self.config.cron_store.clone()
+    }
+
+    /// The kernel cron binding for the current session build: the live
+    /// active session id (the supervisor link carries it) plus the
+    /// durable session id + file from the worker-owned session file's
+    /// header. `None` outside a daemon worker or before the session file
+    /// exists (the engine falls back to its in-memory identity).
+    fn kernel_cron_binding(
+        &self,
+    ) -> Option<pa_core::session_engine::runtime_wiring::KernelCronBinding> {
+        let active_session_id = self
+            .config
+            .supervisor_link
+            .as_ref()?
+            .active_session_id
+            .clone();
+        let file = self
+            .session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let header = pa_core::session::manager::read_session_header(&file)?;
+        Some(pa_core::session_engine::runtime_wiring::KernelCronBinding {
+            active_session_id,
+            session_id: header.id,
+            session_file: file.display().to_string(),
+            cwd: self.cwd().display().to_string(),
+        })
+    }
+
     async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
@@ -879,6 +920,16 @@ impl AgentSessionEngine {
             // purge, so the session engine's surfaces withdraw queued
             // minted continuations.
             queued_goal_context_purge,
+            // The worker's shared scheduled-jobs store with the session
+            // identity the kernel binding needs: the live active session
+            // id the supervisor routes commands by, and the durable session
+            // id + file the store partitions and rebinds by. Both come from
+            // the worker-owned session (the engine's in-memory manager
+            // carries neither), so the enrichment runs per build.
+            cron_store: self.cron_wiring().map(|mut wiring| {
+                wiring.binding = self.kernel_cron_binding().or(wiring.binding);
+                wiring
+            }),
         })
         .await
     }
@@ -3685,6 +3736,7 @@ pub(crate) mod tests {
             faux_script: None,
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         // The explicit selection from the session's create config is
@@ -3721,6 +3773,7 @@ pub(crate) mod tests {
             faux_script: None,
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap()
     }
@@ -3757,6 +3810,7 @@ pub(crate) mod tests {
             faux_script: Some(script.to_string()),
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         (engine, dir)
@@ -3858,6 +3912,7 @@ pub(crate) mod tests {
                 faux_script: Some(r#"{"responses": [{"text": "recovery reply"}]}"#.to_string()),
                 supervisor_link: None,
                 telemetry_disabled: None,
+                cron_store: None,
             })
             .unwrap(),
         );
@@ -3998,6 +4053,7 @@ pub(crate) mod tests {
             ),
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         // The recovery turn builds the session; the build adopts the
@@ -4163,6 +4219,7 @@ pub(crate) mod tests {
                 ),
                 supervisor_link: None,
                 telemetry_disabled: None,
+                cron_store: None,
             })
             .unwrap(),
         );
@@ -4445,6 +4502,7 @@ pub(crate) mod tests {
                     worker_token: "token".to_string(),
                 }),
                 telemetry_disabled: None,
+                cron_store: None,
             })
             .unwrap(),
         );
@@ -5226,6 +5284,7 @@ pub(crate) mod tests {
             ),
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5575,6 +5634,7 @@ pub(crate) mod tests {
             ),
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5665,6 +5725,7 @@ pub(crate) mod tests {
             faux_script: None,
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         let model = engine.resolve_registry_model().expect("resolved model");
@@ -5689,6 +5750,7 @@ pub(crate) mod tests {
             faux_script: None,
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         // A create config with only a model keeps the provider and key.
@@ -5743,6 +5805,7 @@ pub(crate) mod tests {
             faux_script: None,
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5811,6 +5874,7 @@ pub(crate) mod tests {
             faux_script: None,
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap();
         // Without an explicit flag the TS default applies (medium, clamped).
@@ -5875,6 +5939,7 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
         ),
         supervisor_link: None,
         telemetry_disabled: None,
+        cron_store: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6154,6 +6219,7 @@ fn retried_run_restarts_with_its_own_agent_frames() {
         ),
         supervisor_link: None,
         telemetry_disabled: None,
+        cron_store: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();
@@ -6269,6 +6335,7 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
         ),
         supervisor_link: None,
         telemetry_disabled: None,
+        cron_store: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6405,6 +6472,7 @@ fn run_prompts(
         faux_script: Some(script.to_string()),
         supervisor_link: None,
         telemetry_disabled: None,
+        cron_store: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6732,6 +6800,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
         faux_script: Some(script.to_string()),
         supervisor_link: None,
         telemetry_disabled: None,
+        cron_store: None,
     })
     .unwrap();
     let start = std::time::Instant::now();
@@ -7010,6 +7079,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
             ),
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap(),
     );
@@ -7113,6 +7183,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
             faux_script: Some(serde_json::json!({ "responses": ["one", "two"] }).to_string()),
             supervisor_link: None,
             telemetry_disabled: None,
+            cron_store: None,
         })
         .unwrap(),
     );
@@ -7196,6 +7267,7 @@ fn agent_engine_streams_updates_and_final_message() {
         faux_script: Some(serde_json::json!({ "responses": ["streamed answer"] }).to_string()),
         supervisor_link: None,
         telemetry_disabled: None,
+        cron_store: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();

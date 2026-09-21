@@ -288,6 +288,7 @@ async fn scripted_session_executes_the_extension_tool() -> Result<()> {
     provider.push_text_turn("greeted");
 
     let engine = create_session(SessionEngineConfig {
+        cron_store: None,
         cwd: cwd.clone(),
         agent_dir: dir.path().join("agent"),
         model: Some(model),
