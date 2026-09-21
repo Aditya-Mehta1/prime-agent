@@ -64,6 +64,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Smoke npm package assets
+        run: npm run smoke:npm-pack-assets
+
       - name: Check
         run: npm run check
 

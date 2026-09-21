@@ -33,7 +33,8 @@
 		"release:patch": "node scripts/release.mjs patch",
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
-		"prepare": "husky"
+		"prepare": "husky",
+		"smoke:npm-pack-assets": "node scripts/smoke-npm-pack-assets.mjs"
 	},
 	"devDependencies": {
 		"@anthropic-ai/sandbox-runtime": "^0.0.55",

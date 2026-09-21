@@ -31,6 +31,8 @@ import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
+import { getBundledModels } from "./bundled-model-catalog.js";
+import { CATALOG_REFRESH_INTERVAL_MS, CatalogCache } from "./model-catalog-cache.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
 	buildPrimeInferenceModels,
@@ -44,6 +46,7 @@ import {
 	isPrivatePrimeInferenceModel,
 } from "./prime-inference-models.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
+import { PROVIDER_MODEL_CATALOG_URL, parseProviderModelCatalog } from "./provider-model-catalog.js";
 import {
 	resolveConfigValueOrThrow,
 	resolveConfigValueUncached,
@@ -447,6 +450,7 @@ function isOfflineModeEnabled(): boolean {
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
 export class ModelRegistry {
+	private readonly bundledCatalogModels = getBundledModels();
 	private models: Model<Api>[] = [];
 	private xaiModelSources = new WeakMap<Model<Api>, Model<Api>>();
 	private providerRequestConfigs: Map<string, ProviderRequestConfig> = new Map();
@@ -462,6 +466,9 @@ export class ModelRegistry {
 	private backgroundPrivatePrimeAuthorization: { fingerprint: string; promise: Promise<void> } | undefined;
 	private livePrimeInferenceModels: Model<"openai-completions">[] | undefined;
 	private pendingPrimeInferenceCatalogRefresh: Promise<void> | undefined;
+	private readonly providerCatalog: CatalogCache<Model<Api>[]>;
+	private catalogRefreshTimer?: ReturnType<typeof setInterval>;
+	private scheduledCatalogRefresh?: Promise<void>;
 	private loadError: string | undefined = undefined;
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
@@ -471,7 +478,19 @@ export class ModelRegistry {
 		readonly authStorage: AuthStorage,
 		private modelsJsonPath: string | undefined,
 	) {
+		const cachePath = (name: string) => (modelsJsonPath ? join(dirname(modelsJsonPath), name) : undefined);
+		this.providerCatalog = new CatalogCache(
+			PROVIDER_MODEL_CATALOG_URL,
+			cachePath("provider-model-catalog.v1.json"),
+			(payload) => parseProviderModelCatalog(payload, this.bundledCatalogModels),
+		);
 		this.loadModels();
+		const reference = new WeakRef(this);
+		const unsubscribe = authStorage.onChange(() => {
+			const registry = reference.deref();
+			if (registry) void registry.scheduleCatalogRefresh().catch(() => {});
+			else unsubscribe();
+		});
 	}
 
 	setOnOAuthProvidersReset(hook: () => void): void {
@@ -489,7 +508,7 @@ export class ModelRegistry {
 	/**
 	 * Reload models from disk (built-in + custom from models.json).
 	 */
-	refresh(): void {
+	refresh(options: { refreshCatalogs?: boolean } = {}): void {
 		this.providerRequestConfigs.clear();
 		this.modelRequestHeaders.clear();
 		this.lastProviderAuthSourceTokens.clear();
@@ -523,6 +542,8 @@ export class ModelRegistry {
 		this.onOAuthProvidersReset?.();
 
 		this.reloadModelsAfterCatalogChange();
+		if (options.refreshCatalogs !== false && this.catalogRefreshTimer)
+			void this.scheduleCatalogRefresh().catch(() => {});
 	}
 
 	private reloadModelsAfterCatalogChange(): void {
@@ -541,7 +562,10 @@ export class ModelRegistry {
 	}
 
 	private bundledPrimeInferenceModels(): Model<"openai-completions">[] {
-		return getModels(PRIME_INFERENCE_PROVIDER_ID) as Model<"openai-completions">[];
+		return this.bundledCatalogModels.filter(
+			(model): model is Model<"openai-completions"> =>
+				model.provider === PRIME_INFERENCE_PROVIDER_ID && model.api === "openai-completions",
+		);
 	}
 
 	/**
@@ -598,7 +622,8 @@ export class ModelRegistry {
 		modelOverrides: Map<string, Map<string, ModelOverride>>,
 		livePrimeInferenceModels?: Model<"openai-completions">[],
 	): Model<Api>[] {
-		const bundledModels = getProviders().flatMap((provider) => getModels(provider as KnownProvider) as Model<Api>[]);
+		const remote = this.providerCatalog.get("public");
+		const bundledModels = remote ? [...remote, ...this.bundledPrimeInferenceModels()] : this.bundledCatalogModels;
 		return mergePrimeInferenceModels(bundledModels, livePrimeInferenceModels).map((model) => {
 			const providerOverride = overrides.get(model.provider);
 			const perModelOverrides = modelOverrides.get(model.provider);
@@ -873,8 +898,36 @@ export class ModelRegistry {
 				previousTeamId,
 				previousPrivateModels,
 			);
+			if (this.modelsJsonPath) await this.refreshProviderCatalog(false);
 			return this.getAvailable();
 		});
+	}
+
+	private scheduleCatalogRefresh(): Promise<void> {
+		this.scheduledCatalogRefresh ??= Promise.resolve().then(async () => {
+			this.scheduledCatalogRefresh = undefined;
+			this.startCatalogRefreshTimer();
+			await this.refreshProviderCatalog(true);
+		});
+		return this.scheduledCatalogRefresh;
+	}
+
+	private async refreshProviderCatalog(force: boolean): Promise<void> {
+		await this.providerCatalog.refresh("public", { force });
+		this.reloadModelsAfterCatalogChange();
+	}
+
+	private startCatalogRefreshTimer(): boolean {
+		if (this.catalogRefreshTimer) return false;
+		const reference = new WeakRef(this);
+		const timer = setInterval(() => {
+			const registry = reference.deref();
+			if (registry) void registry.refreshAvailableModels().catch(() => {});
+			else clearInterval(timer);
+		}, CATALOG_REFRESH_INTERVAL_MS);
+		timer.unref();
+		this.catalogRefreshTimer = timer;
+		return true;
 	}
 
 	/**
@@ -1123,6 +1176,8 @@ export class ModelRegistry {
 	}
 
 	async refreshModelCatalog(): Promise<ModelCatalogSnapshot> {
+		this.startCatalogRefreshTimer();
+		await this.refreshProviderCatalog(false);
 		const availableModels = await this.refreshAvailableModels();
 		const availablePrivateModels = new Set(
 			availableModels.filter(isPrivatePrimeInferenceModel).map((model) => `${model.provider}/${model.id}`),
@@ -1161,6 +1216,8 @@ export class ModelRegistry {
 	}
 
 	async getExecutableModels(): Promise<Model<Api>[]> {
+		this.startCatalogRefreshTimer();
+		if (this.modelsJsonPath) await this.refreshProviderCatalog(false);
 		await this.runSerializedEntitlementRefresh(() => this.refreshPrivatePrimeInferenceAuthorization());
 		const availableModels = this.getAvailable();
 		const codexModels = availableModels.filter((model) => model.provider === "openai-codex");
