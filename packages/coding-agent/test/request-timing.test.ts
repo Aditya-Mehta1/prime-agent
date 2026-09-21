@@ -106,15 +106,14 @@ async function runTimedRequest(streamFn: StreamFn): Promise<AssistantMessageEven
 
 describe("request timing", () => {
 	let entries: LogEntry[];
-	const originalEnv = process.env.PI_REQUEST_TIMING;
 	beforeEach(() => {
 		entries = [];
 		setLogSink((entry) => entries.push(entry));
-		delete process.env.PI_REQUEST_TIMING;
+		vi.stubEnv("PI_REQUEST_TIMING", "");
 	});
 	afterEach(() => {
 		setLogSink(undefined);
-		process.env.PI_REQUEST_TIMING = originalEnv;
+		vi.unstubAllEnvs();
 	});
 	const timingEntries = () =>
 		entries.filter((entry) => entry.component === "coding-agent.request-timing") as Array<Record<string, any>>;
@@ -229,7 +228,10 @@ describe("request timing", () => {
 		});
 	});
 
-	it("pins the sdk wiring: faux sessions emit the timeline only when the flag is on", async () => {
+	it.each([
+		["the settings flag", true, undefined],
+		["PI_REQUEST_TIMING=1", false, "1"],
+	])("pins the sdk wiring: faux sessions emit the timeline only when %s is on", async (_name, requestTiming, env) => {
 		// Isolate the ambient agent dir so the harness digest renders empty state.
 		const dir = join(tmpdir(), `pi-request-timing-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(dir, { recursive: true });
@@ -237,8 +239,11 @@ describe("request timing", () => {
 		process.env.PRIME_AGENT_CODING_AGENT_DIR = dir;
 		const created: AgentSession[] = [];
 		try {
+			await promptOnFauxSession(dir, false, created);
+			expect(timingEntries()).toHaveLength(0);
+			if (env) vi.stubEnv("PI_REQUEST_TIMING", env);
 			// Flag on: faux never calls onPayload, so request-sent is absent and unmeasured phases are omitted.
-			await promptOnFauxSession(dir, true, created);
+			await promptOnFauxSession(dir, requestTiming, created);
 			expect(
 				timingEntries()
 					.map((entry) => entry.phase)
@@ -246,7 +251,7 @@ describe("request timing", () => {
 			).toBe("prompt-built,first-byte,first-token,stream-done");
 			expect(timingEntries().at(-1)).toMatchObject({
 				outcome: "done",
-				sessionId: created[0].sessionManager.getSessionId(),
+				sessionId: created[1].sessionManager.getSessionId(),
 			});
 		} finally {
 			for (const session of created) session.dispose();

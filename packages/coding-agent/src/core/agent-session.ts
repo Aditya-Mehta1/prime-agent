@@ -2304,6 +2304,7 @@ export class AgentSession {
 			}
 		}
 		this._pendingNextTurnMessages.unshift(...restorableMessages);
+		if (restorableMessages.length > 0) this._flushDeferredRlmTerminalNotices();
 		if (actions.length > 0) this._notifySessionInputCheckpointChange();
 		return actions;
 	}
@@ -2638,7 +2639,6 @@ export class AgentSession {
 			serviceTier: this.serviceTier,
 			imageModelReference: this.settingsManager.getImageModel(),
 			availableModels: this._modelRegistry.getAvailable(),
-			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
 			blockImages: this.settingsManager.getBlockImages(),
 		});
 	}

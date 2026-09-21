@@ -9,6 +9,7 @@ import {
 	appendGlobalRefinement,
 	applyRefinementProposal,
 	formatHarnessStateForPrompt,
+	formatRefinementNoticeBody,
 	getGlobalHarnessStateDir,
 	getHarnessStatePath,
 	getLocalHarnessStateDir,
@@ -793,6 +794,15 @@ describe("global refinement history", () => {
 		// Scope is recovered from the edit snapshots and written back onto the loaded results.
 		expect(loadGlobalRefinementHistory(dir).map((entry) => entry.scope)).toEqual(["global", "global"]);
 		expect(inferRefinementResultScope(editScoped)).toBe("global");
+	});
+
+	it("#2463: labels a malformed entry snapshot in the notice body instead of rendering it", () => {
+		const before = { id: "broken", kind: "memory", title: "T", content: ["one string"] } as unknown as HarnessEntry;
+		const body = formatRefinementNoticeBody(
+			sampleResult("refine_x", { appliedEdits: [{ action: "delete", kind: "memory", id: "broken", applied: true, before }] }),
+		);
+		expect(body).toContain("(skipped malformed entry: content not a string)");
+		expect(body).not.toContain("one string");
 	});
 
 	it("merges global and session history, preferring session entries but keeping global scope", () => {

@@ -75,7 +75,7 @@ describe("daemon mode helpers", () => {
 			if (!parentSessionFile) throw new Error("Missing parent session file");
 			const childSessionDir = join(parentManager.getSessionArtifactDir()!, "child-1");
 			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
-				session: makeRuntimeSession(options.sessionManager),
+				session: makeRuntimeSession(options.sessionManager, options.sessionOptions?.rlmDepth),
 				extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
 					ReturnType<CreateAgentSessionRuntimeFactory>
 				>["extensionsResult"],
@@ -141,6 +141,8 @@ describe("daemon mode helpers", () => {
 			const admission = spawn("child-1");
 			await expect(spawn("child-2")).rejects.toThrow('Agent name "real-worker" is unavailable');
 			const childRuntime = await admission;
+			// Resident sibling, no pending reservation: only the boundary re-assert can reject this.
+			await expect(spawn("child-2")).rejects.toThrow('Agent name "real-worker" is unavailable');
 			const edges = await internals.rlmSpawnLedger().liveEdges();
 			expect(edges.filter((edge) => edge.name === "real-worker")).toHaveLength(1);
 			const childState = [...internals.sessions.values()].find(
@@ -3342,9 +3344,11 @@ function makePersistedRlmDaemonFixture(
 
 function makeRuntimeSession(
 	sessionManager: Parameters<CreateAgentSessionRuntimeFactory>[0]["sessionManager"],
+	rlmDepth?: number,
 ): Awaited<ReturnType<CreateAgentSessionRuntimeFactory>>["session"] {
 	return {
 		sessionManager,
+		rlmDepth,
 		messages: [],
 		extensionRunner: {
 			hasHandlers: vi.fn(() => false),

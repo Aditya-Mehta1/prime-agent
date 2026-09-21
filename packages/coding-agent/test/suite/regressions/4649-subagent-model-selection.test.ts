@@ -392,7 +392,7 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
-	it("fails spawn when an explicit thinking level is unsupported by the resolved model", async () => {
+	it("fails spawn when an explicit thinking level is unsupported and releases the reserved name", async () => {
 		const harness = await createHarness({
 			provider,
 			models: [
@@ -401,11 +401,19 @@ describe("ENG-4649 subagent model selection", () => {
 			],
 		});
 		try {
+			harness.setResponses([fauxAssistantMessage("child answer")]);
 			await expect(
-				harness.session.runRlmChild("think hard", { model: `${provider}/child-model`, thinking: "high" }),
+				harness.session.runRlmChild("think hard", {
+					name: "thinker",
+					model: `${provider}/child-model`,
+					thinking: "high",
+				}),
 			).rejects.toThrow(
 				`Requested thinking level "high" is not supported by model "${provider}/child-model"; supported levels: off`,
 			);
+			await expect(
+				harness.session.runRlmChild("think less", { name: "thinker", model: `${provider}/child-model` }),
+			).resolves.toMatchObject({ name: "thinker" });
 		} finally {
 			harness.cleanup();
 		}

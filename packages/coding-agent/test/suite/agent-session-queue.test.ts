@@ -16,6 +16,7 @@ import {
 	type CustomMessage,
 	createSessionSlashCommandMessage,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "../../src/core/messages.js";
 import { getLocalHarnessStateDir, loadHarnessState, type RefinementResult } from "../../src/core/refinement/index.js";
 import type { ActionStore, SessionAction } from "../../src/core/session-action-store.js";
@@ -706,6 +707,28 @@ describe("AgentSession queue characterization", () => {
 			"context B",
 		]);
 		withStreaming(harness, false);
+	});
+
+	it("#2386: re-queues a re-parked child terminal notice when the capturing turn is cancelled", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const pause = harness.session.acquireQueuedWorkPause();
+		harness.session.restorePendingNextTurnMessages([
+			{
+				role: "custom",
+				customType: RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+				content: "child done",
+				display: false,
+				timestamp: 0,
+			},
+		]);
+		withStreaming(harness, true);
+		await harness.session.prompt("queued", { streamingBehavior: "followUp" });
+		pause.release();
+		expect(harness.session.clearQueue().followUp).toEqual(["queued"]);
+		withStreaming(harness, false);
+		expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([]);
+		expect(harness.session.unfinishedActionCount).toBe(1);
 	});
 
 	it("delivers next-turn context when the first preparing turn is cancelled", async () => {

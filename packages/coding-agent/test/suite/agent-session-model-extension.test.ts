@@ -386,6 +386,35 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.session.thinkingLevel).toBe("high");
 	});
 
+	it("#2453: cycling in the agent_end window keeps a queued routed turn's override", async () => {
+		let overrideAfterCycle: string | undefined;
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-text", input: ["text"] },
+				{ id: "faux-text-2", input: ["text"] },
+				{ id: "faux-vision", input: ["text", "image"] },
+			],
+			settings: { imageModel: "faux-vision" },
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_end", async () => {
+						await harness.session.agent.waitForIdle();
+						await harness.session.cycleModel("forward", { waitForExtensions: false });
+						overrideAfterCycle = harness.session.agent.modelOverride?.model.id;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("seen")]);
+		await harness.session.followUp("look", [{ type: "image", mimeType: "image/png", data: "aGk=" }], {
+			resumeIfIdle: true,
+		});
+		await harness.session.waitForIdle();
+		expect(harness.session.model?.id).toBe("faux-text-2");
+		expect(overrideAfterCycle).toBe("faux-vision");
+	});
+
 	it("throws when setModel is called without configured auth", async () => {
 		const harness = await createHarness({ models: MODELS.slice(0, 2), withConfiguredAuth: false });
 		harnesses.push(harness);

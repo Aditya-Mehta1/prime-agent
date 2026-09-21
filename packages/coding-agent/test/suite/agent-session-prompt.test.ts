@@ -1011,7 +1011,7 @@ describe("Harness digest at cold boundaries", () => {
 		mkdirSync(join(agentDir, "harness"), { recursive: true });
 		writeFileSync(
 			join(agentDir, "harness", "harness_state.json"),
-			'{"schema":1,"entries":{"prompt":{},"skill":{},"subagent":{},"memory":{"broken_memory":{"id":"broken_memory","kind":"memory","title":"Breaking memory","content":["one string"],"path":"arc","scope":"global","version":1},"valid_memory":{"id":"valid_memory","kind":"memory","title":"Valid memory","content":"Worktree workflow notes.","path":"general","scope":"global","version":1}}},"refinements":[{"id":"refine_bad","trigger":["not a string"],"changes":[],"evidence":"","outcome":""},null,"RAWLEAK-5f1e",{"id":null,"trigger":"t","changes":["update memory:m"]},{"id":"bad_changes","trigger":"t","changes":[7]}]}',
+			'{"schema":1,"entries":{"prompt":{},"skill":{},"subagent":{},"memory":{"broken_memory":{"id":"broken_memory","kind":"memory","title":"Breaking memory","content":["one string"],"path":"arc","scope":"global","version":1},"valid_memory":{"id":"valid_memory","kind":"memory","title":"Valid memory","content":"Worktree workflow notes.","path":"general","scope":"global","version":1},"leak_id":{"id":["IDLEAK-77a1"],"kind":"memory","title":"Leaky id","content":["x"],"path":"arc","scope":"global","version":1}}},"refinements":[{"id":"refine_bad","trigger":["not a string"],"changes":[],"evidence":"","outcome":""},null,"RAWLEAK-5f1e",{"id":null,"trigger":"t","changes":["update memory:m"]},{"id":"bad_changes","trigger":"t","changes":[7]}]}',
 		);
 
 		const harness = await createHarness({ persistSession: true });
@@ -1023,6 +1023,8 @@ describe("Harness digest at cold boundaries", () => {
 		expect(digests).toHaveLength(1);
 		const digest = getMessageText(digests[0]);
 		expect(digest).toContain("harness: skipped malformed entry broken_memory (content not a string)");
+		expect(digest).toContain("harness: skipped malformed entry a object id (content not a string)");
+		expect(digest).not.toContain("IDLEAK-77a1");
 		expect(digest).toContain("harness: skipped malformed refinement event refine_bad (trigger not a string)");
 		expect(digest).toContain("harness: skipped malformed refinement event null (event not an object)");
 		// Non-object elements are labeled by type only: the raw value must not leak.
