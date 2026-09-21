@@ -154,7 +154,16 @@ session file's latest valid `thread_goal_state` entry
 (`goal_state_persist.rs`) — status, objective, usage counters, and
 continuation counts continue across a worker-recovery rebuild, and the
 seeded published baseline keeps the rehydrated state from announcing
-itself (TS loads at construction without emitting). Platform wall
+itself (TS loads at construction without emitting). Recovery branch
+rebuild (TS one-store parity): the owned-session worker respawns with
+`--resume <sessionFile>` (`createRpcRecoveryArgs`), so the rebuilt
+session's branch is the durable history — while the Rust worker owns the
+file writes and the engine keeps an in-memory manager, the engine's
+session-build adoption rebuilds the branch from the worker session file
+(the `pending_branch` seam's recovery twin), so a post-recovery compaction
+walk (and the live loop context) reads the full durable history instead
+of a fresh engine's empty branch skipping "Session is too short to
+compact". Platform wall
 (`platform`): per-OS endpoint naming and socket identity; the transport itself
 is the shared trait in `pa_types::platform::transport`, and the private-frame
 codec plus command planes are the shared wire contract in

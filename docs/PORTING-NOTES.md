@@ -638,3 +638,44 @@ TS suite pin `agent-session-compaction.test.ts`
 - The overflow arm stays unported (no Rust overflow recovery path yet); the
   reason vocabulary (`threshold`/`overflow`/`requested`,
   `skipped`/`cancelled`/`failed`) rides the row details exactly like TS.
+
+## Recovered-session compaction walk (2026-09-20)
+
+Reference: TS `cli/owned-session-worker.ts` (`createRpcRecoveryArgs` +
+the crash-recovery relaunch), `core/agent-session.ts` (`_performCompaction`
+walks `this.sessionManager.getBranch()`), `core/session-manager.ts` (the
+one store: resume opens the session file into the branch).
+
+- TS's owned-session worker recovers a crashed session by relaunching with
+  `--resume <sessionFile>`: the fresh AgentSession's SessionManager opens
+  the durable store, so the branch — and the compaction walk over it —
+  sees the full pre-crash history. One store: the walk and the loop
+  context cannot diverge from the file.
+- The Rust daemon worker splits the store by design: the worker owns the
+  session file (emit-closure persistence), the engine's core session keeps
+  an in-memory manager, so the recovered engine's branch started empty —
+  a post-recovery compact walked a fresh branch and skipped with
+  "Session is too short to compact" even when the durable file was long.
+- Fix (mechanism parity, not transcription): `adopt_built_session` (the
+  engine's build-adoption seam) rebuilds the branch from the worker
+  session file whenever no replacement branch was parked — the same
+  `rebuild_branch_context` path tree navigation and the replacement flows
+  use, fed by the worker's own `SessionFile` reader
+  (`branch_file_entries`, the branch the store would walk). Every build
+  re-syncs: fresh creates adopt their prefix rows (no messages yet, so no
+  prompt change), recovery builds adopt the full durable history, and a
+  moved replacement branch still wins (the parked `pending_branch` keeps
+  priority; the durable seed never runs after it).
+- Id notes: the engine's in-memory branch and the durable file keep their
+  own entry ids (pre-existing split — the worker re-pins a compaction
+  row's `firstKeptEntryId` to the durable cut at the emit site). After a
+  recovery the branch IS the durable rows, so a later walk's boundary
+  lookup resolves durable ids exactly like TS's one store; the walk's
+  keep/summarize math is unchanged (`prepare_compaction` +
+  `find_cut_point` over `FileEntry`s).
+- Verifiers: `recovered_engine_compaction_walk_sees_the_durable_history`
+  (pa-daemon unit — a durable two-turn file, a fresh engine build, one
+  recovery turn, a manual compact that runs instead of skipping) and the
+  `killed_mid_goal_worker_rehydrates_the_goal_with_counts` e2e's
+  post-recovery compact (the second compaction entry lands durably and
+  the mint continues the rehydrated count to `continuationsUsed` 2).

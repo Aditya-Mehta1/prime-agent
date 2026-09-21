@@ -205,7 +205,7 @@ fn setup(name: &str) -> Harness {
         .to_string(),
     )
     .expect("write settings");
-    let responses: Vec<Value> = (0..8)
+    let responses: Vec<Value> = (0..12)
         .map(|index| json!({ "text": format!("scripted reply {index}") }))
         .collect();
     let script = dir.path().join("faux.json");
@@ -459,5 +459,54 @@ fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
     assert!(
         goal["tokensUsed"].as_u64().unwrap() > 0,
         "usage accounting never continued: {goal}"
+    );
+
+    // The post-recovery compact runs over the durable history (TS
+    // one-store recovery: the respawned session's branch is rebuilt from
+    // the store, so the compaction walk sees the pre-crash conversation —
+    // never the fresh engine's empty branch that skips "Session is too
+    // short to compact").
+    harness.client.send_command(
+        "c3",
+        json!({ "type": "compact", "activeSessionId": harness.session_id }),
+    );
+    let compact = harness.client.request("c3");
+    assert_eq!(
+        compact["success"], true,
+        "the post-recovery compact skipped on an empty branch: {compact}"
+    );
+    harness.client.send_command(
+        "w3",
+        json!({ "type": "wait_for_idle", "activeSessionId": harness.session_id }),
+    );
+    let idle = harness.client.request("w3");
+    assert_eq!(idle["success"], true, "never went idle: {idle}");
+    harness.client.drain_events(Duration::from_secs(1));
+
+    // The compaction walk saw the durable history: the durable file holds
+    // a second compaction entry, and the compact minted the owed
+    // continuation off the rehydrated goal (continuationsUsed 2, durable
+    // and announced).
+    let compaction_rows = std::fs::read_to_string(harness.session_file())
+        .expect("session file readable")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| line.contains("\"type\":\"compaction\""))
+        .count();
+    assert!(
+        compaction_rows >= 2,
+        "the post-recovery compact never persisted a second compaction entry"
+    );
+    let goal = harness.latest_goal_row();
+    assert_eq!(
+        goal["continuationsUsed"], 2,
+        "the post-recovery compact minted off the rehydrated count: {goal}"
+    );
+    assert_eq!(goal["status"], "active", "durable goal row: {goal}");
+    assert_eq!(goal["objective"], OBJECTIVE);
+    assert!(
+        harness.announced_continuations().contains(&2),
+        "the post-recovery mint never announced continuationsUsed 2: {:?}",
+        harness.client.events
     );
 }

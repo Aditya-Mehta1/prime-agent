@@ -417,6 +417,31 @@ impl AgentSessionEngine {
         }
         if let Some(entries) = pending_branch {
             built.session.rebuild_branch_context(entries).await?;
+            return Ok(());
+        }
+        // A recovery build rebuilds its branch from the durable store (TS
+        // one-store recovery: the owned-session worker respawns with
+        // `--resume <sessionFile>` — `createRpcRecoveryArgs` — so the
+        // session's branch, and the compaction walk that reads it, see
+        // the full durable history, never a fresh empty branch). The
+        // daemon worker owns the file writes while the engine keeps an
+        // in-memory manager, so the build adopts the durable branch
+        // here: the walk and the live loop context read the same history
+        // TS's single store holds. A missing or unreadable file keeps
+        // the fresh branch (the worker create fails on a bad store
+        // before any of this runs).
+        let session_file = self
+            .session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let durable_branch = session_file
+            .as_deref()
+            .and_then(|path| crate::session_store::SessionFile::open(path).ok())
+            .map(|store| store.branch_file_entries())
+            .filter(|entries| !entries.is_empty());
+        if let Some(entries) = durable_branch {
+            built.session.rebuild_branch_context(entries).await?;
         }
         Ok(())
     }
@@ -3488,6 +3513,134 @@ pub(crate) mod tests {
             minted.goal_update.expect("mint moved the state")["continuationsUsed"],
             3
         );
+    }
+
+    /// A durable message row in the worker's persisted wire shape.
+    fn wire_user_message(text: String) -> Value {
+        serde_json::to_value(pa_types::session::AgentMessage::User(
+            pa_types::ai::UserMessage {
+                content: pa_types::ai::UserContent::Text(text),
+                timestamp: 1,
+                rest: Default::default(),
+            },
+        ))
+        .expect("user message serializes")
+    }
+
+    /// A durable assistant row in the worker's persisted wire shape.
+    fn wire_assistant_message(text: String) -> Value {
+        serde_json::to_value(pa_types::session::AgentMessage::Assistant(
+            pa_types::ai::AssistantMessage {
+                content: vec![pa_types::ai::AssistantContentBlock::Text(
+                    pa_types::ai::TextContent {
+                        text,
+                        text_signature: None,
+                        rest: Default::default(),
+                    },
+                )],
+                api: "faux".to_string(),
+                provider: "faux".to_string(),
+                model: "faux-1".to_string(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: pa_types::ai::Usage::default(),
+                stop_reason: pa_types::ai::StopReason::Stop,
+                stop_reason_raw: None,
+                error_message: None,
+                timestamp: 2,
+                rest: Default::default(),
+            },
+        ))
+        .expect("assistant message serializes")
+    }
+
+    /// The recovered engine's compaction walk sees the durable history (TS
+    /// one-store recovery: the owned-session worker respawns with
+    /// `--resume <sessionFile>`, so the rebuilt session's branch carries
+    /// the pre-crash history and a post-recovery compact runs over it —
+    /// never a skip on the fresh engine's empty branch). The daemon worker
+    /// owns the file writes while the engine keeps an in-memory manager,
+    /// so the recovery build adopts the durable branch and the walk
+    /// (prepareCompaction over the branch) reads the same history TS's
+    /// single store holds.
+    #[test]
+    fn recovered_engine_compaction_walk_sees_the_durable_history() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        write_compaction_settings(dir.path(), 1);
+        // The durable store a killed worker leaves behind: a long
+        // conversation the fresh engine never saw in memory.
+        let long = "x".repeat(48_000);
+        let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let session_path = dir.path().join("session.jsonl");
+        store.set_path(session_path.clone());
+        store.append_message(wire_user_message(format!("work turn one {long}")));
+        store.append_message(wire_assistant_message(format!("reply one {long}")));
+        store.rewrite().expect("write session file");
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: Some(session_path),
+            faux_script: Some(
+                serde_json::json!({
+                    "responses": [{"text": "recovery reply"}, {"text": "the summary"}]
+                })
+                .to_string(),
+            ),
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap();
+        // The recovery turn builds the session; the build adopts the
+        // durable branch (TS `--resume`: one store).
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(
+            &engine,
+            format!("keep working after the crash {}", "y".repeat(2_000)),
+            &mut events,
+        );
+        let entries = engine_session_entries(&engine);
+        assert!(
+            entries.iter().any(|entry| match entry {
+                pa_types::session::FileEntry::Message {
+                    message: pa_types::session::AgentMessage::User(user),
+                    ..
+                } => user.content.text().contains("work turn one"),
+                _ => false,
+            }),
+            "the recovery build adopted the durable history: {entries:?}"
+        );
+        // The compact runs over the durable history instead of skipping
+        // "too short" on the fresh branch.
+        let controller = std::sync::Arc::new(pa_agent::abort::AbortController::new());
+        let signal = controller.signal();
+        let outcome = engine.run_compaction(
+            crate::engine::CompactionRequest {
+                custom_instructions: None,
+            },
+            &signal,
+        );
+        match outcome {
+            crate::engine::CompactionOutcome::Compacted { run } => {
+                assert_eq!(run.result["summary"], "the summary", "the compact ran");
+                assert!(
+                    run.result["firstKeptEntryId"].is_string(),
+                    "the cut resolved a kept entry: {run:?}"
+                );
+            }
+            other => panic!("the recovered compact did not run: {other:?}"),
+        }
+        // The post-compaction branch summary stands in for the durable
+        // prefix: the compaction entry landed in the engine branch.
+        assert!(compaction_entry_in_entries(&engine));
     }
 
     #[test]
