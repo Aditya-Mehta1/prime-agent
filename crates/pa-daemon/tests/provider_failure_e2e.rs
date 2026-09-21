@@ -754,4 +754,85 @@ fn provider_failure_recovered_by_retry_settles_the_turn() {
         last_message["message"]["content"][0]["text"],
         "recovered reply"
     );
+
+    // One `agent_end` per agent run (TS parity: the `messages` payload
+    // carries the run's whole message set, and a retried turn restarts its
+    // runs on the wire with their own `agent_start`/`turn_start` frames).
+    // The initial run carries the accepted rows plus its failed assistant
+    // row; each retry run carries only its own messages (the failed row
+    // left the loop context first, TS `messages.slice(0, -1)`).
+    let agent_ends: Vec<&Value> = client
+        .events
+        .iter()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("agent_end"))
+        .collect();
+    assert_eq!(agent_ends.len(), 3, "one agent_end per run: {types:?}");
+    let roles_of = |frame: &Value| -> Vec<String> {
+        frame["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message["role"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        roles_of(agent_ends[0]),
+        ["custom", "user", "assistant"],
+        "the initial run's message set (the deferred harness digest rides first): {agent_ends:?}"
+    );
+    assert_eq!(
+        agent_ends[0]["messages"][0]["customType"],
+        json!("harness_digest"),
+        "the deferred digest row is the run's first message"
+    );
+    assert_eq!(
+        agent_ends[0]["messages"][2]["stopReason"],
+        json!("error"),
+        "the initial run ends on the error row"
+    );
+    assert_eq!(
+        roles_of(agent_ends[1]),
+        ["assistant"],
+        "the first retry carries only its own messages: {agent_ends:?}"
+    );
+    assert_eq!(
+        agent_ends[1]["messages"][0]["stopReason"],
+        json!("error"),
+        "the first retry failed too"
+    );
+    assert_eq!(
+        roles_of(agent_ends[2]),
+        ["assistant"],
+        "the second retry carries only its own messages: {agent_ends:?}"
+    );
+    assert_eq!(
+        agent_ends[2]["messages"][0]["content"][0]["text"],
+        json!("recovered reply"),
+        "the recovered run's settled row"
+    );
+    // The two retry runs re-opened on the wire: three `agent_start` frames
+    // (the worker's run-opening frame plus the two forwarded run starts)
+    // and three `turn_start` frames, each retry pair after the prior run's
+    // `agent_end`.
+    assert_eq!(
+        types.iter().filter(|t| *t == "agent_start").count(),
+        3,
+        "one agent_start per run: {types:?}"
+    );
+    assert_eq!(
+        types.iter().filter(|t| *t == "turn_start").count(),
+        3,
+        "the run-opening turn_start plus the two retry runs': {types:?}"
+    );
+    // No bare synthesized frame trails the runs: every `agent_end` on the
+    // wire carries the messages payload.
+    assert!(
+        agent_ends
+            .iter()
+            .all(|event| event.get("messages").is_some()),
+        "no bare agent_end frames: {agent_ends:?}"
+    );
 }

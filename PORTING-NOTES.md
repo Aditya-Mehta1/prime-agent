@@ -2766,3 +2766,68 @@ didCompact finally arm) rides that missing session-command surface; the
 autonomous continuation loop keeps its separate-run framing (pre-existing,
 unverified against TS).
 
+
+## agent_end wire frame with the run messages payload (agent-end-messages lane, the #250 residue)
+
+TS ruling (read from the TS source plus probed against the installed TS
+binary, `scripts/battery/agent_end_messages_probe.py`): `agent_end`
+carries the run's whole message set - the per-run accumulation of the
+packages/agent agent-loop `newMessages` (prompt rows with the harness
+digest riding as a custom row, assistant rows, tool results, in-run
+steering/follow-up/continuation rows). TS emits ONE `agent_start` +
+`agent_end` pair per agent run: retried runs (provider retry) and
+continued runs (compact-and-continue, `agent.continue()`) each restart
+with their own pair, and the continuation run's `agent_end` payload
+carries ONLY that run's messages (the failed row left the loop context
+first). This resolves the #250-flagged per-runner-item divergence BY the
+accumulation: the Rust worker's trailing synthesized frame is a fallback
+for runs that ended without a model turn (session commands, pre-model
+failures), and a run whose `agent_end` the abort gate swallowed stays
+silent exactly like TS (the compact path's detached run emits none at
+all). The wire `agent_end` is `{type, messages}`.
+
+A second TS ruling on the same surface: `promptAndWait` settles the
+agent-message completion AFTER the whole turn settle
+(agent-session.ts settles `completion` inside the input-pump arm, after
+`_startPreparedTurnActions` fully unwinds). The Rust worker resolved the
+`prompt_and_wait` waiter at the engine `Done` event, inside the turn
+task - a window where the session is still mid-unwind (`core.busy`
+still set, queue projection pending). A client whose follow-up request
+landed in that window hit the suspension gate with busy set, so the gate
+queued it behind the (indefinite) suspension instead of rejecting it
+with the TS admission error - the f7 suspension sequence's post-abort
+prompt hung exactly there. The turn task now parks the settled outcome
+and `run_turn` resolves the waiter after the idle flip, roster delta,
+boundary frames, queue projection, and admission bookkeeping.
+
+Rust port:
+- `EngineEvent::AgentStart/AgentEnd`: the engine forwards the loop's
+  run-boundary events in the session wire shapes (`session_wire_value`
+  converts custom rows too - the harness digest rides the payload).
+- The worker's run-opening `agent_start`/`turn_start` forward only once
+  a boundary frame already passed in the item, so the worker's own
+  frames stay the first run's and retried/continued runs re-open with
+  their own frames.
+- ACP turn settlement resolves on the turn's LAST `agent_end` (a
+  retried turn restarts its runs; an early marker resolution would let
+  the trailing retry frames trail the settlement).
+- run_turn_once: a turn whose admission already settled must not re-poll
+  the completed `pin!` future (pin! futures panic when resumed after
+  completion; the compact-abort drain surfaced it deterministically).
+  Gate the abort wait on `!settled`.
+
+Verifiers: engine tests pin the settled payload ([digest, user,
+assistant]), the retried per-run frames/message sets, and the aborted
+run's `agent_end`; worker tests pin the wire frames (per-run
+agent_start/turn_start/agent_end, the Done-only fallback pair, the
+compact swallow) and the post-settle waiter resolution (the waiter fires
+only after the idle flip); the healing-retry e2e pins three `agent_end`
+frames with per-run messages; the probe
+(`scripts/battery/runs/agent-end-messages-probe-20260921T1331Z/`)
+byte-compares the `agent_end` frames plus run-boundary fingerprints
+(normalized timestamps + JS stack traces) on settled, retried, and
+continued runs against the TS binary - all MATCH. Known follow-up (out
+of lane): the retried boundary sequence diverges on `auto_retry_*`
+placement (TS resets the retry counter at the successful `message_end`
+hook; the Rust retry driver closes `auto_retry_end` after the attempt
+boundary).

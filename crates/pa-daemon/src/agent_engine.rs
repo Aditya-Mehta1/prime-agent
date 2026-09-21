@@ -2241,6 +2241,7 @@ impl AgentSessionEngine {
         &self,
         admission: TurnAdmission,
         prompt: &TurnPrompt,
+        boundary_passed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> TurnResult {
@@ -2324,7 +2325,7 @@ impl AgentSessionEngine {
                             drop_trailing_assistant(&agent).await;
                         }
                         match self
-                            .run_turn_once(&agent, &prompt, first, &mut **emit)
+                            .run_turn_once(&agent, &prompt, first, boundary_passed, &mut **emit)
                             .await
                         {
                             Ok(TurnOnce::Message { assistant }) => {
@@ -2740,6 +2741,14 @@ impl AgentSessionEngine {
         // state, never re-sending attachments).
         let mut prompt = first;
         let mut overflow_retry = false;
+        // Whether a loop-boundary frame already passed in this runner item
+        // (a `turn_end` of an inner turn or an `agent_end` of an earlier
+        // run): the worker's run-opening frames are the item's first run's
+        // `agent_start`/`turn_start`, so the engine forwards the later
+        // runs' opening frames — the retried/continued runs TS restarts
+        // with their own frames (one `agent_start` + `agent_end` pair per
+        // agent run).
+        let boundary_passed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // TS resets `_overflowRecovery` when a message that starts an agent
         // run enters the loop: the admitted prompt here.
         self.reset_overflow_recovery();
@@ -2765,7 +2774,7 @@ impl AgentSessionEngine {
             } else {
                 TurnAdmission::FreshPrompt
             };
-            let turn = self.run_model_turn(admission, &prompt, aborted, emit);
+            let turn = self.run_model_turn(admission, &prompt, &boundary_passed, aborted, emit);
             let assistant = match turn {
                 TurnResult::Message(assistant) => {
                     // A settled non-error turn resets the overflow
@@ -2996,6 +3005,7 @@ impl AgentSessionEngine {
         agent: &std::sync::Arc<pa_agent::agent::Agent>,
         prompt: &TurnPrompt,
         first_attempt: bool,
+        boundary_passed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<TurnOnce> {
         // Stream assistant events while the turn runs.
@@ -3009,14 +3019,17 @@ impl AgentSessionEngine {
         // session's own mutex is held across the turn's admission.
         let goal_runtime = self.goal_runtime.lock().expect("goal runtime lock").clone();
         let goal_budget_crossed = std::sync::Arc::clone(&self.goal_budget_crossed);
-        // The loop's entry emits the run's opening `turn_start` (TS
-        // `runAgentLoop`), which the worker's own run-opening frames carry;
-        // only the inner-turn starts (after the first `turn_end`) reach the
-        // wire through this subscription.
-        let inner_turn_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The run-opening boundary frames (TS `agent_start` / `turn_start`)
+        // are carried by the worker's own run-opening frames for the
+        // item's first run, so this subscription forwards them only once a
+        // boundary frame already passed in the item: an inner turn of the
+        // same run (after the first `turn_end`) or a later run of the same
+        // item (after an `agent_end` — a retry or a compact-and-retry
+        // re-issue, exactly the runs TS restarts with their own frames).
+        let boundary_passed = std::sync::Arc::clone(boundary_passed);
         let subscription = {
             let tx = tx.clone();
-            let inner_turn_started = std::sync::Arc::clone(&inner_turn_started);
+            let boundary_passed = std::sync::Arc::clone(&boundary_passed);
             // Per-message usage accounting runs on every settled assistant
             // message (whatever the stop reason except errors), matching the
             // TS message_end hook. The driver owns the policy; this loop
@@ -3031,7 +3044,7 @@ impl AgentSessionEngine {
             agent
                 .subscribe(move |event, _signal| {
                     let tx = tx.clone();
-                    let inner_turn_started = std::sync::Arc::clone(&inner_turn_started);
+                    let boundary_passed = std::sync::Arc::clone(&boundary_passed);
                     let autonomous_state = std::sync::Arc::clone(&autonomous_state);
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
                     let goal_runtime = goal_runtime.clone();
@@ -3158,19 +3171,37 @@ impl AgentSessionEngine {
                                     _ => {}
                                 }
                             }
-                            // The turn-boundary frames (TS `turn_start` /
-                            // `turn_end`): the entry's opening `turn_start`
-                            // stays with the worker's run-opening frames
-                            // (the `inner_turn_started` gate above), and
-                            // `turn_end` carries the terminal assistant
-                            // message plus the turn's tool-result messages
-                            // (the rows themselves persist and broadcast
-                            // through their own events; this frame is the
-                            // terminal payload, in the session wire shape).
+                            // The loop-boundary frames (TS `turn_start` /
+                            // `turn_end` / `agent_start` / `agent_end`): the
+                            // run-opening `turn_start` and `agent_start`
+                            // stay with the worker's run-opening frames for
+                            // the item's first run (the `boundary_passed`
+                            // gate above — a later run of the same item
+                            // forwards its own), `turn_end` carries the
+                            // terminal assistant message plus the turn's
+                            // tool-result messages, and `agent_end` the
+                            // run's whole message set (the rows themselves
+                            // persist and broadcast through their own
+                            // events; these frames carry only the
+                            // accumulated payloads, in the session wire
+                            // shapes).
                             AgentEvent::TurnStart => {
-                                if inner_turn_started.load(std::sync::atomic::Ordering::SeqCst) {
+                                if boundary_passed.load(std::sync::atomic::Ordering::SeqCst) {
                                     let _ = tx.send(EngineEvent::TurnStart);
                                 }
+                            }
+                            AgentEvent::AgentStart => {
+                                if boundary_passed.load(std::sync::atomic::Ordering::SeqCst) {
+                                    let _ = tx.send(EngineEvent::AgentStart);
+                                }
+                            }
+                            AgentEvent::AgentEnd { messages } => {
+                                let messages = messages
+                                    .iter()
+                                    .filter_map(session_wire_value)
+                                    .collect::<Vec<Value>>();
+                                boundary_passed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let _ = tx.send(EngineEvent::AgentEnd { messages });
                             }
                             AgentEvent::TurnEnd {
                                 message,
@@ -3185,7 +3216,7 @@ impl AgentSessionEngine {
                                             ))
                                         })
                                         .collect::<Vec<Value>>();
-                                    inner_turn_started
+                                    boundary_passed
                                         .store(true, std::sync::atomic::Ordering::SeqCst);
                                     let _ = tx.send(EngineEvent::TurnEnd {
                                         message,
@@ -3226,7 +3257,6 @@ impl AgentSessionEngine {
                                     is_error: *is_error,
                                 });
                             }
-                            _ => {}
                         }
                         Ok(())
                     })
@@ -3302,10 +3332,14 @@ impl AgentSessionEngine {
                 break;
             }
         }
-        if aborted {
+        if aborted && !settled {
             // The emit callback cancelled the turn: stop the still-running
             // admission and wait out its abort path before returning, so no
-            // run outlives this attempt.
+            // run outlives this attempt. A turn whose admission already
+            // settled (the abort gate dropped only the settled run's tail
+            // events in the drain) must not re-poll the completed future -
+            // `std::pin::pin!` futures panic when resumed after
+            // completion - so only an in-flight admission is awaited out.
             agent.abort();
             let _ = (&mut admitted).await;
         }
@@ -5836,6 +5870,26 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
         .position(|event| matches!(event, EngineEvent::Done(_)))
         .expect("the run's trailing Done");
     assert!(turn_end_index < done_index, "turn_end precedes the Done");
+    // The aborted run still ends with its `agent_end` (TS emits it on the
+    // abort paths): the payload carries the run's whole message set with
+    // the aborted row as the terminal message.
+    let agent_end_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::AgentEnd { .. }))
+        .expect("the aborted run's agent_end event");
+    assert!(
+        turn_end_index < agent_end_index && agent_end_index < done_index,
+        "agent_end sits between the turn_end and the Done: {events:?}"
+    );
+    let EngineEvent::AgentEnd { messages } = &events[agent_end_index] else {
+        unreachable!();
+    };
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["stopReason"] == json!("aborted")),
+        "the aborted row rides the agent_end payload: {messages:?}"
+    );
 }
 
 /// The settled turn's terminal frame (TS `turn_end`): the loop's boundary
@@ -5884,6 +5938,198 @@ fn settled_turn_emits_the_terminal_turn_end_payload() {
     };
     assert_eq!(message, assistant, "the terminal message is the payload");
     assert!(tool_results.is_empty(), "the text-only turn ran no tools");
+}
+
+/// The run's terminal frame (TS `agent_end`): the loop's run-end event
+/// carries the run's whole message set — the accepted user row and the
+/// settled assistant row, in the session wire shapes — positioned after
+/// the terminal `turn_end` and before the trailing `Done`. The worker
+/// frames it as the wire `agent_end` with the TS `messages` payload; the
+/// run-opening `agent_start` stays with the worker's own opening frames,
+/// so the engine forwards none for the item's first run.
+#[test]
+fn settled_turn_emits_the_run_agent_end_payload() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (engine, _engine_dir) = tests::faux_engine_with_settings(
+        serde_json::json!({ "responses": [{"text": "settled reply"}] }),
+        1,
+    );
+    let mut events: Vec<EngineEvent> = Vec::new();
+    tests::admit(&engine, "plain turn".to_string(), &mut events);
+    let turn_end_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::TurnEnd { .. }))
+        .expect("the settled turn's turn_end event");
+    let agent_end_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::AgentEnd { .. }))
+        .expect("the run's agent_end event");
+    let done_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::Done(_)))
+        .expect("the trailing Done");
+    assert!(
+        turn_end_index < agent_end_index && agent_end_index < done_index,
+        "agent_end sits between the turn_end and the Done: {events:?}"
+    );
+    let EngineEvent::AgentEnd { messages } = &events[agent_end_index] else {
+        unreachable!();
+    };
+    let roles = messages
+        .iter()
+        .map(|message| message["role"].as_str().unwrap_or_default())
+        .collect::<Vec<&str>>();
+    assert_eq!(
+        roles,
+        ["custom", "user", "assistant"],
+        "the run's message set (the deferred harness digest rides first)"
+    );
+    assert_eq!(
+        messages[0]["customType"],
+        json!("harness_digest"),
+        "the deferred digest row is the run's first message"
+    );
+    assert_eq!(
+        messages[1]["content"],
+        json!([{ "type": "text", "text": "plain turn" }]),
+        "the accepted user row rides the payload"
+    );
+    assert_eq!(
+        messages[2]["content"],
+        json!([{ "type": "text", "text": "settled reply" }]),
+        "the settled assistant row rides the payload"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::AgentStart)),
+        "the first run's agent_start stays with the worker's opening frames: {events:?}"
+    );
+}
+
+/// One `agent_end` per agent run (TS emits per run, so a retried run
+/// restarts with its own frames): a retryable provider failure ends the
+/// first run with its whole message set — the user row and the failed
+/// assistant row — then the retry re-issues as a new run whose `agent_end`
+/// carries only the retry's messages (the failed row left the loop
+/// context first, TS `messages.slice(0, -1)`). The retry run's opening
+/// `agent_start` and `turn_start` forward — a boundary frame (the first
+/// run's `agent_end`) already passed in the item.
+#[test]
+fn retried_run_restarts_with_its_own_agent_frames() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("agent")).unwrap();
+    std::fs::write(
+        dir.path().join("agent").join("settings.json"),
+        serde_json::json!({
+            "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 },
+            "retry": { "enabled": true, "maxRetries": 1, "baseDelayMs": 10 }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(
+            serde_json::json!({
+                "responses": [
+                    { "stopReason": "error", "errorMessage": "faux provider overloaded" },
+                    { "text": "recovered reply" },
+                ]
+            })
+            .to_string(),
+        ),
+        supervisor_link: None,
+        telemetry_disabled: None,
+    })
+    .unwrap();
+    let mut events: Vec<EngineEvent> = Vec::new();
+    tests::admit(&engine, "retried turn".to_string(), &mut events);
+    let agent_end_indexes = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event, EngineEvent::AgentEnd { .. }))
+        .map(|(index, _)| index)
+        .collect::<Vec<usize>>();
+    assert_eq!(
+        agent_end_indexes.len(),
+        2,
+        "one agent_end per run: {events:?}"
+    );
+    let EngineEvent::AgentEnd { messages: first } = &events[agent_end_indexes[0]] else {
+        unreachable!();
+    };
+    let roles = first
+        .iter()
+        .map(|message| message["role"].as_str().unwrap_or_default())
+        .collect::<Vec<&str>>();
+    assert_eq!(
+        roles,
+        ["custom", "user", "assistant"],
+        "the failed run's message set (the digest row rides first)"
+    );
+    assert_eq!(
+        first[2]["stopReason"],
+        json!("error"),
+        "the failed run ends on the error row"
+    );
+    let EngineEvent::AgentEnd { messages: second } = &events[agent_end_indexes[1]] else {
+        unreachable!();
+    };
+    let roles = second
+        .iter()
+        .map(|message| message["role"].as_str().unwrap_or_default())
+        .collect::<Vec<&str>>();
+    assert_eq!(
+        roles,
+        ["assistant"],
+        "the retried run carries only its own messages: {events:?}"
+    );
+    assert_eq!(
+        second[0]["content"],
+        json!([{ "type": "text", "text": "recovered reply" }]),
+        "the retried run's settled row"
+    );
+    // The retry run restarted with its own opening frames: the forwarded
+    // `agent_start` and `turn_start` both follow the first run's
+    // `agent_end`.
+    let agent_start_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::AgentStart))
+        .expect("the retry run's agent_start forwarded");
+    assert!(
+        agent_start_index > agent_end_indexes[0],
+        "the retry run's agent_start follows the failed run's agent_end: {events:?}"
+    );
+    let retry_turn_start_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::TurnStart))
+        .expect("the retry run's turn_start forwarded");
+    assert!(
+        agent_start_index < retry_turn_start_index && retry_turn_start_index < agent_end_indexes[1],
+        "the retry run's turn_start sits between its agent_start and agent_end: {events:?}"
+    );
+    // The retry itself surfaced on the events between the two runs.
+    let auto_retry_index = events
+        .iter()
+        .position(|event| matches!(event, EngineEvent::AutoRetryStart { .. }))
+        .expect("the retry start event");
+    assert!(
+        agent_end_indexes[0] < auto_retry_index && auto_retry_index < agent_start_index,
+        "the retry start sits between the two runs: {events:?}"
+    );
 }
 
 /// The aborted turn's goal accounting (TS
@@ -6915,7 +7161,18 @@ fn session_wire_value(agent_message: &pa_agent::types::AgentMessage) -> Option<V
         pa_agent::types::AgentMessage::Standard(LoopMessage::ToolResult(tool_result)) => {
             pa_types::session::AgentMessage::ToolResult(json_round_trip(tool_result)?)
         }
-        _ => return None,
+        // A custom row (the harness digest, a goal-context row): the
+        // payload is the session-shape custom message and the wire form is
+        // the tagged session message — the payload plus the row's role
+        // (TS `agent_end.messages` carries custom rows in this shape).
+        pa_agent::types::AgentMessage::Custom(custom) => {
+            let mut value = custom.payload.clone();
+            let object = value.as_object_mut()?;
+            object
+                .entry("role".to_string())
+                .or_insert_with(|| Value::String(custom.role.clone()));
+            return Some(value);
+        }
     };
     serde_json::to_value(&session_message).ok()
 }

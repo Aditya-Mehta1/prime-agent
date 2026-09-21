@@ -94,6 +94,21 @@ pub enum EngineEvent {
         message: Value,
         tool_results: Vec<Value>,
     },
+    /// An agent run started (TS wire `agent_start`). The loop emits one per
+    /// agent run — retried and continued runs included — but the worker's
+    /// own run-opening `agent_start` frame is the first run's, so the
+    /// engine forwards only the later runs' frames (a boundary frame
+    /// already passed in the item).
+    AgentStart,
+    /// An agent run ended (TS wire `agent_end`): the run's whole message
+    /// set in the session wire shapes — the prompt rows (the harness digest
+    /// and the user row), every assistant row, the tool results, and every
+    /// steering/follow-up/continuation row drained within the run. Emitted
+    /// per agent run, aborts and provider errors included (the messages
+    /// carry the aborted/error row), like the TS session's loop-event
+    /// forwarding. The rows themselves persist and broadcast through
+    /// their own events; this frame carries only the accumulated payload.
+    AgentEnd { messages: Vec<Value> },
     /// A durable custom message (wire `role: "custom"`): recorded into the
     /// session store and shown to attached clients. Emitted as a
     /// `message_start` + `message_end` pair, matching the TS session's
@@ -1087,11 +1102,17 @@ impl SessionEngine for ScriptedEngine {
         // turn persists and renders the row, then runs on `message` (the
         // real engine's injected-prompt contract, mirrored here so the
         // scripted harness exercises the same worker path).
+        let accepted_row = match &request.custom_message {
+            Some(custom) => custom.clone(),
+            None => json!({
+                "role": "user",
+                "content": request.message.clone(),
+                "timestamp": crate::util::now_ms(),
+            }),
+        };
         let accepted = match &request.custom_message {
-            Some(custom) => EngineEvent::CustomMessage(custom.clone()),
-            None => EngineEvent::UserMessage(
-                json!({"role": "user", "content": request.message, "timestamp": crate::util::now_ms()}),
-            ),
+            Some(_) => EngineEvent::CustomMessage(accepted_row.clone()),
+            None => EngineEvent::UserMessage(accepted_row.clone()),
         };
         if !emit(accepted) {
             emit(cancelled());
@@ -1124,8 +1145,17 @@ impl SessionEngine for ScriptedEngine {
         // The loop's terminal frame (TS `turn_end`): the final assistant
         // message as the payload, no tool results in the scripted shape.
         if !emit(EngineEvent::TurnEnd {
-            message: final_message,
+            message: final_message.clone(),
             tool_results: Vec::new(),
+        }) {
+            emit(cancelled());
+            return;
+        }
+        // The loop's run-end frame (TS `agent_end`): the run's
+        // accumulated message set — the accepted row plus the final
+        // assistant message in the scripted shape.
+        if !emit(EngineEvent::AgentEnd {
+            messages: vec![accepted_row, final_message],
         }) {
             emit(cancelled());
             return;

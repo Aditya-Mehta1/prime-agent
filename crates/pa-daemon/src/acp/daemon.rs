@@ -202,12 +202,19 @@ struct HostedSession {
     cancel_requested: bool,
     /// The newest assistant stop reason observed on the event stream.
     assistant_stop_reason: Option<String>,
-    /// Resolved when the worker emits the post-turn `agent_end` event: the
-    /// worker sends its `prompt_and_wait` response BEFORE that marker, so
-    /// the marker is the deterministic "every turn frame is on the wire"
-    /// signal the settlement waits for (the supervisor's event relay may
-    /// otherwise trail the response).
+    /// Resolved when the worker emits the turn's last `agent_end` event:
+    /// the worker sends its `prompt_and_wait` response BEFORE that marker,
+    /// so the marker is the deterministic "every turn frame is on the
+    /// wire" signal the settlement waits for (the supervisor's event relay
+    /// may otherwise trail the response). One `agent_end` per agent run —
+    /// retried and continued runs restart with their own pair — so the
+    /// marker resolves only when every started run ended (a fallback
+    /// `agent_end` for a run without a model turn settles immediately).
     turn_emitted: Option<oneshot::Sender<()>>,
+    /// `agent_start` frames seen since the marker armed.
+    agent_runs_started: u64,
+    /// `agent_end` frames seen since the marker armed.
+    agent_runs_ended: u64,
 }
 
 /// The daemon-attached transport state: one hosted session at most, like
@@ -266,12 +273,22 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             current.assistant_stop_reason = stop.stop_reason;
                         }
                         // The worker's post-turn marker: the settlement
-                        // waiting on it may resume (every turn frame is
-                        // now on the wire).
-                        if event.get("type").and_then(Value::as_str) == Some("agent_end") {
-                            if let Some(emitted) = current.turn_emitted.take() {
-                                let _ = emitted.send(());
+                        // waiting on it may resume once every agent run of
+                        // the turn ended (a retried or continued run
+                        // restarts with its own `agent_start`, so the LAST
+                        // `agent_end` is the marker — an early one leaves
+                        // the trailing retry frames behind the settlement).
+                        match event.get("type").and_then(Value::as_str) {
+                            Some("agent_start") => current.agent_runs_started += 1,
+                            Some("agent_end") => {
+                                current.agent_runs_ended += 1;
+                                if current.agent_runs_ended >= current.agent_runs_started.max(1) {
+                                    if let Some(emitted) = current.turn_emitted.take() {
+                                        let _ = emitted.send(());
+                                    }
+                                }
                             }
+                            _ => {}
                         }
                         let turn_id = current.producer.active_prompt_turn().await;
                         for update in wire_events::wire_updates(&event, &mut mapping) {
@@ -554,6 +571,8 @@ async fn handle_session_new(
         cancel_requested: false,
         assistant_stop_reason: None,
         turn_emitted: None,
+        agent_runs_started: 0,
+        agent_runs_ended: 0,
     };
     // The ACP MCP servers ride the wire command, not a local manager.
     if let Err(error) = replace_session_servers(link, &hosted, &resolved).await {
@@ -684,6 +703,8 @@ async fn handle_session_prompt(
     let (emitted_tx, emitted_rx) = oneshot::channel::<()>();
     if let Some(hosted) = state.lock().await.session.as_mut() {
         hosted.turn_emitted = Some(emitted_tx);
+        hosted.agent_runs_started = 0;
+        hosted.agent_runs_ended = 0;
     }
     let prompt = DaemonCommand::PromptAndWait {
         id: None,

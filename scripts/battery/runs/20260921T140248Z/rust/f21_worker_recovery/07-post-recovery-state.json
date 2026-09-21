@@ -1,0 +1,49 @@
+{
+ "command": "get_state",
+ "data": {
+  "activeSessionId": "b635fdddccef",
+  "activity": "idle",
+  "attachedClients": 1,
+  "created": "2026-09-21T14:09:25.097Z",
+  "cwd": "/home/ubuntu/lane-worktrees/agent-end-messages/scripts/battery/runs/20260921T140248Z/rust/work",
+  "firstMessage": "f21 seed turn",
+  "hasRegisteredCronJob": false,
+  "id": "b635fdddccef",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T14:09:39.450Z",
+  "lifecycle": "live",
+  "messageCount": 4,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T14:09:39.457Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/agent-end-messages/scripts/battery/runs/20260921T140248Z/rust/agent/sessions/01a0c44c-d669-7664-a0bb-032bd4cc0d71.jsonl",
+  "sessionId": "01a0c44c-d669-7664-a0bb-032bd4cc0d71",
+  "sessionName": "battery-f21",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "usage": {
+   "cost": 0.0,
+   "inputTokens": 200,
+   "outputTokens": 20
+  },
+  "workerPid": 2149894,
+  "workerState": "ready"
+ },
+ "id": "g21r",
+ "success": true,
+ "type": "response"
+}
