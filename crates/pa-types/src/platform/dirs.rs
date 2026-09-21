@@ -38,6 +38,38 @@ pub fn home_dir() -> Option<PathBuf> {
     None
 }
 
+/// `PRIME_AGENT_CODING_AGENT_DIR`: the agent state directory override (a
+/// wire-internal identifier kept byte-compatible with the TS product).
+pub const ENV_AGENT_DIR: &str = "PRIME_AGENT_CODING_AGENT_DIR";
+
+/// The agent state directory name (TS `CONFIG_DIR_NAME`, `.prime/agent`).
+pub const CONFIG_DIR_NAME: &str = ".prime/agent";
+
+/// The agent state directory (TS `getAgentDir`): the env override with a
+/// leading `~`/`~/` expanded against [`home_dir`], else `<home>/.prime/agent`.
+/// `None` when no override is set and the home directory does not resolve
+/// (each caller owns its fallback).
+pub fn agent_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(ENV_AGENT_DIR).filter(|dir| !dir.is_empty()) {
+        return Some(expand_tilde(&dir.to_string_lossy()));
+    }
+    home_dir().map(|home| home.join(CONFIG_DIR_NAME))
+}
+
+/// Expand a leading `~`/`~/` against [`home_dir`]; other values pass
+/// through (TS `expandTildePath`: `~foo` is not an expansion).
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    if path == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    PathBuf::from(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +102,62 @@ mod tests {
                 None => std::env::remove_var(name),
             }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_dir_env_override_expands_tilde() {
+        with_env(
+            &[
+                ("HOME", Some("/home/tester")),
+                ("PRIME_AGENT_CODING_AGENT_DIR", Some("~/state")),
+            ],
+            || {
+                assert_eq!(agent_dir(), Some(PathBuf::from("/home/tester/state")));
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_dir_env_override_passthrough() {
+        with_env(
+            &[
+                ("HOME", None),
+                ("PRIME_AGENT_CODING_AGENT_DIR", Some("/opt/state")),
+            ],
+            || {
+                assert_eq!(agent_dir(), Some(PathBuf::from("/opt/state")));
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_dir_default_under_home() {
+        with_env(
+            &[
+                ("HOME", Some("/home/tester")),
+                ("PRIME_AGENT_CODING_AGENT_DIR", None),
+            ],
+            || {
+                assert_eq!(
+                    agent_dir(),
+                    Some(PathBuf::from("/home/tester/.prime/agent"))
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_dir_without_home_is_none() {
+        with_env(
+            &[("HOME", None), ("PRIME_AGENT_CODING_AGENT_DIR", None)],
+            || {
+                assert_eq!(agent_dir(), None);
+            },
+        );
     }
 
     #[test]

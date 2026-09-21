@@ -15,7 +15,7 @@ pub mod transport;
 #[cfg(windows)]
 pub(crate) mod windows_pipe;
 
-pub use dirs::home_dir;
+pub use dirs::{agent_dir, home_dir};
 pub use identity::socket_identity;
 pub use process::{
     ignore_sigint_for_suspend, is_process_alive, process_start_id, restore_default_sigint,

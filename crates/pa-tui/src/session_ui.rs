@@ -22,6 +22,7 @@ use crate::image_load::LoadedImage;
 use crate::image_markers::{
     collect_marked_images, evict_images_to_budget, format_image_marker, image_marker_ids,
 };
+use crate::info_commands;
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
 use crate::model_picker::{CurrentModel, ModelPicker, ModelPickerAction, ModelPickerOptions};
@@ -1226,15 +1227,19 @@ impl SessionUi {
             SlashCommandExecution::Session => {
                 self.send_prompt(text, SubmitBehavior::Steer, view).await
             }
-            SlashCommandExecution::Client => self.dispatch_client_command(&resolved, view).await,
+            SlashCommandExecution::Client => {
+                self.dispatch_client_command(&resolved, text, view).await
+            }
         }
     }
 
     /// A builtin client command. Only the implemented subset runs locally;
-    /// commands whose UI does not exist yet report unavailability.
+    /// commands whose UI does not exist yet report unavailability. `text` is
+    /// the typed submission (the client echo rows render it verbatim).
     async fn dispatch_client_command(
         &mut self,
         resolved: &pa_types::slash_commands::ResolvedSlashCommand,
+        text: &str,
         view: &mut AgentView,
     ) -> Result<()> {
         match resolved.name {
@@ -1438,6 +1443,161 @@ impl SessionUi {
                 });
                 self.dirty = true;
             }
+            // `/session` (TS `handleSessionCommand`): the daemon's session
+            // stats as the `Session Info` block after the command echo.
+            "session" => {
+                self.track_command_used("session");
+                if !resolved.args.is_empty() {
+                    view.editor.set_text(text);
+                    self.error_row("Usage: /session", view);
+                    return Ok(());
+                }
+                view.push_entry(ChatEntry::User {
+                    text: text.to_string(),
+                });
+                let stats = self
+                    .bounded_request(
+                        Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                        DaemonCommand::GetSessionStats {
+                            id: None,
+                            active_session_id: self.active_session_id.clone(),
+                            rest: Default::default(),
+                        },
+                    )
+                    .await;
+                match stats {
+                    Ok(stats) => {
+                        let name = self.session_name.clone();
+                        view.push_entry(ChatEntry::ClientText {
+                            rows: info_commands::session_info_rows(&stats, name.as_deref()),
+                        });
+                        self.dirty = true;
+                    }
+                    Err(error) => {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
+            // `/context` and its `/usage` alias (TS
+            // `handleContextCommand` over `formatContextTree`): the agent
+            // tree with own token/cost columns and context utilization.
+            "context" => {
+                self.track_command_used("context");
+                if !resolved.args.is_empty() {
+                    view.editor.set_text(text);
+                    self.error_row("Usage: /context", view);
+                    return Ok(());
+                }
+                view.push_entry(ChatEntry::User {
+                    text: text.to_string(),
+                });
+                let tree = self
+                    .bounded_request(
+                        Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                        DaemonCommand::GetContextTree {
+                            id: None,
+                            active_session_id: self.active_session_id.clone(),
+                            rest: Default::default(),
+                        },
+                    )
+                    .await;
+                match tree {
+                    Ok(tree) => {
+                        // TS render width: clamp(columns - 2, 60, 120).
+                        let width = terminal_columns().saturating_sub(2).clamp(60, 120);
+                        view.push_entry(ChatEntry::ClientText {
+                            rows: info_commands::context_tree_rows(&tree, width),
+                        });
+                        self.dirty = true;
+                    }
+                    Err(error) => {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
+            // `/system-prompt` (TS `handleSystemPromptCommand`): the header
+            // with the char count, then the exact assembled prompt.
+            "system-prompt" => {
+                self.track_command_used("system-prompt");
+                if !resolved.args.is_empty() {
+                    view.editor.set_text(text);
+                    self.error_row("Usage: /system-prompt", view);
+                    return Ok(());
+                }
+                view.push_entry(ChatEntry::User {
+                    text: text.to_string(),
+                });
+                let prompt = self
+                    .bounded_request(
+                        Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                        DaemonCommand::GetSystemPrompt {
+                            id: None,
+                            active_session_id: self.active_session_id.clone(),
+                            rest: Default::default(),
+                        },
+                    )
+                    .await;
+                match prompt {
+                    Ok(data) => {
+                        let prompt = data
+                            .get("systemPrompt")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        view.push_entry(ChatEntry::ClientText {
+                            rows: info_commands::system_prompt_header_rows(prompt),
+                        });
+                        view.push_entry(ChatEntry::ClientText {
+                            rows: info_commands::system_prompt_body_rows(prompt),
+                        });
+                        self.dirty = true;
+                    }
+                    Err(error) => {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
+            // `/logs` (TS `handleLogsCommand`): a client-side read of the
+            // logs directory (the daemon writes it, this client lists it).
+            "logs" => {
+                self.track_command_used("logs");
+                if !resolved.args.is_empty() {
+                    view.editor.set_text(text);
+                    self.error_row("Usage: /logs", view);
+                    return Ok(());
+                }
+                view.push_entry(ChatEntry::User {
+                    text: text.to_string(),
+                });
+                let Some(agent_dir) = pa_types::platform::agent_dir() else {
+                    self.error_row(
+                        "home directory not found: set HOME (or USERPROFILE on Windows)",
+                        view,
+                    );
+                    return Ok(());
+                };
+                view.push_entry(ChatEntry::ClientText {
+                    rows: info_commands::logs_rows(&agent_dir.join("logs")),
+                });
+                self.dirty = true;
+            }
+            // `/changelog` (TS `handleChangelogCommand`): the shipped
+            // CHANGELOG.md entries, newest first, between the panel
+            // borders.
+            "changelog" => {
+                self.track_command_used("changelog");
+                if !resolved.args.is_empty() {
+                    view.editor.set_text(text);
+                    self.error_row("Usage: /changelog", view);
+                    return Ok(());
+                }
+                view.push_entry(ChatEntry::User {
+                    text: text.to_string(),
+                });
+                view.push_entry(ChatEntry::ChangelogPanel {
+                    markdown: info_commands::changelog_markdown(&Self::changelog_path()),
+                });
+                self.dirty = true;
+            }
             other => {
                 self.note(
                     &format!("/{other} is not available in this client yet"),
@@ -1446,6 +1606,20 @@ impl SessionUi {
             }
         }
         Ok(())
+    }
+
+    /// The shipped CHANGELOG.md path (TS `getChangelogPath`): the package
+    /// directory (`PI_PACKAGE_DIR` wins, else the directory of the running
+    /// executable — the TS bun-binary layout) plus `CHANGELOG.md`.
+    fn changelog_path() -> std::path::PathBuf {
+        let package_dir = match std::env::var("PI_PACKAGE_DIR") {
+            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from(".")),
+        };
+        package_dir.join("CHANGELOG.md")
     }
 
     // ------------------------------------------------------------------

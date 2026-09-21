@@ -5,6 +5,7 @@
 //! `Compacting context...` loader that replaces the working loader while a
 //! compaction runs.
 
+use crate::info_commands::grouped;
 use crate::theme::{Theme, ThemeColor};
 use crate::width::{str_width, truncate_line, wrap_text};
 use crate::{Line, Span};
@@ -209,19 +210,6 @@ fn collapsed_summary_rows(summary: &str, style: ratatui::style::Style, width: us
             )
         })
         .collect()
-}
-
-/// Digits grouped with commas (`toLocaleString` for the en-US locale).
-fn grouped(value: u64) -> String {
-    let digits = value.to_string();
-    let mut out = String::new();
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
 }
 
 #[cfg(test)]

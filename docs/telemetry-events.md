@@ -106,7 +106,8 @@ Builtin slash commands only (resolved canonical name). Two seams, one event
 per submission: session commands (`compact`, `refine`, `goal`,
 `autonomous`) emit from the worker's session telemetry at execution; client
 commands (`model`, `effort`, `tree`, `fork`, `clone`, `export`, `share`,
-`hotkeys`) emit from the interactive client at dispatch (TS
+`hotkeys`, `session`, `context`, `system-prompt`, `logs`, `changelog`)
+emit from the interactive client at dispatch (TS
 `captureAgentCommandUsed`).
 
 | property | type | notes |

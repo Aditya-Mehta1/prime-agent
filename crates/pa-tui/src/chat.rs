@@ -102,6 +102,17 @@ pub enum ChatEntry {
     /// `chatContainer.addChild(new Markdown(...))`, e.g. the `/hotkeys`
     /// guide): not a durable session row.
     ClientMarkdown { text: String },
+    /// A client-side info block (TS `chatContainer.addChild(new
+    /// Spacer(1))` + `new Text(info, 1, 0)`, e.g. the `/session`,
+    /// `/context`, `/system-prompt`, and `/logs` displays): not a durable
+    /// session row.
+    ClientText {
+        rows: Vec<crate::info_commands::ClientLine>,
+    },
+    /// The `/changelog` panel (TS `handleChangelogCommand`): the border,
+    /// `What's New` title, and the entries markdown. Not a durable
+    /// session row.
+    ChangelogPanel { markdown: String },
 }
 
 // The card types live in `tool_card`; re-exported here because the

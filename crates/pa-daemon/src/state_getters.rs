@@ -309,13 +309,15 @@ fn add_usage(total: &mut Value, usage: &Value) {
             .get_mut("cost")
             .and_then(Value::as_object_mut)
             .expect("usage totals always carry the cost block");
-        let current = cost.get(field).and_then(Value::as_u64).unwrap_or(0);
+        // The running total is a float after the first add (TS costs are
+        // floats); reading it as u64 dropped everything already banked.
+        let current = cost.get(field).and_then(Value::as_f64).unwrap_or(0.0);
         let add = usage
             .get("cost")
             .and_then(|cost| cost.get(field))
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
-        cost.insert(field.to_string(), json!(current as f64 + add));
+        cost.insert(field.to_string(), json!(current + add));
     }
 }
 

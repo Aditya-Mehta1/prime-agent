@@ -375,7 +375,9 @@ impl AgentView {
                 .any(|entry| matches!(entry, ChatEntry::Assistant(m) if m.streaming)),
             ChatEntry::InjectedPrompt(_) | ChatEntry::RefinementOutcome(_) => true,
             ChatEntry::CustomPanel(_) => true,
-            ChatEntry::ClientMarkdown { .. } => true,
+            ChatEntry::ClientMarkdown { .. }
+            | ChatEntry::ClientText { .. }
+            | ChatEntry::ChangelogPanel { .. } => true,
             ChatEntry::Assistant(message) => !message.streaming,
             ChatEntry::Tool(card) => !matches!(
                 crate::tool_card::panel_status(card),
@@ -617,6 +619,20 @@ impl AgentView {
                 rows.push(Vec::new());
                 rows
             }
+            // TS `Spacer(1)` + `Text(info, 1, 0)` blocks: one blank row,
+            // then the styled source lines wrapped with a one-column
+            // margin on each side (the info displays).
+            ChatEntry::ClientText { rows } => {
+                crate::info_commands::render_client_text(rows, &self.theme, width)
+            }
+            // The `/changelog` panel: border, the accent `What's New`
+            // title, and the entries markdown between the closing border.
+            ChatEntry::ChangelogPanel { markdown } => crate::info_commands::render_changelog_panel(
+                markdown,
+                &self.theme,
+                &self.code_block_indent,
+                width,
+            ),
         }
     }
 

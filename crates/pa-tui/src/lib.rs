@@ -34,6 +34,7 @@ pub mod hyperlinks;
 mod image_component;
 mod image_load;
 mod image_markers;
+pub mod info_commands;
 mod input;
 pub mod interactive;
 pub mod keybindings;
