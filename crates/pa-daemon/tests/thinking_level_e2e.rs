@@ -533,3 +533,173 @@ fn invalid_thinking_level_fails_the_create() {
     );
     drop(supervisor);
 }
+
+/// The agents-view roster summaries carry the session's thinking level for
+/// BOTH session kinds: a top-level session after `set_thinking_level`
+/// (live `get_state`), a spawned subagent (the create summary), and — after
+/// their workers stop — the durable-row-backed surfaces (`list --all` saved
+/// rows and the ledger-seeded roster rows) keep rendering "model:level".
+#[test]
+fn session_summaries_carry_the_thinking_level_for_both_session_kinds() {
+    let mut harness = setup("summary-levels", None);
+    let top_level = harness.session_id.clone();
+
+    // The top-level summary carries the level SetThinkingLevel applies.
+    harness.client.send_command(
+        "stl",
+        json!({ "type": "set_thinking_level", "activeSessionId": top_level, "level": "high" }),
+    );
+    let applied = harness.client.request("stl");
+    assert_eq!(
+        applied["success"], true,
+        "set_thinking_level failed: {applied}"
+    );
+    harness.client.send_command(
+        "gs1",
+        json!({ "type": "get_state", "activeSessionId": top_level }),
+    );
+    let state = harness.client.request("gs1");
+    assert_eq!(state["success"], true, "get_state failed: {state}");
+    assert_eq!(
+        state["data"]["thinkingLevel"],
+        json!("high"),
+        "the top-level summary carries the SetThinkingLevel level: {state}"
+    );
+
+    // One prompt persists the durable rows (model_change + the new level).
+    let done = harness.prompt("p1", "persist the level");
+    assert_eq!(done["success"], true, "turn failed: {done}");
+
+    // A spawned subagent (the spawn task context carries its thinking
+    // level into the create): its summary carries it too.
+    let parent_info = {
+        let entries = harness.session_entries();
+        entries
+            .iter()
+            .find(|entry| entry["type"] == "session")
+            .expect("session header")
+            .clone()
+    };
+    let parent_session_id = parent_info["id"].as_str().expect("id").to_string();
+    let session_file = std::fs::read_dir(&harness.session_dir)
+        .expect("read session dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .expect("session file");
+    let child_dir = harness.agent_dir.join("subagents");
+    std::fs::create_dir_all(&child_dir).expect("child dir");
+    harness.client.send_command(
+        "cc",
+        json!({
+            "type": "create",
+            "name": "summary-child",
+            "config": {
+                "cwd": harness.dir.path().to_string_lossy(),
+                "sessionDir": child_dir.to_string_lossy(),
+                "provider": "battery",
+                "model": "mock-1",
+                "thinking": "high",
+                "rlmDepth": 1,
+                "parentSessionPath": session_file.to_string_lossy(),
+                "executionMode": "print",
+            },
+            "runtimeMetadata": {
+                "kind": "subagent",
+                "rlmChildId": "child-1",
+                "rlmDepth": 1,
+                "parentSessionFile": session_file.to_string_lossy(),
+                "parentSessionId": parent_session_id,
+                "parentActiveSessionId": top_level,
+            },
+        }),
+    );
+    let child_created = harness.client.request("cc");
+    assert_eq!(
+        child_created["success"], true,
+        "subagent create failed: {child_created}"
+    );
+    assert_eq!(
+        child_created["data"]["thinkingLevel"],
+        json!("high"),
+        "the subagent summary carries the spawn thinking level: {child_created}"
+    );
+    let child_id = child_created["data"]["activeSessionId"]
+        .as_str()
+        .or_else(|| child_created["data"]["id"].as_str())
+        .expect("child active session id")
+        .to_string();
+
+    // The subagent's live roster row carries the level; after its worker
+    // stops (a plain kill, no ledger tombstone), the ledger-seeded roster
+    // row still carries the model and the persisted level.
+    harness
+        .client
+        .send_command("ck", json!({ "type": "kill", "activeSessionId": child_id }));
+    let killed = harness.client.request("ck");
+    assert_eq!(killed["success"], true, "child kill failed: {killed}");
+    let seeded = {
+        let mut found = None;
+        for _ in 0..50 {
+            harness
+                .client
+                .send_command("rs", json!({ "type": "roster_subscribe" }));
+            let roster = harness.client.request("rs");
+            for entry in roster["data"]["roster"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                let summary = &entry["summary"];
+                if summary["rlmChildId"] == json!("child-1") {
+                    found = Some(summary.clone());
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        found.expect("the seeded subagent roster row appeared")
+    };
+    assert_eq!(
+        seeded["model"],
+        json!({ "provider": "battery", "modelId": "mock-1" }),
+        "the seeded subagent row hydrates the durable model: {seeded}"
+    );
+    assert_eq!(
+        seeded["thinkingLevel"],
+        json!("high"),
+        "the seeded subagent row hydrates the durable thinking level: {seeded}"
+    );
+
+    // After the top-level worker stops too, the saved-session summary row
+    // (the `list --all` agents-view source) still carries the level the
+    // SetThinkingLevel command persisted.
+    harness.client.send_command(
+        "tk",
+        json!({ "type": "kill", "activeSessionId": top_level }),
+    );
+    let top_killed = harness.client.request("tk");
+    assert_eq!(
+        top_killed["success"], true,
+        "top-level kill failed: {top_killed}"
+    );
+    harness.client.send_command(
+        "la",
+        json!({ "type": "list", "all": true, "sessionDir": harness.session_dir.to_string_lossy() }),
+    );
+    let listed = harness.client.request("la");
+    assert_eq!(listed["success"], true, "list failed: {listed}");
+    let top_row = listed["data"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|row| row["sessionId"] == json!(parent_session_id))
+        .expect("the top-level saved row is listed");
+    assert_eq!(
+        top_row["thinkingLevel"],
+        json!("high"),
+        "the saved top-level summary carries the persisted level: {top_row}"
+    );
+}

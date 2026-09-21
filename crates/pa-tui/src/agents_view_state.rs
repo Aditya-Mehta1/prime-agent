@@ -291,6 +291,11 @@ pub fn summary_for_record(record: &UnifiedRecord) -> Value {
                     merged["model"] = json_model(model);
                 }
             }
+            // The saved catalog row carries the persisted thinking level
+            // (the daemon's `thinkingLevel`): it fills the same gap the
+            // model does, so a row the live summary lost its level for
+            // keeps rendering "model:level".
+            enrich(&mut merged, "thinkingLevel", saved);
         }
         merged
     } else {
@@ -298,7 +303,7 @@ pub fn summary_for_record(record: &UnifiedRecord) -> Value {
         let id = get_str(&saved, "id").unwrap_or_default().to_string();
         let modified = get_str(&saved, "modified").unwrap_or_default().to_string();
         let created = get_str(&saved, "created").unwrap_or_default().to_string();
-        serde_json::json!({
+        let mut summary = serde_json::json!({
             "id": id,
             "sessionId": id,
             "lifecycle": "archived",
@@ -323,7 +328,16 @@ pub fn summary_for_record(record: &UnifiedRecord) -> Value {
             "lastActivityAt": modified,
             "firstMessage": saved.get("firstMessage").cloned().unwrap_or(Value::Null),
             "model": json_model(saved.get("model").unwrap_or(&Value::Null)),
-        })
+            "thinkingLevel": saved.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+        });
+        // A saved row without a persisted level stays key-absent, like the
+        // daemon's saved-session summary rows.
+        if summary.get("thinkingLevel").is_none_or(Value::is_null) {
+            if let Some(object) = summary.as_object_mut() {
+                object.remove("thinkingLevel");
+            }
+        }
+        summary
     }
 }
 
@@ -844,6 +858,72 @@ mod tests {
             get_str(records[0].daemon.as_ref().unwrap(), "sessionId"),
             Some("child")
         );
+    }
+
+    /// The persisted thinking level reaches the rendered summary both ways:
+    /// the saved catalog row fills a live summary that lost its level, and a
+    /// saved-only record carries it directly (TS renders "model:level" for
+    /// every session kind; `session_model` shows it whenever present).
+    #[test]
+    fn summary_merges_the_saved_thinking_level() {
+        // The live roster row lost its level (a passivated or restarted
+        // worker); the saved catalog row carries the persisted one.
+        let roster = vec![roster_entry(
+            "s1",
+            "idle",
+            json!({
+                "sessionId": "s1", "lifecycle": "live", "activeSessionId": "a1",
+                "sessionFile": "/x/s1.jsonl",
+                "model": { "id": "mock-1", "provider": "battery" },
+            }),
+        )];
+        let saved = vec![json!({
+            "id": "s1",
+            "path": "/x/s1.jsonl",
+            "model": { "provider": "battery", "modelId": "mock-1" },
+            "thinkingLevel": "high",
+            "messageCount": 2,
+        })];
+        let records = reconcile_unified_sessions(&roster, &saved);
+        let summary = summary_for_record(&records[0]);
+        assert_eq!(summary["thinkingLevel"], json!("high"));
+        // The live summary's own level wins over the saved one.
+        let roster_with_level = vec![roster_entry(
+            "s1",
+            "idle",
+            json!({
+                "sessionId": "s1", "lifecycle": "live", "activeSessionId": "a1",
+                "sessionFile": "/x/s1.jsonl",
+                "model": { "id": "mock-1", "provider": "battery" },
+                "thinkingLevel": "medium",
+            }),
+        )];
+        let records = reconcile_unified_sessions(&roster_with_level, &saved);
+        let summary = summary_for_record(&records[0]);
+        assert_eq!(summary["thinkingLevel"], json!("medium"));
+
+        // A saved-only record synthesizes its summary with the level.
+        let saved_only = vec![json!({
+            "id": "s2",
+            "path": "/x/s2.jsonl",
+            "model": { "provider": "battery", "modelId": "mock-1" },
+            "thinkingLevel": "high",
+            "messageCount": 3,
+        })];
+        let records = reconcile_unified_sessions(&[], &saved_only);
+        let summary = summary_for_record(&records[0]);
+        assert_eq!(summary["thinkingLevel"], json!("high"));
+        // And the rendered Model column shows "model:level".
+        assert_eq!(
+            crate::agents_view_forest::session_model(&summary),
+            "mock-1:high"
+        );
+        // A saved row without a level stays bare.
+        let bare = vec![json!({ "id": "s3", "path": "/x/s3.jsonl", "messageCount": 3 })];
+        let records = reconcile_unified_sessions(&[], &bare);
+        assert!(summary_for_record(&records[0])
+            .get("thinkingLevel")
+            .is_none());
     }
 
     #[test]

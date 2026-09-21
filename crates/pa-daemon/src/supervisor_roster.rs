@@ -269,11 +269,26 @@ impl SeededRosterEntry {
             .parent()
             .map(|dir| dir.to_string_lossy().to_string())
             .unwrap_or_default();
+        // The session-file read hydrates display fields only (topology is
+        // the edge's): the cwd, the persisted model selector, and the
+        // persisted thinking level - the same durable rows a live worker's
+        // summary reports, so a passivated subagent keeps rendering
+        // "model:level" in the agents view.
+        let mut model = Value::Null;
+        let mut thinking_level = Value::Null;
         let (cwd, seeded_cwd) = match read_session_info(child) {
-            Some(info) => (info.cwd, false),
+            Some(info) => {
+                if let Some((provider, model_id)) = &info.model {
+                    model = json!({ "provider": provider, "modelId": model_id });
+                }
+                if let Some(level) = &info.thinking_level {
+                    thinking_level = json!(level);
+                }
+                (info.cwd, false)
+            }
             None => (dirname, true),
         };
-        let summary = json!({
+        let mut summary = json!({
             "id": persisted_session_id,
             "lifecycle": "live",
             "activity": "idle",
@@ -291,6 +306,14 @@ impl SeededRosterEntry {
             "parentSessionPath": edge.parent,
             "rlmChildId": edge.child_id,
         });
+        if let Some(object) = summary.as_object_mut() {
+            if !model.is_null() {
+                object.insert("model".to_string(), model);
+            }
+            if !thinking_level.is_null() {
+                object.insert("thinkingLevel".to_string(), thinking_level);
+            }
+        }
         Self {
             agent_id: roster_agent_id_for_summary(&summary),
             child_file: canonical_session_path(child).to_string_lossy().to_string(),
@@ -400,9 +423,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pa-seed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let child = dir.join("sub-9.jsonl");
+        // The child file carries the durable display rows a live worker's
+        // summary reports: the model selector and the thinking level.
         std::fs::write(
             &child,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"persisted-id\",\"timestamp\":\"t\",\"cwd\":\"/tmp/project\"}\n",
+            "{\"type\":\"session\",\"version\":3,\"id\":\"persisted-id\",\"timestamp\":\"t\",\"cwd\":\"/tmp/project\"}\n             {\"type\":\"model_change\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"t\",\"provider\":\"p\",\"modelId\":\"m\"}\n             {\"type\":\"thinking_level_change\",\"id\":\"t1\",\"parentId\":\"m1\",\"timestamp\":\"t\",\"thinkingLevel\":\"high\"}\n",
         )
         .unwrap();
         let candidate = SeededRosterEntry::for_edge(&edge(
@@ -425,6 +450,13 @@ mod tests {
         assert_eq!(candidate.summary["messageCount"], 0);
         assert_eq!(candidate.summary["parentSessionPath"], "/live/root.jsonl");
         assert_eq!(candidate.summary["isSessionActive"], false);
+        // The durable display rows hydrate the seeded row: a passivated
+        // subagent keeps rendering "model:level" in the agents view.
+        assert_eq!(
+            candidate.summary["model"],
+            json!({ "provider": "p", "modelId": "m" })
+        );
+        assert_eq!(candidate.summary["thinkingLevel"], json!("high"));
         // The agent id keys parentPath#childId like the resident row.
         assert_eq!(candidate.agent_id, "/live/root.jsonl#sub-9");
         assert_eq!(
@@ -443,5 +475,9 @@ mod tests {
         assert!(missing.seeded_cwd);
         assert_eq!(missing.summary["cwd"], "/artifacts/gone");
         assert_eq!(missing.summary["sessionId"], "sub-x");
+        // No readable child file: no durable rows to hydrate, so no model
+        // or thinking level rides the seeded row.
+        assert!(missing.summary.get("model").is_none());
+        assert!(missing.summary.get("thinkingLevel").is_none());
     }
 }

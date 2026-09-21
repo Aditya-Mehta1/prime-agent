@@ -217,6 +217,12 @@ pub fn passive_child_summary(child: &PassiveRlmChild) -> Value {
     if let Some(spawn_code) = &metadata.spawn_code {
         object.insert("spawnCode".to_string(), json!(spawn_code));
     }
+    // The persisted thinking level rides the passive-child row like the
+    // saved-session row: the agents-view Model column keeps rendering
+    // "model:level" for passivated subagents.
+    if let Some(level) = &info.thinking_level {
+        object.insert("thinkingLevel".to_string(), json!(level));
+    }
     row
 }
 
@@ -234,12 +240,69 @@ pub fn passive_child_info(child: &PassiveRlmChild) -> SessionInfo {
 mod tests {
     use super::*;
     use crate::rlm_ledger::{RlmLedgerDeleteReason, RlmSpawnInput};
+    use serde_json::json;
     use std::fs;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pa-roster-{name}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn write_session_with_thinking(path: &std::path::Path, id: &str, level: &str) {
+        let content = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"t\",\"cwd\":\"/x\"}}\n             {{\"type\":\"thinking_level_change\",\"id\":\"t1\",\"parentId\":null,\"timestamp\":\"t\",\"thinkingLevel\":\"{level}\"}}\n"
+        );
+        fs::write(path, content).unwrap();
+    }
+
+    /// The passive-child summary row carries the persisted thinking level:
+    /// a passivated subagent keeps rendering "model:level" in the agents
+    /// view, like its live counterpart.
+    #[test]
+    fn passive_child_summary_carries_the_persisted_thinking_level() {
+        let dir = temp_dir("thinking");
+        let child = dir.join("sub-tl.jsonl");
+        write_session_with_thinking(&child, "sub-tl", "high");
+        let info = read_session_info(&child).expect("child info");
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+        let child_row = PassiveRlmChild {
+            edge: RlmLedgerEdge {
+                child_id: "sub-tl".to_string(),
+                parent: "/live/root.jsonl".to_string(),
+                child: child.to_string_lossy().to_string(),
+                depth: 1,
+                name: "worker-a".to_string(),
+                deleted: None,
+            },
+            info,
+            metadata: RlmChildMetadata::default(),
+            parent_active_session_id: None,
+        };
+        let summary = passive_child_summary(&child_row);
+        assert_eq!(summary["thinkingLevel"], json!("high"));
+
+        // A child file without a persisted level stays bare.
+        let plain = dir.join("sub-plain.jsonl");
+        write_session(&plain, "sub-plain", 0);
+        let plain_info = read_session_info(&plain).expect("plain info");
+        assert_eq!(plain_info.thinking_level, None);
+        let plain_row = PassiveRlmChild {
+            edge: RlmLedgerEdge {
+                child_id: "sub-plain".to_string(),
+                parent: "/live/root.jsonl".to_string(),
+                child: plain.to_string_lossy().to_string(),
+                depth: 1,
+                name: "worker-b".to_string(),
+                deleted: None,
+            },
+            info: plain_info,
+            metadata: RlmChildMetadata::default(),
+            parent_active_session_id: None,
+        };
+        assert!(passive_child_summary(&plain_row)
+            .get("thinkingLevel")
+            .is_none());
     }
 
     fn write_session(path: &std::path::Path, id: &str, messages: usize) {

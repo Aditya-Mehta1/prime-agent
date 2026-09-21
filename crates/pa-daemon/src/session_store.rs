@@ -561,6 +561,10 @@ pub struct SessionInfo {
     pub name: Option<String>,
     pub state: Option<String>,
     pub model: Option<(String, String)>,
+    /// The last persisted `thinking_level_change` level (the durable row
+    /// `set_thinking_level` writes); agents-view summaries surface it for
+    /// sessions without a live worker (top-level and subagent alike).
+    pub thinking_level: Option<String>,
     pub parent_session_path: Option<String>,
     pub rlm_depth: u32,
     pub created: String,
@@ -601,6 +605,7 @@ pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
     let mut name = None;
     let mut state = None;
     let mut model = None;
+    let mut thinking_level = None;
     let mut message_count = 0usize;
     let mut first_message = String::new();
     let mut all_messages_text = String::new();
@@ -643,6 +648,19 @@ pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
                     entry.fields.get("provider")?.as_str()?.to_string(),
                     entry.fields.get("modelId")?.as_str()?.to_string(),
                 ));
+            }
+            // The last persisted level wins, like `model_change`: a later
+            // `set_thinking_level` overwrites the creation prefix.
+            "thinking_level_change" => {
+                if let Some(level) = entry
+                    .fields
+                    .get("thinkingLevel")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|level| !level.is_empty())
+                {
+                    thinking_level = Some(level.to_string());
+                }
             }
             // Keep the latest recap/verdict (TS `agent_status` fold): the
             // `summary` text is part of the agents-view search corpus.
@@ -702,6 +720,7 @@ pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
         name,
         state,
         model,
+        thinking_level,
         parent_session_path: header.parent_session,
         rlm_depth: header.rlm_depth.unwrap_or(0) as u32,
         created: header.timestamp,
@@ -791,6 +810,23 @@ mod tests {
             info.model.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
             Some(("p", "m"))
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The persisted thinking level (`thinking_level_change`): the last
+    /// entry wins, like the model; a malformed or empty level never
+    /// replaces a prior good one.
+    #[test]
+    fn scan_keeps_the_latest_persisted_thinking_level() {
+        let dir = temp_dir();
+        let mut session = SessionFile::create("/tmp", None, 0);
+        let path = dir.join(session_file_name(session.session_id()));
+        session.set_path(path.clone());
+        session.append_thinking_level_change("medium");
+        session.append_thinking_level_change("high");
+        session.rewrite().unwrap();
+        let info = read_session_info(&path).unwrap();
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
         let _ = fs::remove_dir_all(&dir);
     }
 

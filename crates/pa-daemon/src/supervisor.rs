@@ -3402,7 +3402,7 @@ struct ResidentRoot {
 }
 
 fn saved_session_summary(info: &crate::session_store::SessionInfo) -> Value {
-    json!({
+    let mut row = json!({
         "id": info.id,
         // TS `inactiveLifecycleForSession`: archived/crash markers stay
         // archived; everything else is live once a message exists, draft
@@ -3427,7 +3427,17 @@ fn saved_session_summary(info: &crate::session_store::SessionInfo) -> Value {
         "created": info.created,
         "modified": info.modified,
         "firstMessage": info.first_message,
-    })
+    });
+    // The persisted thinking level rides every saved-session summary row
+    // (the durable `thinking_level_change` entry): the agents-view Model
+    // column renders "model:level" for sessions without a live worker,
+    // top-level and subagent alike.
+    if let Some(level) = &info.thinking_level {
+        if let Some(object) = row.as_object_mut() {
+            object.insert("thinkingLevel".to_string(), json!(level));
+        }
+    }
+    row
 }
 
 fn offline_summary(worker_id: &str) -> Value {
@@ -3485,6 +3495,11 @@ fn saved_session_row(info: &crate::session_store::SessionInfo) -> Value {
             "model".to_string(),
             json!({ "provider": provider, "modelId": model_id }),
         );
+    }
+    // The persisted thinking level rides the catalog row too: the TUI merges
+    // it into live summaries that lack one (the same enrichment as `model`).
+    if let Some(level) = &info.thinking_level {
+        object.insert("thinkingLevel".to_string(), json!(level));
     }
     row
 }
@@ -3546,6 +3561,46 @@ const WORKER_EXIT_POLL: Duration = Duration::from_millis(250);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The saved-session surfaces (the `list --all` summary row and the
+    /// `list_saved_sessions` catalog row) carry the persisted thinking
+    /// level: the agents-view Model column renders "model:level" for
+    /// sessions without a live worker, top-level and subagent alike.
+    #[test]
+    fn saved_session_rows_carry_the_persisted_thinking_level() {
+        let dir = std::env::temp_dir().join(format!("pa-saved-tl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let path = dir.join(format!("{}.jsonl", session.session_id()));
+        session.set_path(path.clone());
+        session.append_model_change("p", "m");
+        session.append_thinking_level_change("high");
+        session.append_message(json!({"role": "user", "content": "hi", "timestamp": 1u64}));
+        session.rewrite().unwrap();
+        let info = crate::session_store::read_session_info(&path).unwrap();
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+        let summary = saved_session_summary(&info);
+        assert_eq!(summary["thinkingLevel"], json!("high"));
+        assert!(summary["model"].is_null(), "saved rows carry no model");
+        let row = saved_session_row(&info);
+        assert_eq!(row["thinkingLevel"], json!("high"));
+        assert_eq!(row["model"], json!({ "provider": "p", "modelId": "m" }));
+        // A session file without a persisted level stays bare (a fresh
+        // draft, or a model that cannot think).
+        let mut draft = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let draft_path = dir.join(format!("{}.jsonl", draft.session_id()));
+        draft.set_path(draft_path.clone());
+        draft.rewrite().unwrap();
+        let draft_info = crate::session_store::read_session_info(&draft_path).unwrap();
+        assert_eq!(draft_info.thinking_level, None);
+        assert!(saved_session_summary(&draft_info)
+            .get("thinkingLevel")
+            .is_none());
+        assert!(saved_session_row(&draft_info)
+            .get("thinkingLevel")
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn worker_probe_fails_at_the_deadline_and_names_the_worker() {
