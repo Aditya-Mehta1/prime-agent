@@ -2920,6 +2920,71 @@ class Battery:
                     f"{side.name}: opening the Running row attached to the live session and its in-flight reply rendered",
                     gap=False,
                 )
+            # Selection persistence under live roster churn (Kevin dogfood
+            # 2026-09-21: "it keeps teleporting me up — especially when
+            # subagents are being spawned"): a fresh view, the selection
+            # arrowed onto a session row, then the roster churns through a
+            # real busy flip (a live prompt on the idle session). The
+            # highlight must stay on the SAME session row across the
+            # rebuild-and-resort; the selected row is the one line in the
+            # pane that carries a background escape (48;...).
+            churn_session = f"{self.runid}-f9sel-{side.name}"
+            B.tmux_launch(
+                churn_session,
+                [side.binary, "agents", "--daemon-socket", str(side.daemon_socket)],
+                side.env,
+                side.work_dir,
+            )
+            B.tmux_wait_text(churn_session, "Idle \(|No sessions", timeout=45)
+            time.sleep(1.0)
+            B.tmux_send(churn_session, "Down", enter=False)
+            time.sleep(1.0)
+            pre_churn = B.tmux("capture-pane", "-e", "-p", "-t", churn_session).stdout
+            side.evidence(flow, "06-selection-pre-churn-ansi.txt", pre_churn)
+            session_markers = ["battery-f9-busy", "battery-f9-idle", "f9 inactive prompt"]
+            selected_pre = self.selected_row_name(pre_churn, session_markers)
+            if not selected_pre:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: no selected row found in the churn view before the flip",
+                    evidence=side.root / flow / "06-selection-pre-churn-ansi.txt",
+                )
+            # Live churn: the idle session flips busy through a delayed
+            # prompt, and the roster pushes re-sort its row into the
+            # Running section while the view is open.
+            side.mock.set_responses([{"text": "f9 churn reply", "delayMs": 60000}])
+            wire = B.Wire(side.daemon_socket)
+            wire.send_command(
+                "p9c",
+                {"type": "prompt_and_wait", "activeSessionId": idle_id, "message": "f9 churn prompt"},
+            )
+            wire.close()
+            if not self.wait_roster_status(side, idle_id, "running", timeout=15):
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: the churn prompt never reached Running on the roster",
+                )
+            time.sleep(1.5)
+            post_churn = B.tmux("capture-pane", "-e", "-p", "-t", churn_session).stdout
+            side.evidence(flow, "07-selection-post-churn-ansi.txt", post_churn)
+            selected_post = self.selected_row_name(post_churn, session_markers)
+            if selected_pre and selected_post and selected_post != selected_pre:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: the selection teleported during roster churn (was {selected_pre!r}, now {selected_post!r})",
+                    evidence=side.root / flow / "07-selection-post-churn-ansi.txt",
+                )
+            elif selected_pre and selected_post:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: the selection stayed on the same session row through live roster churn ({selected_post!r})",
+                    gap=False,
+                )
+            B.tmux_kill(churn_session)
             B.tmux_kill(view_session)
             # Leave the mock script plain for the flows that follow (f11's
             # healthy exchange expects the HELLO_TEXT response).
@@ -3019,6 +3084,18 @@ class Battery:
                 last_change = time.time()
             elif time.time() - last_change >= quiet_s:
                 return
+
+    def selected_row_name(self, frame: str, markers: list[str]) -> str:
+        """Which session row the pane highlights: the selected row is the
+        one line carrying a background escape (the selection background
+        paints exactly that row). Returns the marker the highlighted line
+        contains, or "" when nothing is highlighted."""
+        for line in frame.splitlines():
+            if "\x1b[48;" in line or "\x1B[48;" in line:
+                for marker in markers:
+                    if marker in line:
+                        return marker
+        return ""
 
     def wait_roster_status(self, side: B.Side, active_session_id: str, status: str, timeout: float = 15.0) -> bool:
         """Poll the roster snapshot until the session reaches `status`."""

@@ -1,0 +1,7 @@
+supervisor started pid 2660304
+supervisor started pid 2660316
+[2026-09-21T19:40:11.753Z] session worker eb04a5a5d387 registered (epoch 1, pid 2660322)
+[2026-09-21T19:40:11.877Z] session worker eb04a5a5d387 re-registered (epoch 2, pid 2660322)
+[2026-09-21T19:40:16.397Z] session worker 0cc39d1d32b4 registered (epoch 1, pid 2660442)
+[2026-09-21T19:40:16.598Z] session worker 0cc39d1d32b4 re-registered (epoch 2, pid 2660442)
+[2026-09-21T19:40:49.342Z] session worker eb04a5a5d387 stopped intentionally (status Ok(ExitStatus(unix_wait_status(0))))

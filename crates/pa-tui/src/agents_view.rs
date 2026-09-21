@@ -363,15 +363,7 @@ impl AgentsViewMode {
             self.selected_key.as_ref(),
         );
         self.rows = rows;
-        // Track the selected row's identity and key (TS
-        // `syncSelectedRowState`): they survive rebuilds and view re-entry.
-        if let Some(row) = self.rows.get(self.selected) {
-            self.selected_identity = Some(row.identity.clone());
-            self.selected_key = Some(crate::agents_view_forest::selection_key(&row.summary));
-        } else {
-            self.selected_identity = None;
-            self.selected_key = None;
-        }
+        self.sync_selected_row_state();
     }
 
     /// Apply one roster push (`changed` upserts, `removed` deletes,
@@ -402,7 +394,26 @@ impl AgentsViewMode {
         self.rebuild_rows();
     }
 
-    /// Move the selection by `delta` selectable rows (TS `moveSelection`).
+    /// Track the selected row's identity and key (TS
+    /// `syncSelectedRowState`): they survive rebuilds and view re-entry,
+    /// and EVERY selection move refreshes them. A stale key from an
+    /// earlier position would otherwise win the active-session-id
+    /// fallback on the next roster rebuild and teleport the selection
+    /// back to where the user arrowed from.
+    fn sync_selected_row_state(&mut self) {
+        if let Some(row) = self.rows.get(self.selected) {
+            self.selected_identity = Some(row.identity.clone());
+            self.selected_key = Some(crate::agents_view_forest::selection_key(&row.summary));
+        } else {
+            self.selected_identity = None;
+            self.selected_key = None;
+        }
+    }
+
+    /// Move the selection by `delta` selectable rows (TS `moveSelection`,
+    /// which ends with `syncSelectedRowState`): the move refreshes the
+    /// carried identity/key so the next roster rebuild resolves the
+    /// selection back onto the row the user actually landed on.
     fn move_selection(&mut self, delta: isize) {
         let selectable: Vec<usize> = self
             .rows
@@ -413,6 +424,7 @@ impl AgentsViewMode {
             .collect();
         if selectable.is_empty() {
             self.selected = 0;
+            self.sync_selected_row_state();
             return;
         }
         let current = selectable
@@ -421,6 +433,7 @@ impl AgentsViewMode {
             .unwrap_or(0);
         let next = (current as isize + delta).clamp(0, selectable.len() as isize - 1) as usize;
         self.selected = selectable[next];
+        self.sync_selected_row_state();
     }
 
     /// Open the selected row (TS `openSelected`): the summary row toggles
@@ -861,11 +874,15 @@ impl AgentsViewMode {
         (lines, cursor)
     }
 
-    /// The sectioned session list (legend header, section headings, rows).
-    /// Nested rows (summary rows and expanded subagents) render inside
-    /// their top-level agent's section block, and the headings count
-    /// top-level agents only (TS `getDisplayRowsForSection` /
-    /// `countRowsBySection`).
+    /// The sectioned session list (TS `renderSessionRows`): the rows group
+    /// into section blocks behind their headings, and the viewport follows
+    /// the selection — the slice centers on the selected row and clips
+    /// the overflow behind leading/trailing ellipses, so a roster rebuild
+    /// (spawn churn, activity re-sorts) never scrolls the user's position
+    /// off-screen. Nested rows (summary rows and expanded subagents)
+    /// render inside their top-level agent's section block, and the
+    /// headings count top-level agents only (TS `getDisplayRowsForSection`
+    /// / `countRowsBySection`).
     fn render_list(&mut self, width: usize, max_rows: usize) -> Vec<Line> {
         if max_rows == 0 {
             return Vec::new();
@@ -878,47 +895,117 @@ impl AgentsViewMode {
             };
             return vec![vec![self.theme.fg(ThemeColor::Dim, text.to_string())]];
         }
+        /// One rendered display entry of the sectioned list (TS
+        /// `DisplayItem`): the spacer between section blocks, a section
+        /// heading, or one row.
+        enum DisplayItem<'a> {
+            Spacer,
+            Heading(Section),
+            Row(&'a AgentsViewRow),
+        }
         let layout = build_layout(&self.rows, width);
-        let mut lines: Vec<Line> = vec![
-            vec![crate::Span::styled(
-                layout.legend.clone(),
-                self.theme
-                    .fg_style(ThemeColor::Text)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            )],
-            vec![],
-        ];
-        for section in [Section::Running, Section::Idle, Section::Inactive] {
-            let mut block: Vec<&AgentsViewRow> = Vec::new();
+        // The display-item sequence (TS `displayItems`): each non-empty
+        // section contributes a spacer (when not first), its heading, then
+        // its rows.
+        let counts: Vec<(Section, usize)> = [Section::Running, Section::Idle, Section::Inactive]
+            .into_iter()
+            .map(|section| {
+                (
+                    section,
+                    self.rows
+                        .iter()
+                        .filter(|row| row.kind == RowKind::Agent && row.section == section)
+                        .count(),
+                )
+            })
+            .collect();
+        let mut display: Vec<DisplayItem> = Vec::new();
+        for (section, count) in &counts {
+            if *count == 0 {
+                continue;
+            }
+            if !display.is_empty() {
+                display.push(DisplayItem::Spacer);
+            }
+            display.push(DisplayItem::Heading(*section));
             let mut include = false;
             for row in &self.rows {
                 if row.depth == 0 {
-                    include = row.kind == RowKind::Agent && row.section == section;
+                    include = row.kind == RowKind::Agent && row.section == *section;
                 }
                 if include {
-                    block.push(row);
+                    display.push(DisplayItem::Row(row));
                 }
             }
-            if block.is_empty() {
-                continue;
-            }
-            if lines.len() > 2 {
-                lines.push(vec![]);
-            }
-            let top_level = block
-                .iter()
-                .filter(|row| row.kind == RowKind::Agent)
-                .count();
-            lines.push(vec![self.theme.fg(
-                ThemeColor::Muted,
-                format!("{} ({})", section_title(section), top_level),
-            )]);
-            for row in block {
-                lines.push(self.render_row(row, &layout, width));
-            }
         }
-        while lines.len() > max_rows {
-            lines.pop();
+        // The viewport (TS `renderSessionRows`): reserve the column header
+        // and its spacer, center the slice on the selected row, and clip
+        // the overflow behind ellipsis lines. The selected row's display
+        // index drives the window, so a rebuild that re-sorts the rows
+        // keeps the selection on-screen instead of snapping the window
+        // back to the top of the list.
+        let header_rows = max_rows.saturating_sub(1).min(2);
+        let visible_rows = max_rows - header_rows;
+        let selected_identity = self
+            .rows
+            .get(self.selected)
+            .map(|row| row.identity.as_str());
+        let selected_display_index = display
+            .iter()
+            .position(
+                |item| matches!(item, DisplayItem::Row(row) if Some(row.identity.as_str()) == selected_identity),
+            )
+            .map(|index| index as isize)
+            .unwrap_or(-1);
+        let anchor = selected_display_index - (visible_rows / 2) as isize;
+        let upper = display.len() as isize - visible_rows as isize;
+        let start = anchor.min(upper).max(0) as usize;
+        let show_leading = start > 0 && visible_rows > 1;
+        let show_trailing = start + visible_rows < display.len() && visible_rows > 2;
+        let content_rows = visible_rows - show_leading as usize - show_trailing as usize;
+        let slice_start = if selected_display_index >= start as isize + content_rows as isize {
+            (selected_display_index + 1 - content_rows as isize) as usize
+        } else {
+            start
+        };
+        let slice_end = (slice_start + content_rows).min(display.len());
+        let mut lines: Vec<Line> = display[slice_start..slice_end]
+            .iter()
+            .map(|item| match item {
+                DisplayItem::Spacer => Vec::new(),
+                DisplayItem::Heading(section) => {
+                    let count = counts
+                        .iter()
+                        .find(|(count_section, _)| count_section == section)
+                        .map(|(_, count)| *count)
+                        .unwrap_or(0);
+                    vec![self.theme.fg(
+                        ThemeColor::Muted,
+                        truncate_text(&format!("{} ({count})", section_title(*section)), width),
+                    )]
+                }
+                DisplayItem::Row(row) => self.render_row(row, &layout, width),
+            })
+            .collect();
+        if show_leading {
+            lines.insert(0, vec![self.theme.fg(ThemeColor::Dim, "  ...".to_string())]);
+        }
+        if show_trailing {
+            lines.push(vec![self.theme.fg(ThemeColor::Dim, "  ...".to_string())]);
+        }
+        if header_rows > 1 {
+            lines.insert(0, Vec::new());
+        }
+        if header_rows > 0 {
+            lines.insert(
+                0,
+                vec![crate::Span::styled(
+                    layout.legend.clone(),
+                    self.theme
+                        .fg_style(ThemeColor::Text)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )],
+            );
         }
         lines
     }
@@ -1923,5 +2010,228 @@ mod tests {
             opened.status_message.as_deref(),
             Some("Child session is unavailable; opened its parent instead")
         );
+    }
+    /// A multi-session roster for the selection-persistence probes: six
+    /// idle top-level sessions with distinct activity stamps (newest
+    /// first, matching the Idle section's recency sort).
+    fn churn_roster() -> Vec<serde_json::Value> {
+        (1..=6)
+            .map(|n| {
+                roster_entry(
+                    &format!("s{n}"),
+                    "idle",
+                    serde_json::json!({
+                        "sessionId": format!("s{n}"), "lifecycle": "live",
+                        "activeSessionId": format!("s{n}-live"),
+                        "sessionFile": format!("/x/s{n}.jsonl"),
+                        "runtimeKind": "top-level",
+                        "sessionName": format!("session {n}"),
+                        "messageCount": 2,
+                        "rlmDepth": 0,
+                        "lastActivityAt": format!("2025-01-{:02}T00:00:00.000Z", 7 - n),
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    fn fresh_mode(roster: Vec<serde_json::Value>) -> AgentsViewMode {
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: None,
+            scope: None,
+            query: None,
+            expanded_ancestors: Vec::new(),
+            selected_row_identity: None,
+            selected_key: None,
+            status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
+        });
+        mode.roster = roster;
+        mode.rebuild_rows();
+        mode
+    }
+
+    /// Kevin's dogfood symptom (2026-09-21): arrowing down while the
+    /// roster churns (subagent spawns, activity re-sorts) must keep the
+    /// selection on the same SESSION, and the list window must keep
+    /// showing it. The selection is session-keyed (identity, then
+    /// active/session id — TS `resolveAgentsViewSelectionState`), so a
+    /// rebuild that adds rows ABOVE the selection follows the session
+    /// down, and the render window (TS `renderSessionRows`) centers on it
+    /// instead of snapping back to the top of the list.
+    #[test]
+    fn selection_follows_the_session_through_spawn_churn() {
+        let roster = churn_roster();
+        let mut mode = fresh_mode(roster.clone());
+        // Arrow down three times: the selection sits on session 4.
+        for _ in 0..3 {
+            mode.handle_key("down");
+        }
+        assert_eq!(mode.rows[mode.selected].title, "session 4");
+        // Spawn churn above the selection: session 1 flips to running
+        // (moves to the Running section) and a new running child appears
+        // under it, both above the selected row's position.
+        let mut churned = roster;
+        churned[0] = roster_entry(
+            "s1",
+            "running",
+            serde_json::json!({
+                "sessionId": "s1", "lifecycle": "live",
+                "activeSessionId": "s1-live",
+                "sessionFile": "/x/s1.jsonl",
+                "runtimeKind": "top-level",
+                "sessionName": "session 1",
+                "messageCount": 2, "rlmDepth": 0,
+                "lastActivityAt": "2025-01-08T00:00:00.000Z",
+            }),
+        );
+        churned.push(roster_entry(
+            "/x/s1.jsonl#child-w",
+            "running",
+            child_summary("w", "s1", "spawned worker"),
+        ));
+        mode.apply_roster_update(churned.clone(), Vec::new(), false);
+        // The selection follows session 4's identity, not the row index.
+        assert_eq!(
+            mode.rows[mode.selected].title, "session 4",
+            "spawn churn must not move the selection off the selected session"
+        );
+        // The selected session stays selectable and its key stays synced
+        // (TS `syncSelectedRowState`): further churn keeps following it.
+        for _ in 0..3 {
+            mode.apply_roster_update(churned.clone(), Vec::new(), false);
+        }
+        assert_eq!(mode.rows[mode.selected].title, "session 4");
+    }
+
+    /// TS parity: an idle roster re-push (same sessions, same states) is a
+    /// no-op — the rebuild must not touch the selection at all (same row,
+    /// same index, same identity).
+    #[test]
+    fn selection_untouched_by_noop_roster_updates() {
+        let roster = churn_roster();
+        let mut mode = fresh_mode(roster.clone());
+        for _ in 0..3 {
+            mode.handle_key("down");
+        }
+        let (index, identity, key) = (
+            mode.selected,
+            mode.rows[mode.selected].identity.clone(),
+            mode.selected_key.clone(),
+        );
+        // The daemon re-pushes identical entries (idle status ticks).
+        mode.apply_roster_update(roster, Vec::new(), false);
+        assert_eq!(mode.selected, index);
+        assert_eq!(mode.rows[mode.selected].identity, identity);
+        assert_eq!(mode.selected_key, key);
+    }
+
+    /// The selected session left the roster (archived away, no saved-catalog
+    /// row for it): the resolution cannot re-find it, and TS
+    /// `resolveAgentsViewSelectionState` keeps the bounded current index —
+    /// never a reset to the top of the list.
+    #[test]
+    fn selected_session_gone_keeps_the_bounded_position() {
+        let roster = churn_roster();
+        let mut mode = fresh_mode(roster.clone());
+        for _ in 0..3 {
+            mode.handle_key("down");
+        }
+        assert_eq!(mode.rows[mode.selected].title, "session 4");
+        let shrunk: Vec<serde_json::Value> = roster
+            .into_iter()
+            .filter(|entry| entry["agentId"] != serde_json::json!("s4"))
+            .collect();
+        mode.apply_roster_update(Vec::new(), vec!["s4".to_string()], false);
+        assert_eq!(mode.roster.len(), shrunk.len());
+        // The identity and its keys are gone: the selection keeps the
+        // bounded index (the row that now occupies the slot), not 0.
+        assert_eq!(mode.selected, 3);
+        assert_eq!(mode.rows[mode.selected].title, "session 5");
+    }
+
+    /// TS `renderSessionRows` viewport parity: the list window centers on
+    /// the selected row and clips the overflow behind ellipsis lines, so
+    /// arrowing below the fold keeps the selection visible — the Rust view
+    /// used to render from the top and truncate, which read as the
+    /// selection teleporting back up while the roster churned.
+    #[test]
+    fn list_window_follows_the_selection_below_the_fold() {
+        let roster: Vec<serde_json::Value> = (1..=12)
+            .map(|n| {
+                roster_entry(
+                    &format!("s{n}"),
+                    "idle",
+                    serde_json::json!({
+                        "sessionId": format!("s{n}"), "lifecycle": "live",
+                        "activeSessionId": format!("s{n}-live"),
+                        "sessionFile": format!("/x/s{n}.jsonl"),
+                        "runtimeKind": "top-level",
+                        "sessionName": format!("session {n}"),
+                        "messageCount": 2, "rlmDepth": 0,
+                        "lastActivityAt": format!("2025-01-{:02}T00:00:00.000Z", 13 - n),
+                    }),
+                )
+            })
+            .collect();
+        let mut mode = fresh_mode(roster);
+        assert_eq!(mode.rows.len(), 12);
+        let frame_texts = |mode: &mut AgentsViewMode| -> Vec<String> {
+            mode.render_list(120, 8)
+                .iter()
+                .map(|line| line.iter().map(|span| span.content.as_str()).collect())
+                .collect()
+        };
+        // Selection at the top: legend + spacer + heading + four rows +
+        // the trailing ellipsis — 8 lines, the first four sessions below
+        // the fold clipped away (TS `renderSessionRows` with maxRows 8:
+        // headerRows 2, visibleRows 6, one trailing clip row).
+        let texts = frame_texts(&mut mode);
+        assert_eq!(texts.len(), 8);
+        assert!(texts[0].contains("Session"), "legend: {texts:?}");
+        assert!(texts[2].contains("Idle (12)"));
+        assert!(texts[3].contains("session 1"));
+        assert_eq!(texts[7].trim(), "...");
+        assert!(!texts.iter().any(|t| t.contains("session 5")));
+        // Arrow to the bottom: the window centers on the selected row
+        // (session 12 stays on-screen), the leading ellipsis covers the
+        // clipped rows above, and the trailing one disappears at the end.
+        for _ in 0..11 {
+            mode.handle_key("down");
+        }
+        assert_eq!(mode.rows[mode.selected].title, "session 12");
+        let texts = frame_texts(&mut mode);
+        assert_eq!(texts.len(), 8);
+        assert_eq!(texts[2].trim(), "...");
+        assert!(
+            texts.iter().any(|t| t.contains("session 12")),
+            "the selected row must render inside the window: {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("session 7")));
+        assert_ne!(texts.last().map(|t| t.trim()), Some("..."));
+        // The selected row carries the selection background (its line
+        // paints over the full width; the unselected rows do not).
+        let selected_line = mode.render_list(120, 8);
+        let painted = selected_line
+            .iter()
+            .any(|line| line.iter().any(|span| span.style.bg.is_some()));
+        assert!(
+            painted,
+            "the selected row renders with the selection background"
+        );
+        // Arrow back to the top: the leading ellipsis goes away and the
+        // first rows render behind the legend again.
+        for _ in 0..11 {
+            mode.handle_key("up");
+        }
+        assert_eq!(mode.rows[mode.selected].title, "session 1");
+        let texts = frame_texts(&mut mode);
+        assert!(texts[3].contains("session 1"));
+        assert_eq!(texts[7].trim(), "...");
     }
 }

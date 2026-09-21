@@ -9,7 +9,17 @@ Rendering (markdown, themes, layout, tool panels, custom-message decorated rows:
 first/last messages, the capped saved transcript, the recap summary, cwd,
 and file paths; Escape clears the query and the view restores the roster;
 the query survives opening a chat and returning), open-to-attach/resume,
-`n`-via-ctrl+n new session, live `roster_subscribe` pushes).
+`n`-via-ctrl+n new session, live `roster_subscribe` pushes; the
+selection is session-keyed, not index-keyed (TS
+`resolveAgentsViewSelectionState`: row identity, then active-session id,
+then session id re-find the same session across roster rebuilds — spawn
+churn, activity re-sorts, and identical no-op re-pushes never move it;
+a session that left the roster keeps the bounded position, TS parity),
+and the list window follows the selection (TS `renderSessionRows`: the
+slice centers on the selected row and clips the overflow behind
+leading/trailing ellipses, so arrowing below the fold keeps the
+selection on-screen instead of the view snapping back to the top of the
+list).
 
 ## Non-goals
 No session logic, no providers, no loop policy. The interactive UI renders daemon events and sends user intents (prompts, abort, switch) as daemon commands; the session loop itself lives in the pa-daemon worker. It never computes agent behavior and never spawns the supervisor (launch semantics live in pa-cli).

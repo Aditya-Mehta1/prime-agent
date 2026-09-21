@@ -1,0 +1,19 @@
+{
+ "argv": [
+  "/tmp/av-merged-musl",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/av-selection/scripts/battery/runs/20260921T193923Z/rust/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "f9 inactive prompt"
+ ],
+ "exit_code": 0,
+ "stdout": "f9 idle reply\n",
+ "stderr": "",
+ "duration_s": 0.63,
+ "timeout": false
+}
