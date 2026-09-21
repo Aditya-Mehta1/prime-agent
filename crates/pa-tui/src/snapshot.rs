@@ -402,6 +402,27 @@ pub enum TurnUpdate {
         steering: Vec<String>,
         follow_ups: Vec<String>,
     },
+    /// `bash_start` (the user-bash slot, TS `!command`): a command run
+    /// outside the model loop; `transient` marks a side-conversation run
+    /// that renders only in the owning client's pane.
+    BashStart {
+        command: String,
+        exclude_from_context: bool,
+        transient: bool,
+        run_id: Option<String>,
+    },
+    /// `bash_output` (the user-bash slot): one streamed output chunk.
+    BashOutput { chunk: String },
+    /// `bash_end` (the user-bash slot): the settled run.
+    BashEnd {
+        exit_code: Option<i64>,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+        error_message: Option<String>,
+        transient: bool,
+        run_id: Option<String>,
+    },
     /// Other state churn: the footer status only.
     StatusUpdate,
 }
@@ -608,6 +629,62 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 follow_ups: queue_lane(&actions, "followUps"),
             })
         }
+        // `bash_start` (TS `runUserBash` emits before the process runs):
+        // the identity fields ride the same frame (`transient` marks a
+        // side-conversation run, `runId` matches the owning client).
+        "bash_start" => Some(TurnUpdate::BashStart {
+            command: event
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            exclude_from_context: event
+                .get("excludeFromContext")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            transient: event
+                .get("transient")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            run_id: event
+                .get("runId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        "bash_output" => Some(TurnUpdate::BashOutput {
+            chunk: event
+                .get("chunk")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        "bash_end" => Some(TurnUpdate::BashEnd {
+            exit_code: event.get("exitCode").and_then(Value::as_i64),
+            cancelled: event
+                .get("cancelled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            truncated: event
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            full_output_path: event
+                .get("fullOutputPath")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error_message: event
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            transient: event
+                .get("transient")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            run_id: event
+                .get("runId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
 
         // Queue churn and unknown events only affect the status line.
         _ => Some(TurnUpdate::StatusUpdate),
@@ -1249,6 +1326,68 @@ mod tests {
                 follow_ups: vec!["then summarize".to_string()],
             },
             "an attach re-syncs the queue strip from the snapshot"
+        );
+    }
+
+    #[test]
+    fn decodes_the_user_bash_event_triple() {
+        // The `!command` lane (TS `runUserBash`): bash_start carries the
+        // command and identity, bash_output one chunk, bash_end the
+        // settled outcome — all decoded whole-object.
+        let start = event_to_update(&json!({
+            "type": "bash_start",
+            "command": "echo hi",
+            "excludeFromContext": false,
+        }))
+        .expect("a bash start");
+        assert_eq!(
+            start,
+            TurnUpdate::BashStart {
+                command: "echo hi".to_string(),
+                exclude_from_context: false,
+                transient: false,
+                run_id: None,
+            }
+        );
+        let side_start = event_to_update(&json!({
+            "type": "bash_start",
+            "command": "echo pane",
+            "excludeFromContext": true,
+            "transient": true,
+            "runId": "run-1",
+        }))
+        .expect("a transient bash start");
+        assert_eq!(
+            side_start,
+            TurnUpdate::BashStart {
+                command: "echo pane".to_string(),
+                exclude_from_context: true,
+                transient: true,
+                run_id: Some("run-1".to_string()),
+            }
+        );
+        assert_eq!(
+            event_to_update(&json!({ "type": "bash_output", "chunk": "hi\n" })),
+            Some(TurnUpdate::BashOutput {
+                chunk: "hi\n".to_string()
+            })
+        );
+        assert_eq!(
+            event_to_update(&json!({
+                "type": "bash_end",
+                "exitCode": 0,
+                "cancelled": false,
+                "truncated": false,
+            })),
+            Some(TurnUpdate::BashEnd {
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                error_message: None,
+                transient: false,
+                run_id: None,
+            })
         );
     }
 

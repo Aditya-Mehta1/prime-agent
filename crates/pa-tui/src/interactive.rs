@@ -110,6 +110,14 @@ pub trait InteractionTelemetry: Send + Sync {
     /// is `resumed` (the SIGCONT continuation restored the terminal) /
     /// `failed` (the cycle errored).
     fn suspend_used(&self, outcome: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// The `!`/`!!` bash shortcut ran a command from the chat view (event
+    /// `tui bash shortcut used`): `excluded` is the `!!` variant, and
+    /// `side_conversation` marks a run inside a side-question pane.
+    fn bash_shortcut_used(
+        &self,
+        excluded: bool,
+        side_conversation: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// A prompt-stash transition (`tui prompt stash`): `action` is
     /// `agents_view` / `session_switch` (a draft stashed on the way out)
     /// or `restored` (a stashed draft returned to the editor);

@@ -314,6 +314,17 @@ transition; never carries prompt content.
 | `action` | string | `agents_view` / `session_switch` (a draft stashed on the way out) / `restored` (a stashed draft returned to the editor) |
 | `had_images` | boolean | the draft carried pasted images |
 
+### `tui bash shortcut used`
+
+The `!`/`!!` bash-from-chat shortcut ran a command from the input editor
+(adoption of the bash-mode surface; emitted once per dispatched run, never
+carrying the command or its output).
+
+| property | type | notes |
+|---|---|---|
+| `excluded` | boolean | the `!!` variant: the run stays out of the session context |
+| `side_conversation` | boolean | the run executed inside a side-question pane (transient, pane-rendered) |
+
 ## Planned events (seams not yet in the product)
 
 These stay in the catalog as planned schema v1 additions; they are NOT

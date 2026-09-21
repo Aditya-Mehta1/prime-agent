@@ -157,6 +157,26 @@ impl CliInteractionTelemetry {
 }
 
 impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
+    fn bash_shortcut_used(
+        &self,
+        excluded: bool,
+        side_conversation: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("excluded", serde_json::Value::from(excluded));
+            properties.set(
+                "side_conversation",
+                serde_json::Value::from(side_conversation),
+            );
+            client.track("tui bash shortcut used", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
     fn prompt_stash(
         &self,
         action: &'static str,

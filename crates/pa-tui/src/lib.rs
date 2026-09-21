@@ -11,6 +11,7 @@ pub mod altscreen;
 pub mod ansi;
 pub mod app;
 pub mod autocomplete;
+pub mod bash_bang;
 pub mod chat;
 pub mod chat_slash;
 pub mod chrome;
