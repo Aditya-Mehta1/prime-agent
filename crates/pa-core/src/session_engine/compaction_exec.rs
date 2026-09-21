@@ -404,6 +404,22 @@ mod tests {
         );
     }
 
+    /// The serialized `details` block byte-matches the TS literal order:
+    /// `{"readFiles":[...],"modifiedFiles":[...]}` (TS `summaryDetails` in
+    /// `agent-session.ts` builds `readFiles` first). The JSON map preserves
+    /// insertion order, so the struct field order is the wire byte order.
+    #[test]
+    fn details_serialize_in_the_ts_key_order() {
+        let details = CompactionDetails {
+            read_files: vec!["a.rs".to_string(), "b.rs".to_string()],
+            modified_files: vec!["c.rs".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_string(&details).unwrap(),
+            "{\"readFiles\":[\"a.rs\",\"b.rs\"],\"modifiedFiles\":[\"c.rs\"]}"
+        );
+    }
+
     #[tokio::test]
     async fn compact_summarizes_prefix_and_returns_result() {
         let messages = vec![user("one"), user("two"), user("three")];

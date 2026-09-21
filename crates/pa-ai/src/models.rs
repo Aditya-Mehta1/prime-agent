@@ -50,9 +50,11 @@ mod tests {
     use super::*;
     use crate::types::{ModelCost, ModelInput, ModelThinkingLevel};
     use pa_types::JsNumber;
-    use std::collections::HashMap;
 
-    fn model(reasoning: bool, map: Option<HashMap<ModelThinkingLevel, Option<String>>>) -> Model {
+    fn model(
+        reasoning: bool,
+        map: Option<std::collections::BTreeMap<ModelThinkingLevel, Option<String>>>,
+    ) -> Model {
         Model {
             id: "m".into(),
             name: "m".into(),

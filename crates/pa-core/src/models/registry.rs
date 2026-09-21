@@ -1,7 +1,7 @@
 //! ModelRegistry: composes built-in, custom (models.json), and Prime Inference
 //! catalogs; resolves request auth per provider/model. Port of model-registry.ts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use pa_types::ai::Model;
@@ -27,7 +27,9 @@ use super::private_auth::{
 #[derive(Debug, Clone, Default)]
 pub struct ProviderRequestConfig {
     pub api_key: Option<String>,
-    pub headers: Option<HashMap<String, String>>,
+    /// Ordered (`BTreeMap`): these headers merge into request-header maps
+    /// that providers iterate deterministically.
+    pub headers: Option<BTreeMap<String, String>>,
     pub auth_header: Option<bool>,
 }
 
@@ -36,7 +38,9 @@ pub struct ProviderRequestConfig {
 pub struct ResolvedRequestAuth {
     pub ok: bool,
     pub api_key: Option<String>,
-    pub headers: Option<HashMap<String, String>>,
+    /// Ordered (`BTreeMap`): providers iterate this map when composing
+    /// request headers, and unordered iteration would order them randomly.
+    pub headers: Option<BTreeMap<String, String>>,
     pub error: Option<String>,
 }
 
@@ -47,7 +51,7 @@ pub struct ModelRegistry {
     models: Vec<Model>,
     load_error: Option<String>,
     provider_request_configs: HashMap<String, ProviderRequestConfig>,
-    model_request_headers: HashMap<String, HashMap<String, String>>,
+    model_request_headers: HashMap<String, BTreeMap<String, String>>,
     explicit_private_ids: HashSet<String>,
     authorized_private_ids: HashSet<String>,
     authorized_private_models: Vec<Model>,
@@ -331,7 +335,7 @@ impl ModelRegistry {
         &mut self,
         provider: &str,
         model_id: &str,
-        headers: Option<HashMap<String, String>>,
+        headers: Option<BTreeMap<String, String>>,
     ) {
         let key = format!("{provider}:{model_id}");
         match headers {
@@ -594,7 +598,7 @@ impl ModelRegistry {
     pub fn get_api_key_and_headers(
         &mut self,
         model: &Model,
-        request_headers: Option<&HashMap<String, String>>,
+        request_headers: Option<&BTreeMap<String, String>>,
     ) -> ResolvedRequestAuth {
         let stored = self
             .auth
@@ -619,7 +623,7 @@ impl ModelRegistry {
         let model_request_key = format!("{}:{}", model.provider, model.id);
         let model_request_headers = self.model_request_headers.get(&model_request_key).cloned();
 
-        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut headers: BTreeMap<String, String> = BTreeMap::new();
         if let Some(model_headers) = &model.headers {
             headers.extend(model_headers.clone());
         }
@@ -771,7 +775,7 @@ mod tests {
             "anthropic": { "type": "api_key", "key": "sk-ant" }
         })));
         let mut m = model("m", "anthropic");
-        m.headers = Some(HashMap::from([(
+        m.headers = Some(BTreeMap::from([(
             "X-Model".to_string(),
             "model".to_string(),
         )]));
@@ -782,7 +786,7 @@ mod tests {
             "model"
         );
         // Request headers win over everything.
-        let request = HashMap::from([("X-Model".to_string(), "request".to_string())]);
+        let request = BTreeMap::from([("X-Model".to_string(), "request".to_string())]);
         let result = registry.get_api_key_and_headers(&m, Some(&request));
         assert_eq!(
             result.headers.as_ref().unwrap().get("X-Model").unwrap(),

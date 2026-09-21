@@ -205,6 +205,9 @@ impl CompactionManager {
         } else {
             let mut fields = json!({
                 "summary": result.get("summary").cloned().unwrap_or_default(),
+                // The TS `CompactionEntry` field order (the JSON map preserves
+                // insertion order; the value is re-pinned in place below).
+                "firstKeptEntryId": "",
                 "tokensBefore": result.get("tokensBefore").cloned().unwrap_or(json!(0)),
                 "details": result.get("details").cloned().unwrap_or_else(|| json!({
                     "readFiles": [], "modifiedFiles": [],
@@ -458,6 +461,14 @@ mod tests {
                 "details": { "readFiles": ["a.rs"], "modifiedFiles": ["b.rs"] },
             })
         );
+        // Byte order: the TS `compact` response dataKeys are summary,
+        // firstKeptEntryId, tokensBefore, details (the JSON map preserves
+        // insertion order), and the `details` block keeps the TS
+        // readFiles-first literal order.
+        assert_eq!(
+            serde_json::to_string(&compaction_result_value(&result, &entry)).unwrap(),
+            "{\"summary\":\"the story so far\",\"firstKeptEntryId\":\"abcd1234\",\"tokensBefore\":1234,\"details\":{\"readFiles\":[\"a.rs\"],\"modifiedFiles\":[\"b.rs\"]}}"
+        );
         // A run whose entry carries no details drops the key, like the TS
         // extension arm's `undefined` under JSON serialization.
         let bare = pa_types::session::CompactionEntry {
@@ -500,7 +511,10 @@ mod tests {
             json!({ "type": "compaction_start", "reason": "manual" })
         );
         assert_eq!(
-            compaction_end_event(&CompactionOutcome::Compacted { run }, Some("focus")),
+            compaction_end_event(
+                &CompactionOutcome::Compacted { run: Box::new(run) },
+                Some("focus")
+            ),
             json!({
                 "type": "compaction_end",
                 "reason": "manual",

@@ -43,7 +43,9 @@ use super::AcpModeState;
 /// proceeds to the autonomous arm).
 pub(super) enum GoalFollowUp {
     None,
-    Turn(CustomMessage),
+    /// Boxed: the message's insertion-ordered JSON maps (preserve_order,
+    /// wire parity) would dwarf the empty variant (`large_enum_variant`).
+    Turn(Box<CustomMessage>),
 }
 
 /// Mint one goal continuation and announce it (the shared
@@ -86,11 +88,11 @@ pub(super) async fn goal_follow_up(mode: &AcpModeState, session: &AcpSession) ->
             }
         };
         if let Some(message) = steer {
-            return GoalFollowUp::Turn(message);
+            return GoalFollowUp::Turn(Box::new(message));
         }
     }
     match mint_goal_continuation(mode, session).await {
-        Some(message) => GoalFollowUp::Turn(message),
+        Some(message) => GoalFollowUp::Turn(Box::new(message)),
         None => GoalFollowUp::None,
     }
 }

@@ -297,7 +297,10 @@ async fn run_stream(
         on_response(
             crate::types::ProviderResponse {
                 status: response.status,
-                headers: response.headers.clone(),
+                // Collected into the ordered map: the hook payload can
+                // serialize, and the HTTP header arrival order is not a
+                // stable serialization order.
+                headers: response.headers.clone().into_iter().collect(),
             },
             model,
         );

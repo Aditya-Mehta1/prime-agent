@@ -71,7 +71,7 @@ pub fn create_codex_request_id() -> String {
 
 /// Port of `buildBaseCodexHeaders` + `buildSSEHeaders`.
 pub fn build_sse_headers(
-    model_headers: Option<&std::collections::HashMap<String, String>>,
+    model_headers: Option<&std::collections::BTreeMap<String, String>>,
     additional_headers: Option<&std::collections::HashMap<String, String>>,
     account_id: &str,
     token: &str,
@@ -100,7 +100,7 @@ pub fn build_sse_headers(
 
 /// Port of `buildWebSocketHeaders`.
 pub fn build_websocket_headers(
-    model_headers: Option<&std::collections::HashMap<String, String>>,
+    model_headers: Option<&std::collections::BTreeMap<String, String>>,
     additional_headers: Option<&std::collections::HashMap<String, String>>,
     account_id: &str,
     token: &str,

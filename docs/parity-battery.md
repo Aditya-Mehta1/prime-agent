@@ -172,4 +172,13 @@ version banner), 20260919T042122Z (f17 re-run on the tree merged with #161:
 the same 8 of 9 hold), 20260920T024329Z/024419Z/024505Z (f20 only,
 session-scoped-mock lane: with the session-scoped mock all 11 f20 checks
 pass — the spawn and child-status frame diffs flipped to identical, and the
-subagents-tui EXPECTED-FAIL tag is retired).
+subagents-tui EXPECTED-FAIL tag is retired), 20260921T162039Z/162802Z/
+163508Z/164229Z/165454Z (f7 only, wire-order lane: five consecutive runs —
+the durable compaction row's `details` block is byte-identical to TS in
+EVERY run (`{"readFiles":[],"modifiedFiles":[]}`, vs
+`{"modifiedFiles":[],"readFiles":[]}` in all prior runs), the `compact`
+wire response dataKeys and the session header line match the TS order, and
+the #255-flagged durable-row gap is closed; residual rows in those runs are
+the two known flakes — the split-turn summarizer request-order flip
+(proven on the MAIN binary, run 20260921T061150Z) and the ipython-prewarm
+15s settle window under box load).

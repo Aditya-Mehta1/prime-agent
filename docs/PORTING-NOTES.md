@@ -767,3 +767,77 @@ the autonomous accounting counts everything non-error).
   reproduces the split-turn summarizer request-order flip (the battery's
   own nondeterministic-arrival note) and the suspension compact's
   too-short/compacted flip — run-to-run flakes, not this lane.
+
+## Wire JSON key order: insertion order, not BTreeMap order (2026-09-21, the #255 flagged residue)
+
+The #255 flagged product bug: the durable compaction row's `details`
+key order diverged from the TS bytes (`{"modifiedFiles":[],
+"readFiles":[]}` vs TS `{"readFiles":[],"modifiedFiles":[]}`), and the
+daemon `compact` response data plus the session header line carried the
+same divergence. Root cause: every wire/durable surface serializes
+`serde_json::Value` maps, and serde_json's default `Map` is a `BTreeMap`
+— insertion order is thrown away and every object re-sorts its keys
+alphabetically at serialization time. The TS side byte-emits JS
+insertion order everywhere, so every Value-built frame diverged, not
+just the flagged row. (Mechanism note for the #255 flag itself: the
+order was deterministic-but-wrong across the evidence runs, not a
+run-to-run HashMap flip; the PR #255 wording over-attributed the
+mechanism. The byte-parity consequence is the same.)
+
+The fix is a workspace-wide semantic, not a per-site patch: serde_json
+now runs with `preserve_order` (the workspace dep plus pa-tui), so
+`Value` maps keep insertion order — the JS object model the TS daemon
+and session files byte-emit. Serde struct field order then IS the wire
+byte order, so the lane re-pinned the order-critical construction sites
+to the TS declaration order:
+
+- `response_line` (`{id?, type, command, success, data|error|errorInfo}`),
+  `session_header_line` (`{type, version, id, timestamp, cwd, ...}`),
+  `SessionHeader` field order, `compaction_summary_message`
+  (`{role, summary, tokensBefore, retainedMessageCount,
+  customInstructions?, harnessDigest?, timestamp}`), the worker's
+  `handle_attach` result and snapshot (TS `createAttachResult` /
+  `createSessionSnapshot` order), and the scripted-engine compaction
+  fallback's `firstKeptEntryId` position. The compaction seams were
+  already in TS order (the `CompactionEntry`/`CompactionDetails`/`Usage`
+  struct fields and every `json!` literal).
+- Audit of unordered std maps that would leak HashMap iteration order
+  into bytes once maps preserve insertion order (all switched to
+  `BTreeMap`, none reached wire JSON before): bedrock
+  `request_metadata` (provider request body), `Model.headers` and
+  `ThinkingLevelMap` (model catalog wire), `ProviderResponse.headers`
+  (on_response hook payload, collected ordered at the 9 provider call
+  sites), the models.json config maps, the request-auth header merge
+  chain, and the harness state file's `entries`. Two latent unordered
+  reads were fixed by the same switch: bedrock picked an arbitrary
+  model header (`iter().next()`), and the harness state file wrote
+  random key order straight from a `HashMap`.
+- Enum variants carrying the now-wider insertion-ordered `Value` maps
+  trip clippy `large_enum_variant` and are boxed:
+  `CompactionOutcome::Compacted`, `GoalFollowUp::Turn`,
+  `PeerDeliveryOutcome::Answered`, and the pa-agent
+  `TaskOrOutcome::Outcome`.
+- Cache-prefix note (MISSION.md first-class rule): request bodies are
+  built from `json!` literals and typed structs, so preserve_order
+  changes the provider request byte order from alphabetical to the
+  construction order — deterministic per code path, stable across
+  runs, so prefix stability holds; the request bytes never matched the
+  TS SDK's own serialization either way.
+
+Verifiers: unit tests byte-assert the TS-captured key sequences
+(`durable_compaction_row_serializes_in_the_ts_key_order`,
+`response_line_serializes_in_the_ts_key_order`,
+`session_header_line_leads_with_the_type_tag`, the details and compact
+response byte assertions in `compaction.rs`/`compaction_exec.rs`), the
+session-header/attach/stats golden asserts in supervisor_e2e now encode
+the TS order their comments always claimed, and five f7_compaction
+battery runs (`scripts/battery/runs/20260921T162*.Z`-`165*.Z`) show the
+durable `details` block byte-identical to TS in every run (before:
+`{"modifiedFiles":[],"readFiles":[]}` in all prior runs, e.g.
+`20260921T140248Z`). The f7 residual gaps in those runs are the two
+known flakes: the split-turn summarizer request-order flip (proven on
+the MAIN binary, run `20260921T061150Z`, PORTING-NOTES above) and the
+ipython-prewarm 15s settle window (box at load 13-17 with ~94 leaked
+lane daemons; passes in the runs it lands in). Residue NOT fixed here:
+the `DaemonOutbound::Response` tagged-enum arm is never serialized
+(tag-first vs TS id-first would diverge if it ever goes on the wire).

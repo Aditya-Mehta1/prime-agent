@@ -341,7 +341,10 @@ async fn run_stream(
         on_response(
             crate::types::ProviderResponse {
                 status: response.status,
-                headers: response.headers.clone(),
+                // Collected into the ordered map: the hook payload can
+                // serialize, and the HTTP header arrival order is not a
+                // stable serialization order.
+                headers: response.headers.clone().into_iter().collect(),
             },
             model,
         );
@@ -827,7 +830,7 @@ mod tests {
 
     #[test]
     fn additional_headers_override_model_headers() {
-        let mut model_headers = std::collections::HashMap::new();
+        let mut model_headers = std::collections::BTreeMap::new();
         model_headers.insert("x-model".to_string(), "a".to_string());
         let mut additional = std::collections::HashMap::new();
         additional.insert("x-model".to_string(), "b".to_string());

@@ -1,0 +1,6 @@
+{"activeSessionId":"c80989cf78d9","sessionId":"01a0c4da-b5a7-73ca-acbb-c0edb0d186ae","sessionFile":"/home/ubuntu/lane-worktrees/wire-order/scripts/battery/runs/20260921T164229Z/rust/agent/sessions/01a0c4da-b5a7-73ca-acbb-c0edb0d186ae.jsonl","busy":true,"operation":"create","recordedAt":"2026-09-21T16:44:22.885Z"}
+{"version":1,"type":"queue_snapshot","active_session_id":"c80989cf78d9","steering":["start the kernel and define notice_var"],"follow_up":[],"recorded_at":"2026-09-21T16:44:23.059Z"}
+{"version":1,"type":"queue_snapshot","active_session_id":"c80989cf78d9","steering":[],"follow_up":[],"recorded_at":"2026-09-21T16:44:37.722Z"}
+{"version":1,"type":"queue_snapshot","active_session_id":"c80989cf78d9","steering":["history turn for the summary"],"follow_up":[],"recorded_at":"2026-09-21T16:44:37.812Z"}
+{"version":1,"type":"queue_snapshot","active_session_id":"c80989cf78d9","steering":[],"follow_up":[],"recorded_at":"2026-09-21T16:44:38.172Z"}
+{"activeSessionId":"c80989cf78d9","sessionId":"01a0c4da-b5a7-73ca-acbb-c0edb0d186ae","sessionFile":"/home/ubuntu/lane-worktrees/wire-order/scripts/battery/runs/20260921T164229Z/rust/agent/sessions/01a0c4da-b5a7-73ca-acbb-c0edb0d186ae.jsonl","busy":false,"operation":"shutdown","recordedAt":"2026-09-21T16:45:14.122Z"}

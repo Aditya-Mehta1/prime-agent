@@ -115,7 +115,7 @@ pub enum ThinkingLevel {
 }
 
 /// `ThinkingLevel` plus the explicit `off` value used by agent state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelThinkingLevel {
     Off,
@@ -146,7 +146,11 @@ impl ModelThinkingLevel {
 
 /// Maps Prime Agent thinking levels to provider/model-specific values.
 /// `None` values mark a level as unsupported.
-pub type ThinkingLevelMap = std::collections::HashMap<ModelThinkingLevel, Option<String>>;
+///
+/// Ordered (`BTreeMap`): the map serializes into wire JSON (the model
+/// catalog) and unordered iteration would leak random key order into the
+/// bytes.
+pub type ThinkingLevelMap = std::collections::BTreeMap<ModelThinkingLevel, Option<String>>;
 
 /// Token budgets for each thinking level (token-based providers only).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -200,7 +204,10 @@ pub enum ServiceTier {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderResponse {
     pub status: u16,
-    pub headers: std::collections::HashMap<String, String>,
+    /// Ordered (`BTreeMap`): response metadata can serialize into failure
+    /// diagnostics on the wire; unordered iteration would leak random key
+    /// order into the bytes.
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -964,8 +971,11 @@ pub struct Model {
     /// Flagship model surfaced above non-featured models of the same provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub featured: Option<bool>,
+    /// Extra request headers. Ordered (`BTreeMap`): the model serializes
+    /// into wire JSON (the model catalog) and unordered iteration would
+    /// leak random key order into the bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headers: Option<std::collections::HashMap<String, String>>,
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Compatibility overrides; auto-detected from `baseUrl` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<ModelCompat>,

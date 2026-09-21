@@ -1,0 +1,7 @@
+{
+ "command": "compact",
+ "error": "Already compacted",
+ "id": "prewarm-notice-k2",
+ "success": false,
+ "type": "response"
+}

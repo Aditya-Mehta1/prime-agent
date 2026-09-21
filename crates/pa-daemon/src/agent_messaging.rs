@@ -246,6 +246,7 @@ impl LinkAgentMessageController {
                 "Peer delivery to the target session was sent but not acknowledged".to_string(),
             ),
             crate::peer_client::PeerDeliveryOutcome::Answered(response) => {
+                let response = *response;
                 if !response.success {
                     return DirectDelivery::Failed(
                         response

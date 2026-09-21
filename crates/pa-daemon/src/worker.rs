@@ -2117,19 +2117,24 @@ impl Worker {
         // them at the top level would serialize the history twice per attach
         // (port of `createAttachResult`).
         let slim = capabilities.iter().any(|cap| cap == "slim_attach");
+        // TS `createAttachResult` key order: protocol, activeSessionId,
+        // state?, messages? (non-slim), snapshot, replay,
+        // lastEventSequence, lastEventCursor, client. The JSON map
+        // preserves insertion order (the wire byte order), so the
+        // non-slim keys insert at their TS positions, not appended.
         let mut result = json!({
             "protocol": { "name": "prime-agent.daemon", "version": 7 },
             "activeSessionId": active_session_id,
-            "snapshot": snapshot,
-            "replay": replay,
-            "lastEventSequence": last_event_sequence,
-            "lastEventCursor": cursor,
-            "client": { "id": client_id, "capabilities": capabilities },
         });
         if !slim {
             result["state"] = summary_value;
-            result["messages"] = Value::Array(messages);
+            result["messages"] = Value::Array(messages.clone());
         }
+        result["snapshot"] = snapshot;
+        result["replay"] = json!(replay);
+        result["lastEventSequence"] = json!(last_event_sequence);
+        result["lastEventCursor"] = cursor;
+        result["client"] = json!({ "id": client_id, "capabilities": capabilities });
 
         response_success(None, "attach", Some(result))
     }
@@ -2927,6 +2932,7 @@ impl Worker {
         }
         match outcome {
             crate::engine::CompactionOutcome::Compacted { run } => {
+                let run = *run;
                 // TS `compact()` schedules the compact-trigger auto-refine
                 // review after every successful compaction and the
                 // background round runs while the session is idle: the
@@ -6361,6 +6367,7 @@ mod turn_stream_tests {
         fn rebuild_session_context(
             &self,
             _branch_entries: Vec<pa_types::session::FileEntry>,
+            _goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
         ) -> anyhow::Result<()> {
             Ok(())
         }

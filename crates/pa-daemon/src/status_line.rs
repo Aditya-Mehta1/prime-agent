@@ -457,7 +457,9 @@ pub async fn generate_agent_status(
         pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
             max_tokens: Some(SUMMARY_MAX_TOKENS),
             api_key: request_auth.api_key,
-            headers: request_auth.headers,
+            headers: request_auth
+                .headers
+                .map(|headers| headers.into_iter().collect()),
             ..Default::default()
         });
     let response = pa_ai::complete_simple(&model, &context, Some(stream_options))

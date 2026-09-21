@@ -161,7 +161,10 @@ async fn execute_tool_calls_parallel(
 ) -> anyhow::Result<ExecutedToolCallBatch> {
     enum TaskOrOutcome {
         Task(tokio::task::JoinHandle<anyhow::Result<FinalizedToolCallOutcome>>),
-        Outcome(FinalizedToolCallOutcome),
+        // Boxed: the finalized outcome holds the tool call's ordered
+        // argument map (insertion-ordered for wire parity), which dwarfs
+        // the join handle and would trip `large_enum_variant`.
+        Outcome(Box<FinalizedToolCallOutcome>),
     }
 
     let mut entries: Vec<TaskOrOutcome> = Vec::new();
@@ -190,7 +193,7 @@ async fn execute_tool_calls_parallel(
                     is_error,
                 };
                 emit_tool_execution_end(&finalized, emit).await?;
-                entries.push(TaskOrOutcome::Outcome(finalized));
+                entries.push(TaskOrOutcome::Outcome(Box::new(finalized)));
             }
             Preparation::Prepared(prepared) => {
                 let sink = Arc::clone(emit);
@@ -227,7 +230,7 @@ async fn execute_tool_calls_parallel(
     let mut ordered_finalized_calls: Vec<FinalizedToolCallOutcome> = Vec::new();
     for entry in entries {
         match entry {
-            TaskOrOutcome::Outcome(finalized) => ordered_finalized_calls.push(finalized),
+            TaskOrOutcome::Outcome(finalized) => ordered_finalized_calls.push(*finalized),
             TaskOrOutcome::Task(handle) => {
                 let finalized = handle.await.map_err(|error| {
                     anyhow::anyhow!("Parallel tool execution task failed: {error}")

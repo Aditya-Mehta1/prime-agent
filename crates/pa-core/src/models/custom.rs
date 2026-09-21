@@ -2,7 +2,7 @@
 //! Port of the config schema, `stripJsonComments`, `validateConfig`,
 //! `parseModels`, `applyModelOverride`, and `mergeCompat`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -110,12 +110,12 @@ pub struct ModelDefinition {
     pub api: Option<String>,
     pub base_url: Option<String>,
     pub reasoning: Option<bool>,
-    pub thinking_level_map: Option<HashMap<String, Option<String>>>,
+    pub thinking_level_map: Option<BTreeMap<String, Option<String>>>,
     pub input: Option<Vec<String>>,
     pub cost: Option<ModelCostConfig>,
     pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
-    pub headers: Option<HashMap<String, String>>,
+    pub headers: Option<BTreeMap<String, String>>,
     pub compat: Option<serde_json::Value>,
 }
 
@@ -124,12 +124,12 @@ pub struct ModelDefinition {
 pub struct ModelOverride {
     pub name: Option<String>,
     pub reasoning: Option<bool>,
-    pub thinking_level_map: Option<HashMap<String, Option<String>>>,
+    pub thinking_level_map: Option<BTreeMap<String, Option<String>>>,
     pub input: Option<Vec<String>>,
     pub cost: Option<ModelCostConfig>,
     pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
-    pub headers: Option<HashMap<String, String>>,
+    pub headers: Option<BTreeMap<String, String>>,
     pub compat: Option<serde_json::Value>,
 }
 
@@ -140,17 +140,17 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub api: Option<String>,
-    pub headers: Option<HashMap<String, String>>,
+    pub headers: Option<BTreeMap<String, String>>,
     pub compat: Option<serde_json::Value>,
     pub auth_header: Option<bool>,
     pub models: Option<Vec<ModelDefinition>>,
-    pub model_overrides: Option<HashMap<String, ModelOverride>>,
+    pub model_overrides: Option<BTreeMap<String, ModelOverride>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
-    pub providers: HashMap<String, ProviderConfig>,
+    pub providers: BTreeMap<String, ProviderConfig>,
 }
 
 /// Result of loading models.json.
@@ -158,7 +158,7 @@ pub struct ModelsConfig {
 pub struct CustomModelsResult {
     pub models: Vec<Model>,
     pub provider_overrides: HashMap<String, ProviderOverride>,
-    pub model_overrides: HashMap<String, HashMap<String, ModelOverride>>,
+    pub model_overrides: HashMap<String, BTreeMap<String, ModelOverride>>,
     pub error: Option<String>,
 }
 

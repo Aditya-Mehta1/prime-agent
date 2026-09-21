@@ -96,7 +96,7 @@ pub fn thinking_level_from_str(name: &str) -> Option<ModelThinkingLevel> {
 /// Build a thinking level map from pairs (helper for tests and catalogs).
 pub fn thinking_level_map(
     pairs: &[(ModelThinkingLevel, Option<&str>)],
-) -> std::collections::HashMap<ModelThinkingLevel, Option<String>> {
+) -> std::collections::BTreeMap<ModelThinkingLevel, Option<String>> {
     pairs
         .iter()
         .map(|(key, value)| (*key, value.map(|value| value.to_string())))

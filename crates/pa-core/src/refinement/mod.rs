@@ -2,7 +2,7 @@
 //! history, and prompt rendering. Port of core/refinement/refinement.ts
 //! (state half).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ pub const DEFAULT_OVERVIEW_REFINEMENT_LIMIT: usize = 10;
 pub const DEFAULT_OVERVIEW_CONTENT_LIMIT: usize = 140;
 
 /// Harness component kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RefinementKind {
     Prompt,
@@ -92,8 +92,10 @@ pub struct HarnessRefinementEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HarnessState {
     pub schema: u64,
-    /// Entries keyed by kind, then id.
-    pub entries: HashMap<RefinementKind, HashMap<String, HarnessEntry>>,
+    /// Entries keyed by kind, then id. Ordered (`BTreeMap`): the state
+    /// serializes to the on-disk harness JSON, and unordered iteration
+    /// would write random key order (and churn the file between runs).
+    pub entries: BTreeMap<RefinementKind, BTreeMap<String, HarnessEntry>>,
     pub refinements: Vec<HarnessRefinementEvent>,
 }
 
@@ -101,10 +103,10 @@ pub fn empty_harness_state() -> HarnessState {
     HarnessState {
         schema: 1,
         entries: [
-            (RefinementKind::Prompt, HashMap::new()),
-            (RefinementKind::Memory, HashMap::new()),
-            (RefinementKind::Skill, HashMap::new()),
-            (RefinementKind::Subagent, HashMap::new()),
+            (RefinementKind::Prompt, BTreeMap::new()),
+            (RefinementKind::Memory, BTreeMap::new()),
+            (RefinementKind::Skill, BTreeMap::new()),
+            (RefinementKind::Subagent, BTreeMap::new()),
         ]
         .into_iter()
         .collect(),

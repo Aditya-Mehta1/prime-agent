@@ -38,10 +38,16 @@ pub struct GitContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHeader {
-    pub id: String,
     /// Session format version; v1 sessions have no `version` field.
+    ///
+    /// Field order is the TS `SessionHeader` declaration order
+    /// (`type` tag, `version`, `id`, `timestamp`, `cwd`, `parentSession`,
+    /// `rlmDepth`, `git`); the serialized line must byte-match the TS
+    /// session file's first line, and the JSON map preserves this order
+    /// (the workspace's `serde_json` runs with `preserve_order`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
+    pub id: String,
     /// ISO-8601 creation timestamp.
     pub timestamp: String,
     pub cwd: String,

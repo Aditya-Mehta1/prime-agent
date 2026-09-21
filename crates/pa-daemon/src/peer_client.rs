@@ -25,8 +25,10 @@ const DELIVERY_TIMEOUT_MS: u64 = 15_000;
 /// delivery command has been sent.
 pub(crate) enum PeerDeliveryOutcome {
     /// The target answered this response (a failure response is final
-    /// too - the target refused the delivery).
-    Answered(DaemonResponse),
+    /// too - the target refused the delivery). Boxed: the response's
+    /// insertion-ordered JSON maps (preserve_order, wire parity) would
+    /// dwarf the empty variants (`large_enum_variant`).
+    Answered(Box<DaemonResponse>),
     /// The link could not be established (connect, hello, or the grant
     /// burn failed at the door): nothing was delivered, a fallback may
     /// take over.
@@ -114,7 +116,7 @@ async fn deliver_once(
         payload["deliveryMode"] = json!(mode);
     }
     match request(&mut writer, &mut reader, "worker_deliver_message", &payload).await {
-        Ok(response) => PeerDeliveryOutcome::Answered(response),
+        Ok(response) => PeerDeliveryOutcome::Answered(Box::new(response)),
         Err(_) => PeerDeliveryOutcome::Lost,
     }
 }

@@ -457,12 +457,39 @@ pub fn response_failure(
 }
 
 /// Serialize a standalone response line (`type: "response"`).
+///
+/// The key order matches the TS wire bytes (`daemon-protocol.ts` `success`/
+/// `failure`): `id`, `type`, `command`, `success`, then `data` or
+/// `error`/`errorInfo`. `type` is inserted at its TS position, not appended:
+/// the JSON map preserves insertion order (the workspace's `serde_json`
+/// runs with `preserve_order`), so a trailing insert would emit the tag last.
 pub fn response_line(response: &DaemonResponse) -> Value {
-    let mut value = serde_json::to_value(response).unwrap_or(Value::Null);
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("type".to_string(), Value::String("response".to_string()));
+    let mut obj = serde_json::Map::new();
+    if let Some(id) = &response.id {
+        obj.insert("id".to_string(), Value::String(id.clone()));
     }
-    value
+    obj.insert("type".to_string(), Value::String("response".to_string()));
+    obj.insert(
+        "command".to_string(),
+        Value::String(response.command.clone()),
+    );
+    obj.insert("success".to_string(), Value::Bool(response.success));
+    match (&response.data, &response.error) {
+        (Some(data), _) => {
+            obj.insert("data".to_string(), data.clone());
+        }
+        (None, Some(error)) => {
+            obj.insert("error".to_string(), Value::String(error.clone()));
+        }
+        (None, None) => {}
+    }
+    if let Some(error_info) = &response.error_info {
+        obj.insert(
+            "errorInfo".to_string(),
+            serde_json::to_value(error_info).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(obj)
 }
 
 /// Session selector carried by a command, when it has one.
@@ -896,6 +923,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn envelope_round_trips() {
@@ -947,6 +975,23 @@ mod tests {
         assert_eq!(
             info.reason.as_deref(),
             Some("resume_cursor_ahead_of_session")
+        );
+    }
+
+    /// The standalone response line byte-orders its keys exactly like the
+    /// TS daemon wire bytes (`daemon-protocol.ts` `success`/`failure`):
+    /// id?, type, command, success, then data or error/errorInfo.
+    #[test]
+    fn response_line_serializes_in_the_ts_key_order() {
+        let success = response_success(Some("k1"), "compact", Some(json!({"x": 1})));
+        assert_eq!(
+            serde_json::to_string(&response_line(&success)).unwrap(),
+            "{\"id\":\"k1\",\"type\":\"response\",\"command\":\"compact\",\"success\":true,\"data\":{\"x\":1}}"
+        );
+        let failure = response_failure(Some("k2"), "compact", "boom", None);
+        assert_eq!(
+            serde_json::to_string(&response_line(&failure)).unwrap(),
+            "{\"id\":\"k2\",\"type\":\"response\",\"command\":\"compact\",\"success\":false,\"error\":\"boom\"}"
         );
     }
 }

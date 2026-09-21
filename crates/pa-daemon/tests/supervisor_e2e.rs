@@ -316,16 +316,19 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         .keys()
         .map(String::as_str)
         .collect();
+    // TS `createAttachResult` key order (protocol, activeSessionId,
+    // snapshot, replay, lastEventSequence, lastEventCursor, client): the
+    // JSON map preserves insertion order, so this is the wire byte order.
     assert_eq!(
         keys,
         vec![
-            "activeSessionId",
-            "client",
-            "lastEventCursor",
-            "lastEventSequence",
             "protocol",
-            "replay",
+            "activeSessionId",
             "snapshot",
+            "replay",
+            "lastEventSequence",
+            "lastEventCursor",
+            "client",
         ]
     );
     let snapshot = &data["snapshot"];
@@ -335,16 +338,18 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         .keys()
         .map(String::as_str)
         .collect();
+    // TS `createSessionSnapshot` key order: activeSessionId, summary,
+    // state, messages, lastEventSequence, lastEventCursor, children.
     assert_eq!(
         snapshot_keys,
         vec![
             "activeSessionId",
-            "children",
-            "lastEventCursor",
-            "lastEventSequence",
-            "messages",
-            "state",
             "summary",
+            "state",
+            "messages",
+            "lastEventSequence",
+            "lastEventCursor",
+            "children",
         ]
     );
     assert_eq!(snapshot["children"], serde_json::json!([]));
@@ -621,9 +626,11 @@ fn session_stats_and_header_match_live_daemon_goldens() {
         .keys()
         .map(String::as_str)
         .collect();
+    // The TS session-file header key order (the comment above): the JSON
+    // map preserves insertion order, so this is the wire byte order.
     assert_eq!(
         header_keys,
-        vec!["cwd", "id", "rlmDepth", "timestamp", "type", "version"]
+        vec!["type", "version", "id", "timestamp", "cwd", "rlmDepth"]
     );
 
     // get_session_stats: the TS stats shape over the scripted turn. The
@@ -658,18 +665,21 @@ fn session_stats_and_header_match_live_daemon_goldens() {
         .keys()
         .map(String::as_str)
         .collect();
+    // TS `SessionStats` key order (sessionFile, sessionId, userMessages,
+    // assistantMessages, toolCalls, toolResults, totalMessages, tokens,
+    // cost): the JSON map preserves insertion order.
     assert_eq!(
         stats_keys,
         vec![
-            "assistantMessages",
-            "cost",
             "sessionFile",
             "sessionId",
-            "tokens",
+            "userMessages",
+            "assistantMessages",
             "toolCalls",
             "toolResults",
             "totalMessages",
-            "userMessages",
+            "tokens",
+            "cost",
         ]
     );
 

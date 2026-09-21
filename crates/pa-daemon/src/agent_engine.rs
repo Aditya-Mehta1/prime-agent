@@ -1473,7 +1473,7 @@ impl SessionEngine for AgentSessionEngine {
                 // the run settled.
                 self.mark_compact_auto_refine_pending();
                 CompactionOutcome::Compacted {
-                    run: CompactionRun {
+                    run: Box::new(CompactionRun {
                         // The wire result is the TS `CompactionResult` shape
                         // (`_performCompaction`'s return): summary,
                         // firstKeptEntryId, tokensBefore, and the file-op
@@ -1494,7 +1494,7 @@ impl SessionEngine for AgentSessionEngine {
                             .ipython_state
                             .as_ref()
                             .map(crate::session_commands::custom_message_value),
-                    },
+                    }),
                 }
             }
         }

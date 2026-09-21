@@ -726,8 +726,11 @@ pub struct CompactionRun {
 /// "Compaction cancelled", or failure).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactionOutcome {
-    /// Compacted; the run carries the result and entry usage.
-    Compacted { run: CompactionRun },
+    /// Compacted; the run carries the result and entry usage. Boxed: the
+    /// run's insertion-ordered JSON maps (preserve_order, wire parity)
+    /// would make this variant dwarf the skip/abort/fail variants
+    /// (`large_enum_variant`).
+    Compacted { run: Box<CompactionRun> },
     /// Nothing to compact (TS `CompactionSkippedError`); the string is the
     /// user-facing skip message.
     Skipped { message: String },
@@ -1270,7 +1273,7 @@ impl SessionEngine for ScriptedEngine {
             self.compaction.responses.get(index)
         })() else {
             return CompactionOutcome::Compacted {
-                run: CompactionRun {
+                run: Box::new(CompactionRun {
                     result: json!({
                         "summary": "scripted compaction summary",
                         "firstKeptEntryId": "",
@@ -1280,7 +1283,7 @@ impl SessionEngine for ScriptedEngine {
                     usage: None,
                     entry: Value::Null,
                     ipython_state: None,
-                },
+                }),
             };
         };
         if let Some(error) = entry.get("error").and_then(Value::as_str) {
@@ -1310,12 +1313,12 @@ impl SessionEngine for ScriptedEngine {
             })),
         });
         CompactionOutcome::Compacted {
-            run: CompactionRun {
+            run: Box::new(CompactionRun {
                 result,
                 usage: entry.get("usage").cloned().filter(|usage| !usage.is_null()),
                 entry: Value::Null,
                 ipython_state: None,
-            },
+            }),
         }
     }
 

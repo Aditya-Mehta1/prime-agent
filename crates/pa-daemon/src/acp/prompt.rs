@@ -351,6 +351,7 @@ async fn run_prompt_turn(
         // prompt); no active goal falls through to the autonomous arm.
         match goal_continuation::goal_follow_up(&mode, &session).await {
             goal_continuation::GoalFollowUp::Turn(message) => {
+                let message = *message;
                 session.run_pre_turn_compaction(&mode).await;
                 if let Err(error) = mode.engine.session.prompt_injected_message(&message).await {
                     turn_failure = Some(format!("{error:#}"));

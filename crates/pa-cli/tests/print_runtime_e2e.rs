@@ -758,15 +758,16 @@ fn print_mode_json_streams_the_message_update_deltas() {
     // empty partial; the end delta carries the full text.
     assert_eq!(updates[0]["message"]["content"][0]["text"], "");
     assert_eq!(last["message"]["content"][0]["text"], "a streamed answer");
-    // The event field order matches the TS stream (type, message,
-    // assistantMessageEvent) — the wire object carries exactly those keys.
+    // The event field order matches the TS stream (`MessageUpdateEvent`:
+    // type, message, assistantMessageEvent) — the JSON map preserves
+    // insertion order, so this is the wire byte order.
     let keys: Vec<&str> = updates[0]
         .as_object()
         .unwrap()
         .keys()
         .map(String::as_str)
         .collect();
-    assert_eq!(keys, ["assistantMessageEvent", "message", "type"]);
+    assert_eq!(keys, ["type", "message", "assistantMessageEvent"]);
 }
 
 /// The threshold compaction arm (TS `_checkCompaction` Case 3): a settled

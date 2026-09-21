@@ -484,12 +484,25 @@ impl SessionFile {
 }
 
 /// The stored first line: the typed header plus the `session` type tag.
+///
+/// The tag leads the line (TS `SessionHeader` declares `type` first, so the
+/// TS session file's first line starts with `{"type":"session",...}`); the
+/// JSON map preserves insertion order (the workspace's `serde_json` runs
+/// with `preserve_order`), so the tag is rebuilt into the leading slot
+/// instead of appended.
 pub fn session_header_line(header: &SessionHeader) -> Value {
-    let mut value = serde_json::to_value(header).unwrap_or(Value::Null);
-    if let Some(object) = value.as_object_mut() {
-        object.insert("type".to_string(), Value::String("session".to_string()));
-    }
-    value
+    let value = serde_json::to_value(header).unwrap_or(Value::Null);
+    let Some(object) = value.as_object() else {
+        return json!({ "type": "session" });
+    };
+    let mut ordered = serde_json::Map::new();
+    ordered.insert("type".to_string(), Value::String("session".to_string()));
+    ordered.extend(
+        object
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    Value::Object(ordered)
 }
 
 fn write_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<()> {
@@ -507,12 +520,15 @@ fn message_role(message: &Value) -> Option<&str> {
 /// `createCompactionSummaryMessage`).
 fn compaction_summary_message(entry: &SessionEntry, retained_count: usize) -> Value {
     let timestamp = crate::util::iso_to_unix_ms(&entry.timestamp).unwrap_or(0);
+    // TS `createCompactionSummaryMessage` key order: role, summary,
+    // tokensBefore, retainedMessageCount, customInstructions?,
+    // harnessDigest?, timestamp. The JSON map preserves insertion order,
+    // so the optional keys insert before `timestamp`.
     let mut message = json!({
         "role": "compactionSummary",
         "summary": entry.fields.get("summary").cloned().unwrap_or_default(),
         "tokensBefore": entry.fields.get("tokensBefore").cloned().unwrap_or(json!(0)),
         "retainedMessageCount": retained_count as u64,
-        "timestamp": timestamp,
     });
     if let Some(custom_instructions) = entry.fields.get("customInstructions") {
         message["customInstructions"] = custom_instructions.clone();
@@ -520,6 +536,7 @@ fn compaction_summary_message(entry: &SessionEntry, retained_count: usize) -> Va
     if let Some(harness_digest) = entry.fields.get("harnessDigest") {
         message["harnessDigest"] = harness_digest.clone();
     }
+    message["timestamp"] = json!(timestamp);
     message
 }
 
@@ -925,5 +942,114 @@ mod tests {
         let loaded = SessionFile::open(&path).unwrap();
         assert_eq!(loaded.message_count(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The durable compaction row must byte-serialize in the TS key order
+    /// (TS `appendCompaction`'s `CompactionEntry` literal, verified against
+    /// the TS binary's session file — battery run 20260921T140248Z,
+    /// `ts/f7_compaction/sessions/*.jsonl`):
+    /// type, id, parentId, timestamp, summary, firstKeptEntryId,
+    /// tokensBefore, details, fromHook, customInstructions?, usage,
+    /// harnessDigest — with `details` as `{readFiles, modifiedFiles}` and
+    /// `usage` in the TS `Usage` field order. The JSON map preserves
+    /// insertion order (`serde_json` `preserve_order`), so any drift shows
+    /// up here as a wrong key sequence, not just a wrong shape.
+    #[test]
+    fn durable_compaction_row_serializes_in_the_ts_key_order() {
+        let entry = pa_types::session::CompactionEntry {
+            summary: "pre-compaction reply 6".to_string(),
+            first_kept_entry_id: "ebd5e444".to_string(),
+            tokens_before: 110,
+            details: Some(
+                serde_json::to_value(
+                    &pa_core::session_engine::compaction_exec::CompactionDetails {
+                        read_files: vec!["a.rs".to_string()],
+                        modified_files: vec!["b.rs".to_string()],
+                    },
+                )
+                .unwrap(),
+            ),
+            from_hook: Some(false),
+            custom_instructions: None,
+            usage: Some(pa_types::ai::Usage {
+                input: 20,
+                output: 10,
+                cache_read: 80,
+                cache_write: 0,
+                total_tokens: 110,
+                cost: pa_types::ai::UsageCost::default(),
+            }),
+            harness_digest: Some("# Continual Harness State".to_string()),
+        };
+        let fields = serde_json::to_value(&entry).unwrap();
+        let mut session = SessionFile::create("/tmp", None, 0);
+        session.append_entry("compaction", fields);
+        let row = serde_json::to_string(session.entries.last().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&row).unwrap();
+        let keys: Vec<&str> = parsed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "type",
+                "id",
+                "parentId",
+                "timestamp",
+                "summary",
+                "firstKeptEntryId",
+                "tokensBefore",
+                "details",
+                "fromHook",
+                "usage",
+                "harnessDigest",
+            ]
+        );
+        // The details block is the TS `readFiles`-first literal order, and
+        // usage keeps the TS field order (input, output, cacheRead,
+        // cacheWrite, totalTokens, cost).
+        let details = serde_json::to_string(parsed["details"].as_object().unwrap()).unwrap();
+        assert_eq!(
+            details,
+            "{\"readFiles\":[\"a.rs\"],\"modifiedFiles\":[\"b.rs\"]}"
+        );
+        let usage: Vec<&str> = parsed["usage"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            usage,
+            vec![
+                "input",
+                "output",
+                "cacheRead",
+                "cacheWrite",
+                "totalTokens",
+                "cost"
+            ]
+        );
+    }
+
+    /// The session header line leads with the `type` tag, exactly like the
+    /// TS session file's first line (`{"type":"session","version":...}`).
+    #[test]
+    fn session_header_line_leads_with_the_type_tag() {
+        let header = SessionHeader {
+            version: Some(3),
+            id: "abc".to_string(),
+            timestamp: "t".to_string(),
+            cwd: "/x".to_string(),
+            parent_session: None,
+            rlm_depth: Some(0),
+            git: None,
+            rest: serde_json::Map::new(),
+        };
+        let line = serde_json::to_string(&session_header_line(&header)).unwrap();
+        assert!(line.starts_with("{\"type\":\"session\",\"version\":3,\"id\":\"abc\""));
     }
 }
