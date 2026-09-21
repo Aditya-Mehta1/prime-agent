@@ -210,12 +210,10 @@ export function runTailscaleStatus(json = false): number {
 		return 1;
 	}
 	if (!probe.onTailnet) {
-		if (probe.offlineButUp) {
-			console.log(chalk.yellow("This node is up on a tailnet but currently offline - check connectivity"));
-		} else {
-			console.log(chalk.yellow("Tailscale is installed but this machine is not up on a tailnet"));
-			console.log("Run `tailscale up` first (or log in), then retry.");
-		}
+		// offlineButUp implies onTailnet, so an offline node reaches the success
+		// path (which prints its state); this branch is genuinely not up.
+		console.log(chalk.yellow("Tailscale is installed but this machine is not up on a tailnet"));
+		console.log("Run `tailscale up` first (or log in), then retry.");
 		return 1;
 	}
 	console.log(
@@ -362,7 +360,10 @@ export function runTailscaleServe(port: number, funnel: boolean): number {
 			}
 		}
 	} catch {
-		servedExactly = false;
+		// Serve-status output was unparseable: report the parse failure (matching
+		// the status command), NOT a pending-enable flow that never happened.
+		console.log(chalk.red("post-serve verification failed: tailscale serve status output was unparseable"));
+		return 1;
 	}
 	if (!servedExactly) {
 		console.log(
