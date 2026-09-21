@@ -30,7 +30,7 @@ for (const name of ["tui", "ai", "agent", "coding-agent"]) {
 	});
 }
 
-execFileSync("node", ["scripts/catalog-assets.mjs", "generate", "--out", "dist"], {
+execFileSync("node", ["scripts/catalog-assets.mjs", "copy-source", "--out", "dist"], {
 	cwd: packageDir,
 	stdio: "inherit",
 });

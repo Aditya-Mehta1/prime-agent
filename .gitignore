@@ -23,6 +23,7 @@ packages/*/dist-firefox/
 *~
 
 # Package specific
+packages/coding-agent/catalog/*.bundled.json
 .npm/
 coverage/
 .nyc_output/

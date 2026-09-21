@@ -14,7 +14,7 @@ const required = [
 	"dist/skills/websearch/SKILL.md",
 ];
 
-validateBundledCatalogDir(join(root, "packages/coding-agent/dist"));
+validateBundledCatalogDir(join(root, "packages/coding-agent/dist"), { allowSmallFixture: true });
 const outDir = mkdtempSync(join(tmpdir(), "prime-agent-npm-pack-"));
 try {
 	const result = spawnSync(
