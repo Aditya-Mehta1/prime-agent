@@ -769,10 +769,12 @@ fn builtin_tools(_cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTo
 /// (the overflow compact-and-retry arm, the requested compaction/refinement
 /// consumption, and the threshold arm) run through
 /// [`crate::print_boundary::TurnBoundary`] at every prompt's quiescent
-/// boundaries. When autonomous flags are present the gate loop runs after
-/// every settled prompt: continuations stream like any other turn, and a
-/// stop surfaces the durable `autonomous_status` row as a `message_end`
-/// event before the process exits.
+/// boundaries. The autonomous continuation loop rides the agent's
+/// natural-turn-end hook (the TS in-run shape: continuations churn inside
+/// the one prompt wait with no run boundary between them); a held
+/// threshold continuation drains through the boundary pair, and a stop
+/// surfaces only through the headless exit contract (TS: no row, no
+/// stream frame).
 async fn run_prompts_and_emit(
     engine: &std::sync::Arc<pa_core::session_engine::engine::SessionEngine>,
     model: &Model,
@@ -810,40 +812,36 @@ async fn run_prompts_and_emit(
     let goal = std::sync::Arc::new(crate::print_goal::PrintGoalSurface::new(json_mode));
     goal.seed_publish_baseline(engine).await;
     let goal_accounting = goal.wire_accounting(engine, engine.session.agent()).await;
-    crate::print_goal::PrintGoalSurface::wire_continuation_hook(
+    // The autonomous run (the verifier/eval composition seam): the CLI
+    // flags enable it, a no-flag session starts disabled and `/autonomous`
+    // rewrites it live. Per-message accounting runs against the one shared
+    // state, and the composed in-run continuation hook drives both the
+    // CLI-flag run and the flipped session state (TS: the continuation rides
+    // the agent loop's natural-turn-end hook, in-run).
+    let autonomous = std::sync::Arc::new(match options.config.autonomous.as_ref() {
+        Some(config) => HeadlessAutonomous::from_cli(config, &options.config.cwd),
+        None => HeadlessAutonomous::disabled(&options.config.cwd),
+    });
+    let accounting = autonomous.wire_accounting(engine.session.agent()).await;
+    // The composed natural-turn-end hook (TS `_getContinuationMessages`):
+    // the goal arm first (exclusive priority), the autonomous arm on the
+    // fall-through, the boundary gates shared (queued input, a requested
+    // compaction, the threshold arm's held continuation).
+    crate::print_autonomous::wire_continuation_hook(
         engine,
         engine.session.agent(),
         model,
         &goal,
+        &autonomous,
     );
-    // The autonomous run from the CLI flags (the verifier/eval composition
-    // seam): per-message accounting plus the gate continuation loop.
-    let autonomous = options
-        .config
-        .autonomous
-        .as_ref()
-        .map(|config| HeadlessAutonomous::from_cli(config, &options.config.cwd));
-    let mut accounting: Option<pa_agent::agent::Subscription> = None;
-    if let Some(run) = &autonomous {
-        accounting = Some(run.wire_accounting(engine.session.agent()).await);
-    }
     let global_harness_dir =
         pa_core::refinement::get_global_harness_state_dir(&options.config.agent_dir);
     let mut boundary = crate::print_boundary::TurnBoundary::new(json_mode);
-    // The autonomous runtime state the session-command executor mutates:
-    // the CLI-flag run's state when one exists, the TS default (disabled)
-    // state otherwise — the session always carries one (TS
-    // `createAgentSession`), and `/autonomous` rewrites it live.
-    let autonomous_state: std::sync::Arc<
-        tokio::sync::Mutex<pa_core::autonomous::AutonomousRuntimeState>,
-    > = autonomous
-        .as_ref()
-        .map(|run| run.state_handle())
-        .unwrap_or_else(|| {
-            std::sync::Arc::new(tokio::sync::Mutex::new(
-                pa_core::autonomous::create_autonomous_runtime_state(None, None),
-            ))
-        });
+    // The autonomous runtime state the session-command executor mutates —
+    // the run's own shared state (the session always carries one, TS
+    // `createAgentSession`), so `/autonomous` rewrites the state the hook,
+    // the accounting, and the exit contract read.
+    let autonomous_state = autonomous.state_handle();
     // A failed session command rejects the prompt wait (TS print-mode's
     // catch): the raw error prints to stderr and the run exits 1 without
     // the later prompts or the terminal selection.
@@ -942,27 +940,25 @@ async fn run_prompts_and_emit(
         // exclusive priority; autonomous is never consulted while a goal
         // is active).
         if !goal_owns_boundary {
-            if let Some(run) = &autonomous {
-                if let Some(row) = run
-                    .drive(
-                        engine,
-                        &mut boundary,
-                        model,
-                        api_key.clone(),
-                        global_harness_dir.clone(),
-                    )
-                    .await
-                    .map_err(|error| format!("{error:#}"))?
-                {
-                    emit_stop_row_events(json_mode, &row);
-                }
-            }
+            // The held threshold continuation drains as this invocation's
+            // follow-up turn (TS's queued `followUp` admission); its own
+            // natural end churns the in-run hook again. The stop surfaces
+            // only through the headless exit contract (TS: no row, no
+            // stream frame).
+            autonomous
+                .drive_boundary(
+                    engine,
+                    &mut boundary,
+                    model,
+                    api_key.clone(),
+                    global_harness_dir.clone(),
+                )
+                .await
+                .map_err(|error| format!("{error:#}"))?;
         }
     }
     goal_accounting.unsubscribe().await;
-    if let Some(subscription) = accounting {
-        subscription.unsubscribe().await;
-    }
+    accounting.unsubscribe().await;
     if let Some(subscription) = unsubscribe {
         subscription.unsubscribe().await;
     }
@@ -1009,11 +1005,9 @@ async fn run_prompts_and_emit(
         }
     }
     // The TS print-mode autonomous contract applies to both output modes.
-    if let Some(run) = &autonomous {
-        if let Some(stderr) = run.exit_stderr().await {
-            eprintln!("{stderr}");
-            exit_code = 1;
-        }
+    if let Some(stderr) = autonomous.exit_stderr().await {
+        eprintln!("{stderr}");
+        exit_code = 1;
     }
     // The TS disposal order: print mode returns its exit code first, then
     // the connection teardown disposes the session — which drains a
@@ -1026,19 +1020,6 @@ async fn run_prompts_and_emit(
         .drain_compact_auto_refine_at_disposal(engine, model, api_key, global_harness_dir)
         .await;
     Ok(exit_code)
-}
-
-/// The durable stop row as `message_start` + `message_end` events (the daemon
-/// worker's wire shape for custom rows). Text mode stays quiet.
-fn emit_stop_row_events(json_mode: bool, row: &pa_types::session::CustomMessage) {
-    if !json_mode {
-        return;
-    }
-    let message = crate::headless_autonomous::stop_row_wire_value(row);
-    for event_type in ["message_start", "message_end"] {
-        let event = serde_json::json!({ "type": event_type, "message": message });
-        println!("{event}");
-    }
 }
 
 /// The faux-script engine: identical session assembly, scripted provider.

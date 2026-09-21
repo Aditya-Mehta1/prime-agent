@@ -522,7 +522,7 @@ impl TurnBoundary {
                     // `_appendDurableRefineMessage`: the outcome row always,
                     // the model-facing notice when edits applied).
                     for row in Self::refinement_rows_since(engine, entries_before).await {
-                        let value = crate::headless_autonomous::stop_row_wire_value(&row);
+                        let value = crate::headless_autonomous::custom_row_wire_value(&row);
                         for event_type in ["message_start", "message_end"] {
                             (self.sink)(&json!({ "type": event_type, "message": value }));
                         }
@@ -908,7 +908,7 @@ impl TurnBoundary {
         let Some(row) = &run.ipython_state else {
             return;
         };
-        let value = crate::headless_autonomous::stop_row_wire_value(row);
+        let value = crate::headless_autonomous::custom_row_wire_value(row);
         for event_type in ["message_start", "message_end"] {
             (self.sink)(&json!({ "type": event_type, "message": value }));
         }
@@ -935,7 +935,7 @@ impl TurnBoundary {
             .record_compaction_outcome(reason, outcome, message)
             .await;
         if self.json_mode {
-            let value = crate::headless_autonomous::stop_row_wire_value(&row);
+            let value = crate::headless_autonomous::custom_row_wire_value(&row);
             for event_type in ["message_start", "message_end"] {
                 (self.sink)(&json!({ "type": event_type, "message": value }));
             }
@@ -1513,18 +1513,18 @@ mod tests {
         assert_eq!(user_texts(&engine_b).await.len(), 3);
     }
 
-    /// The autonomous continuation loop crosses the same boundary arms the
-    /// CLI prompts do (TS: the session admits an owed continuation through
-    /// its own turn loop, so the overflow recovery fires on a continuation
-    /// turn too). A continuation turn that overflows gets its
-    /// compact-and-retry at the settled boundary — the #229 print-arms
-    /// reconciliation: without the boundary the drive loop admitted
-    /// continuations raw, the overflow error surfaced as the run's final
-    /// turn, and no recovery ran.
+    /// The in-run autonomous continuation loop (the composed
+    /// natural-turn-end hook) still crosses the boundary arms where TS
+    /// runs them inside the loop: a continuation turn that overflows gets
+    /// its compact-and-retry at the settled boundary — the run ends on the
+    /// error turn, the boundary recovers it (the #229 reconciliation
+    /// under the in-run shape). The limit stop writes no row: the durable
+    /// store carries no `autonomous_status` stop entry, and the headless
+    /// exit contract carries the stop.
     #[tokio::test]
     async fn autonomous_continuation_turns_cross_the_boundary_arms() {
         let _faux = FAUX_TEST_LOCK.lock().await;
-        let (engine, dir, model) = faux_engine_with_settings(
+        let (built, dir, model) = faux_engine_with_settings(
             json!({
                 "responses": [
                     {"text": "seed reply"},
@@ -1537,7 +1537,27 @@ mod tests {
             None,
         )
         .await;
+        let engine = std::sync::Arc::new(built);
         let mut boundary = TurnBoundary::new(false);
+        // The autonomous run (one continuation, no gates) with its
+        // accounting and the composed in-run hook wired: the settled seed
+        // turn mints the continuation inside the same agent run.
+        let run = std::sync::Arc::new(crate::headless_autonomous::HeadlessAutonomous::from_cli(
+            &crate::args::AutonomousConfig {
+                max_continuations: Some(1),
+                ..Default::default()
+            },
+            dir.path(),
+        ));
+        let _accounting = run.wire_accounting(engine.session.agent()).await;
+        let goal = std::sync::Arc::new(crate::print_goal::PrintGoalSurface::new(false));
+        crate::print_autonomous::wire_continuation_hook(
+            &engine,
+            engine.session.agent(),
+            &model,
+            &goal,
+            &run,
+        );
         admit(
             &mut boundary,
             &engine,
@@ -1546,30 +1566,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // One continuation, no gates: the first decision injects the
-        // continuation turn, the second hits the max-continuations limit
-        // and stops (the durable `autonomous_status` row).
-        let run = crate::headless_autonomous::HeadlessAutonomous::from_cli(
-            &crate::args::AutonomousConfig {
-                max_continuations: Some(1),
-                ..Default::default()
-            },
-            dir.path(),
-        );
-        let row = run
-            .drive(
-                &engine,
-                &mut boundary,
-                &model,
-                None,
-                std::path::PathBuf::new(),
-            )
-            .await
-            .unwrap()
-            .expect("the limit stop row");
-        assert_eq!(row.custom_type, "autonomous_status");
-
-        // The continuation turn overflowed and the settled boundary
+        // The in-run continuation turn overflows and the settled boundary
         // recovered it: one compaction, the retry settled, no failure rows.
         assert_eq!(compaction_count(&engine).await, 1);
         assert!(outcome_rows(&engine).await.is_empty());
@@ -1588,6 +1585,25 @@ mod tests {
         // The CLI prompt plus the injected continuation; the overflow
         // retry re-issued without re-adding a user message.
         assert_eq!(user_texts(&engine).await.len(), 2);
+        assert!(user_texts(&engine).await[1].starts_with("[autonomous-continuation]"));
+        // The limit stop surfaces only through the headless exit contract:
+        // no durable `autonomous_status` row (the TS shape, probed against
+        // the binary).
+        assert!(engine
+            .session
+            .entries()
+            .await
+            .into_iter()
+            .all(|entry| !matches!(
+                &entry,
+                pa_types::session::FileEntry::CustomMessage { payload, .. }
+                    if payload.custom_type == "autonomous_status"
+            )));
+        let stderr = run
+            .exit_stderr()
+            .await
+            .expect("the limit stop exits non-zero");
+        assert!(stderr.starts_with("Autonomous run stopped before terminal evidence;"));
     }
 
     /// A capturing sink for json-mode event verification.

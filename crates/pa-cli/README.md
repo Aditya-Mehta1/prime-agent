@@ -21,17 +21,21 @@ checks (`print_boundary.rs` — the overflow compact-and-retry arm, the
 model-requested compaction/refinement consumption, and the threshold arm,
 the TS `_checkCompaction` flow), the json event stream, and the headless
 terminal selection (stdout/stderr/exit code) mirroring modes/print-mode.ts.
-Every turn the loop issues crosses the boundary pair: the autonomous
-continuation loop (`headless_autonomous.rs`) admits its follow-up turns
-through `TurnBoundary::admit_continuation`, so continuation turns run the
-same arms CLI prompts do (TS: the session loop owns the arms).
+Autonomous continuation (print_autonomous.rs, the #254 follow-up): the
+composed in-run continuation hook (the pa-agent loop's
+`getContinuationMessages` seam) runs the natural continuations inside
+the one agent run (the TS shape: `turn_end` -> `turn_start` with the
+continuation user row between them, no run boundary); the goal arm runs
+first (exclusive priority), the boundary gates (queued input, a
+requested compaction, the threshold arm) are shared, and a threshold
+compaction holds its minted continuation for the boundary's queued
+`followUp` admission (`TurnBoundary::admit_continuation`). The stop
+surfaces only through the headless exit contract (TS: no row, no frame).
 Goal continuation (print_goal.rs, the #252 residue): the `--goal` seed rides
-the first turn; the in-loop continuation hook (the pa-agent loop's
-`getContinuationMessages` seam) runs an active goal's natural continuations
-inside the one agent run; the budget-limit steer and the threshold-held
-continuation drain as this invocation's follow-up runs with the TS
-session-action phase frames. The goal has exclusive priority over the
-autonomous arm (TS `_getContinuationMessages`).
+the first turn; the in-loop continuation hook runs an active goal's natural
+continuations inside the one agent run; the budget-limit steer and the
+threshold-held continuation drain as this invocation's follow-up runs
+with the TS session-action phase frames.
 Session slash commands (`print_session_command.rs`, the #253 residue): print
 prompts that are `/compact`, `/refine`, `/goal`, or `/autonomous` execute
 through the pa-core session-command executor (the daemon worker's seam — no

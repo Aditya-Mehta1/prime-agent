@@ -70,6 +70,24 @@ enum QueueLane {
     FollowUp,
 }
 
+/// The goal arm's consult outcome for the composed natural-turn-end hook.
+pub(crate) enum NaturalContinuation {
+    /// Queued session input owns the boundary (the armed budget steer): no
+    /// turn mints, the run ends so the queue drains.
+    QueuedInput,
+    /// A pending requested compaction consumes the stop: no mint, the
+    /// boundary consumes the request.
+    RequestedCompaction,
+    /// A threshold compaction is due: the loop stops (any owed mint is held
+    /// for the post-compaction admission), the boundary compacts.
+    ThresholdDue,
+    /// The goal minted its next continuation row (the hook runs it inside
+    /// the same agent run).
+    GoalRow(Box<pa_agent::types::AgentMessage>),
+    /// No goal work owns the boundary: the autonomous arm may consult.
+    FallThrough,
+}
+
 /// One queued goal turn's stream bookkeeping.
 struct QueuedGoalTurn {
     message: CustomMessage,
@@ -382,7 +400,7 @@ impl PrintGoalSurface {
     /// (rows appended outside the agent loop — the session-command echo,
     /// result, and status rows).
     pub(crate) fn emit_row_pair(&self, row: &CustomMessage) {
-        let value = crate::headless_autonomous::stop_row_wire_value(row);
+        let value = crate::headless_autonomous::custom_row_wire_value(row);
         for event_type in ["message_start", "message_end"] {
             self.emit(json!({ "type": event_type, "message": value }));
         }
@@ -499,71 +517,58 @@ impl PrintGoalSurface {
             .await
     }
 
-    /// Install the in-loop goal continuation hook (TS
-    /// `_installAgentContinuationHook` -> `_getContinuationMessages`'s goal
-    /// arm): at each natural turn end the hook mints the goal's next
-    /// continuation turn and runs it inside the same agent run. Queued input
-    /// (the armed steer) and a compaction due (requested or threshold, TS
-    /// `_shouldStopForThresholdCompaction` stopping the loop) defer to the
-    /// turn boundary instead; the threshold arm mints its continuation ahead
-    /// of the compaction and holds it for the driver (TS
-    /// `_queueGoalContinuationForThresholdCompaction`).
-    pub(crate) fn wire_continuation_hook(
+    /// The goal arm of the natural-turn-end consult (TS
+    /// `_getContinuationMessages`'s goal arm plus its boundary gates): at
+    /// each natural turn end, queued input (the armed steer) and a
+    /// compaction due (requested or threshold, TS
+    /// `_shouldStopForThresholdCompaction` stopping the loop) gate the mint
+    /// — the threshold arm mints the goal's continuation ahead of the
+    /// compaction and holds it for the driver (TS
+    /// `_queueGoalContinuationForThresholdCompaction`) — and an active goal
+    /// mints its next continuation turn, which the composed hook runs
+    /// inside the same agent run. [`NaturalContinuation::FallThrough`]
+    /// hands the boundary to the autonomous arm.
+    pub(crate) async fn natural_continuation(
+        &self,
         engine: &Arc<SessionEngine>,
-        agent: &Arc<Agent>,
-        model: &pa_types::ai::Model,
-        surface: &Arc<Self>,
-    ) {
-        let weak_engine = Arc::downgrade(engine);
-        let weak_surface = Arc::downgrade(surface);
-        let context_window = model.context_window;
-        agent.set_continuation_hook(Some(Arc::new(move |_context, _signal| {
-            let weak_engine = weak_engine.clone();
-            let weak_surface = weak_surface.clone();
-            Box::pin(async move {
-                let (Some(engine), Some(surface)) = (weak_engine.upgrade(), weak_surface.upgrade())
-                else {
-                    return Ok(Vec::new());
-                };
-                // TS `_getContinuationMessages`: queued session input owns
-                // the boundary before any goal work — the armed budget steer
-                // ends the run so the queue drains it.
-                if surface.queued.lock().await.is_some() {
-                    return Ok(Vec::new());
+        context_window: u64,
+    ) -> NaturalContinuation {
+        // TS `_getContinuationMessages`: queued session input owns
+        // the boundary before any goal work — the armed budget steer
+        // ends the run so the queue drains it.
+        if self.queued.lock().await.is_some() {
+            return NaturalContinuation::QueuedInput;
+        }
+        // A pending requested compaction consumes the stop (TS
+        // `_shouldStopForThresholdCompaction`'s first arm): no mint,
+        // the boundary consumes the request.
+        if engine.turn_boundary.compaction_scheduled().await {
+            return NaturalContinuation::RequestedCompaction;
+        }
+        // The threshold arm: the crossing turn mints BEFORE the loop
+        // stops (the mint's `goal_update` and queue frame land between
+        // `turn_end` and `agent_end`, the TS event order); the boundary
+        // compacts, and the driver runs the held turn as the
+        // post-compaction turn.
+        if engine.session.auto_compaction_due(context_window).await {
+            if let Some(message) = engine.mint_goal_continuation().await {
+                self.publish_goal_update(engine).await;
+                self.hold_threshold_continuation(message).await;
+            }
+            return NaturalContinuation::ThresholdDue;
+        }
+        // The natural continuation mint: the goal's context turn runs
+        // as the next turn of the same run (TS pendingMessages).
+        match engine.mint_goal_continuation().await {
+            Some(message) => {
+                self.publish_goal_update(engine).await;
+                match custom_message_to_loop_row(&message) {
+                    Some(row) => NaturalContinuation::GoalRow(Box::new(row)),
+                    None => NaturalContinuation::FallThrough,
                 }
-                // A pending requested compaction consumes the stop (TS
-                // `_shouldStopForThresholdCompaction`'s first arm): no mint,
-                // the boundary consumes the request.
-                if engine.turn_boundary.compaction_scheduled().await {
-                    return Ok(Vec::new());
-                }
-                // The threshold arm: the crossing turn mints BEFORE the loop
-                // stops (the mint's `goal_update` and queue frame land between
-                // `turn_end` and `agent_end`, the TS event order); the boundary
-                // compacts, and the driver runs the held turn as the
-                // post-compaction turn.
-                if engine.session.auto_compaction_due(context_window).await {
-                    if let Some(message) = engine.mint_goal_continuation().await {
-                        surface.publish_goal_update(&engine).await;
-                        surface.hold_threshold_continuation(message).await;
-                    }
-                    return Ok(Vec::new());
-                }
-                // The natural continuation mint: the goal's context turn runs
-                // as the next turn of the same run (TS pendingMessages).
-                match engine.mint_goal_continuation().await {
-                    Some(message) => {
-                        surface.publish_goal_update(&engine).await;
-                        match custom_message_to_loop_row(&message) {
-                            Some(row) => Ok(vec![row]),
-                            None => Ok(Vec::new()),
-                        }
-                    }
-                    None => Ok(Vec::new()),
-                }
-            })
-                as pa_agent::BoxFut<'static, anyhow::Result<Vec<pa_agent::types::AgentMessage>>>
-        })));
+            }
+            None => NaturalContinuation::FallThrough,
+        }
     }
 
     /// The settled boundary's goal drain (the print driver's queue loop):
@@ -906,7 +911,16 @@ mod tests {
         let accounting = surface
             .wire_accounting(&engine, engine.session.agent())
             .await;
-        PrintGoalSurface::wire_continuation_hook(&engine, engine.session.agent(), &model, &surface);
+        let autonomous_run = std::sync::Arc::new(
+            crate::headless_autonomous::HeadlessAutonomous::disabled(dir.path()),
+        );
+        crate::print_autonomous::wire_continuation_hook(
+            &engine,
+            engine.session.agent(),
+            &model,
+            &surface,
+            &autonomous_run,
+        );
         let harness_dir = dir.path().join("harness");
         GoalBed {
             engine,
@@ -915,6 +929,7 @@ mod tests {
             frames,
             harness_dir,
             _accounting: accounting,
+            _autonomous_run: autonomous_run,
             _dir: dir,
         }
     }
@@ -926,6 +941,9 @@ mod tests {
         frames: Frames,
         harness_dir: std::path::PathBuf,
         _accounting: pa_agent::agent::Subscription,
+        /// Keeps the composed hook's autonomous arm alive for the bed's
+        /// lifetime (the hook holds it weakly).
+        _autonomous_run: Arc<crate::headless_autonomous::HeadlessAutonomous>,
         _dir: tempfile::TempDir,
     }
 
@@ -1437,7 +1455,16 @@ mod tests {
         let accounting = surface
             .wire_accounting(&engine, engine.session.agent())
             .await;
-        PrintGoalSurface::wire_continuation_hook(&engine, engine.session.agent(), &model, &surface);
+        let autonomous_run = std::sync::Arc::new(
+            crate::headless_autonomous::HeadlessAutonomous::disabled(dir.path()),
+        );
+        crate::print_autonomous::wire_continuation_hook(
+            &engine,
+            engine.session.agent(),
+            &model,
+            &surface,
+            &autonomous_run,
+        );
         GoalBed {
             engine,
             model,
@@ -1445,6 +1472,7 @@ mod tests {
             frames,
             harness_dir: dir.path().join("harness"),
             _accounting: accounting,
+            _autonomous_run: autonomous_run,
             _dir: dir,
         }
     }

@@ -203,12 +203,16 @@ supervisor-routed). Verifier: `scripts/battery/streaming_render.py`
 
 Autonomous
 continuation driving in the worker's engine: per-message usage accounting
-runs in the agent-loop subscription, and after every settled turn the
-engine consults the pa-core `AutonomousDriver` policy (product default:
-shell quality gates in the session cwd; deterministic drivers injectable
-for eval harnesses) — continuations are injected as durable user rows
-and gate pass/fail or limit stops surface as durable `autonomous_status`
-custom rows.
+runs in the agent-loop subscription, and the in-run continuation hook
+(`autonomous_continuation.rs`) consults the pa-core `AutonomousDriver`
+policy at the agent loop's natural turn end (product default: shell
+quality gates in the session cwd; deterministic drivers injectable for
+eval harnesses) — continuations mint as durable user rows churned
+inside the one prompt wait (the TS `getContinuationMessages` shape), a
+threshold compaction holds its minted continuation for the worker's
+queued `followUp` admission, and gate pass/fail or limit stops surface no
+row (the headless status request and the print exit contract carry
+them).
 
 Live MCP product-path verifier
 (`tests/mcp_product_path_e2e.rs`): a settings-declared stdio MCP server

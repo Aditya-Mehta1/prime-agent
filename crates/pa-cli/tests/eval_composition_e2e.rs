@@ -136,11 +136,12 @@ fn parse_events(stdout: &str) -> Vec<Value> {
 }
 
 /// The verifier-driven session completing: the first turn fails the fixture
-/// verifier, the gate-failure continuation drives a second turn, the second
-/// consult passes, and the run stops with the durable stop row surfaced as
-/// structured events and session rows.
+/// verifier, the gate-failure continuation drives a second turn IN-RUN (the
+/// TS shape: no run boundary between continuation turns), the second
+/// consult passes, and the run stops without a row (the TS shape, probed
+/// against the binary: the stop surfaces through the exit contract only).
 #[test]
-fn verifier_gate_pass_stops_the_run_with_structured_events_and_durable_rows() {
+fn verifier_gate_pass_stops_the_run_with_structured_events_in_run() {
     let home = isolated_home();
     let verifier = pass_on_second_consult_verifier(home.path());
     let script = json!({ "responses": ["first attempt", "fixed it"] });
@@ -201,33 +202,44 @@ fn verifier_gate_pass_stops_the_run_with_structured_events_and_durable_rows() {
         "verifier output surfaced: {continuation}"
     );
 
-    // The stop row streamed as message_start + message_end custom events.
-    let stop_events: Vec<&Value> = events
-        .iter()
-        .filter(|event| {
-            event["type"] == "message_end"
-                && event["message"]["role"] == "custom"
-                && event["message"]["customType"] == "autonomous_status"
-        })
-        .collect();
-    assert_eq!(stop_events.len(), 1, "events: {events:?}");
-    let stop = &stop_events[0]["message"];
-    assert_eq!(
-        stop["content"],
-        "[autonomous-stop: gate-passed] All autonomous quality gates passed."
+    // The stop surfaces no row (the TS shape, probed against the binary):
+    // no autonomous_status event on the stream, and the run's single
+    // `agent_end` closes it (the continuation churned inside the one run).
+    assert!(
+        !events
+            .iter()
+            .any(|event| { event["message"]["customType"] == "autonomous_status" }),
+        "events: {events:?}"
     );
-    assert_eq!(stop["display"], true);
-    assert_eq!(stop["details"]["stopReason"], "gate_passed");
-    assert_eq!(stop["details"]["turnsUsed"], 2, "per-turn accounting");
-    assert_eq!(stop["details"]["continuationsUsed"], 1);
-    assert!(events.iter().any(|event| {
-        event["type"] == "message_start" && event["message"]["customType"] == "autonomous_status"
-    }));
-    // The stop row is the last event pair: the run ends with the stop.
-    assert_eq!(events.last().unwrap()["type"], "message_end");
+    let agent_ends = events
+        .iter()
+        .filter(|event| event["type"] == "agent_end")
+        .count();
+    assert_eq!(agent_ends, 1, "one run for the whole loop: {events:?}");
+    assert_eq!(events.last().unwrap()["type"], "agent_end");
+    // The in-run ordering (the TS frame order): the continuation's user row
+    // pair is preceded by the continuation turn's `turn_start`, which
+    // follows the settled turn's `turn_end`.
+    let continuation_index = events
+        .iter()
+        .position(|event| {
+            event["type"] == "message_end"
+                && event["message"]["role"] == "user"
+                && text_of(&event["message"]).starts_with("[autonomous-continuation: gate-failed]")
+        })
+        .expect("the continuation's wire pair");
+    let preceding: Vec<&str> = events[..continuation_index]
+        .iter()
+        .filter_map(|event| event.get("type").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        preceding.iter().rev().take(3).copied().collect::<Vec<_>>(),
+        vec!["message_start", "turn_start", "turn_end"],
+        "turn_end -> turn_start -> the continuation row, events: {events:?}"
+    );
 
     // The durable session rows: the continuation is a user entry, the stop
-    // is a custom_message entry with the accounting snapshot.
+    // wrote no custom entry.
     let files = session_files(home.path());
     assert_eq!(files.len(), 1, "one session file, got {files:?}");
     let entries = read_entries(&files[0]);
@@ -240,23 +252,18 @@ fn verifier_gate_pass_stops_the_run_with_structured_events_and_durable_rows() {
         })
         .collect();
     assert_eq!(durable_continuations.len(), 1, "entries: {entries:?}");
-    let durable_stops: Vec<&Value> = entries
-        .iter()
-        .filter(|entry| {
-            entry["type"] == "custom_message" && entry["customType"] == "autonomous_status"
-        })
-        .collect();
-    assert_eq!(durable_stops.len(), 1, "entries: {entries:?}");
-    assert_eq!(
-        durable_stops[0]["content"],
-        "[autonomous-stop: gate-passed] All autonomous quality gates passed."
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["type"] == "custom_message"
+                && entry["customType"] == "autonomous_status"),
+        "entries: {entries:?}"
     );
-    assert_eq!(durable_stops[0]["details"]["stopReason"], "gate_passed");
 }
 
 /// A verifier that never passes exhausts its retry window: the process exits
 /// one, the TS print-mode stderr line names the attempt and exit code, and
-/// the retry-exhausted stop row is durable.
+/// the stop writes no row (the exit contract carries it).
 #[test]
 fn verifier_gate_failure_exhausts_retries_and_exits_one() {
     let home = isolated_home();
@@ -292,42 +299,28 @@ fn verifier_gate_failure_exhausts_retries_and_exits_one() {
         "stdout is all json events: {stdout}"
     );
     let events = parse_events(&stdout);
-    let stops: Vec<&Value> = events
-        .iter()
-        .filter(|event| {
-            event["type"] == "message_end"
-                && event["message"]["role"] == "custom"
-                && event["message"]["customType"] == "autonomous_status"
-        })
-        .collect();
-    assert_eq!(stops.len(), 1, "events: {events:?}");
-    let stop = &stops[0]["message"];
+    // The stop surfaces no row (the TS shape): the stream carries no
+    // autonomous_status event and the store no custom entry — the stderr
+    // line and the exit code carry the retry-exhausted stop.
     assert!(
-        stop["content"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("[autonomous-stop: retry-exhausted]"),
-        "stop content: {stop}"
+        !events
+            .iter()
+            .any(|event| event["message"]["customType"] == "autonomous_status"),
+        "events: {events:?}"
     );
-    assert_eq!(stop["details"]["stopReason"], "retry_exhausted");
-    assert_eq!(stop["details"]["lastGateFailure"]["attempt"], 2);
-
-    // The retry-exhausted stop is durable.
     let files = session_files(home.path());
     let entries = read_entries(&files[0]);
-    let durable_stops: Vec<&Value> = entries
-        .iter()
-        .filter(|entry| {
-            entry["type"] == "custom_message" && entry["customType"] == "autonomous_status"
-        })
-        .collect();
-    assert_eq!(durable_stops.len(), 1, "entries: {entries:?}");
-    assert_eq!(durable_stops[0]["details"]["stopReason"], "retry_exhausted");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["type"] == "custom_message"
+                && entry["customType"] == "autonomous_status"),
+        "entries: {entries:?}"
+    );
 }
 
 /// Text mode prints the final answer on a passing verifier run, and stays
-/// quiet about the autonomous machinery (the stop row is durable, not
-/// printed).
+/// quiet about the autonomous machinery (the stop writes nothing).
 #[test]
 fn text_mode_verifier_pass_prints_the_final_answer() {
     let home = isolated_home();
@@ -348,14 +341,22 @@ fn text_mode_verifier_pass_prints_the_final_answer() {
     assert_eq!(stdout, "fixed it\n");
     assert!(stderr.is_empty(), "stderr: {stderr}");
 
-    // The stop row is durable even though it never printed.
+    // The stop wrote no row (the TS shape); the continuation is the only
+    // autonomous surface in the store.
     let files = session_files(home.path());
     let entries = read_entries(&files[0]);
     assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["type"] == "custom_message"
+                && entry["customType"] == "autonomous_status"),
+        "entries: {entries:?}"
+    );
+    assert!(
         entries.iter().any(|entry| {
-            entry["type"] == "custom_message"
-                && entry["customType"] == "autonomous_status"
-                && entry["details"]["stopReason"] == "gate_passed"
+            entry["type"] == "message"
+                && entry["message"]["role"] == "user"
+                && text_of(&entry["message"]).starts_with("[autonomous-continuation: gate-failed]")
         }),
         "entries: {entries:?}"
     );
@@ -363,9 +364,9 @@ fn text_mode_verifier_pass_prints_the_final_answer() {
 
 /// The autonomous contract without gates: a budget limit stops the run and
 /// the process exits one with the TS "stopped before terminal evidence"
-/// line; the limit stop row is durable.
+/// line; the stop writes no row.
 #[test]
-fn autonomous_limit_without_gates_exits_one_with_limit_stop_row() {
+fn autonomous_limit_without_gates_exits_one_without_a_row() {
     let home = isolated_home();
     let script = json!({ "responses": ["still working", "more work"] });
     let (stdout, stderr, code) = run(
@@ -389,14 +390,21 @@ fn autonomous_limit_without_gates_exits_one_with_limit_stop_row() {
     );
     let files = session_files(home.path());
     let entries = read_entries(&files[0]);
-    let stops: Vec<&Value> = entries
-        .iter()
-        .filter(|entry| {
-            entry["type"] == "custom_message" && entry["customType"] == "autonomous_status"
-        })
-        .collect();
-    assert_eq!(stops.len(), 1, "entries: {entries:?}");
-    assert_eq!(stops[0]["details"]["stopReason"], "maxContinuations");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["type"] == "custom_message"
+                && entry["customType"] == "autonomous_status"),
+        "entries: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|entry| {
+            entry["type"] == "message"
+                && entry["message"]["role"] == "user"
+                && text_of(&entry["message"]).starts_with("[autonomous-continuation]")
+        }),
+        "entries: {entries:?}"
+    );
 }
 
 /// Verifier observation without autonomous flags: nothing changes — the

@@ -244,6 +244,14 @@ impl AgentSession {
         self.compaction.enabled
     }
 
+    /// The resolved compaction settings (TS `getCompactionSettings`): the
+    /// in-run continuation consult reads the threshold headroom without
+    /// owning the session (a compaction in flight owns it across its
+    /// model turn).
+    pub fn compaction_settings(&self) -> &compaction::CompactionSettings {
+        &self.compaction
+    }
+
     /// The latest compaction boundary in the live loop context, if any
     /// (the TS `getLatestCompactionEntry` guard source): the timestamp of
     /// the newest compaction summary in the agent state.

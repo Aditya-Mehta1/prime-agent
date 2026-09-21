@@ -342,7 +342,8 @@ Verifier flows ride existing product seams - CLI autonomous flags
 (`--autonomous`, `--autonomous-gate <command>`, ...) driving a session
 headlessly, the configured gate command being the verifier (run in the
 session cwd with retries/timeouts, `pa-core/autonomous`, #98), completion
-observed through durable `autonomous_status` rows, the json event stream, or
+observed through the json event stream (the in-run continuation turns, the
+autonomous-ordering lane), the headless stderr exit contract, or
 ACP `_meta.autonomous`.
 
 Landed with this lane: the headless print/json composition (pa-cli

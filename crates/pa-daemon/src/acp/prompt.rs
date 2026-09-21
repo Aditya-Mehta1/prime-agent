@@ -8,9 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use pa_core::autonomous::{
-    autonomous_stop_row, AgentAutonomousStatus, AutonomousFollowUp, AutonomousStopReason,
-};
+use pa_core::autonomous::{AgentAutonomousStatus, AutonomousFollowUp, AutonomousStopReason};
 use pa_core::session_engine::session_commands::execute_session_command;
 use pa_core::session_engine::session_commands::SessionCommandParams;
 use pa_core::session_engine::{PromptOptions, PromptOutcome, StreamingBehavior};
@@ -389,7 +387,9 @@ async fn run_prompt_turn(
                         mode.engine.session.agent().wait_for_idle().await;
                     }
                     AutonomousFollowUp::Stop { reason, status } => {
-                        persist_autonomous_stop_row(&mode, &reason, &status).await;
+                        // The stop writes no row (the TS shape): the stop
+                        // reason and status ride the completion update and
+                        // the response's stop reason.
                         autonomous_stop = Some((reason, status));
                         break;
                     }
@@ -561,25 +561,6 @@ async fn publish_engine_event(session: &Arc<AcpSession>, event: &events::AcpEngi
             .publish(&update, turn_id, PrimeAgentEventPhase::Event, None)
             .await;
     }
-}
-
-/// Persist the durable autonomous stop row the way the session-command
-/// executor persists its rows: same session state, same flush.
-async fn persist_autonomous_stop_row(
-    mode: &AcpModeState,
-    reason: &pa_core::autonomous::AutonomousStopReason,
-    status: &AgentAutonomousStatus,
-) {
-    let row = autonomous_stop_row(reason, status);
-    let session = mode.engine.session.shared_persistence();
-    let mut session = session.lock().await;
-    session.append_custom_message(
-        &row.custom_type,
-        row.content.clone(),
-        row.display,
-        row.details.clone(),
-    );
-    session.flush_now();
 }
 
 /// Settle one finished turn: the correlated boundary envelope, the response,

@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot, Notify};
 
 use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine, SupervisorLinkConfig};
+use crate::autonomous_continuation::AUTONOMOUS_QUEUE_KEY;
 use crate::engine::{
     EngineEvent, EngineModelSelection, PromptRequest, RlmSessionIdentity, ScriptedEngine,
     SessionEngine,
@@ -779,6 +780,33 @@ impl Worker {
             // registry's settle hook (registered inside) delivers a
             // continuation owed behind descendant work.
             if let Some(concrete) = agent_engine.as_ref() {
+                // The in-run autonomous continuation seam (TS
+                // `getContinuationMessages` -> the autonomous arm): the
+                // engine's hook holds itself weakly through the registered
+                // arc, and the held threshold continuation admits through
+                // the worker's follow-up lane (`/autonomous off` withdraws
+                // it, TS `_clearQueuedAutonomousContinuations`).
+                concrete.register_arc();
+                let sink_core = Arc::clone(&core);
+                let sink_notify = Arc::clone(&work_notify);
+                let autonomous_sink: crate::agent_engine::AutonomousAdmission = {
+                    let sink_core = Arc::clone(&sink_core);
+                    let sink_notify = Arc::clone(&sink_notify);
+                    std::sync::Arc::new(move |text| {
+                        admit_autonomous_follow_up(&sink_core, &sink_notify, text);
+                    })
+                };
+                concrete.set_autonomous_admission(autonomous_sink);
+                let purge_core = Arc::clone(&core);
+                let autonomous_purge: std::sync::Arc<dyn Fn() + Send + Sync> =
+                    std::sync::Arc::new(move || {
+                        let mut core = purge_core.lock().unwrap();
+                        core.follow_up
+                            .retain(|item| item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY));
+                        core.steering
+                            .retain(|item| item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY));
+                    });
+                concrete.set_autonomous_queue_purge(autonomous_purge);
                 let probe_core = Arc::clone(&core);
                 let probe: crate::engine::SessionInputProbe = Arc::new(move || {
                     let core = probe_core.lock().unwrap();
@@ -3738,6 +3766,30 @@ pub(crate) fn emit_worker_event_with(
 /// minted turn queues into its lane (the steering lane for the
 /// budget-limit wrap-up steer, the follow-up lane for the continuation),
 /// and the runner wakes (`resumeIfIdle`).
+/// Admit one held autonomous continuation through the follow-up lane (TS
+/// `_queueAutonomousContinuationForThresholdCompaction`'s queued `followUp`
+/// admission): the runner wakes, the item runs as its own queue item after
+/// the current run settles.
+pub(crate) fn admit_autonomous_follow_up(
+    core: &Arc<Mutex<SessionCore>>,
+    work_notify: &Arc<Notify>,
+    text: String,
+) {
+    {
+        let mut core = core.lock().unwrap();
+        core.follow_up.push_back(QueuedItem {
+            message: text,
+            custom_message: None,
+            agent_message: None,
+            queue_key: Some(AUTONOMOUS_QUEUE_KEY.to_string()),
+            admission_id: None,
+            images: Vec::new(),
+            done: None,
+        });
+    }
+    work_notify.notify_waiters();
+}
+
 pub(crate) fn admit_goal_follow_up(
     core: &Arc<Mutex<SessionCore>>,
     events: &Arc<EventPump>,

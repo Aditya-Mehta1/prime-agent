@@ -98,6 +98,13 @@ pub(crate) fn run_session_command(
     if is_compact && !emit_compact_end(&command, &execution, emit) {
         return None;
     }
+    // `/autonomous` (either flip): the previous run's owed continuations
+    // clear (TS `_handleAutonomousSlashCommand`: the off branch drops the
+    // queued and held turns, the on branch resets the run state; the
+    // durable status row follows with the new state).
+    if command.name == "autonomous" {
+        engine.clear_autonomous_continuations();
+    }
     // The executor's first row is the echo (already emitted); the rest of
     // the durable rows follow in order.
     for message in execution.messages.iter().skip(1) {

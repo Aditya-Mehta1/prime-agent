@@ -59,7 +59,12 @@ impl AgentSessionEngine {
         let weak = Arc::downgrade(self);
         children.set_settle_hook(Arc::new(move || {
             if let Some(engine) = weak.upgrade() {
+                // The settle site retries both owed continuations (TS
+                // `_maybeResumeGoalContinuationAfterRlmWork` and
+                // `_maybeResumeAutonomousContinuationAfterRlmWork` share
+                // the RLM settle sites).
                 engine.retry_owed_goal_continuation();
+                engine.retry_owed_autonomous_continuation();
             }
         }));
     }
@@ -171,7 +176,7 @@ impl AgentSessionEngine {
     /// The worker's session-input probe: `true` while queued user work or
     /// the queued-input suspension owns the next turn boundary. An
     /// unwired probe (engine without a worker) answers `false`.
-    fn session_input_queued(&self) -> bool {
+    pub(crate) fn session_input_queued(&self) -> bool {
         self.goal_input_probe
             .lock()
             .expect("goal probe lock")

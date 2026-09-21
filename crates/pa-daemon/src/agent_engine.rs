@@ -16,7 +16,6 @@ use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveControl
 use crate::overflow_compaction::{OverflowArmRun, OverflowRecovery};
 use pa_agent::abort::AbortController;
 use pa_agent::types::StopReason;
-use pa_core::autonomous::AutonomousFollowUp;
 use pa_core::kernel::shared::HostRequestHandlers;
 use pa_core::session_engine::agent_messaging::{
     register_agent_message_host_handlers, register_agent_observe_host_handlers,
@@ -81,6 +80,10 @@ pub struct SupervisorLinkConfig {
     pub worker_token: String,
 }
 
+/// The worker's autonomous admission sink: a held threshold continuation's
+/// text, queued into the worker's follow-up lane.
+pub(crate) type AutonomousAdmission = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+
 /// The goal driver and session-manager handles mirrored from the core
 /// session (see `AgentSessionEngine::goal_runtime`).
 #[derive(Clone)]
@@ -133,6 +136,14 @@ pub struct AgentSessionEngine {
     /// abort request from the worker must reach the agent's run controller
     /// without locking it.
     turn_agent: std::sync::Mutex<Option<std::sync::Arc<pa_agent::agent::Agent>>>,
+    /// The in-run autonomous consult's deadlock-free mirror (see
+    /// [`crate::autonomous_continuation`]): the shared turn-boundary slot,
+    /// agent, and compaction settings the consult reads without ever
+    /// taking the session mutex — a compaction run holds that mutex
+    /// across its model turn, and the consult runs inside one (an agent
+    /// turn the loop drives mid-run).
+    pub(crate) autonomous_boundary:
+        std::sync::Mutex<Option<crate::autonomous_continuation::AutonomousBoundaryMirror>>,
     /// The worker-owned session file (conversation-log path), set at create.
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection. Starts from the process fallback
@@ -187,11 +198,36 @@ pub struct AgentSessionEngine {
     /// every settled turn. Product default: the shell-gate driver in the
     /// session cwd; deterministic harnesses replace it through
     /// [`AgentSessionEngine::set_autonomous_driver`].
-    autonomous_driver: std::sync::RwLock<std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>>,
+    pub(crate) autonomous_driver:
+        std::sync::RwLock<std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>>,
     /// Whether `autonomous_driver` still holds the product default (no
     /// harness replaced it): a cwd rebind swaps the default shell driver
     /// (it runs in the session cwd) but must keep an injected one.
     autonomous_driver_default: std::sync::atomic::AtomicBool,
+    /// The continuation the in-run hook's threshold arm minted ahead of the
+    /// boundary's compaction (TS
+    /// `_queueAutonomousContinuationForThresholdCompaction`): held for the
+    /// queued `followUp` admission the turn loop hands to the worker's
+    /// queue lanes once the boundary arms ran.
+    pub(crate) held_autonomous_continuation: std::sync::Mutex<Option<String>>,
+    /// The worker's autonomous admission sink: the turn loop hands the held
+    /// continuation to it at the settled boundary (the worker queues it in
+    /// the follow-up lane and wakes the turn runner).
+    pub(crate) autonomous_admission: std::sync::Mutex<Option<AutonomousAdmission>>,
+    /// Whether the in-run hook deferred the natural continuation behind
+    /// unsettled RLM descendant work (TS `_autonomousContinuationAwaitsRlmWork`):
+    /// the children registry's settle hook delivers the owed continuation.
+    pub(crate) autonomous_awaits_rlm_work: std::sync::atomic::AtomicBool,
+    /// The engine's own arc, registered by the worker after construction:
+    /// the in-run autonomous continuation hook upgrades the weak so the
+    /// agent's loop never pins the engine (the goal seam's pattern, held
+    /// by the worker's queue instead).
+    pub(crate) self_weak: std::sync::Mutex<Option<std::sync::Weak<AgentSessionEngine>>>,
+    /// The worker's queue purge for held autonomous continuations (TS
+    /// `_clearQueuedAutonomousContinuations`): `/autonomous off` withdraws
+    /// the queued `followUp` item the threshold arm admitted.
+    pub(crate) autonomous_queue_purge:
+        std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     /// The session's live working directory (TS the runtime's `cwd`, rebuilt
     /// per replacement): seeds the core session build (the kernel-resident
     /// tools run there), the settings reads, and the MCP settings
@@ -337,6 +373,7 @@ impl AgentSessionEngine {
             goal_admission_sink: std::sync::Mutex::new(None),
             goal_queue_purge: std::sync::Mutex::new(None),
             turn_agent: std::sync::Mutex::new(None),
+            autonomous_boundary: std::sync::Mutex::new(None),
             session_file,
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
@@ -352,6 +389,11 @@ impl AgentSessionEngine {
             children,
             autonomous_driver,
             autonomous_driver_default: std::sync::atomic::AtomicBool::new(true),
+            held_autonomous_continuation: std::sync::Mutex::new(None),
+            autonomous_admission: std::sync::Mutex::new(None),
+            autonomous_awaits_rlm_work: std::sync::atomic::AtomicBool::new(false),
+            self_weak: std::sync::Mutex::new(None),
+            autonomous_queue_purge: std::sync::Mutex::new(None),
             cwd,
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
@@ -413,6 +455,21 @@ impl AgentSessionEngine {
     /// branch and the session would start off the moved branch's entries.
     async fn adopt_built_session(&self, built: &CoreSessionEngine) -> anyhow::Result<()> {
         self.mirror_goal_runtime(built);
+        // The in-run consult's mirror (deadlock-free reads: the session
+        // mutex is held across compaction model turns, and the consult
+        // runs inside one of them).
+        *self
+            .autonomous_boundary
+            .lock()
+            .expect("autonomous boundary lock") =
+            Some(crate::autonomous_continuation::AutonomousBoundaryMirror {
+                turn_boundary: std::sync::Arc::clone(&built.turn_boundary),
+                agent: std::sync::Arc::clone(built.session.agent()),
+                compaction: *built.session.compaction_settings(),
+            });
+        // The in-run autonomous continuation hook (the natural mint rides
+        // the agent loop; the goal seam keeps its own boundary mint).
+        self.install_autonomous_continuation_hook_on(built.session.agent());
         // The eager-abort target rides the same mirror (see
         // [`Self::turn_agent`]).
         *self.turn_agent.lock().expect("turn agent lock") =
@@ -508,6 +565,10 @@ impl AgentSessionEngine {
         let built = self.session.lock().await.take();
         *self.goal_runtime.lock().expect("goal runtime lock") = None;
         *self.turn_agent.lock().expect("turn agent lock") = None;
+        *self
+            .autonomous_boundary
+            .lock()
+            .expect("autonomous boundary lock") = None;
         *self.published_goal.lock().expect("published goal lock") = None;
         if let Some(engine) = built {
             // The session's telemetry ends with it (the TS dispose
@@ -2784,7 +2845,7 @@ impl AgentSessionEngine {
         // images, or an injected custom row); every autonomous follow-up
         // turn runs text-only (the TS driver regenerates from the loop
         // state, never re-sending attachments).
-        let mut prompt = first;
+        let prompt = first;
         let mut overflow_retry = false;
         // Whether a loop-boundary frame already passed in this runner item
         // (a `turn_end` of an inner turn or an `agent_end` of an earlier
@@ -2813,15 +2874,17 @@ impl AgentSessionEngine {
             // The overflow compact-and-retry re-issues the loop without a
             // new user message; every other iteration runs a fresh prompt
             // (autonomous continuations are real user rows).
-            let admission = if overflow_retry {
-                overflow_retry = false;
+            // `mem::take` clears the retry slot as it reads it (the
+            // slot's cleared value is never read back on the loop's
+            // exits, so a plain clear would be a dead store).
+            let admission = if std::mem::take(&mut overflow_retry) {
                 TurnAdmission::Continue
             } else {
                 TurnAdmission::FreshPrompt
             };
             let turn = self.run_model_turn(admission, &prompt, &boundary_passed, aborted, emit);
-            let assistant = match turn {
-                TurnResult::Message(assistant) => {
+            match turn {
+                TurnResult::Message(_assistant) => {
                     // A settled non-error turn resets the overflow
                     // recovery state (TS resets at every non-error
                     // assistant message end) and counts into the
@@ -2830,7 +2893,6 @@ impl AgentSessionEngine {
                     // increment).
                     self.reset_overflow_recovery();
                     self.note_settled_turn_since_auto_refine_review();
-                    assistant
                 }
                 // An aborted turn never services boundary requests (TS
                 // `_checkCompaction` abort arm): drop any pending ones so
@@ -2932,58 +2994,34 @@ impl AgentSessionEngine {
                     GoalBoundary::Proceed => {}
                 }
             }
-            match self.autonomous_follow_up(&assistant) {
-                AutonomousFollowUp::Inactive => {
-                    emit(EngineEvent::Done(Ok(())));
-                    return;
-                }
-                AutonomousFollowUp::Continue { text } => {
-                    if aborted()
-                        || !emit(EngineEvent::UserMessage(json!({
-                            "role": "user",
-                            "content": [{ "type": "text", "text": text }],
-                            "timestamp": now_millis(),
-                        })))
-                    {
-                        emit(EngineEvent::Done(Err("No response produced.".to_string())));
-                        return;
-                    }
-                    prompt = TurnPrompt::User {
-                        text,
-                        images: Vec::new(),
-                    };
-                }
-                AutonomousFollowUp::Stop { reason, status } => {
-                    let row = pa_core::autonomous::autonomous_stop_row(&reason, &status);
-                    emit(EngineEvent::CustomMessage(
-                        crate::session_commands::custom_message_value(&row),
-                    ));
-                    emit(EngineEvent::Done(Ok(())));
-                    return;
+            // The natural autonomous continuation already churned inside
+            // the agent run (the in-run hook, TS `getContinuationMessages`
+            // -> `_getContinuationMessages`'s autonomous arm): what may
+            // remain here is the continuation the threshold arm minted and
+            // held ahead of the boundary's compaction (TS
+            // `_queueAutonomousContinuationForThresholdCompaction` queues
+            // it as a `followUp` admission) — hand it to the worker's queue
+            // lanes, which run it as its own item after this run ends. A
+            // stop surfaces nothing here: the headless status and exit
+            // contracts carry it (TS: no row, no stream frame).
+            if let Some(text) = self
+                .held_autonomous_continuation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let admission = self
+                    .autonomous_admission
+                    .lock()
+                    .expect("autonomous admission lock")
+                    .clone();
+                if let Some(admit) = admission {
+                    admit(text);
                 }
             }
+            emit(EngineEvent::Done(Ok(())));
+            return;
         }
-    }
-
-    /// Consult the autonomous driver for one settled turn: gate evaluation
-    /// (a shell command per configured gate) runs on the engine runtime.
-    fn autonomous_follow_up(
-        &self,
-        assistant: &pa_agent::types::AssistantMessage,
-    ) -> pa_core::autonomous::AutonomousFollowUp {
-        let Some(message) = json_round_trip::<_, pa_types::ai::AssistantMessage>(assistant) else {
-            return pa_core::autonomous::AutonomousFollowUp::Inactive;
-        };
-        let driver = std::sync::Arc::clone(
-            &*self
-                .autonomous_driver
-                .read()
-                .expect("autonomous driver lock"),
-        );
-        self.runtime.block_on(async {
-            let mut state = self.autonomous.lock().await;
-            driver.after_turn(&mut state, &message).await
-        })
     }
 
     /// The hosted session's agent loop, building the session on first use.
@@ -3211,6 +3249,24 @@ impl AgentSessionEngine {
                                                 EngineEvent::AssistantMessage(value)
                                             };
                                             let _ = tx.send(event);
+                                        }
+                                    }
+                                    // An in-run continuation's user row
+                                    // (the autonomous hook's mint): the
+                                    // loop drains it between turns, so the
+                                    // `boundary_passed` gate separates it
+                                    // from the admitted prompt's row — the
+                                    // turn loop already emitted that one at
+                                    // admission. Forwarded as the accepted
+                                    // user-message frame (persist + the
+                                    // message pair).
+                                    pa_agent::types::AgentMessage::Standard(
+                                        pa_agent::types::Message::User(_),
+                                    ) if boundary_passed
+                                        .load(std::sync::atomic::Ordering::SeqCst) =>
+                                    {
+                                        if let Some(value) = session_wire_value(agent_message) {
+                                            let _ = tx.send(EngineEvent::UserMessage(value));
                                         }
                                     }
                                     _ => {}
@@ -6332,7 +6388,7 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
 fn run_prompts(
     script: serde_json::Value,
     prompts: &[&str],
-) -> (AgentSessionEngine, Vec<EngineEvent>) {
+) -> (std::sync::Arc<AgentSessionEngine>, Vec<EngineEvent>) {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6351,6 +6407,9 @@ fn run_prompts(
         telemetry_disabled: None,
     })
     .unwrap();
+    let engine = std::sync::Arc::new(engine);
+    // The in-run continuation hook upgrades the engine's registered arc.
+    engine.register_arc();
     let mut events: Vec<EngineEvent> = Vec::new();
     for prompt in prompts {
         engine.run_prompt(
@@ -6390,7 +6449,7 @@ async fn replacement_teardown_retires_the_session_and_the_funnel_adopts_the_bran
         })
         .await
         .expect("prompt join");
-        std::sync::Arc::new(engine)
+        engine
     };
     // The prompt built the session.
     assert!(engine.session.lock().await.is_some());
@@ -6873,13 +6932,17 @@ fn autonomous_on_enables_the_driver_loop() {
 }
 
 #[test]
-fn autonomous_limit_stops_the_run_with_durable_stop_row() {
+fn autonomous_limit_stops_the_run_without_a_row() {
     let (engine, events) = run_prompts(
         serde_json::json!({ "responses": ["first", "second"] }),
         &["/autonomous on --max-continuations 1 --max-turns 5", "go"],
     );
-    // Turn 1 continues (missing terminal evidence), turn 2 hits the
-    // continuation cap: one injected continuation, then the stop row.
+    // The continuation churns INSIDE the one run (the TS in-run shape,
+    // probed against the binary): the settled turn's `turn_end` is
+    // followed by the continuation turn's `turn_start` and user row, with
+    // no run boundary between them. Turn 1 continues (missing terminal
+    // evidence), turn 2 hits the continuation cap: the stop writes no row
+    // (the headless status and exit contracts carry it).
     assert_eq!(assistant_texts(&events), vec!["first", "second"]);
     let texts = user_texts(&events);
     assert_eq!(
@@ -6889,21 +6952,31 @@ fn autonomous_limit_stops_the_run_with_durable_stop_row() {
             "[autonomous-continuation]\n\nNo human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.".to_string()
         ]
     );
-    let stop = custom_rows(&events)
+    // The continuation's frames: one `turn_start` frame between the
+    // settled turn's `turn_end` and the continuation user row (the loop's
+    // inner-turn start, the run-opening one stays with the worker).
+    let turn_ends = events
+        .iter()
+        .filter(|event| matches!(event, EngineEvent::TurnEnd { .. }))
+        .count();
+    let turn_starts = events
+        .iter()
+        .filter(|event| matches!(event, EngineEvent::TurnStart))
+        .count();
+    assert_eq!(turn_ends, 2);
+    assert_eq!(turn_starts, 1, "the continuation turn's inner start");
+    // The stop surfaces no `autonomous_status` row of its own: the enable
+    // announcement is the only one (the limit stop writes no row — the
+    // headless status and exit contracts carry it, the TS shape).
+    let status_rows: Vec<_> = custom_rows(&events)
         .into_iter()
-        .find(|row| {
-            row["content"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("[autonomous-stop:")
-        })
-        .expect("durable stop row");
-    assert!(stop["content"]
+        .filter(|row| row["customType"] == "autonomous_status")
+        .collect();
+    assert_eq!(status_rows.len(), 1, "the enable announcement only");
+    assert!(status_rows[0]["content"]
         .as_str()
-        .unwrap()
-        .starts_with("[autonomous-stop: limit-reached] maxContinuations reached (1/1)"));
-    assert_eq!(stop["details"]["stopReason"], "maxContinuations");
-    assert_eq!(stop["details"]["enabled"], true);
+        .unwrap_or_default()
+        .starts_with("[autonomous-status: on]"));
     assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
     // Per-turn usage accounting: two settled turns.
     let state = engine.autonomous.blocking_lock();
@@ -6922,22 +6995,26 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
         "n=$(cat {0}/cnt 2>/dev/null || echo 0); echo $((n+1)) > {0}/cnt; [ $n -ge 1 ]",
         dir.path().display()
     );
-    let engine = AgentSessionEngine::new(AgentEngineConfig {
-        cwd: dir.path().to_path_buf(),
-        agent_dir: dir.path().join("agent"),
-        provider: None,
-        model: None,
-        api_key: None,
-        thinking: None,
-        session_dir: None,
-        session_file: None,
-        faux_script: Some(
-            serde_json::json!({ "responses": ["first attempt", "fixed it"] }).to_string(),
-        ),
-        supervisor_link: None,
-        telemetry_disabled: None,
-    })
-    .unwrap();
+    let engine = std::sync::Arc::new(
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(
+                serde_json::json!({ "responses": ["first attempt", "fixed it"] }).to_string(),
+            ),
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap(),
+    );
+    // The in-run continuation hook upgrades the engine's registered arc.
+    engine.register_arc();
     let on = format!("/autonomous on --gate {gate:?}");
     let mut events: Vec<EngineEvent> = Vec::new();
     for prompt in [on.as_str(), "go"] {
@@ -6957,27 +7034,27 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
             },
         );
     }
-    // Turn 1 fails the gate -> gate-failure continuation; turn 2 passes ->
-    // gate-passed stop row.
+    // Turn 1 fails the gate -> gate-failure continuation (in-run, the next
+    // turn of the same run); turn 2 passes -> the run stops with no row
+    // (the TS shape: the stop surfaces through the status request and the
+    // exit contracts, never a durable row).
     assert_eq!(assistant_texts(&events), vec!["first attempt", "fixed it"]);
     let texts = user_texts(&events);
     assert_eq!(texts.len(), 2);
     assert!(texts[1].starts_with("[autonomous-continuation: gate-failed]"));
     assert!(texts[1].contains("exited with code 1"));
-    let stop = custom_rows(&events)
+    let status_rows: Vec<_> = custom_rows(&events)
         .into_iter()
-        .find(|row| {
-            row["content"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("[autonomous-stop: gate-passed]")
-        })
-        .expect("gate-passed stop row");
-    assert_eq!(stop["details"]["stopReason"], "gate_passed");
-    assert_eq!(
-        stop["details"]["gates"]["commands"][0],
-        serde_json::json!(gate)
-    );
+        .filter(|row| row["customType"] == "autonomous_status")
+        .collect();
+    assert_eq!(status_rows.len(), 1, "the enable announcement only");
+    assert!(status_rows[0]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("[autonomous-status: on]"));
+    let state = engine.autonomous.blocking_lock();
+    assert_eq!(state.gates.commands, vec![gate]);
+    assert_eq!(state.last_gate_failure, None);
     assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
 }
 
@@ -7023,20 +7100,24 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = tempfile::TempDir::new().unwrap();
-    let engine = AgentSessionEngine::new(AgentEngineConfig {
-        cwd: dir.path().to_path_buf(),
-        agent_dir: dir.path().join("agent"),
-        provider: None,
-        model: None,
-        api_key: None,
-        thinking: None,
-        session_dir: None,
-        session_file: None,
-        faux_script: Some(serde_json::json!({ "responses": ["one", "two"] }).to_string()),
-        supervisor_link: None,
-        telemetry_disabled: None,
-    })
-    .unwrap();
+    let engine = std::sync::Arc::new(
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(serde_json::json!({ "responses": ["one", "two"] }).to_string()),
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap(),
+    );
+    // The in-run continuation hook upgrades the engine's registered arc.
+    engine.register_arc();
     let status = pa_core::autonomous::autonomous_status(&engine.autonomous.blocking_lock());
     // The queue pops from the end: the continuation is consulted first,
     // the stop on the second settled turn.
@@ -7073,8 +7154,9 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
             true
         },
     );
-    // The engine holds no autonomous logic of its own: the injected text,
-    // the stop row, and the turn count come straight from the trait.
+    // The engine holds no autonomous logic of its own: the injected text
+    // and the turn count come straight from the trait, minted by the
+    // in-run hook (the continuation runs inside the one agent run).
     assert_eq!(
         user_texts(&events),
         vec!["go".to_string(), "scripted continuation".to_string()]
@@ -7083,16 +7165,10 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
         assistant_texts(&events),
         vec!["one".to_string(), "two".to_string()]
     );
-    let stop = custom_rows(&events)
+    // The stop surfaces no row (the TS shape).
+    assert!(custom_rows(&events)
         .into_iter()
-        .find(|row| {
-            row["content"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("[autonomous-stop:")
-        })
-        .expect("durable stop row");
-    assert_eq!(stop["details"]["stopReason"], "maxTurns");
+        .all(|row| row["customType"] != "autonomous_status"));
     assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
     // Per-message accounting ran through the trait for both settled turns.
     assert_eq!(

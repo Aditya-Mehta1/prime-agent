@@ -238,6 +238,9 @@ def normalize_value(key, item, sandbox_root):
             "timeUsedSeconds",
             "createdAt",
             "updatedAt",
+            # The autonomous status snapshot's wall-clock start (the /autonomous
+            # on row's details): volatile per run.
+            "startedAt",
         ):
             return "<N>"
         return item
@@ -744,6 +747,59 @@ SCENARIOS = {
                 "script": faux_script([], 128000),
                 "prompts": ["/autonomous status"],
                 "args": [],
+            }
+        ]
+    },
+    "autonomous-on": {
+        "runs": [
+            {
+                # The /autonomous on flip plus the in-run continuation
+                # (the #254 ambiguity, resolved against the binary): the
+                # command's action frames and rows (the #254 surface),
+                # then the "task" prompt's ONE run churning both
+                # continuations IN-RUN (turn_end -> turn_start, the
+                # continuation user row pair between them, no
+                # agent_start/agent_end between continuation turns), and
+                # the max-continuations budget ending the loop with no
+                # stop row or frame (the stderr exit contract carries it).
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False},
+                },
+                "script": faux_script(
+                    [
+                        {"text": "work turn reply"},
+                        {"text": "task turn reply"},
+                        {"text": "continuation reply one"},
+                        {"text": "continuation reply two"},
+                    ],
+                    128000,
+                ),
+                "prompts": ["work", "/autonomous on --max-continuations 2", "task"],
+                "args": [],
+            }
+        ]
+    },
+    "autonomous-cli": {
+        "runs": [
+            {
+                # The CLI-flag autonomous run: the same in-run shape (the
+                # flags enable the loop from the first turn; one run, the
+                # continuation churns inside the prompt wait, the budget
+                # ends it silently).
+                "settings": {
+                    "onboardingCompleted": True,
+                    "compaction": {"enabled": False},
+                },
+                "script": faux_script(
+                    [
+                        {"text": "task turn reply"},
+                        {"text": "continuation reply one"},
+                    ],
+                    128000,
+                ),
+                "prompts": ["task"],
+                "args": ["--autonomous-max-continuations", "1"],
             }
         ]
     },

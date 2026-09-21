@@ -330,7 +330,7 @@ fn durable_autonomous_rows(harness: &Harness, prefix: &str) -> Vec<Value> {
 }
 
 #[test]
-fn autonomous_gate_failure_then_pass_stops_the_run_with_durable_rows() {
+fn autonomous_gate_failure_then_pass_stops_the_run_in_run() {
     let mut harness = setup(
         "gate",
         json!([{ "text": "first attempt" }, { "text": "fixed it" }]),
@@ -380,8 +380,10 @@ fn autonomous_gate_failure_then_pass_stops_the_run_with_durable_rows() {
         user_texts[1]
     );
 
-    // The continuation is a durable user row, the stop a durable custom row
-    // (with the accounting snapshot), and both reached the wire as events.
+    // The continuation is a durable user row that reached the wire as its
+    // message pair, and the gate-passed stop writes no row (the TS shape,
+    // probed against the binary: the stop surfaces through the status
+    // request and the headless exit contract, never the stream).
     let durable_users = durable_messages(&harness, "user");
     assert!(
         durable_users
@@ -389,31 +391,50 @@ fn autonomous_gate_failure_then_pass_stops_the_run_with_durable_rows() {
             .any(|text| text.starts_with("[autonomous-continuation: gate-failed]")),
         "durable user rows: {durable_users:?}"
     );
-    let stops = durable_autonomous_rows(&harness, "[autonomous-stop: gate-passed]");
-    assert_eq!(stops.len(), 1, "one durable stop row");
-    let stop = &stops[0];
-    assert_eq!(stop["details"]["stopReason"], "gate_passed");
-    assert_eq!(stop["details"]["turnsUsed"], 2, "per-turn accounting");
-    assert_eq!(stop["details"]["continuationsUsed"], 1);
-    assert_eq!(stop["display"], true);
-    let wire_stops: Vec<Value> = harness
-        .message_ends("custom")
-        .into_iter()
-        .filter(|message| {
-            message["customType"] == "autonomous_status"
-                && text_of(message).starts_with("[autonomous-stop: gate-passed]")
+    // The in-run ordering (the TS frame order): the continuation's user
+    // row pair is preceded by the continuation turn's `turn_start`, which
+    // follows the settled turn's `turn_end` with no run boundary between.
+    let continuation_index = harness
+        .client
+        .events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("message_end")
+                && event["message"]["role"] == "user"
+                && text_of(&event["message"]).starts_with("[autonomous-continuation: gate-failed]")
         })
+        .expect("the continuation's wire pair");
+    let preceding: Vec<&str> = harness.client.events[..continuation_index]
+        .iter()
+        .filter_map(|event| event.get("type").and_then(Value::as_str))
         .collect();
     assert_eq!(
-        wire_stops.len(),
-        1,
-        "stop row streamed to the client, events: {:?}",
+        preceding.iter().rev().take(3).copied().collect::<Vec<_>>(),
+        vec!["message_start", "turn_start", "turn_end"],
+        "turn_end -> turn_start -> the continuation row, events: {:?}",
+        harness.client.events
+    );
+    assert!(
+        durable_autonomous_rows(&harness, "[autonomous-stop:").is_empty(),
+        "no durable stop row"
+    );
+    assert!(
+        harness
+            .custom_entries("autonomous_status")
+            .into_iter()
+            .all(|entry| {
+                entry["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("[autonomous-status:")
+            }),
+        "the only autonomous_status rows are the command's, events: {:?}",
         harness.client.events
     );
 }
 
 #[test]
-fn autonomous_limit_reached_stops_the_run_with_durable_stop_row() {
+fn autonomous_limit_reached_stops_the_run_without_a_row() {
     let mut harness = setup(
         "limit",
         json!([{ "text": "still working" }, { "text": "more work" }]),
@@ -443,18 +464,24 @@ fn autonomous_limit_reached_stops_the_run_with_durable_stop_row() {
         "plain continuation: {}",
         user_texts[1]
     );
-    let stops = durable_autonomous_rows(&harness, "[autonomous-stop: limit-reached]");
-    assert_eq!(stops.len(), 1, "one durable stop row");
-    let stop = &stops[0];
-    assert_eq!(stop["details"]["stopReason"], "maxContinuations");
-    assert_eq!(stop["details"]["turnsUsed"], 2);
-    assert_eq!(stop["details"]["continuationsUsed"], 1);
+    // The limit stop writes no row and no stream frame (the TS shape,
+    // probed against the binary): the durable autonomous_status rows are
+    // the command's alone.
     assert!(
-        stop["content"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("[autonomous-stop: limit-reached] maxContinuations reached (1/1)"),
-        "stop text: {}",
-        stop["content"].as_str().unwrap_or_default()
+        durable_autonomous_rows(&harness, "[autonomous-stop:").is_empty(),
+        "no durable stop row"
+    );
+    assert!(
+        harness
+            .custom_entries("autonomous_status")
+            .into_iter()
+            .all(|entry| {
+                entry["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("[autonomous-status:")
+            }),
+        "the only autonomous_status rows are the command's, events: {:?}",
+        harness.client.events
     );
 }

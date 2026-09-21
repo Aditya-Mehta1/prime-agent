@@ -10,8 +10,8 @@ mod driver;
 mod gates;
 
 pub use driver::{
-    autonomous_stop_row, AutonomousDriver, AutonomousFollowUp, AutonomousFollowUpFuture,
-    AutonomousStopReason, ShellAutonomousDriver,
+    AutonomousDriver, AutonomousFollowUp, AutonomousFollowUpFuture, AutonomousStopReason,
+    ShellAutonomousDriver,
 };
 pub use gates::{
     should_autonomously_continue, ChildProcessResult, GateCommandRunner, ShellGateRunner,
@@ -427,6 +427,28 @@ pub fn build_autonomous_gate_failure_continuation(
 /// The plain `[autonomous-continuation]` message body.
 pub fn autonomous_continuation_text(state: &AutonomousRuntimeState) -> String {
     format!("[autonomous-continuation]\n\n{}", state.continuation_prompt)
+}
+
+/// The continuation row an in-run continuation hook returns to the agent
+/// loop (TS `createAutonomousContinuationMessage`: `{ role: "user", content:
+/// [{ type: "text", text }], timestamp }`): the loop emits and persists the
+/// row through its own message events, so the surface that mints it owns no
+/// emission of its own.
+pub fn autonomous_continuation_loop_row(
+    text: &str,
+    timestamp: u64,
+) -> pa_agent::types::AgentMessage {
+    pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::User(
+        pa_agent::types::UserMessage {
+            content: pa_agent::types::UserContent::Parts(vec![pa_agent::types::UserPart::Text(
+                pa_agent::types::TextContent {
+                    text: text.to_string(),
+                    text_signature: None,
+                },
+            )]),
+            timestamp: timestamp as i64,
+        },
+    ))
 }
 
 /// Keep-alive message delivered while subagents are still active.

@@ -7,14 +7,11 @@
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use pa_types::session::CustomMessage;
-
 use super::gates::{should_autonomously_continue, GateCommandRunner, ShellGateRunner};
 use super::{
     add_autonomous_continuation, add_autonomous_usage, autonomous_limit_reason, autonomous_status,
-    build_autonomous_gate_failure_continuation, describe_autonomous_limit, now_millis,
-    AgentAutonomousStatus, AutonomousDecisionReason, AutonomousLimitReason, AutonomousRuntimeState,
-    AUTONOMOUS_STATUS_CUSTOM_TYPE,
+    build_autonomous_gate_failure_continuation, now_millis, AgentAutonomousStatus,
+    AutonomousDecisionReason, AutonomousLimitReason, AutonomousRuntimeState,
 };
 
 /// Future returned by [`AutonomousDriver::after_turn`].
@@ -164,62 +161,6 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
             }
         })
     }
-}
-
-/// The durable stop row (the `autonomous_status` custom type): the stop is
-/// described in the content, the full status snapshot rides in `details`.
-pub fn autonomous_stop_row(
-    reason: &AutonomousStopReason,
-    status: &AgentAutonomousStatus,
-) -> CustomMessage {
-    CustomMessage {
-        custom_type: AUTONOMOUS_STATUS_CUSTOM_TYPE.to_string(),
-        content: pa_types::ai::UserContent::Text(stop_text(reason, status)),
-        display: true,
-        details: stop_details(reason, status),
-        timestamp: now_millis(),
-        rest: Default::default(),
-    }
-}
-
-fn stop_text(reason: &AutonomousStopReason, status: &AgentAutonomousStatus) -> String {
-    match reason {
-        AutonomousStopReason::GatePassed => {
-            "[autonomous-stop: gate-passed] All autonomous quality gates passed.".to_string()
-        }
-        AutonomousStopReason::GateRetryExhausted => {
-            let failure = status.last_gate_failure.as_ref();
-            match failure {
-                Some(failure) => format!(
-                    "[autonomous-stop: retry-exhausted] Autonomous quality gate still failing after attempt {}/{}: `{}` {}.",
-                    failure.attempt, status.gates.max_retries, failure.command, failure.exit_text
-                ),
-                None => "[autonomous-stop: retry-exhausted] Autonomous quality gate exhausted its retry window.".to_string(),
-            }
-        }
-        AutonomousStopReason::Limit(limit) => format!(
-            "[autonomous-stop: limit-reached] {}.",
-            describe_autonomous_limit(status, *limit, now_millis())
-        ),
-    }
-}
-
-fn stop_details(
-    reason: &AutonomousStopReason,
-    status: &AgentAutonomousStatus,
-) -> Option<serde_json::Value> {
-    let mut details = serde_json::to_value(status).ok()?;
-    details["stopReason"] = match reason {
-        AutonomousStopReason::GatePassed => serde_json::json!("gate_passed"),
-        AutonomousStopReason::GateRetryExhausted => serde_json::json!("retry_exhausted"),
-        AutonomousStopReason::Limit(limit) => serde_json::json!(match limit {
-            AutonomousLimitReason::MaxContinuations => "maxContinuations",
-            AutonomousLimitReason::MaxTurns => "maxTurns",
-            AutonomousLimitReason::MaxTokens => "maxTokens",
-            AutonomousLimitReason::TimeoutMs => "timeoutMs",
-        }),
-    };
-    Some(details)
 }
 
 #[cfg(test)]
@@ -508,34 +449,25 @@ mod tests {
         assert_eq!(state.turns_used, 2);
     }
 
-    #[test]
-    fn stop_row_shape() {
+    /// A stop carries the reason and a status snapshot (the surfaces map
+    /// them: the headless exit contract, the ACP stop reason): the stop
+    /// itself never writes a row (probed against the TS binary — a
+    /// limit-ended print run's stream ends at `agent_end` with no
+    /// `autonomous_status` row, and the headless stderr contract carries
+    /// the stop).
+    #[tokio::test]
+    async fn stop_carries_reason_and_status_only() {
         let config = enabled_config(Some(AgentAutonomousGateConfig {
             commands: Some(vec!["make check".to_string()]),
             ..Default::default()
         }));
-        let state = create_autonomous_runtime_state(Some(&config), None);
-        let status = autonomous_status(&state);
-        let row = autonomous_stop_row(&AutonomousStopReason::GatePassed, &status);
-        assert_eq!(row.custom_type, "autonomous_status");
-        assert_eq!(
-            row.content.text(),
-            "[autonomous-stop: gate-passed] All autonomous quality gates passed."
-        );
-        assert!(row.display);
-        let details = row.details.unwrap();
-        assert_eq!(details["stopReason"], "gate_passed");
-        assert_eq!(details["enabled"], true);
-        assert_eq!(details["gates"]["commands"][0], "make check");
-
-        let row = autonomous_stop_row(
-            &AutonomousStopReason::Limit(AutonomousLimitReason::MaxTurns),
-            &status,
-        );
-        assert!(row
-            .content
-            .text()
-            .starts_with("[autonomous-stop: limit-reached] maxTurns reached ("));
-        assert_eq!(row.details.unwrap()["stopReason"], "maxTurns");
+        let mut state = create_autonomous_runtime_state(Some(&config), None);
+        let stop = after_turn(&driver_with(vec![ok()]), &mut state).await;
+        let AutonomousFollowUp::Stop { reason, status } = stop else {
+            panic!("the passing gate stops the run");
+        };
+        assert_eq!(reason, AutonomousStopReason::GatePassed);
+        assert!(status.enabled);
+        assert_eq!(status.gates.commands[0], "make check");
     }
 }

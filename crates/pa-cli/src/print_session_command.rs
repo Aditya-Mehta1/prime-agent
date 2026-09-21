@@ -315,6 +315,9 @@ mod tests {
         autonomous: Arc<tokio::sync::Mutex<AutonomousRuntimeState>>,
         frames: Frames,
         harness_dir: std::path::PathBuf,
+        /// Keeps the composed hook's autonomous arm alive for the bed's
+        /// lifetime (the hook holds it weakly).
+        _run: Arc<crate::headless_autonomous::HeadlessAutonomous>,
         _dir: tempfile::TempDir,
     }
 
@@ -383,10 +386,17 @@ mod tests {
         let goal = Arc::new(PrintGoalSurface::with_sink(true, sink));
         goal.seed_publish_baseline(&engine).await;
         let _accounting = goal.wire_accounting(&engine, engine.session.agent()).await;
-        PrintGoalSurface::wire_continuation_hook(&engine, engine.session.agent(), &model, &goal);
-        let autonomous = Arc::new(tokio::sync::Mutex::new(
-            pa_core::autonomous::create_autonomous_runtime_state(None, None),
+        let run = Arc::new(crate::headless_autonomous::HeadlessAutonomous::disabled(
+            dir.path(),
         ));
+        crate::print_autonomous::wire_continuation_hook(
+            &engine,
+            engine.session.agent(),
+            &model,
+            &goal,
+            &run,
+        );
+        let autonomous = run.state_handle();
         Bed {
             engine,
             model,
@@ -394,6 +404,7 @@ mod tests {
             autonomous,
             frames,
             harness_dir: dir.path().join("harness"),
+            _run: run,
             _dir: dir,
         }
     }

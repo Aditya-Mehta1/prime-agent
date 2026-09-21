@@ -28,6 +28,32 @@ continuation through it. Unit test:
 settled boundary; without the fix the overflow error was the run's final
 turn and no recovery ran).
 
+**Superseded (the autonomous-ordering lane, 2026-09-21)**: the admission
+shape above was applied to EVERY autonomous continuation, but the TS
+ground truth (probed against the binary over the shared faux harness,
+`--mode json`, prompts `["work", "/autonomous on --max-continuations 2",
+"task"]`) runs the NATURAL continuation inside the agent loop — the
+autonomous arm of `_getContinuationMessages`: `turn_end` → `turn_start`
+with the continuation user row's message pair between them, NO
+`agent_start`/`agent_end` between continuation turns, one `agent_end`
+per prompt wait. A separate admission (a fresh `session.prompt` run)
+shows run boundaries TS never emits. The queued `followUp` admission
+(`_createPreparedTurnAction("followUp", ...)`) exists in TS only for the
+THRESHOLD-HELD continuation (`_queueAutonomousContinuationForThresholdCompaction`:
+mint ahead of the loop stop, compact at the boundary, run post-compaction)
+and the goal's own held turns. The natural loop now rides the agent's
+continuation hook on every surface (print: the composed
+`print_autonomous.rs` hook; daemon: the engine's
+`autonomous_continuation.rs` hook), and `admit_continuation` serves only
+the held turns.
+
+The loop's end was also re-probed: a passing gate, an exhausted limit,
+`/autonomous off`, or an error/abort turn ends the loop with NO row and
+NO stream frame (the print stream ends at the run's `agent_end`; the
+headless stderr exit contract and the daemon's status request carry the
+stop). The `autonomous_status` durable stop row the port had invented
+(#98, never probed) is gone from every surface.
+
 ### Coverage matrix (arm × surface)
 
 TS `agent-session.ts` hosts the arms in the session loop, so every
