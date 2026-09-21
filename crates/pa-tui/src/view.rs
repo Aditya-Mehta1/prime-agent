@@ -1436,15 +1436,16 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
             text,
             kind: crate::chat::StatusKind::Info,
         },
-        TranscriptItem::Assistant { text } => {
-            ChatEntry::Assistant(Box::new(crate::chat::AssistantMessage {
-                blocks: vec![crate::chat::MessageBlock::Text(text)],
-                has_tool_calls: false,
-                streaming: false,
-                error: None,
-                aborted: false,
-            }))
-        }
+        TranscriptItem::Assistant {
+            blocks,
+            has_tool_calls,
+        } => ChatEntry::Assistant(Box::new(crate::chat::AssistantMessage {
+            blocks,
+            has_tool_calls,
+            streaming: false,
+            error: None,
+            aborted: false,
+        })),
         TranscriptItem::ToolCall {
             id,
             name,
@@ -1562,7 +1563,10 @@ mod tests {
                 text: format!("user line {index}"),
             });
             v.push(TranscriptItem::Assistant {
-                text: format!("assistant reply {index}"),
+                blocks: vec![crate::chat::MessageBlock::Text(format!(
+                    "assistant reply {index}"
+                ))],
+                has_tool_calls: false,
             });
         }
         v

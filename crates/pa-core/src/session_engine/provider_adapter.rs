@@ -340,6 +340,53 @@ mod tests {
         );
     }
 
+    /// Regression guard for the pa-ai -> pa-agent boundary: provider
+    /// signatures (`thinkingSignature`, `thoughtSignature`, `textSignature`)
+    /// must survive the wire-shape round-trip. pa-agent has no catch-all
+    /// field, so a key-casing mismatch silently dropped them — an
+    /// unsigned thinking block degraded to plain text in the next
+    /// provider request (see the anthropic convert), and a Rust-written
+    /// session lost the signature TS-written ones carry.
+    #[test]
+    fn provider_signatures_round_trip_both_directions() {
+        let thinking = pa_types::ai::ThinkingContent {
+            thinking: "trace".into(),
+            thinking_signature: Some("sig-1".into()),
+            redacted: None,
+            rest: Default::default(),
+        };
+        let wire = serde_json::to_value(&thinking).unwrap();
+        assert_eq!(
+            wire.get("thinkingSignature").and_then(|v| v.as_str()),
+            Some("sig-1"),
+            "the TS wire key is camelCase: {wire}"
+        );
+        // pa-ai stream output -> the pa-agent loop's message form.
+        let agent_thinking: pa_agent::types::ThinkingContent =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(agent_thinking.thinking_signature.as_deref(), Some("sig-1"));
+        // The loop's message -> the provider-facing pa-ai form again.
+        let back: pa_types::ai::ThinkingContent =
+            serde_json::from_value(serde_json::to_value(&agent_thinking).unwrap()).unwrap();
+        assert_eq!(back.thinking_signature.as_deref(), Some("sig-1"));
+        // The tool-call thought signature (Google) rides the same boundary.
+        let tool_call = pa_types::ai::ToolCall {
+            id: "toolu_1".into(),
+            name: "bash".into(),
+            arguments: serde_json::Map::new(),
+            thought_signature: Some("sig-2".into()),
+            rest: Default::default(),
+        };
+        let wire = serde_json::to_value(&tool_call).unwrap();
+        assert_eq!(
+            wire.get("thoughtSignature").and_then(|v| v.as_str()),
+            Some("sig-2"),
+            "the TS wire key is camelCase: {wire}"
+        );
+        let agent_tool_call: pa_agent::types::ToolCall = serde_json::from_value(wire).unwrap();
+        assert_eq!(agent_tool_call.thought_signature.as_deref(), Some("sig-2"));
+    }
+
     /// The turn-abort cancels the in-flight fetch at the seam: a delayed
     /// faux response holds the request mid-wait; `ModelStream::close`
     /// (the loop's `closeIterator` abort callback, fired the moment the

@@ -14,8 +14,14 @@ pub enum TranscriptItem {
     UserMessage {
         text: String,
     },
+    /// One assistant message's rendered content (text and thinking blocks
+    /// in wire order). Thinking blocks keep their type through the replay:
+    /// the transcript gates them on the detail level like the live path.
     Assistant {
-        text: String,
+        blocks: Vec<crate::chat::MessageBlock>,
+        /// `toolUse` when the message carried tool calls (drives the
+        /// trailing spacer before its tool cards).
+        has_tool_calls: bool,
     },
     ToolCall {
         id: String,
@@ -171,27 +177,45 @@ fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
             // rendering nothing.
             text: user_display_text(&u.content),
         }],
+        // TS `buildConversationComponents`: one assistant component per
+        // message (text and thinking blocks together, in wire order), then
+        // the message's tool cards. Thinking blocks keep their type —
+        // `AssistantMessageComponent` renders them gated on the detail
+        // level (hidden at `overview`, dim at `details`/`all`), so a
+        // replayed thinking trace renders exactly like a live one.
         AgentMessage::Assistant(a) => {
             let mut items = Vec::new();
+            let mut blocks = Vec::new();
+            let mut has_tool_calls = false;
             for block in &a.content {
                 match block {
                     pa_types::ai::AssistantContentBlock::Text(t) => {
-                        items.push(TranscriptItem::Assistant {
-                            text: t.text.clone(),
-                        })
+                        if !t.text.trim().is_empty() {
+                            blocks.push(crate::chat::MessageBlock::Text(t.text.clone()));
+                        }
+                    }
+                    pa_types::ai::AssistantContentBlock::Thinking(t) => {
+                        if !t.thinking.trim().is_empty() {
+                            blocks.push(crate::chat::MessageBlock::Thinking(t.thinking.clone()));
+                        }
                     }
                     pa_types::ai::AssistantContentBlock::ToolCall(tc) => {
+                        has_tool_calls = true;
                         items.push(TranscriptItem::ToolCall {
                             id: tc.id.clone(),
                             name: tc.name.clone(),
                             arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                        })
+                        });
                     }
-                    // Thinking blocks render as collapsible UI in TS; replay
-                    // keeps them out of the transcript by default.
-                    pa_types::ai::AssistantContentBlock::Thinking(_) => {}
                 }
             }
+            items.insert(
+                0,
+                TranscriptItem::Assistant {
+                    blocks,
+                    has_tool_calls,
+                },
+            );
             items
         }
         AgentMessage::ToolResult(t) => vec![TranscriptItem::ToolResult {
@@ -321,6 +345,68 @@ mod tests {
             other => panic!("agent row: {other:?}"),
         }
         assert!(entry_to_items(&entry(false)).is_empty());
+    }
+
+    #[test]
+    fn replay_keeps_thinking_blocks_and_tool_flags() {
+        // A replayed assistant message keeps its thinking blocks' type (the
+        // dim/gated treatment) alongside the text, and flags its tool calls
+        // for the trailing spacer — one Assistant item before the ToolCall
+        // items, TS `buildConversationComponents` order.
+        let line = r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"probe the replay trace","thinkingSignature":"sig-1"},{"type":"text","text":"body after thinking"},{"type":"toolCall","id":"toolu_1","name":"bash","arguments":{"command":"ls"}}],"api":"openai-completions","provider":"prime-inference","model":"m","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","timestamp":1},"id":"e1"}"#;
+        let entries = parse_jsonl(line).unwrap();
+        let items = entry_to_items(&entries[0]);
+        let [TranscriptItem::Assistant {
+            blocks,
+            has_tool_calls,
+        }, TranscriptItem::ToolCall { name, .. }] = items.as_slice()
+        else {
+            panic!("replay items: {items:?}");
+        };
+        assert_eq!(
+            blocks,
+            &vec![
+                crate::chat::MessageBlock::Thinking("probe the replay trace".to_string()),
+                crate::chat::MessageBlock::Text("body after thinking".to_string()),
+            ]
+        );
+        assert!(has_tool_calls);
+        assert_eq!(name, "bash");
+    }
+
+    #[test]
+    fn thinking_signature_round_trips_through_the_file_entry() {
+        // The persisted thinking block's provider signature survives the
+        // replay round-trip verbatim, so a resumed session can replay its
+        // reasoning context to the provider unchanged.
+        let line = r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"keep my signature","thinkingSignature":"sig-abc","redacted":false},{"type":"text","text":"done"}],"api":"openai-completions","provider":"prime-inference","model":"m","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1},"id":"e1"}"#;
+        let entries = parse_jsonl(line).unwrap();
+        let wire = serde_json::to_string(&entries[0]).unwrap();
+        let reloaded: FileEntry = serde_json::from_str(&wire).unwrap();
+        let rewire = serde_json::to_string(&reloaded).unwrap();
+        let FileEntry::Message { message, .. } = reloaded else {
+            panic!("reloaded: {reloaded:?}");
+        };
+        let AgentMessage::Assistant(assistant) = message else {
+            panic!("message: {message:?}");
+        };
+        let thinking = assistant
+            .content
+            .iter()
+            .find_map(|block| match block {
+                pa_types::ai::AssistantContentBlock::Thinking(t) => Some(t),
+                _ => None,
+            })
+            .expect("thinking block survives the round-trip");
+        assert_eq!(thinking.thinking, "keep my signature");
+        assert_eq!(thinking.thinking_signature.as_deref(), Some("sig-abc"));
+        // The re-serialized wire keeps the signature key (computed before
+        // the destructure moves the entry): the replay feeds the provider
+        // the same reasoning context it produced.
+        assert!(
+            rewire.contains("\"thinkingSignature\":\"sig-abc\""),
+            "wire: {rewire}"
+        );
     }
 
     #[test]

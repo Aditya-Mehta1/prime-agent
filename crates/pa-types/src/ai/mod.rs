@@ -216,10 +216,14 @@ pub struct ProviderResponse {
 
 /// Text content block (`type: "text"`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TextContent {
     pub text: String,
     /// OpenAI Responses message metadata: a legacy id string or a
-    /// [`TextSignatureV1`] JSON payload.
+    /// [`TextSignatureV1`] JSON payload (TS wire key `textSignature`; the
+    /// camelCase rename keeps the provider signature attached to the block
+    /// across the pa-ai <-> pa-agent wire-shape round trips, which have no
+    /// catch-all field to carry a dropped key through).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_signature: Option<String>,
     #[serde(flatten)]
@@ -245,9 +249,16 @@ pub enum TextSignaturePhase {
 
 /// Thinking content block (`type: "thinking"`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ThinkingContent {
     pub thinking: String,
-    /// Provider reasoning item id (e.g. OpenAI Responses).
+    /// Provider reasoning item id (e.g. OpenAI Responses), or the encoded
+    /// reasoning-details payload for redacted blocks. TS wire key
+    /// `thinkingSignature`; the camelCase rename keeps the provider
+    /// signature attached to the block across the pa-ai <-> pa-agent
+    /// wire-shape round trips (pa-agent has no catch-all field, so a
+    /// snake_case key was silently dropped there) and matches the TS
+    /// product's session files and event frames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_signature: Option<String>,
     /// True when the thinking content was redacted by safety filters.
@@ -269,11 +280,14 @@ pub struct ImageContent {
 
 /// Tool call content block (`type: "toolCall"`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: JsonMap,
-    /// Google-specific opaque signature for reusing thought context.
+    /// Google-specific opaque signature for reusing thought context (TS
+    /// wire key `thoughtSignature`; see [`ThinkingContent`] for why the
+    /// camelCase rename must match pa-agent's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
     #[serde(flatten)]
