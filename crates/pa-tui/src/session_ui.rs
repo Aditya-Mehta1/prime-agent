@@ -5521,8 +5521,12 @@ impl SessionUi {
             view.editor.cancel_autocomplete();
             self.clear_ctrl_c_hint();
             // TS `handleEscape`: an open side-question pane owns the key —
-            // the running turn aborts and the pane closes.
+            // the running turn aborts and the pane closes; the armed
+            // escape-repeat from an earlier press disarms first (TS
+            // `clearEscapeRepeat`).
             if view.side_pane.is_some() {
+                self.escape_repeat_action = None;
+                self.escape_repeat_until = None;
                 self.clear_side_question(true, view).await;
                 return Ok(());
             }
@@ -5582,6 +5586,29 @@ impl SessionUi {
                 self.exit_reason = "ctrl_c_twice";
                 *running = false;
                 return Ok(());
+            }
+            // TS `interruptOrClearInput`: a running side question is
+            // aborted first (its failure reported through the note
+            // channel, unlike the silent pane-close abort); the pane stays
+            // mounted and renders the cancelled turn when the run's
+            // terminal event streams back.
+            if let Some(side_question_id) = self.active_side_question_id.clone() {
+                let client = self.client.clone();
+                let active_session_id = self.active_session_id.clone();
+                let notes = self.notes.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = client
+                        .request_ok(DaemonCommand::AbortSideQuestion {
+                            id: None,
+                            active_session_id,
+                            side_question_id,
+                            rest: Default::default(),
+                        })
+                        .await
+                    {
+                        let _ = notes.send(format!("the side question abort failed: {error:#}"));
+                    }
+                });
             }
             if view.compaction.is_some() {
                 // The compaction loader is up (TS `isAgentCompacting()`):

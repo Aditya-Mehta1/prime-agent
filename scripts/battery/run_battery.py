@@ -788,6 +788,140 @@ class Battery:
                 f"post-turn status-line request missing: ts={status_rows['ts']} rust={status_rows['rust']}",
                 evidence="statusline-requests.json",
             )
+        # Client-driven path: the /btw pane in the interactive TUI. The pane
+        # is a client surface over the engine above (no new daemon surface):
+        # /btw opens it mid-task, the answer streams into the pane, a reply
+        # seeds a follow-up, and esc returns to the main thread.
+        self.f5_side_questions_client()
+
+    def f5_side_questions_client(self) -> None:
+        """The /btw pane in each product's interactive TUI: open mid-task,
+        answer, follow up, and close with esc; frames diffed TS vs Rust."""
+        flow = "f5_side_questions"
+        frames: dict[str, str] = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            # Model-scoped queues: the main trio serves mock-1 requests in
+            # order, and the dashboard status-line requests (which arrive
+            # on their own debounce, even strays from the wire part's
+            # session) get their own queue instead of stealing a reply.
+            side.mock.set_responses(
+                [{"text": "status"}],
+                queues=[
+                    {
+                        "name": "client-turns",
+                        "matchModels": ["mock-1"],
+                        "responses": [
+                            {"text": "main turn reply"},
+                            {"text": "btw answer from mock"},
+                            {"text": "btw follow-up answer from mock"},
+                        ],
+                    },
+                    {
+                        "name": "statusline",
+                        "matchModels": [STATUSLINE_MODEL_ID],
+                        "responses": [{"text": "status"}],
+                    },
+                ],
+            )
+            session = f"{self.runid}-f5t-{side.name}"
+            argv = P.launch_argv(side, side.daemon_socket)
+            B.tmux_launch(session, argv, side.env, side.work_dir)
+            self.settle_first_run(session)
+            mark = len(side.mock.requests())
+            # The main turn runs first (the /btw purpose — ask about the
+            # in-flight work without disturbing it). Wait for the mock's
+            # reply before opening the pane: the 0.2s fire-and-hope gap is
+            # a race (a session still starting up can send the side
+            # question's provider request before the main prompt's, and the
+            # mock serves first-come).
+            B.tmux_send(session, "run the main task")
+            B.tmux_wait_text(session, "main turn reply", timeout=90)
+            B.tmux_send(session, "/btw what is the side answer?")
+            pane_open = B.tmux_wait_text(session, "what is the side answer\?", timeout=45)
+            side.evidence(flow, "10-btw-pane-open.txt", pane_open)
+            answered = B.tmux_wait_text(session, "btw answer from mock", timeout=90)
+            side.evidence(flow, "11-btw-pane-answered.txt", answered)
+            if "/btw" not in answered or "btw answer from mock" not in answered:
+                self.record(
+                    flow,
+                    "visual",
+                    f"{side.name}: /btw pane did not render the question header and answer",
+                    evidence=side.root / flow / "11-btw-pane-answered.txt",
+                )
+            else:
+                self.record(
+                    flow,
+                    "visual",
+                    f"{side.name}: /btw pane renders the question header and the streamed answer",
+                    gap=False,
+                )
+            # The pane hint line: esc returns to the main thread.
+            if "esc to return to session" not in answered:
+                self.record(
+                    flow,
+                    "visual",
+                    f"{side.name}: /btw pane hint line missing (answer arrived; hint should read 'reply to follow up ...')",
+                    evidence=side.root / flow / "11-btw-pane-answered.txt",
+                )
+            # A reply becomes a follow-up side question whose provider
+            # request replays the answered exchange (previousTurns seeding).
+            B.tmux_send(session, "and the follow-up?")
+            follow_up = B.tmux_wait_text(session, "btw follow-up answer from mock", timeout=90)
+            side.evidence(flow, "12-btw-follow-up.txt", follow_up)
+            requests = self.new_mock_requests(side, mark)
+            side.evidence_json(flow, "10-client-mock-requests.json", requests)
+            seeded = any(
+                "btw answer from mock" in json.dumps(req.get("body") or {})
+                and "and the follow-up?" in json.dumps(req.get("body") or {})
+                for req in requests
+            )
+            if seeded:
+                self.record(
+                    flow,
+                    "protocol",
+                    f"{side.name}: follow-up reply seeded the side transcript (previous turns replayed to the provider)",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "protocol",
+                    f"{side.name}: follow-up reply did not replay the previous turns to the provider",
+                    evidence=side.root / flow / "10-client-mock-requests.json",
+                )
+            # esc closes the pane (aborting nothing: every turn settled).
+            B.tmux_send(session, "Escape", enter=False)
+            time.sleep(1.5)
+            after_esc = B.tmux_capture(session)
+            side.evidence(flow, "13-btw-after-esc.txt", after_esc)
+            if (
+                "what is the side answer?" in after_esc
+                or "esc to return to session" in after_esc
+            ):
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: esc did not close the /btw pane",
+                    evidence=side.root / flow / "13-btw-after-esc.txt",
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"{side.name}: esc closes the /btw pane and returns to the main thread",
+                    gap=False,
+                )
+            frames[side.name] = answered
+            B.tmux_kill(session)
+        # Capture-compare: the answered-pane frame, normalized like the
+        # other real-surface flows.
+        self.frame_diff(
+            flow,
+            "btw-pane-answered",
+            frames,
+            normalizer=self.normalize_transcript_frame,
+        )
 
     def overflow_wire_projection(self, events: list) -> list:
         """The overflow-relevant wire surface of one session: the

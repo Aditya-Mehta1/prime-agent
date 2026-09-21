@@ -825,6 +825,17 @@ impl AgentView {
         } else if let Some(working) = &self.working {
             lines.extend(render_loader(working, self.pulse_frame, &self.theme, width));
         }
+        // The side-question pane (TS `sideQuestionContainer`): a scroll-area
+        // component under the status area, not a dock row — it hugs the
+        // transcript tail, so the frame's slack (a short transcript against
+        // a bottom-pinned dock) lands between the pane and the editor like
+        // TS, never inside the pane. TS mounts the pane behind a `Spacer(1)`
+        // (`sideQuestionContainer.addChild(new Spacer(1))`), so one blank
+        // row precedes the component's own leading blank.
+        if let Some(pane) = &self.side_pane {
+            lines.push(Vec::new());
+            lines.extend(pane.render(&self.theme, width));
+        }
         lines
     }
 
@@ -840,11 +851,6 @@ impl AgentView {
         };
         let queue_rows = crate::queued::render_queue(&self.theme, &self.queued, &browse_key, width);
         let mut lines = queue_rows;
-        // The side-question pane (TS `sideQuestionContainer`) sits between
-        // the queue strip and the prompt context.
-        if let Some(pane) = &self.side_pane {
-            lines.extend(pane.render(&self.theme, width));
-        }
         lines.extend(render_prompt_context(
             &self.detail_label(),
             &self.theme,

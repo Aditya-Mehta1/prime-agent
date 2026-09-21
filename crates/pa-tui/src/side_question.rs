@@ -131,17 +131,22 @@ impl SideQuestionPane {
                 crate::markdown::render_markdown(&turn.answer, content_width, &style)
             };
             if let Some(message) = &turn.error_message {
-                let mut line: crate::Line = vec![crate::Span::styled(" ".repeat(PADDING_X), bg)];
+                // TS `renderAnswer`: the error row is a single-paddingX
+                // `Text` row; the `padded` prefix below supplies the pad.
+                let mut line: crate::Line = Vec::new();
                 line.push(crate::Span::styled(message.clone(), error));
                 rendered.push(line);
             }
             if rendered.is_empty() {
+                // The placeholder rows (`Cancelled`/`No response`/
+                // `Thinking…`) are single-paddingX `Text` rows too (TS
+                // renders each with `new Text(..., this.paddingX, 0)`).
                 let text = match turn.status.as_str() {
                     "cancelled" => "Cancelled".to_string(),
                     "complete" => "No response".to_string(),
                     _ => "Thinking…".to_string(),
                 };
-                let mut line: crate::Line = vec![crate::Span::styled(" ".repeat(PADDING_X), bg)];
+                let mut line: crate::Line = Vec::new();
                 line.push(crate::Span::styled(text, user_text));
                 rendered.push(line);
             }

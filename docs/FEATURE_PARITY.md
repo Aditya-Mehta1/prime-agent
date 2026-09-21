@@ -82,7 +82,9 @@ Notable systemic findings:
 - Interrupt paths only send `Abort`/`AbortCompaction`; `AbortBash`/`AbortRetry`/
   `AbortBranchSummary` wire commands exist but are never sent from the UI.
 - The `/btw` side-question engine and wire protocol exist (`pa-daemon/src/side_question.rs`,
-  `start_side_question`/`abort_side_question`), but the entire client pane family is unported.
+  `start_side_question`/`abort_side_question`); the client pane family landed in
+  `pa-tui/src/side_question.rs` — only the in-pane `!` bash arm remains
+  (the bash-bang surface).
 
 
 
@@ -163,7 +165,7 @@ Paths are relative to the two repo roots.
 | packages/coding-agent/src/modes/interactive/components/user-message.ts:13-15,62-71 | OSC133 A/B/C markers on the user block | crates/pa-tui/src/chat.rs:324-331; crates/pa-tui/src/osc133.rs:17-36 | MATCHES | - |
 | packages/coding-agent/src/modes/interactive/components/user-message.ts:32-37 | HighlightedMarkdown.getSelectionRegions (markdown table-cell selection regions) | MISSING (no markdown selection-region surface) | IN-FLIGHT | mouse-select |
 | packages/coding-agent/src/modes/interactive/components/user-message-selector.ts:11-124 | Fork-from-message selector (cursor, per-message metadata, windowing, key handling) | crates/pa-tui/src/user_message_selector.rs:48-131 | PARTIAL | - |
-| packages/coding-agent/src/modes/interactive/components/side-question.ts:20-160 | /btw side-question pane (question bubble/answer turns, embedded bash, status placeholders, hint line, popup surface) | MISSING (no side-question surface in pa-tui; engine side exists in pa-core/pa-daemon) | MISSING | side-question (new) |
+| packages/coding-agent/src/modes/interactive/components/side-question.ts:20-160 | /btw side-question pane (question bubble/answer turns, embedded bash, status placeholders, hint line, popup surface) | crates/pa-tui/src/side_question.rs (pane; the f5 client flow frame-diffs identical) — embedded bash pending the `!`/`!!` bash-bang surface | MATCHES | bash-bang (new) |
 | packages/coding-agent/src/modes/interactive/components/conversation-components.ts:159-265 | buildConversationComponents dispatch (roles + custom types, display filter, tool/result pairing) | crates/pa-tui/src/snapshot.rs:680-696; crates/pa-tui/src/custom_message/mod.rs:147-194; crates/pa-tui/src/session_ui.rs:3578-3610 | MATCHES | - |
 | packages/coding-agent/src/modes/interactive/components/conversation-components.ts:52-104 | Conversation spacing (hidden/tool-only assistant skip, trailing space, compact neighbors) | crates/pa-tui/src/view.rs:387-462 (is_compact_neighbor crates/pa-tui/src/view.rs:40-45) | MATCHES | - |
 | packages/coding-agent/src/modes/interactive/components/conversation-components.ts:106-116,253-261 | User text join + image-only "[image]" placeholder | crates/pa-tui/src/snapshot.rs:634-661 | MATCHES | - |
@@ -188,7 +190,7 @@ Paths are relative to the two repo roots.
 Top proposed new lane groupings:
 1. **edit-diffs** — the whole edit/diff rendering family: the `edit` tool's dedicated renderer (file summary + `renderDiff` rows), ipython `renderDiffs` (per-path `╰─ path +N -M` + rich diff rows with the editDiffsExpanded gate), and the `formatTotalChangeSummary` turn-changes recap row. All four rows cite `edit-summary.ts`/`diff.ts` shapes that have no Rust counterpart; one lane can port `edit-diff`/`renderRichDiff` once and reuse it three ways.
 2. **msg-card-gaps** — missing transcript cards: `[branch]` box (branchSummary role), `[skill]` invocation box (parseSkillBlock user messages), and the legacy heartbeat-prompt user-message rows. All are "decode a row the engine already persists and render its expandable box" work, well-scoped against existing generic-box plumbing (custom_message/render.rs).
-3. **side-question + bash-bang** — the two live panes with no Rust surface at all: the `/btw` side-question pane (bubbles/turns/hint line) and the `!`/`!!` bang-execution box (bash_start/output/bash_end live events plus the bordered component). They share the "live in-pane streaming component" pattern and could be one lane or two closely-related ones.
+3. **bash-bang** — the remaining live pane with no Rust surface: the `!`/`!!` bang-execution box (bash_start/output/bash_end live events plus the bordered component), including its `/btw`-pane arm (transient runId, excludeFromContext, seed). The `/btw` side-question pane itself landed (`pa-tui/src/side_question.rs`); both share the "live in-pane streaming component" pattern.
 
 Other smaller proposed lanes (not in the top 3): **extension-renderers** (renderCall/renderResult/renderShell + custom message renderers), **shell-completion-attach** (attach-to-card flow + in-cell shell-completion state), **abort-tool-cards** (pending cards get error results on abort), **mermaid-blocks**, and the login-recovery inline merge (assignable to in-flight **clip-auth-cmds**).
 
@@ -639,19 +641,19 @@ TS reference: packages/coding-agent/src/modes/interactive/ (read-only). Rust wor
 | packages/coding-agent/src/modes/interactive/interactive-mode.ts:4631-4636 | rememberPastedImage (64MB budget, keep live ids) | crates/pa-tui/src/session_ui.rs:904-916 (MAX_PASTED_IMAGE_BYTES 869) | MATCHES |  |
 | packages/coding-agent/src/modes/interactive/interactive-mode.ts:4643-4662 | liveImageMarkerIds (editor + stash + history + queue texts) | crates/pa-tui/src/session_ui.rs:923-933 (editor + history only) | PARTIAL |  |
 | packages/coding-agent/src/modes/interactive/interactive-mode.ts:4675-4682 | collectImagesFor (marker presence + model image-input drop) | crates/pa-tui/src/session_ui.rs:975-998,939-947 | MATCHES |  |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4684-4686 | hasPastedImagesFor (side-conversation image notice) | MISSING | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4688-4734 | handleSideQuestion (/btw pane, turns seeding, running gate) | MISSING (TUI reports "/btw is not available"; wire + engine exist: crates/pa-types/src/slash_commands.rs:57, crates/pa-daemon/src/side_question.rs) | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4736-4750 | handleSideQuestionEvent (running/complete/error updates) | MISSING | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4752-4782 | finishSideQuestionBash (side ! bash seeds follow-up turns) | MISSING | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4784-4814 | clearSideQuestion / resetSideQuestion (abort + pane teardown + discarded-run swallow) | MISSING | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4816-4829 | abortSideQuestion (abort RPC + error report) | MISSING | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:5503-5504 | side_question_event connection event | MISSING | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4882-4898 | slash commands rejected inside side conversations (pane notice) | MISSING | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:5321-5352 | side conversation reply capture (follow-up / running gate / image notice) | MISSING | MISSING | btw-side-questions (proposed) |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:5269-5315 | ! bash inside side pane (transient runId, excludeFromContext, abort guard) | MISSING | MISSING | btw-side-questions (proposed) |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4684-4686 | hasPastedImagesFor (side-conversation image notice) | crates/pa-tui/src/session_ui.rs (the submit-capture image gate + `add_side_notice`) | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4688-4734 | handleSideQuestion (/btw pane, turns seeding, running gate) | crates/pa-tui/src/session_ui.rs (`start_side_question` over the daemon engine) | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4736-4750 | handleSideQuestionEvent (running/complete/error updates) | crates/pa-tui/src/session_ui.rs (`apply_side_question_event`) | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4752-4782 | finishSideQuestionBash (side ! bash seeds follow-up turns) | MISSING (the `!`/`!!` bash-bang surface has no pa-tui implementation) | MISSING | bash-bang (proposed) |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4784-4814 | clearSideQuestion / resetSideQuestion (abort + pane teardown + discarded-run swallow) | crates/pa-tui/src/session_ui.rs (`clear_side_question` on esc and session rebuild; the discarded-run swallow is bash-bang's) | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4816-4829 | abortSideQuestion (abort RPC + error report) | crates/pa-tui/src/session_ui.rs (the `abort_side_question` request; fired by esc and the ctrl-c interrupt) | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:5503-5504 | side_question_event connection event | crates/pa-tui/src/daemon_client.rs (DaemonClientEvent::SideQuestionEvent) -> session_ui.rs | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4882-4898 | slash commands rejected inside side conversations (pane notice) | crates/pa-tui/src/session_ui.rs (the submit-capture slash gate + notice turn) | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:5321-5352 | side conversation reply capture (follow-up / running gate / image notice) | crates/pa-tui/src/session_ui.rs (the submit-capture ladder; the `!` branch rides the bash-bang lane) | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:5269-5315 | ! bash inside side pane (transient runId, excludeFromContext, abort guard) | MISSING (the `!`/`!!` bash-bang surface has no pa-tui implementation; inside the pane a `!` reply is captured as a follow-up question until that lane lands) | MISSING | bash-bang (proposed) |
 | packages/coding-agent/src/modes/interactive/interactive-mode.ts:4841-4853 | submit handler: queue-browsing edit branch | crates/pa-tui/src/session_ui.rs:2965-2977,3083-3126 | MATCHES |  |
 | packages/coding-agent/src/modes/interactive/interactive-mode.ts:4899-4905 | captureAgentCommandUsed telemetry | crates/pa-tui/src/session_ui.rs:2621-2627 + interactive.rs:82-83 | MATCHES |  |
-| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4907-4911 | /btw dispatch | MISSING | MISSING | btw-side-questions (proposed) |
+| packages/coding-agent/src/modes/interactive/interactive-mode.ts:4907-4911 | /btw dispatch | crates/pa-tui/src/session_ui.rs (dispatch_client_command "btw" arm; /side resolves by alias) | MATCHES | - |
 | packages/coding-agent/src/modes/interactive/interactive-mode.ts:4912-4921 | /settings -> showSettingsSelector | MISSING | MISSING | settings-menu (proposed) |
 | packages/coding-agent/src/modes/interactive/interactive-mode.ts:4922-4931 | /scoped-models -> showModelsSelector | MISSING | MISSING | model-fix |
 | packages/coding-agent/src/modes/interactive/interactive-mode.ts:4932-4937 | /model [search] -> handleModelCommand | crates/pa-tui/src/session_ui.rs:1285-1309 | IN-FLIGHT | model-fix |
@@ -791,10 +793,10 @@ TS reference: packages/coding-agent/src/modes/interactive/ (read-only). Rust wor
 - `interactive-mode.ts:1399-1478` — createBaseAutocompleteProvider (builtin + connection + skill commands, source tags): Autocomplete serves builtin names/aliases/hints from the static pa-types registry; connection (extension/prompt/skill) commands and source tags are missing.
 
 #### Summary
-- Rows: 255 — MATCHES: 85, PARTIAL: 43, MISSING: 113, IN-FLIGHT: 14
+- Rows: 255 — MATCHES: 94, PARTIAL: 43, MISSING: 104, IN-FLIGHT: 14 (post-audit delta: the `/btw` pane family landed in pa-tui — 9 section-4 rows MISSING→MATCHES plus the section-2 pane row, two re-scoped to the bash-bang lane)
 
 Top proposed new lane groupings (each closes a grouped set of rows):
-1. **btw-side-questions** — the /btw pane family: handleSideQuestion/handleSideQuestionEvent/finishSideQuestionBash/clear+abort/reset, side_question_event, in-pane `!` bash, slash-rejection and image notices. Wire (`start_side_question`/`abort_side_question`) and daemon engine already exist; only the pa-tui client pane is missing.
+1. **bash-bang** (was btw-side-questions) — the `/btw` pane family landed (`crates/pa-tui/src/side_question.rs` + `session_ui.rs`: handleSideQuestion/handleSideQuestionEvent/clear+abort, side_question_event, slash-rejection and image notices, all over the existing wire + daemon engine). The remainder — in-pane `!` bash — rides the bash-bang surface.
 2. **extension-ui** — bindCurrentSessionExtensions, widgets above/below editor, custom footer/header, extension selector/input/editor/confirm/notify/error/custom, the extension_ui_request wire methods, setWorkingMessage/Visible/Indicator, setStatus, extension shortcuts.
 3. **bash-mode** — `!` / `!!` user bash commands (executeBash, bash_start/output/end events, isBashRunning, running gates in /update and submit paths).
 4. **loaded-resources** — showLoadedResources plus the whole path/source-labeling + diagnostics helper family (scope groups, compact labels, collision ✓/✗ rows).
@@ -831,7 +833,7 @@ Method: every TS method in scope read in full; the Rust implementing code locate
 | interactive-mode.ts:7095 | handleEscape (arm + interrupt-or-clear) | crates/pa-tui/src/session_ui.rs:2680-2712 | PARTIAL | interrupt-paths |
 | interactive-mode.ts:7116 | armEscapeRepeat/takeEscapeRepeatAction/clearEscapeRepeat (500ms window) | crates/pa-tui/src/session_ui.rs:1927-1947 | MATCHES | — |
 | interactive-mode.ts:7145 | handleCtrlC/handleInterruptKey (first press abort + hint) | crates/pa-tui/src/session_ui.rs:2718-2753 | MATCHES | — |
-| interactive-mode.ts:7160 | interruptOrClearInput (abort retry/bash/compaction/branch-summary/side-question/stream) | crates/pa-tui/src/session_ui.rs:2740-2749 (Abort/AbortCompaction only) | PARTIAL | interrupt-paths |
+| interactive-mode.ts:7160 | interruptOrClearInput (abort retry/bash/compaction/branch-summary/side-question/stream) | crates/pa-tui/src/session_ui.rs (Abort/AbortCompaction/AbortSideQuestion; AbortBash/AbortRetry/AbortBranchSummary still unsent) | PARTIAL | interrupt-paths |
 | interactive-mode.ts:7184 | showCtrlCExitHint/clearCtrlCExitHint/isCtrlCExitHintVisible (2s window) | crates/pa-tui/src/session_ui.rs:2112-2142 | MATCHES | — |
 | interactive-mode.ts:7221 | handleCtrlD (exit on empty editor) | crates/pa-tui/src/session_ui.rs:2713-2717 | MATCHES | — |
 | interactive-mode.ts:7232 | shutdown (stats, drain, dispose, resume hint, exit 0) | crates/pa-tui/src/interactive.rs:1055-1103 + session_ui.rs:808-854 | MATCHES | — |
@@ -968,7 +970,7 @@ Method: every TS method in scope read in full; the Rust implementing code locate
 
 - `interactive-mode.ts:6639` echoLocalCommand (local command echoed as user message): Rust echoes only /hotkeys; TS echoes /session,/system-prompt,/context,/logs,/changelog,/hotkeys — moot until those commands land, but the echo seam exists for exactly one of six.
 - `interactive-mode.ts:7095` handleEscape (arm + interrupt-or-clear): Arm/tree/clear/draft-restore match (session_ui.rs:2680-2712), but the first Escape never calls interruptOrClearInput, so a running turn/retry/bash is not aborted by Escape.
-- `interactive-mode.ts:7160` interruptOrClearInput (abort retry/bash/compaction/branch-summary/side-question/stream): Rust sends only Abort (turn) and AbortCompaction; AbortBash/AbortRetry/AbortBranchSummary/AbortSideQuestion exist on the wire (crates/pa-types/src/daemon/command.rs:419-840) but are never sent by the interrupt key.
+- `interactive-mode.ts:7160` interruptOrClearInput (abort retry/bash/compaction/branch-summary/side-question/stream): Rust sends Abort (turn), AbortCompaction, and AbortSideQuestion; AbortBash/AbortRetry/AbortBranchSummary exist on the wire (crates/pa-types/src/daemon/command.rs:419-840) but are never sent by the interrupt key.
 - `interactive-mode.ts:7631` collectQueueReplaceImages (marker-resolved image replace/clear): Rust always omits `images` on a queue replace (preserves server attachments); TS resolves markers to replace, sends [] to clear when none, and undefined only when unresolvable.
 - `interactive-mode.ts:7680` applyFullscreen (alt screen + mouse + scroll): The Rust client is structurally always-fullscreen (alt screen + SGR mouse + scroll on every run); there is no inline mode and no on/off toggle.
 - `interactive-mode.ts:7881` flushPendingBashComponents / pendingMessagesContainer (live bash above indicator): Live bash output streams into the transcript tool card; TS holds in-flight bash output in a pending strip above the execution indicator and flushes it into the chat at turn end.
@@ -1026,7 +1028,7 @@ Priority reflects user-visible impact.
 
 | Proposed lane | Rows | Scope |
 |---|---|---|
-| `btw-side-questions` | ~14 (sections 4, 1) | The `/btw` pane family: turns seeding, bubbles, hint line, in-pane `!` bash, abort/clear, `side_question_event`. Wire + daemon engine exist; only the pa-tui client pane is missing. |
+| `bash-bang` (was btw-side-questions) | ~8 (sections 4, 1) | The `/btw` pane family landed (turns seeding, bubbles, hint line, abort/clear, `side_question_event`, notices). The remainder is the in-pane `!` bash arm, which rides the bash-mode lane. |
 | `bash-mode` | ~8 (sections 4, 1) | `!`/`!!` user bash: `executeBash`, `bash_start`/`bash_output`/`bash_end` live events, `isBashRunning`, the bang-execution box. |
 | `settings-menu` | ~10 (sections 2, 4, 5) | `settings-selector.ts`, theme-selector, show-images-selector, the settings submenus behind `/settings`, and `InteractiveModeUiServices`. |
 | `provider-auth-ui` | ~6 (section 2) | `oauth-selector.ts`, `login-dialog.ts`, `prime-team-selector.ts` UI components (auth flows themselves are in-flight under `clip-auth-cmds`; this is the panel/selector UI complement). |
