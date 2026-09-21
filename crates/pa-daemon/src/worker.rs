@@ -2742,9 +2742,26 @@ impl Worker {
                     if let Some(continuation) = continuation {
                         // The mint's `goal_update` surfaces at the moment
                         // the state changes (TS `_setGoalState` ->
-                        // `_emitGoalUpdate`), before the continuation
-                        // turn is admitted.
+                        // `_emitGoalUpdate`), before the continuation turn
+                        // is admitted — and the state change is durable
+                        // before the announcement (TS `_persistGoalState`
+                        // appends + flushes the `thread_goal_state` custom
+                        // entry; the mint runs outside a turn, so the
+                        // store write rides here, not the turn's emit
+                        // closure).
                         if let Some(goal) = continuation.goal_update {
+                            {
+                                let mut core = self.core.lock().unwrap();
+                                if let Some(store) = core.store.as_mut() {
+                                    let _ = store.persist_entry(
+                                        "custom",
+                                        json!({
+                                            "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                                            "data": goal,
+                                        }),
+                                    );
+                                }
+                            }
                             self.emit_worker_event(json!({
                                 "type": "goal_update",
                                 "goal": goal,
@@ -3762,6 +3779,22 @@ impl TurnRunner {
                         // skip shape): publish the event, never persist it.
                         if let Some(store) = core.store.as_mut().filter(|_| !entry.is_null()) {
                             let _ = store.persist_entry("compaction", entry.clone());
+                        }
+                    }
+                    // The durable mirror of a goal-state change (TS
+                    // `_setGoalState` -> `_persistGoalState`: the
+                    // `thread_goal_state` custom entry + flush, one store
+                    // with the transcript). The announcement only fires on
+                    // a real state change, so each row is the new state.
+                    EngineEvent::GoalUpdate { goal } => {
+                        if let Some(store) = core.store.as_mut() {
+                            let _ = store.persist_entry(
+                                "custom",
+                                json!({
+                                    "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                                    "data": goal,
+                                }),
+                            );
                         }
                     }
                     _ => {}
@@ -5023,6 +5056,132 @@ mod tests {
                 .any(|event| event.get("type").and_then(Value::as_str) == Some("goal_update")),
             "a paused goal minted a continuation: {events:?}"
         );
+    }
+
+    /// A scripted goal session's dispatch worker with a durable session
+    /// file (the `noSession` create keeps everything in memory; this
+    /// variant lands the store on disk so the `thread_goal_state` mirror
+    /// is observable).
+    async fn goal_dispatch_worker_with_store(
+        goal: serde_json::Value,
+    ) -> (std::sync::Arc<Worker>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pa-worker-goal-{}", uuid::Uuid::new_v4()));
+        let session_dir = dir.join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "goal-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "responses": ["ack"],
+                "goal": goal,
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({
+                    "cwd": dir.to_string_lossy(),
+                    "name": "goal",
+                    "sessionDir": session_dir.to_string_lossy(),
+                }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let file = std::fs::read_dir(&session_dir)
+            .expect("session dir readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("session file created");
+        (worker, file)
+    }
+
+    /// The session file's `thread_goal_state` custom rows, in order.
+    fn thread_goal_state_rows(path: &std::path::Path) -> Vec<Value> {
+        crate::session_store::parse_session_entries(&std::fs::read_to_string(path).expect("read"))
+            .into_iter()
+            .filter(|entry| {
+                entry.get("type").and_then(Value::as_str) == Some("custom")
+                    && entry.get("customType").and_then(Value::as_str)
+                        == Some(pa_core::goals::GOAL_STATE_CUSTOM_TYPE)
+            })
+            .collect()
+    }
+
+    /// A goal-state change announced mid-turn (TS `_setGoalState` ->
+    /// `_emitGoalUpdate`) mirrors into the worker session file as a
+    /// `thread_goal_state` custom row: the engine's in-memory branch is
+    /// not the durable store, so the mirror is what a recovery rebuild
+    /// replays.
+    #[tokio::test]
+    async fn goal_update_events_mirror_the_durable_goal_row() {
+        let (worker, file) = goal_dispatch_worker_with_store(json!({
+            "emitUpdateOnPrompt": true,
+            "state": {
+                "active": true,
+                "status": "active",
+                "goalId": "goal-1",
+                "objective": "ship the port",
+                "tokensUsed": 340,
+                "timeUsedSeconds": 9,
+                "continuationsUsed": 2,
+            },
+        }))
+        .await;
+        let prompt = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "goal-session", "message": "work" }),
+            )
+            .await;
+        assert!(prompt.success, "prompt failed: {prompt:?}");
+        let rows = thread_goal_state_rows(&file);
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(rows[0]["data"]["status"], "active");
+        assert_eq!(rows[0]["data"]["objective"], "ship the port");
+        assert_eq!(rows[0]["data"]["goalId"], "goal-1");
+        assert_eq!(rows[0]["data"]["tokensUsed"], 340);
+        assert_eq!(rows[0]["data"]["continuationsUsed"], 2);
+    }
+
+    /// The post-compaction mint's state change (the compact branch runs
+    /// outside a turn) persists its `thread_goal_state` row before the
+    /// `goal_update` announcement, so the continuation count survives a
+    /// worker crash mid-goal.
+    #[tokio::test]
+    async fn compact_mint_persists_the_goal_state_row() {
+        let (worker, file) = goal_dispatch_worker_with_store(json!({
+            "status": "active",
+            "objective": "ship the port",
+            "state": {
+                "active": true,
+                "status": "active",
+                "goalId": "goal-1",
+                "objective": "ship the port",
+                "tokensUsed": 340,
+                "timeUsedSeconds": 9,
+                "continuationsUsed": 1,
+            },
+        }))
+        .await;
+        let compact = worker
+            .dispatch("compact", &json!({ "activeSessionId": "goal-session" }))
+            .await;
+        assert!(compact.success, "scripted compact failed: {compact:?}");
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "never went idle: {idle:?}");
+        let rows = thread_goal_state_rows(&file);
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(rows[0]["data"]["status"], "active");
+        assert_eq!(rows[0]["data"]["continuationsUsed"], 1);
+        assert_eq!(rows[0]["data"]["objective"], "ship the port");
     }
 
     /// `abort_and_clear_queue` suspends like the bare `abort` (TS

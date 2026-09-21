@@ -144,7 +144,17 @@ with the durable goal-context row), emits the mint's `goal_update`, then
 resumes: the parked continuation crosses the suspension gate through the
 resume site and the turn runner drives it (the `_schedulePostCompactionContinue`
 schedule). The compact-trigger auto-refine defers behind that continuation
-(TS `_compactAutoRefinePending`), servicing at its turn boundary. Platform wall
+(TS `_compactAutoRefinePending`), servicing at its turn boundary.
+Thread-goal durability (TS one-store parity): every `goal_update`
+announcement mirrors the new state as a `thread_goal_state` custom row in
+the worker session file (the turn emit closure; the compact mint persists
+its row at the mint site, outside a turn), and the engine's session-build
+adoption rehydrates the fresh goal driver from the moved branch's or the
+session file's latest valid `thread_goal_state` entry
+(`goal_state_persist.rs`) — status, objective, usage counters, and
+continuation counts continue across a worker-recovery rebuild, and the
+seeded published baseline keeps the rehydrated state from announcing
+itself (TS loads at construction without emitting). Platform wall
 (`platform`): per-OS endpoint naming and socket identity; the transport itself
 is the shared trait in `pa_types::platform::transport`, and the private-frame
 codec plus command planes are the shared wire contract in

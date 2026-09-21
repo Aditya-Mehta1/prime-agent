@@ -66,13 +66,29 @@ impl GoalDriver {
                 }
             }
         }
-        let accounting_started_at =
-            (state.status == GoalStatus::Active).then_some(AccountingStartedAt(now_millis()));
-        Self {
-            state,
-            accounting_started_at,
-            accounted_messages: Default::default(),
-        }
+        Self::restore_persisted(state)
+    }
+
+    /// Adopt an already-persisted goal state without re-persisting it: a
+    /// recovery rebuild continues the durable state verbatim (the
+    /// `thread_goal_state` row already records it, and the accounting
+    /// anchor restarts wall-clock attribution like the TS constructor's
+    /// `_goalState = this._loadPersistedGoalState()`).
+    pub fn restore_persisted(state: GoalState) -> Self {
+        let mut driver = Self::new();
+        driver.restore_from_persisted(state);
+        driver
+    }
+
+    /// [`GoalDriver::restore_persisted`]'s in-place form, for the driver
+    /// behind the session's shared handle: adopts the persisted state and
+    /// restarts the wall-clock anchor, never re-persisting (the durable
+    /// row already exists) and never resetting the per-message
+    /// double-counting guard (a fresh build starts it empty anyway).
+    pub fn restore_from_persisted(&mut self, state: GoalState) {
+        self.state = normalize_goal_state(state);
+        self.accounting_started_at =
+            (self.state.status == GoalStatus::Active).then_some(AccountingStartedAt(now_millis()));
     }
 
     pub fn state(&self) -> &GoalState {
@@ -537,6 +553,57 @@ mod tests {
             driver.state().last_reason.as_deref(),
             Some("Goal token budget already reached")
         );
+    }
+
+    /// TS `_loadPersistedGoalState` construction rehydration: the
+    /// persisted state (counts included) is adopted verbatim, wall-clock
+    /// attribution restarts for an active goal, and nothing re-persists.
+    #[test]
+    fn restore_persisted_adopts_the_state_without_rewriting_it() {
+        let state = GoalState {
+            active: true,
+            status: GoalStatus::Active,
+            goal_id: Some("goal-1".to_string()),
+            objective: Some("ship the port".to_string()),
+            token_budget: Some(1000),
+            tokens_used: 340,
+            time_used_seconds: 12,
+            continuations_used: 2,
+            created_at: Some(1),
+            updated_at: Some(2),
+            last_reason: None,
+            last_error: None,
+        };
+        let driver = GoalDriver::restore_persisted(state);
+        assert_eq!(driver.state().status, GoalStatus::Active);
+        assert_eq!(driver.state().objective.as_deref(), Some("ship the port"));
+        assert_eq!(driver.state().tokens_used, 340);
+        assert_eq!(driver.state().continuations_used, 2);
+        assert!(driver.owns_continuation_wakeup());
+        assert_eq!(driver.active_objective().as_deref(), Some("ship the port"));
+        // A budget_limited state stays inactive: no wakeup, no anchor.
+        let limited = GoalDriver::restore_persisted(GoalState {
+            active: false,
+            status: GoalStatus::BudgetLimited,
+            objective: Some("ship the port".to_string()),
+            continuations_used: 5,
+            tokens_used: 1000,
+            token_budget: Some(1000),
+            ..empty_goal_state()
+        });
+        assert!(!limited.owns_continuation_wakeup());
+        assert!(limited.active_objective().is_none());
+        // The next continuation continues the persisted count.
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::restore_persisted(GoalState {
+            active: true,
+            status: GoalStatus::Active,
+            objective: Some("ship the port".to_string()),
+            continuations_used: 2,
+            ..empty_goal_state()
+        });
+        driver.next_continuation_message(&mut session).unwrap();
+        assert_eq!(driver.state().continuations_used, 3);
     }
 
     #[test]

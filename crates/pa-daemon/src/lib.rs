@@ -20,6 +20,7 @@ mod compaction_outcome;
 pub mod descriptor;
 pub mod engine;
 pub mod framing;
+pub(crate) mod goal_state_persist;
 pub mod input_pause_lease;
 pub mod journal;
 pub mod lease;

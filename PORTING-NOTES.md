@@ -2389,3 +2389,77 @@ NOT this lane's surface — reported for their owning lanes):
   `replacement_kernel_e2e::switch_session_rebinds_the_kernel_cwd_onto_the_target_session`
   (a session created in `alpha/` switches onto a file recording `beta/`;
   the post-switch kernel's `os.getcwd()` receipt is `beta`).
+
+
+## Durable thread_goal_state mirror + recovery rehydration (goal-state-persist lane, the #238 residue)
+
+TS ground truth (agent-session.ts, goals.ts): the goal state lives in ONE
+store with the transcript. `_setGoalState` -> `_persistGoalState` appends
+the `thread_goal_state` custom entry to the session branch and
+`flushNow()`s it (durable before the first assistant response), so a
+started goal, its usage counters, and `continuationsUsed` survive any
+rebuild; the constructor rehydrates with
+`this._goalState = this._loadPersistedGoalState()` (branch scan
+newest-first, `isPersistedGoalState` validation, `normalizeGoalState`),
+silently — construction never emits. `_reloadGoalStateFromBranch({
+monotonicTokens })` after a context rebuild never lets the same goal's
+counters regress. The owed-continuation flag
+(`_goalContinuationAwaitsRlmWork`) is in-memory only and does NOT
+persist — a killed worker's parked continuation is restored by the queue
+journal or dropped, like TS.
+
+Rust port (the daemon split: the worker owns the session file; the
+engine's session manager is in-memory):
+
+- Mirror: every `goal_update` announcement persists the announced state
+  as a `custom` row (`customType: thread_goal_state`, `data: <GoalState>`)
+  in the worker session file — the turn emit closure in `worker.rs`
+  (engine events flow through it under the core lock) and the compact mint
+  site (the mint runs outside a turn, so its row rides the mint branch
+  next to `emit_worker_event`). The announcement only fires on real state
+  change (`goal_update_if_changed`), which matches TS `_setGoalState`
+  (every persisted transition also emits). pa-core standalone consumers
+  (print mode) keep the direct `SessionManager` persistence — no change.
+- Rehydration: the engine's build adoption
+  (`adopt_built_session`, every build path) seeds the fresh
+  `GoalDriver` with `GoalDriver::restore_from_persisted` from the moved
+  branch's entries (a pre-build tree navigation: faithful branch
+  semantics, the TS `_reloadGoalStateFromBranch` plain move) or the
+  session file's latest valid `thread_goal_state` entry
+  (`goal_state_persist.rs`, branch scan + validation + normalize), and
+  seeds the published baseline so the rehydrated state never announces
+  itself. Wall-clock accounting restarts for an active goal (the TS
+  constructor's `_goalAccountingStartedAt = Date.now()`).
+- Not ported here (documented adjacent gaps, other lanes): the
+  goal-continuation loop hook at natural turn end (nothing sets the
+  owed-continuation flag yet — the compact branch is the only mint site),
+  the recovered engine's empty transcript branch (a post-recovery compact
+  can skip "Session is too short" even when the durable file is long),
+  and compaction-boundary reload rules (`_reloadGoalStateFromBranch`
+  monotonic tokens) — the daemon engine keeps its driver across an
+  in-process compaction, so no reload is needed there.
+
+Verifiers:
+
+- pa-core unit: `GoalDriver::restore_persisted` +
+  `restore_persisted_adopts_the_state_without_rewriting_it` (counts
+  adopted verbatim, accounting anchor by status, next continuation
+  continues the persisted count).
+- pa-daemon unit: `goal_state_persist` reader (latest-valid-entry-wins,
+  invalid data skipped, missing/invalid files -> None, branch-entry scan
+  matches the store read); engine
+  `recovery_rebuild_rehydrates_the_goal_from_the_session_file` (fresh
+  engine over a prepared file rehydrates objective + counts, one
+  usage-accounting announcement from the rehydrated base, mint continues
+  the count); worker dispatch `goal_update_events_mirror_the_durable_goal_row`
+  and `compact_mint_persists_the_goal_state_row` (the two mirror sites
+  write the durable row; ScriptedEngine goal section gains
+  `emitUpdateOnPrompt` and the session-pathed store fixture).
+- e2e `goal_recovery_e2e::killed_mid_goal_worker_rehydrates_the_goal_with_counts`
+  (the f21 pattern, faux-scripted real engine): `/goal` start persists the
+  durable row; a compact mint bumps `continuationsUsed` to 1 durably and
+  announces it; SIGKILL the worker pid; the respawned worker serves the
+  recovery prompt and `get_connection_state` reports the goal active with
+  the preserved objective and `continuationsUsed: 1`; the recovery's
+  accounting announcements carry the rehydrated count (never reset); the
+  durable rows keep growing with objective and count intact.

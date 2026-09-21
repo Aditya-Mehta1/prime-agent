@@ -390,6 +390,31 @@ impl AgentSessionEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+        // Rehydrate the goal driver from the durable store (TS
+        // constructor: `this._goalState = this._loadPersistedGoalState()`
+        // reads the same session rows `_persistGoalState` wrote). A moved
+        // branch's own latest entry wins (faithful branch semantics); the
+        // worker-owned session file answers otherwise. The seed also sets
+        // the published baseline so the rehydrated state never announces
+        // itself (TS loads at construction without emitting).
+        let seed = if let Some(entries) = &pending_branch {
+            crate::goal_state_persist::goal_state_in_branch(entries)
+        } else {
+            let path = self
+                .session_file
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            crate::goal_state_persist::persisted_goal_state(path.as_deref())
+        };
+        if let Some(state) = seed {
+            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+            if let Some(handles) = handles {
+                let mut driver = handles.driver.lock().await;
+                driver.restore_from_persisted(state.clone());
+            }
+            *self.published_goal.lock().expect("published goal lock") = Some(state);
+        }
         if let Some(entries) = pending_branch {
             built.session.rebuild_branch_context(entries).await?;
         }
@@ -3383,6 +3408,88 @@ pub(crate) mod tests {
     /// follow-up turn — the continuation prompt text carrying the durable
     /// goal-context row — plus the `goal_update` payload of the state
     /// change. A goal that is not active mints nothing.
+    /// A recovery rebuild rehydrates the goal driver from the worker-owned
+    /// session file (TS constructor `_loadPersistedGoalState`): the fresh
+    /// engine continues the persisted objective and counts, the rehydrated
+    /// state never announces itself (the published baseline is seeded),
+    /// and later state changes (usage accounting) announce from the
+    /// rehydrated base, not from zero.
+    #[test]
+    fn recovery_rebuild_rehydrates_the_goal_from_the_session_file() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // The durable store a killed worker leaves behind: an active goal
+        // mid-pursuit with usage and continuation counts on the books.
+        let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let session_path = dir.path().join("session.jsonl");
+        store.set_path(session_path.clone());
+        store.append_entry(
+            "custom",
+            json!({
+                "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                "data": {
+                    "active": true,
+                    "status": "active",
+                    "goalId": "goal-1",
+                    "objective": "ship the port",
+                    "tokensUsed": 340,
+                    "timeUsedSeconds": 9,
+                    "continuationsUsed": 2,
+                },
+            }),
+        );
+        store.rewrite().expect("write session file");
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: Some(session_path),
+            faux_script: Some(r#"{"responses": [{"text": "recovery reply"}]}"#.to_string()),
+            supervisor_link: None,
+            telemetry_disabled: None,
+        })
+        .unwrap();
+        // The first turn builds the session; the adoption rehydrates the
+        // driver from the session file.
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "keep working".to_string(), &mut events);
+        let goal = engine.goal_state_value();
+        assert_eq!(goal["status"], "active");
+        assert_eq!(goal["objective"], "ship the port");
+        assert_eq!(goal["goalId"], "goal-1");
+        assert_eq!(goal["continuationsUsed"], 2);
+        assert!(goal["tokensUsed"].as_u64().unwrap() >= 340);
+        // Usage accounting announced from the rehydrated base (TS
+        // `_accountGoalUsageForAssistantMessage` -> `_emitGoalUpdate`): one
+        // `goal_update`, carrying the continued objective and count.
+        let goal_updates: Vec<&EngineEvent> = events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::GoalUpdate { .. }))
+            .collect();
+        assert_eq!(goal_updates.len(), 1, "events: {events:?}");
+        let EngineEvent::GoalUpdate { goal } = goal_updates[0] else {
+            unreachable!();
+        };
+        assert_eq!(goal["objective"], "ship the port");
+        assert_eq!(goal["continuationsUsed"], 2);
+        // A mint continues the persisted continuation count.
+        let minted = engine
+            .mint_post_compaction_goal_continuation()
+            .expect("the rehydrated goal mints");
+        assert_eq!(
+            minted.goal_update.expect("mint moved the state")["continuationsUsed"],
+            3
+        );
+    }
+
     #[test]
     fn post_compaction_goal_continuation_mint() {
         let _faux = FAUX_TEST_LOCK

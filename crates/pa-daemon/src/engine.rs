@@ -784,6 +784,11 @@ pub struct ScriptedEngine {
 struct ScriptedGoal {
     state: Value,
     message: String,
+    /// Verification fixture only: emit the scripted state as a
+    /// `goal_update` engine event during a turn (the real engine's
+    /// announcement path), so worker tests drive the durable
+    /// `thread_goal_state` mirror.
+    emit_update_on_prompt: bool,
 }
 
 /// Scripted compaction results, consumed one per run in order; when the
@@ -881,6 +886,10 @@ impl ScriptedEngine {
                             goal.get("objective").and_then(Value::as_str).unwrap_or("")
                         )
                     }),
+                emit_update_on_prompt: goal
+                    .get("emitUpdateOnPrompt")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             });
         Ok(ScriptedEngine {
             responses,
@@ -1006,6 +1015,17 @@ impl SessionEngine for ScriptedEngine {
         if !emit(accepted) {
             emit(cancelled());
             return;
+        }
+        // The fixture's mid-turn goal announcement (the real engine's
+        // `goal_update` emission path, TS `_setGoalState` ->
+        // `_emitGoalUpdate`).
+        if let Some(goal) = self.goal.as_ref().filter(|goal| goal.emit_update_on_prompt) {
+            if !emit(EngineEvent::GoalUpdate {
+                goal: goal.state.clone(),
+            }) {
+                emit(cancelled());
+                return;
+            }
         }
         let usage = scripted_usage();
         if !emit(EngineEvent::AssistantUpdate {
