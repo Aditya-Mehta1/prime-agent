@@ -493,7 +493,8 @@ export class ModelRegistry {
 	/**
 	 * Stat identity of the models.json bytes the current in-memory catalog was
 	 * built from: undefined when the file was absent at both bracket stats (or
-	 * there is no path), "unstable" when the bracket stats raced a write.
+	 * there is no path), "unstable" when the bracket stats raced a write or
+	 * the read/parse failed.
 	 */
 	private modelsJsonIdentity: CatalogFileIdentity | "unstable" | undefined = "unstable";
 
@@ -626,8 +627,8 @@ export class ModelRegistry {
 			} else if (!error && modelsJsonIdentity && after && isSameCatalogFileIdentity(modelsJsonIdentity, after)) {
 				this.modelsJsonIdentity = after;
 			} else {
-				// A failed read or parse is not a catalog build: the next refresh
-				// re-reads the file instead of pinning the empty result.
+				// A failed read or parse must not pin its empty custom-model set:
+				// the next refresh re-reads the file.
 				this.modelsJsonIdentity = "unstable";
 			}
 		}
