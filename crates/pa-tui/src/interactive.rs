@@ -201,6 +201,17 @@ pub struct InteractiveOptions {
     /// composition root provides (login suspends the TUI and prompts on
     /// the terminal). `None` reports the commands as unavailable.
     pub client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
+    /// `/traces`: the settings + credential state the composition root
+    /// owns (the trace upload subsystem itself stays unported). `None`
+    /// reports the command as unavailable.
+    pub traces: Option<crate::traces::TracesCommandsHandle>,
+    /// `/login` + `/logout`: the provider auth flows (credential storage,
+    /// OAuth, the provider catalog) the composition root owns. `None`
+    /// reports the commands as unavailable.
+    pub provider_auth: Option<crate::provider_auth::ProviderAuthCommandsHandle>,
+    /// `/update`: the CLI child runner + the post-update relaunch the
+    /// composition root owns. `None` reports the command as unavailable.
+    pub update_commands: Option<crate::update_command::UpdateCommandsHandle>,
     /// Adoption telemetry for the interactive view; `None` drops events.
     pub telemetry: Option<std::sync::Arc<dyn InteractionTelemetry>>,
     /// The effective keybindings (defaults merged with the user's
@@ -418,6 +429,9 @@ pub struct InteractiveOutcome {
     pub resume_hint: Option<String>,
     pub last_assistant_text: Option<String>,
     pub frames: Vec<String>,
+    /// OSC 52 clipboard sequences emitted during the run (headless capture
+    /// only; terminal runs write them to stdout directly).
+    pub clipboard_emissions: Vec<String>,
     /// `/resume` requested the agents view next (return-to-session flow).
     pub return_to_agents_view: bool,
     /// The subagent summary line opened the agents view scoped to this
@@ -586,7 +600,13 @@ pub async fn run_interactive(
         session.dirty = true;
     }
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
+    // Headless verification runs capture the OSC 52 clipboard channel
+    // instead of writing it to the plain pipes.
+    let headless = matches!(ui, UiMode::Headless(_));
     let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone(), options.fullscreen_mouse)?;
+    if headless {
+        session.osc_sink = crate::clipboard::OscSink::Buffer(Vec::new());
+    }
     // First-run onboarding owns the pane before the session screen (TS
     // `runStartupOnboarding`, model-ready branch: splash + trace question).
     // Headless harness runs have no terminal to draw it on and skip it.
@@ -608,6 +628,7 @@ pub async fn run_interactive(
                 resume_hint: None,
                 last_assistant_text: None,
                 frames: Vec::new(),
+                clipboard_emissions: Vec::new(),
                 agents_view_scope: None,
                 // Onboarding exit leaves no session open; no return-to-view
                 // or pending selection applies.
@@ -678,6 +699,23 @@ pub async fn run_interactive(
                     // Headless runs keep no terminal renderer (TS never
                     // registers the action without one), so the request is
                     // observed and dropped.
+                    // A provider login that prompts on the plain terminal
+                    // (browser OAuth, the MCP device flow): hand the
+                    // terminal over while the flow runs, like `/mcp
+                    // login`.
+                    if session.pending_terminal_login() {
+                        renderer.suspend(&mut view)?;
+                        session.run_terminal_login(&mut view).await?;
+                        renderer.resume()?;
+                    }
+                    // A `/update` run: the child processes own the plain
+                    // terminal, and a successful self-update replaces this
+                    // process with the updated CLI (never returns).
+                    if session.pending_update() {
+                        renderer.suspend(&mut view)?;
+                        session.run_update(&mut view).await?;
+                        renderer.resume()?;
+                    }
                     if session.take_suspend_request() && renderer.is_terminal_mut().is_some() {
                         match crate::suspend::suspend_cycle(
                             &mut crate::suspend::ProcessSignals,
@@ -735,6 +773,14 @@ pub async fn run_interactive(
                         session.error_row(&format!("{error:#}"), &mut view);
                         view.editor.set_text(&text);
                         session.dirty = true;
+                    }
+                    // A `/update` run parked by the submission: the child
+                    // processes own the plain terminal, and a successful
+                    // self-update replaces this process (never returns).
+                    if session.pending_update() {
+                        renderer.suspend(&mut view)?;
+                        session.run_update(&mut view).await?;
+                        renderer.resume()?;
                     }
                 }
                 UiInput::HeadlessDone => headless_done = true,
@@ -1111,6 +1157,9 @@ pub async fn run_interactive(
         resume_hint,
         last_assistant_text: session.last_assistant_text.clone(),
         frames: renderer.finish(&mut view, preserve_alt_screen),
+        // The headless OSC 52 capture (terminal runs wrote the sequences
+        // to stdout as they happened).
+        clipboard_emissions: session.take_osc_emissions(),
         return_to_agents_view: preserve_alt_screen,
         agents_view_scope: session.scoped_agents_view.take(),
         selection_request: session.pending_selection,
@@ -1590,6 +1639,9 @@ mod tests {
             onboarding: None,
             telemetry_disabled: None,
             client_auth: None,
+            traces: None,
+            provider_auth: None,
+            update_commands: None,
             telemetry: None,
             keybindings: crate::keybindings::KeybindingsManager::new(),
             session_rlm_depth: None,

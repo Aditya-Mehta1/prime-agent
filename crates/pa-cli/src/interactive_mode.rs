@@ -594,6 +594,23 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
                 config.agent_dir.clone(),
             )),
         )),
+        // `/traces`: the settings flag and the resolved credential the
+        // status block shows; the upload subsystem itself stays unported.
+        traces: Some(pa_tui::traces::TracesCommandsHandle(std::sync::Arc::new(
+            crate::client_traces::ClientTraces::new(config.cwd.clone(), config.agent_dir.clone()),
+        ))),
+        // `/update`: the CLI child runner and the post-update relaunch.
+        update_commands: Some(pa_tui::update_command::UpdateCommandsHandle(
+            std::sync::Arc::new(crate::client_update::ClientUpdate),
+        )),
+        // `/login` + `/logout`: the provider auth flows (the API-key store,
+        // the MCP device flow, the provider catalog).
+        provider_auth: Some(pa_tui::provider_auth::ProviderAuthCommandsHandle(
+            std::sync::Arc::new(crate::provider_login::ProviderAuth::new(
+                config.cwd.clone(),
+                config.agent_dir.clone(),
+            )),
+        )),
         telemetry: Some(std::sync::Arc::new(CliInteractionTelemetry {
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),

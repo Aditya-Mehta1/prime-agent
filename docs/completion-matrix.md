@@ -40,7 +40,7 @@ below is evidence-based, not battery-based.
 | 16 | Headless modes | partial | print/json done; RPC and ACP modes missing |
 | 17 | Session persistence | partial | entry-set parity + `toolResult` entries landed; per-entry gaps remain elsewhere |
 | 18 | First-run onboarding | complete | - |
-| 19 | Trace sharing | missing | opt-in setting persists; no upload subsystem, `/traces` UI unavailable |
+| 19 | Trace sharing | partial | opt-in setting persists; `/traces` UI ported (status block, on/off writes, credential/endpoint rows; the upload subsystem and its login/preview/upload arms stay unported and report it) |
 | 20 | Eval / verifiers Prime flow | partial | headless verifier gates (print/json) landed; `prime eval` hosted platform CLI is out of coding-agent scope; daemon RPC driving pending |
 | 21 | Native release / installer / CI | missing | binary does not ship the kernel runtime sidecar; `PI_PACKAGE_DIR` workaround |
 | 22 | Platform readiness (Windows) | in-flight | traits audited (`docs/windows-readiness.md`); no shipping support yet |
@@ -99,10 +99,12 @@ Did you mean /y?"), and session-command forwarding to the worker.
 
 Remaining:
 
-- Client command UIs: `pa-tui/src/session_ui.rs` L418-445 implements only
-  `help`, `list`, `switch`, `exit`, `new`, `quit`; every other client command
-  (model/settings/mcp/hotkeys/theme/traces/export...) prints "/x is not
-  available in this client yet" (L442).
+- Client command UIs: `pa-tui/src/session_ui.rs` implements `help`, `list`,
+  `switch`, `exit`, `new`, `quit`, `model`, `effort`, `tree`, `fork`,
+  `clone`, `mcp login/logout`, `export`, `share`, `hotkeys`, `copy`,
+  `import`, `login`, `logout`, `traces`, and `update`; the remaining client
+  commands (settings/theme/name/session/system-prompt/context/...) print
+  "/x is not available in this client yet".
 - `/effort` is additionally blocked by family 2.
 - Dynamic `/effort` argument hint and model-eligibility filtering of `/fast`
   (battery B-9 note) remain.
@@ -321,13 +323,17 @@ persisted completion flag (`pa-tui/src/onboarding.rs`;
 (`runs/20260917T062810Z` f1: "first-run splash + trace-sharing notice
 rendered and answerable on both sides").
 
-## 19. Trace sharing - missing
+## 19. Trace sharing - partial
 
 The opt-in setting persists (`set_agent_traces_enabled`,
-`pa-tui/src/interactive.rs` L62), but the trace upload subsystem
-(TS `core/agent-traces.ts`: outbox, credential flow, session upload) does not
-exist in Rust, and `/traces` (the command the onboarding note advertises) is a
-client command without a UI (family 3).
+`pa-tui/src/interactive.rs` L62) and `/traces` (the command the onboarding
+note advertises) is ported (`pa-tui/src/traces.rs` + the composition-root
+hook `pa-cli/src/client_traces.rs`): the TS status block, the on/off
+settings writes, and the credential/endpoint rows. The trace upload
+subsystem (TS `core/agent-traces.ts`: outbox, credential flow, session
+upload) does not exist in Rust; the upload/preview/login arms keep the TS
+state shapes (missing-credential errors, the no-session-file status) and
+report the unported backend.
 
 ## 20. Eval / verifiers Prime flow - partial
 

@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::engine::SessionEngine;
-use crate::protocol::{response_failure, response_success, DaemonResponse};
+use crate::protocol::{response_failure, response_success, DaemonErrorInfo, DaemonResponse};
 use crate::session_store::{session_file_name, SessionFile};
 use crate::worker::{SessionCore, Worker};
 
@@ -199,7 +199,9 @@ impl SessionNavigation {
                 None,
                 "import_jsonl",
                 &format!("File not found: {}", resolved.display()),
-                None,
+                Some(DaemonErrorInfo::SessionImportFileNotFound {
+                    file_path: resolved.display().to_string(),
+                }),
             ));
         }
         // The destination is the session dir's copy of the imported file
@@ -269,13 +271,22 @@ impl SessionNavigation {
                     let core = self.core.lock().unwrap();
                     core.cwd.clone()
                 };
+                // The typed error info lets clients render the TS
+                // missing-cwd prompt (the issue carries the fallback cwd
+                // the confirm answers with).
                 return Err(response_failure(
                     None,
                     command,
                     &format!(
                         "Stored session working directory does not exist: {cwd}\nSession file: {path}\nCurrent working directory: {fallback}"
                     ),
-                    None,
+                    Some(DaemonErrorInfo::MissingSessionCwd {
+                        issue: json!({
+                            "sessionFile": path,
+                            "sessionCwd": cwd,
+                            "fallbackCwd": fallback,
+                        }),
+                    }),
                 ));
             }
         }
@@ -791,5 +802,78 @@ mod tests {
             response.error.as_deref(),
             Some("File not found: /tmp/no-such-import.jsonl")
         );
+        // The typed error info lets the client render the TS import
+        // error surface (daemon-errors.ts `serializeDaemonError`).
+        assert_eq!(
+            response.error_info,
+            Some(DaemonErrorInfo::SessionImportFileNotFound {
+                file_path: "/tmp/no-such-import.jsonl".to_string()
+            })
+        );
+    }
+
+    /// A replacement whose stored cwd is gone answers the TS
+    /// `MissingSessionCwdError` text plus its typed error info (the
+    /// issue carries the fallback cwd the client's confirm answers with).
+    #[tokio::test]
+    async fn import_jsonl_answers_the_ts_missing_cwd_error_info() {
+        let dir = std::env::temp_dir().join(format!("pa-import-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The live session persists (the import copies its input into the
+        // live session's directory), so the worker starts on a real file.
+        let live = dir.join("live-session.jsonl");
+        let mut live_file = SessionFile::create("/tmp", None, 0);
+        live_file.set_path(live.clone());
+        live_file.rewrite().unwrap();
+        let config = crate::worker::WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "nav-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let worker = Arc::new(crate::worker::Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "cwd": "/tmp", "name": "nav", "sessionPath": live.to_string_lossy() }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let gone = dir.join("gone-session.jsonl");
+        let gone_cwd = dir.join("gone-cwd");
+        // A well-formed session file whose stored cwd no longer exists.
+        let mut file = SessionFile::create(&gone_cwd.to_string_lossy(), None, 0);
+        file.set_path(gone.clone());
+        file.rewrite().unwrap();
+        let response = worker
+            .dispatch(
+                "import_jsonl",
+                &json!({
+                    "activeSessionId": "nav-session",
+                    "inputPath": gone.to_string_lossy(),
+                }),
+            )
+            .await;
+        assert!(!response.success, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Stored session working directory does not exist:"),
+            "the TS-verbatim error text, got {response:?}"
+        );
+        match response.error_info {
+            Some(DaemonErrorInfo::MissingSessionCwd { issue }) => {
+                assert_eq!(issue["sessionCwd"], json!(gone_cwd.to_string_lossy()));
+                assert_eq!(issue["fallbackCwd"], json!("/tmp"));
+            }
+            other => panic!("expected the typed missing-cwd error info, got {other:?}"),
+        }
     }
 }

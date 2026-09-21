@@ -26,6 +26,7 @@ use crate::info_commands;
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
 use crate::model_picker::{CurrentModel, ModelPicker, ModelPickerAction, ModelPickerOptions};
+use crate::provider_auth::{AuthSelectorAction, AuthSelectorKind};
 use crate::queued::{QueueBrowseDirection, QueueLane};
 use crate::snapshot::{
     assistant_message_parts, attach_data_from_response, event_to_update, reconstruct, TurnUpdate,
@@ -105,6 +106,17 @@ fn queue_mutation_status_note(status: &str, is_edit: bool) -> String {
         _ if is_edit => "Queue changed; edit kept in the editor".to_string(),
         _ => "Queue changed; reorder not applied".to_string(),
     }
+}
+
+/// The question a pending confirm answers (TS `showExtensionConfirm`
+/// callers await inline; the TUI loop parks the continuation instead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingConfirm {
+    /// `/import <path>`: replace the current session with the JSONL file.
+    Import { path: String },
+    /// The import's stored session cwd is gone: `Yes` retries with the
+    /// fallback cwd (TS `promptForMissingSessionCwd`).
+    ImportCwdFallback { path: String, fallback_cwd: String },
 }
 
 pub(crate) struct SessionUi {
@@ -193,6 +205,27 @@ pub(crate) struct SessionUi {
     /// renders the failure once, through the message or the retry banner).
     turn_error_shown: bool,
     pub(crate) last_assistant_text: Option<String>,
+    /// The OSC 52 channel for clipboard writes (TS `process.stdout`):
+    /// stdout in the terminal, a captured buffer in headless runs.
+    pub(crate) osc_sink: crate::clipboard::OscSink,
+    /// The question the open confirm panel answers (TS `showExtensionConfirm`).
+    pending_confirm: Option<PendingConfirm>,
+    /// `/traces`: the settings + credential state the composition root
+    /// owns (the trace upload subsystem itself stays unported).
+    traces: Option<crate::traces::TracesCommandsHandle>,
+    /// `/login` + `/logout`: the provider auth flows the composition root
+    /// owns (credential storage, OAuth flows, the provider catalog).
+    provider_auth: Option<crate::provider_auth::ProviderAuthCommandsHandle>,
+    /// A provider login that needs the plain terminal (browser OAuth /
+    /// the MCP device flow): the run loop hands the terminal over and
+    /// runs this row's flow.
+    pending_terminal_login: Option<crate::provider_auth::ProviderRow>,
+    /// A `/update` run parked for the run loop: the child processes need
+    /// the plain terminal, and a successful self-update replaces this
+    /// process with the updated CLI.
+    pending_update: Option<crate::update_command::UpdatePlan>,
+    /// `/update`: the child runner + relaunch the composition root owns.
+    update_commands: Option<crate::update_command::UpdateCommandsHandle>,
     pub(crate) exit_requested: bool,
     /// `/resume` or the agents-back key: reopen the agents view after this
     /// session detaches.
@@ -342,6 +375,13 @@ impl SessionUi {
             working_tokens: LoaderTokenTracker::default(),
             turn_error_shown: false,
             last_assistant_text: None,
+            osc_sink: crate::clipboard::OscSink::Stdout,
+            pending_confirm: None,
+            traces: options.traces.clone(),
+            provider_auth: options.provider_auth.clone(),
+            pending_terminal_login: None,
+            pending_update: None,
+            update_commands: options.update_commands.clone(),
             exit_requested: false,
             open_agents_view: false,
             scoped_agents_view: None,
@@ -829,6 +869,17 @@ impl SessionUi {
             self.last_status_index = Some(view.chat_len() - 1);
         }
         self.dirty = true;
+    }
+
+    /// The OSC 52 sequences the headless run captured (TS writes them to
+    /// stdout; headless verification reads them here).
+    pub(crate) fn take_osc_emissions(&mut self) -> Vec<String> {
+        match std::mem::replace(&mut self.osc_sink, crate::clipboard::OscSink::Stdout) {
+            crate::clipboard::OscSink::Buffer(buffer) => {
+                vec![String::from_utf8_lossy(&buffer).into_owned()]
+            }
+            crate::clipboard::OscSink::Stdout => Vec::new(),
+        }
     }
 
     pub(crate) async fn detach(&self) -> Result<()> {
@@ -1420,6 +1471,96 @@ impl SessionUi {
                     self.handle_clone_command(view).await?;
                 }
             }
+            // TS `handleCopyCommand`: the last assistant text (the
+            // daemon `get_last_assistant_text` lookup) copied to the
+            // clipboard (platform tools, OSC 52 fallback). An argument is
+            // the usage error with the text kept in the editor.
+            "copy" => {
+                if !resolved.args.is_empty() {
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /copy", view);
+                } else {
+                    self.track_command_used("copy");
+                    self.handle_copy_command(view).await?;
+                }
+            }
+            // `/login` (TS `showConfigurationMenu("providers")`): the
+            // providers selector this build ports of that tab (the full
+            // configuration menu stays unported; the panel is the same
+            // TS `OAuthSelectorComponent` the tab mounts).
+            "login" => {
+                if !resolved.args.is_empty() {
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /login", view);
+                } else {
+                    self.track_command_used("login");
+                    self.open_provider_auth(AuthSelectorKind::Login, view)
+                        .await?;
+                }
+            }
+            // `/logout` (TS `showLogoutSelector`): the stored-credential
+            // selector; an empty store answers the TS status directly.
+            "logout" => {
+                if !resolved.args.is_empty() {
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /logout", view);
+                } else {
+                    self.track_command_used("logout");
+                    self.open_provider_auth(AuthSelectorKind::Logout, view)
+                        .await?;
+                }
+            }
+            // `/import <path.jsonl>` (TS `handleImportCommand`): the
+            // path parses like `/export`'s, then the confirm guards the
+            // replacement.
+            "import" => {
+                self.track_command_used("import");
+                let command_text = if resolved.args.is_empty() {
+                    "/import".to_string()
+                } else {
+                    format!("/import {}", resolved.args)
+                };
+                self.open_import_confirm(&command_text, view);
+            }
+            // `/traces [status|on|off|preview|upload|upload-current|
+            // upload-all|login]` (TS `handleTracesCommand`): the status
+            // block, the settings writes, and the TS command shapes over
+            // the upload subsystem this build has.
+            "traces" => {
+                self.track_command_used("traces");
+                self.handle_traces_command(resolved, view).await?;
+            }
+            // `/update [source|--self|--extensions|--extension <source>
+            // |--force|--rollback|--nightly|--stable]` (TS
+            // `handleUpdateCommand`): the busy guard, then the child
+            // runs own the terminal (a successful self-update replaces
+            // this process with the updated CLI).
+            "update" => {
+                self.track_command_used("update");
+                let plan = crate::update_command::parse_update_args(
+                    &resolved
+                        .args
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<String>>(),
+                );
+                // TS: the guard applies when the run does not update the
+                // binary (package updates wait for the turn; the self path
+                // tears the session down anyway).
+                if !plan.includes_self && self.turn_active {
+                    self.note_as(
+                        "Wait for the current work to finish before updating.",
+                        StatusKind::Warning,
+                        view,
+                    );
+                } else {
+                    view.editor.set_text("");
+                    self.pending_update = Some(plan);
+                }
+            }
             // TS `handleMcpCommand`'s login/logout branches: the auth
             // flows run in the client process (the composition root's
             // hook); the other management subcommands surface through the
@@ -1645,6 +1786,467 @@ impl SessionUi {
                 .unwrap_or_else(|| PathBuf::from(".")),
         };
         package_dir.join("CHANGELOG.md")
+    }
+
+    // ------------------------------------------------------------------
+    // Session import (/import)
+    // ------------------------------------------------------------------
+
+    /// The import confirm (TS `handleImportCommand`'s
+    /// `showExtensionConfirm`): parse the path, park the confirm, and let
+    /// the panel answer it.
+    fn open_import_confirm(&mut self, command_text: &str, view: &mut AgentView) {
+        let Some(input_path) = crate::export_share::path_command_argument(command_text, "/import")
+        else {
+            self.error_row("Usage: /import <path.jsonl>", view);
+            return;
+        };
+        view.editor.set_text("");
+        view.confirm = Some(crate::confirm::ConfirmPanel::yes_no(
+            "Import session",
+            &format!("Replace current session with {input_path}?"),
+        ));
+        self.pending_confirm = Some(PendingConfirm::Import { path: input_path });
+        self.dirty = true;
+    }
+
+    /// One key press while the confirm panel owns the frame.
+    async fn handle_confirm_key(&mut self, key: KeyEvent, view: &mut AgentView) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        let action = {
+            let Some(confirm) = view.confirm.as_mut() else {
+                return Ok(());
+            };
+            let kb = view.editor.keybindings();
+            confirm.handle_key(kb, &id)
+        };
+        match action {
+            crate::confirm::ConfirmAction::None => {}
+            crate::confirm::ConfirmAction::Cancel => {
+                view.confirm = None;
+                self.pending_confirm = None;
+            }
+            crate::confirm::ConfirmAction::Select(option) => {
+                let pending = self.pending_confirm.take();
+                view.confirm = None;
+                if option == "Yes" {
+                    match pending {
+                        Some(PendingConfirm::Import { path }) => {
+                            self.run_import(&path, None, view).await?;
+                        }
+                        Some(PendingConfirm::ImportCwdFallback { path, fallback_cwd }) => {
+                            self.run_import(&path, Some(&fallback_cwd), view).await?;
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// The import request and its outcomes (TS `handleImportCommand`'s
+    /// `importFromJsonl` call: the cancelled note, the typed error
+    /// surfaces, and the successful rebuild + status).
+    async fn run_import(
+        &mut self,
+        input_path: &str,
+        cwd_override: Option<&str>,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .request(DaemonCommand::ImportJsonl {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                input_path: input_path.to_string(),
+                cwd_override: cwd_override.map(str::to_string),
+                rest: Default::default(),
+            })
+            .await?;
+        if !response.success {
+            let error = response.error.unwrap_or_default();
+            match response.error_info {
+                Some(pa_types::daemon::DaemonErrorInfo::SessionImportFileNotFound {
+                    file_path,
+                }) => {
+                    self.error_row(
+                        &format!("Failed to import session: File not found: {file_path}"),
+                        view,
+                    );
+                }
+                Some(pa_types::daemon::DaemonErrorInfo::MissingSessionCwd { issue }) => {
+                    // TS `promptForMissingSessionCwd`: the confirm carries
+                    // the issue's text, and `Yes` retries with the fallback
+                    // cwd as the override.
+                    let session_cwd = issue
+                        .get("sessionCwd")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let fallback_cwd = issue
+                        .get("fallbackCwd")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    view.confirm = Some(crate::confirm::ConfirmPanel::yes_no(
+                        "Session cwd not found",
+                        &format!(
+                            "cwd from session file does not exist\n{session_cwd}\n\ncontinue in current cwd\n{fallback_cwd}"
+                        ),
+                    ));
+                    self.pending_confirm = Some(PendingConfirm::ImportCwdFallback {
+                        path: input_path.to_string(),
+                        fallback_cwd,
+                    });
+                    self.dirty = true;
+                }
+                _ => {
+                    self.error_row(&format!("Failed to import session: {error}"), view);
+                }
+            }
+            return Ok(());
+        }
+        if response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("cancelled"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            self.note("Import cancelled", view);
+            return Ok(());
+        }
+        // TS `renderCurrentSessionState`: the replacement's fresh branch
+        // renders from scratch, then the status row lands.
+        self.rebuild_transcript(view).await;
+        self.refresh_stats().await;
+        self.note(&format!("Session imported from: {input_path}"), view);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Provider auth (/login, /logout)
+    // ------------------------------------------------------------------
+
+    /// `/login` / `/logout` (TS `showConfigurationMenu("providers")` /
+    /// `showLogoutSelector`): fetch the hook's rows and mount the selector.
+    /// An empty logout store answers the TS status directly.
+    async fn open_provider_auth(
+        &mut self,
+        kind: AuthSelectorKind,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(auth) = self.provider_auth.clone() else {
+            let command = if kind == AuthSelectorKind::Login {
+                "/login"
+            } else {
+                "/logout"
+            };
+            self.note(
+                &format!("{command} is not available in this client yet"),
+                view,
+            );
+            return Ok(());
+        };
+        let rows = match kind {
+            AuthSelectorKind::Login => auth.0.login_options().await,
+            AuthSelectorKind::Logout => auth.0.logout_options().await,
+        };
+        if kind == AuthSelectorKind::Logout && rows.is_empty() {
+            self.note(
+                "No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
+                view,
+            );
+            return Ok(());
+        }
+        view.editor.set_text("");
+        view.provider_auth = Some(crate::provider_auth::ProviderAuthSelector::new(kind, rows));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// One key press while the provider selector owns the frame (TS
+    /// `OAuthSelectorComponent.handleInput`): Enter closes the panel and
+    /// runs the row's flow; the terminal-suspending flows park for the
+    /// run loop to hand the terminal over first.
+    async fn handle_provider_auth_key(
+        &mut self,
+        key: KeyEvent,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        let action = {
+            let Some(selector) = view.provider_auth.as_mut() else {
+                return Ok(());
+            };
+            let kb = view.editor.keybindings();
+            selector.handle_key(&id, kb)
+        };
+        match action {
+            AuthSelectorAction::None => {}
+            AuthSelectorAction::Cancel => {
+                view.provider_auth = None;
+            }
+            AuthSelectorAction::LoginError { message } => {
+                view.provider_auth = None;
+                self.error_row(&message, view);
+            }
+            AuthSelectorAction::Login { provider, api_key } => {
+                view.provider_auth = None;
+                match api_key {
+                    // The panel-prompted key: store it (TS
+                    // `showApiKeyLoginDialog`'s save path, no terminal
+                    // handover needed).
+                    Some(api_key) => {
+                        let auth = self.provider_auth.clone().expect("the selector was open");
+                        let outcome = auth.0.login(&provider, Some(&api_key)).await;
+                        self.apply_auth_outcome(outcome, view);
+                    }
+                    None => {
+                        self.pending_terminal_login = Some(provider);
+                    }
+                }
+            }
+            AuthSelectorAction::Logout { provider } => {
+                view.provider_auth = None;
+                let auth = self.provider_auth.clone().expect("the selector was open");
+                let outcome = auth.0.logout(&provider).await;
+                self.apply_auth_outcome(outcome, view);
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// One flow outcome (TS `completeProviderAuthentication`'s status vs
+    /// the flow's error row).
+    fn apply_auth_outcome(
+        &mut self,
+        outcome: crate::provider_auth::ProviderAuthOutcome,
+        view: &mut AgentView,
+    ) {
+        match outcome {
+            crate::provider_auth::ProviderAuthOutcome::Status(message) => {
+                self.note(&message, view);
+            }
+            crate::provider_auth::ProviderAuthOutcome::Error(message) => {
+                self.error_row(&message, view);
+            }
+        }
+    }
+
+    /// Whether a provider login parked for the plain terminal (the run
+    /// loop checks this after each key and hands the terminal over).
+    pub(crate) fn pending_terminal_login(&self) -> bool {
+        self.pending_terminal_login.is_some()
+    }
+
+    /// The run loop hands the terminal over and calls this for a parked
+    /// terminal login flow (the TS auth panel prompts on the plain
+    /// terminal; this build runs the composition root's flow there).
+    pub(crate) async fn run_terminal_login(&mut self, view: &mut AgentView) -> Result<()> {
+        let Some(provider) = self.pending_terminal_login.take() else {
+            return Ok(());
+        };
+        let Some(auth) = self.provider_auth.clone() else {
+            return Ok(());
+        };
+        let outcome = auth.0.login(&provider, None).await;
+        self.apply_auth_outcome(outcome, view);
+        self.dirty = true;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Update (/update)
+    // ------------------------------------------------------------------
+
+    /// Whether an update run parked for the run loop (the terminal handoff
+    /// seam).
+    pub(crate) fn pending_update(&self) -> bool {
+        self.pending_update.is_some()
+    }
+
+    /// The parked update run (TS `handleUpdateCommand`'s child phase):
+    /// run with the terminal handed over — package updates first, the
+    /// self update last (it replaces this process on success). The
+    /// relaunch preserves an explicit session selection, else it resumes
+    /// this session by file.
+    pub(crate) async fn run_update(&mut self, view: &mut AgentView) -> Result<()> {
+        let Some(plan) = self.pending_update.take() else {
+            return Ok(());
+        };
+        let Some(update) = self.update_commands.clone() else {
+            self.note("/update is not available in this client yet", view);
+            return Ok(());
+        };
+        if let Some(package) = &plan.package {
+            let mut args = vec!["package".to_string(), "update".to_string()];
+            match package {
+                crate::update_command::PackageUpdate::All => args.push("--extensions".to_string()),
+                crate::update_command::PackageUpdate::Source(source) => args.push(source.clone()),
+            }
+            match update.0.run_cli_child(args).await {
+                Err(error) => {
+                    self.error_row(&format!("Update failed: {error}"), view);
+                    return Ok(());
+                }
+                Ok(code) if code != 0 => {
+                    self.error_row(&format!("Update exited with code {code}"), view);
+                    return Ok(());
+                }
+                Ok(_) => {}
+            }
+            if !plan.includes_self {
+                // TS reloads resources after the child persisted settings;
+                // `/reload` stays unported in this client.
+                self.note("Packages updated. Reloading resources...", view);
+                return Ok(());
+            }
+        }
+        // The self-update child (TS passes the interactive-child marker;
+        // the split CLI needs no target flags here).
+        let mut args = vec!["update".to_string()];
+        args.extend(plan.flags.clone());
+        let child_result = update.0.run_cli_child(args).await;
+        match child_result {
+            Err(error) => {
+                eprintln!("Update failed: {error}");
+                eprintln!("Relaunching Prime Agent...");
+            }
+            Ok(code) if code != 0 => {
+                eprintln!("Update exited with code {code}");
+                eprintln!("Relaunching Prime Agent...");
+            }
+            Ok(_) => {}
+        }
+        // The relaunch (TS `buildUpdateRelaunchArgs`: this run's args plus
+        // a session resume when the invocation did not select one).
+        let mut relaunch_args: Vec<String> = std::env::args().skip(1).collect();
+        if !crate::update_command::args_include_session_selection(&relaunch_args) {
+            if let Some(session_file) = self.session_file.clone() {
+                relaunch_args.push("--resume".to_string());
+                relaunch_args.push(session_file);
+            }
+        }
+        update.0.relaunch(relaunch_args)
+    }
+
+    // ------------------------------------------------------------------
+    // Trace sharing (/traces)
+    // ------------------------------------------------------------------
+
+    /// `/traces` (TS `handleTracesCommand`): the status block, the
+    /// enable/disable settings writes, and the TS command shapes. The
+    /// upload subsystem (TS `core/agent-traces.ts`) is not ported yet, so
+    /// the upload/preview/login arms report the TS state where the state
+    /// decides it and their unavailability otherwise.
+    async fn handle_traces_command(
+        &mut self,
+        resolved: &pa_types::slash_commands::ResolvedSlashCommand,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(traces) = self.traces.clone() else {
+            self.note("/traces is not available in this client yet", view);
+            return Ok(());
+        };
+        let command = resolved.args.trim().to_lowercase();
+        let enabled = traces.0.enabled().await;
+        let credential = traces.0.credential().await;
+        let state = self.connection_state(view).await;
+        let session_file = state
+            .as_ref()
+            .and_then(|state| state.get("sessionFile"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let outcome = crate::traces::traces_command(
+            &command,
+            enabled,
+            credential.as_deref(),
+            session_file.as_deref(),
+            false,
+        );
+        match outcome {
+            crate::traces::TracesOutcome::StatusBlock(rows) => {
+                // TS `chatContainer.addChild(new Spacer(1))` then
+                // `new Text(info, 1, 0)`: the info-display block the
+                // `/session`-style commands share.
+                view.push_entry(ChatEntry::ClientText { rows });
+                self.dirty = true;
+            }
+            crate::traces::TracesOutcome::Status(text) => {
+                match command.as_str() {
+                    "off" | "disable" => {
+                        if let Err(error) = traces.0.set_enabled(false).await {
+                            self.error_row(
+                                &format!("Trace sharing disabled write failed: {error:#}"),
+                                view,
+                            );
+                            return Ok(());
+                        }
+                    }
+                    "on" | "enable" => {
+                        if let Err(error) = traces.0.set_enabled(true).await {
+                            self.error_row(
+                                &format!("Trace sharing enabled write failed: {error:#}"),
+                                view,
+                            );
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+                self.note(&text, view);
+            }
+            crate::traces::TracesOutcome::Warning(text) => {
+                self.note_as(&text, StatusKind::Warning, view);
+            }
+            crate::traces::TracesOutcome::Error(text) => {
+                self.error_row(&text, view);
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Clipboard (/copy)
+    // ------------------------------------------------------------------
+
+    /// `/copy` (TS `handleCopyCommand`): fetch the last assistant text
+    /// from the daemon and copy it to the clipboard. No assistant text
+    /// yet is the TS error row; a clipboard failure surfaces the copy
+    /// chain's own message.
+    async fn handle_copy_command(&mut self, view: &mut AgentView) -> Result<()> {
+        let data = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::GetLastAssistantText {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    rest: Default::default(),
+                },
+            )
+            .await?;
+        let text = data
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let Some(text) = text else {
+            self.error_row("No agent messages to copy yet.", view);
+            return Ok(());
+        };
+        match crate::clipboard::copy_to_clipboard(&text, &mut self.osc_sink) {
+            Ok(()) => self.note("Copied last agent message to clipboard", view),
+            Err(message) => self.error_row(&message, view),
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -2221,6 +2823,9 @@ impl SessionUi {
             version: String::new(),
             onboarding: None,
             client_auth: self.client_auth.clone(),
+            traces: self.traces.clone(),
+            provider_auth: self.provider_auth.clone(),
+            update_commands: self.update_commands.clone(),
             telemetry: self.telemetry.clone(),
             keybindings: self.keybindings.clone(),
             // `/new` starts a fresh root session: no depth label.
@@ -3004,6 +3609,16 @@ impl SessionUi {
         }
         if view.fork_selector.is_some() {
             return self.handle_fork_selector_key(key, view).await;
+        }
+        // A pending extension confirm owns the frame the same way (TS
+        // `showExtensionConfirm` mounts its selector over the prompt).
+        if view.confirm.is_some() {
+            return self.handle_confirm_key(key, view).await;
+        }
+        // The `/login` / `/logout` provider selector owns the frame the
+        // same way (TS's auth panel mounts over the prompt).
+        if view.provider_auth.is_some() {
+            return self.handle_provider_auth_key(key, view).await;
         }
         // The `/share` loader owns the frame while an upload runs (TS the
         // loader takes focus): the cancel binding aborts, other keys are

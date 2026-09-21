@@ -101,6 +101,12 @@ pub struct AgentView {
     pub model_picker: Option<crate::model_picker::ModelPicker>,
     /// The `/tree` selector (owns the frame while open).
     pub tree_selector: Option<crate::tree_selector::TreeSelector>,
+    /// A pending extension confirm (TS `showExtensionConfirm`: the
+    /// Yes/No selector over the editor dock).
+    pub confirm: Option<crate::confirm::ConfirmPanel>,
+    /// The `/login` / `/logout` provider selector (TS
+    /// `OAuthSelectorComponent` inline): owns the frame while open.
+    pub provider_auth: Option<crate::provider_auth::ProviderAuthSelector>,
     /// The `/fork` user-message selector.
     pub fork_selector: Option<crate::user_message_selector::UserMessageSelector>,
     /// The `/effort` inline picker (TS `ThinkingSelectorComponent` seam):
@@ -174,6 +180,8 @@ impl AgentView {
             onboarding: None,
             model_picker: None,
             tree_selector: None,
+            confirm: None,
+            provider_auth: None,
             fork_selector: None,
             effort_picker: None,
             share_loader: None,
@@ -1058,6 +1066,8 @@ impl AgentView {
         let selector_dock: Option<Vec<Line>> = if self.tree_selector.is_some()
             || self.fork_selector.is_some()
             || self.share_loader.is_some()
+            || self.confirm.is_some()
+            || self.provider_auth.is_some()
         {
             // TS's editor container holds the prompt context (the detail
             // hint) and the editor; `showSelector` replaces only the editor
@@ -1069,6 +1079,10 @@ impl AgentView {
                 dock.extend(selector.render(&self.theme, width));
             } else if let Some(loader) = self.share_loader.as_ref() {
                 dock.extend(self.render_share_loader(loader, width));
+            } else if let Some(confirm) = self.confirm.as_ref() {
+                dock.extend(confirm.render(&self.theme, width));
+            } else if let Some(selector) = self.provider_auth.as_mut() {
+                dock.extend(selector.render(&self.theme, width));
             }
             Some(dock)
         } else {
@@ -1180,6 +1194,8 @@ impl AgentView {
             || self.tree_selector.is_some()
             || self.fork_selector.is_some()
             || self.share_loader.is_some()
+            || self.confirm.is_some()
+            || self.provider_auth.is_some()
         {
             return None;
         }

@@ -893,3 +893,82 @@ frames identical. Sandbox gates: fmt, clippy -D warnings, cargo test
 --workspace (86 suites) green. The `--all-targets` compile break in
 pa-daemon's test engines (#251's second `rebuild_session_context` impl) is
 fixed in-lane so the lib tests run at all.
+
+## Clipboard/auth/update client commands (PR: `pa-tui: clipboard/import/auth/update commands (TS parity)`)
+
+TS reference: `packages/coding-agent/src/modes/interactive/interactive-mode.ts` —
+`handleCopyCommand`, `handleImportCommand`, `handleTracesCommand`,
+`handleUpdateCommand`, the `login`/`logout` dispatch arms, `auth-flows.ts`,
+`utils/clipboard.ts`, `oauth-selector.ts`, `extension-selector.ts`,
+`session-cwd.ts`, `agent-traces.ts`, `prime-inference-auth.ts`,
+`package-manager-cli.ts`.
+
+- `/copy`: the full TS clipboard chain (platform tools first — pbcopy/clip/
+  termux/wl-copy/xclip/xsel gated on their session envs — with the OSC 52
+  fallback for remote sessions or when nothing copied, `100_000`-byte
+  encoded cap, TS wording on failure). The OSC 52 emitter is its own
+  module (`osc52.rs`) so the mouse-selection drag-copy lane can reuse the
+  same bytes. Text comes from the daemon `get_last_assistant_text` (the TS
+  connection call), trimmed-empty answering the TS error row. Verifier:
+  raw-pty byte capture of both binaries on the same scripted turn —
+  `scripts/clipboard_parity.py` PASSes (identical `]52;c;<b64>`
+  sequences, same payload); headless e2e asserts the emitted sequence and
+  the status/error rows.
+- `/import`: TS path argument parse (shared with `/export`), the TS confirm
+  ("Import session" / "Replace current session with <path>?"), the daemon
+  `import_jsonl` call, and the typed error surfaces. The daemon now
+  attaches the TS errorInfo codes to the import failures
+  (`session_import_file_not_found` with `filePath`, `missing_session_cwd`
+  with the issue — `session_navigation.rs`), so the TUI renders the TS
+  missing-cwd confirm ("Session cwd not found" with the issue text) and
+  retries with the fallback cwd as `cwdOverride` — the TS
+  `promptForMissingSessionCwd` contract. Divergences: the confirm panel is
+  the `showExtensionSelector` surface this build has (the same Yes/No
+  pane TS mounts), and the transcript rebuild after the import is the
+  `rebuild_transcript` refetch (TS `renderCurrentSessionState` re-renders
+  the same state through its own path).
+- `/login` + `/logout`: the TS providers selector (`OAuthSelectorComponent`
+  inline: the "Providers"/"MCP Connections" tab bar, the search field, the
+  `name · subscription|api key` rows with the TS status indicators —
+  configured/unconfigured/env-key/expired — the scroll counter, the TS
+  empty messages). The API-key login prompts in the panel (TS
+  `LoginDialogComponent.showPrompt`), stores through the composition
+  root, and shows the TS status ("Saved API key for <name>. Credentials
+  saved to <authPath>"). Documented divergences: (1) `/login` opens the
+  providers selector directly — the full `ConfigurationMenuComponent`
+  (the tabbed settings menu around it) is not ported, so post-login model
+  selection refresh happens on the next `/model` open; (2) the provider
+  subscription OAuth flows (Anthropic/Copilot/Codex/xAI) and the Prime
+  browser logins are not ported — their rows render (TS names, TS order,
+  prime-inference first) and their flows report the unavailability; the
+  MCP device flow runs like `/mcp login` (terminal suspended); (3) the
+  post-logout `/reload` for removed `mcp:` credentials stays unported
+  (the TS rule), reported with the removal status instead.
+- `/traces`: the TS status block verbatim ("Trace Sharing", automatic
+  uploads/credential/endpoint/session-file rows, the commands line —
+  plain text, not markdown, so env-key labels survive byte-for-byte),
+  on/off through the settings hook (TS `setAgentTracesEnabled`+flush),
+  the credential resolution order (traces env key, stored
+  `prime-agent-traces`, `PRIME_API_KEY`, stored prime-inference), the
+  endpoint resolution (`PRIME_AGENT_TRACES_BASE_URL` normalized, the
+  `api.primeintellect.ai` default). The upload subsystem (TS
+  `core/agent-traces.ts` — outbox, session upload, browser login) is not
+  ported: its arms keep the TS state shapes (the missing-credential
+  errors, the no-session-file enable status) and report the unported
+  upload/login honestly.
+- `/update`: the TS busy guard (package targets wait for the running turn;
+  the binary update tears down anyway), the TS target parse
+  (`--self`/`--extensions`/`--extension <src>`/positionals — "all"
+  default), and the child runs with inherited stdio under a suspended
+  terminal. Divergences from TS (the split CLI): the TS single
+  `prime-agent update <targets>` child is two Rust children —
+  `prime-agent package update [--extensions|<source>]` first, then
+  `prime-agent update [--force|--rollback|--nightly|--stable]` (packages
+  before the binary because the binary run ends this process); the
+  post-update reload for package-only runs and the `--daemon-socket`
+  preservation are unported (`/reload` missing; the Rust `update` command
+  targets the default socket). A successful self-update replaces this
+  process with the updated launcher from the managed install root
+  (TS `tryExecUpdateRelaunch` semantics: exec, child fallback, exit-code
+  relay), relaunching with this run's args plus `--resume <sessionFile>`
+  unless the invocation already selected a session.
