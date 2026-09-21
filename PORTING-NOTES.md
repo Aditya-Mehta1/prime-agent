@@ -2193,11 +2193,10 @@ the diff catches). The seam itself is pinned by the pa-core
   replacement branch), so a read-seam build cannot strand a parked
   replacement branch (pre-existing latent gap: only the turn-driven build
   consumed it before).
-  Remaining documented divergence (out of this lane's scope): TS
-  `teardownCurrent` also disposes the session's hosted RLM subagent
-  runtimes on replacement; the Rust port's RLM children are separate
-  daemon workers under the supervisor, so their lifecycle on a parent
-  replacement belongs to the rlm-children surface. TS `session.reload()`
+  TS `teardownCurrent` also disposes the session's hosted RLM subagent
+  runtimes on replacement — that half is the `rlm-children-replacement`
+  lane below (resolved there: the children close with the parent). TS
+  `session.reload()`
   disposes the kernel provisioner (a previous provisioner's final snapshot
   flush gates the next read); the Rust `reload` arm is not yet implemented
   (no daemon `reload` command exists) — the ruling will apply when it lands.
@@ -2481,3 +2480,70 @@ Verifiers:
   the preserved objective and `continuationsUsed: 1`; the recovery's
   accounting announcements carry the rehydrated count (never reset); the
   durable rows keep growing with objective and count intact.
+
+
+- lane `rlm-children-replacement`: RLM children lifecycle on a parent
+  runtime replacement (the #237 flagged divergence; TS ruling).
+  TS ground truth (`core/agent-session-runtime.ts` +
+  `modes/daemon/daemon-mode.ts`): every whole-runtime replacement flow
+  (`newSession` / `switchSession` / `fork` / `importFromJsonl`) runs
+  `teardownForReplacement` -> `teardownCurrent`, which disposes the
+  session's kernel first and then `disposeHostedSubagentRuntimes`: the
+  daemon host's `disposeRlmSubagentRuntimes` runs
+  `closeChildSessions(parentState, "replaced")`, closing every resident
+  child session (`getChildActiveSessionStates`: `metadata.parentActiveSessionId
+  === parent.activeSessionId`) recursively through grandchildren. So TS
+  children do NOT survive a parent replacement: they are archived, aborted,
+  disposed, removed from the session map, and the replacement session's
+  roster starts empty (a fresh `AgentSession` has no `_activeRlmChildRuns`).
+  The close is a plain stop — `closeSessionOnce("replaced")` archives the
+  child session file and aborts its in-flight work, but only
+  `recordRlmSubagentDeletion` (explicit delete/cancel) tombstones the
+  ledger, so the spawn edge and the passive roster row survive the close.
+  `rlm.create_session` depth-0 root sessions carry no
+  `parentActiveSessionId` and SURVIVE the replacement. A child-close error
+  rethrows out of `teardownCurrent`: the replacement command fails with
+  the old runtime already disposed. The same `closeChildSessions` cascade
+  runs at `kill` (`closeSession(state, "killed")` — default
+  `cascadeChildren: true`) and at shutdown (`closeSessionOnce("shutdown")`
+  still calls `runtime.dispose` -> `disposeHostedSubagentRuntimes`).
+  Ruling: the Rust redesign hosts each child as its own supervisor-owned
+  worker, so the close ports as a signal through the supervisor.
+  Port: `SupervisorChildSessions::close_children` (rlm_children.rs) stops
+  every tracked child through the supervisor link — a `kill` with NO
+  `rlmLedgerDelete` marker (a stop, not a delete: the ledger edge and the
+  passive roster row survive, mirroring TS), suppresses the terminal
+  notices (no notice is owed to a session being torn down), ends the
+  settle watchers (`closed_by_parent`), and treats a child whose session
+  is already gone as a completed no-op (the TS `sessions.has` early
+  return); every other close failure propagates after the walk, exactly
+  like TS `closeChildSessions` collecting the first error. The worker
+  runs the close at `teardown_for_replacement` (after the kernel retire —
+  TS `disposeAsync` precedes `disposeHostedSubagentRuntimes`; a failure
+  fails the replacement command), at `handle_kill` (best-effort, like the
+  TS daemon kill handler's `.catch(() => undefined)`), and at
+  `handle_shutdown` (best-effort; TS close at shutdown runs the
+  hosted-subagent disposal through `runtime.dispose`). Because the close
+  reaches a child through the child worker's own `kill` handler, each
+  child closes its own children first: the cascade to grandchildren is
+  the kill route's recursion, matching the TS `closeSessionOnce` cascade.
+  The harness's `childScript` create-config key (the TS analog: the child
+  runtime inherits the parent's `sessionConfig`) lets a scripted parent
+  spawn scripted children through the real worker path, and the key rides
+  the replacement identity rebind (the replacement session's children
+  stay scripted). Documented adjacent gaps (out of this lane's scope): a
+  parent worker killed with SIGKILL cannot close its children (TS
+  children die with the in-process parent); the supervisor's parent-death
+  cleanup is the follow-up seam.
+  Verifiers: `pa-daemon/tests/rlm_children_replacement_e2e.rs` — a real
+  supervisor, a real parent worker whose kernel cell spawns the child
+  through the product `rlm.spawn` surface, and a scripted child held
+  mid-run: `new_session` must close the child (supervisor roster drops
+  it, the child session file archives, `get_rlm_children` reads empty,
+  and the replacement session's kernel `rlm.list_subagents()` returns
+  `[]`), while an `rlm.create_session` root session must SURVIVE the
+  same replacement. Mutation-checked: disabling the replacement
+  close fails the e2e. Unit: `rlm_children::watch_tests` — the close
+  carries no delete marker, an already-gone child is a no-op, a real
+  close failure keeps the child tracked, and a closed child delivers no
+  terminal notice.

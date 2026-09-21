@@ -1677,7 +1677,7 @@ impl SessionEngine for AgentSessionEngine {
                 session_id: identity.session_id.clone(),
                 session_file: identity.session_file.clone(),
                 thinking: identity.thinking.clone(),
-                child_script: None,
+                child_script: identity.child_script,
             };
             children.set_identity(parent);
         }

@@ -235,6 +235,11 @@ pub(crate) struct SessionCore {
     pub(crate) rlm_child_id: Option<String>,
     parent_active_session_id: Option<String>,
     parent_session_id: Option<String>,
+    /// The create command's harness `childScript` (the TS child runtime
+    /// inherits the parent's `sessionConfig`; the Rust replacement keeps
+    /// the seam across the runtime swap so a replacement session's
+    /// children stay scripted). `None` for product sessions.
+    pub(crate) child_script: Option<String>,
     /// The session's service-tier preference (TS `_serviceTierPreference`;
     /// `None` is the settings default "auto"). The effective tier clamps
     /// `priority` to `default` on models without fast mode.
@@ -302,6 +307,7 @@ impl SessionCore {
             rlm_child_id: None,
             parent_active_session_id: None,
             parent_session_id: None,
+            child_script: None,
             service_tier: None,
             steering_mode: "all".to_string(),
             follow_up_mode: "all".to_string(),
@@ -649,6 +655,7 @@ impl Worker {
             rlm_child_id: None,
             parent_active_session_id: None,
             parent_session_id: None,
+            child_script: None,
             service_tier: None,
             steering_mode: "all".to_string(),
             follow_up_mode: "all".to_string(),
@@ -1650,6 +1657,13 @@ impl Worker {
             .get("thinking")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // Verification seam (the TS child runtime inherits the parent's
+        // `sessionConfig`): a scripted parent session passes its children's
+        // engine file down the recursion. Product creates carry `None`.
+        let child_script = payload
+            .get("childScript")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         let mut store = match (&session_path, no_session) {
             (Some(path), false) if path.exists() => match SessionFile::open(path) {
@@ -1817,11 +1831,12 @@ impl Worker {
             core.rlm_child_id = rlm_child_id;
             core.parent_active_session_id = parent_active_session_id;
             core.parent_session_id = parent_session_id;
+            core.child_script = child_script.clone();
             (self.summary_locked(&core), rlm_depth)
         };
         // Seed the engine's RLM identity: recursion depth and bound, this
-        // session's persistence ids, and the default thinking level its
-        // children inherit.
+        // session's persistence ids, the default thinking level its
+        // children inherit, and the harness's child engine file.
         if let Err(error) = self.engine.configure_rlm_identity(RlmSessionIdentity {
             rlm_depth,
             rlm_max_depth,
@@ -1829,6 +1844,7 @@ impl Worker {
             session_id: Some(summary.session_id.clone()),
             session_file: summary.session_file.clone(),
             thinking,
+            child_script: child_script.clone(),
         }) {
             return response_failure(None, "create", &error.to_string(), None);
         }
@@ -2483,6 +2499,15 @@ impl Worker {
         self.compaction.abort();
         self.tree_navigation.abort();
         self.await_session_work_settled().await;
+        // The runtime dispose at shutdown runs the hosted-subagent
+        // disposal with it (TS `closeSessionOnce("shutdown")` ->
+        // `runtime.dispose` -> `disposeHostedSubagentRuntimes`): the
+        // children close before the process exits, so the close's kills
+        // never race the exit. Best-effort: an unreachable child must not
+        // block the worker's own exit.
+        if let Err(error) = self.close_rlm_children().await {
+            eprintln!("pa-daemon: RLM child close at shutdown failed: {error:#}");
+        }
         if let Some(agent_engine) = &self.agent_engine {
             agent_engine.dispose_kernel().await;
         }
@@ -2524,10 +2549,14 @@ impl Worker {
     /// kernel disposes (its final namespace snapshot flushes before the
     /// process exits) and the built session drops, so the replacement
     /// rebuilds a fresh session against the moved file exactly like the
-    /// TS fresh runtime. The tree moves (`navigate_tree`) never run
+    /// TS fresh runtime. The teardown then closes the session's RLM
+    /// children (TS `teardownCurrent` ->
+    /// `disposeHostedSubagentRuntimes`): a parent that replaces its
+    /// runtime disposes its children, and the replacement session's
+    /// roster starts empty. The tree moves (`navigate_tree`) never run
     /// this: TS rebuilds the branch context in place and the kernel
     /// stays warm.
-    pub(crate) async fn teardown_for_replacement(&self) {
+    pub(crate) async fn teardown_for_replacement(&self) -> anyhow::Result<()> {
         {
             let mut core = self.core.lock().unwrap();
             core.steering.clear();
@@ -2537,6 +2566,32 @@ impl Worker {
         self.tree_navigation.abort();
         self.await_replacement_settled().await;
         self.engine.teardown_for_replacement().await;
+        // TS `teardownCurrent` ends with `disposeHostedSubagentRuntimes`:
+        // the session's runtime is disposed first (the kernel retire
+        // above), then the hosted RLM subagent runtimes close with it -
+        // the daemon host's `disposeRlmSubagentRuntimes` runs
+        // `closeChildSessions(parentState, "replaced")`. A close failure
+        // rethrows out of the teardown exactly like TS (the replacement
+        // fails with the old runtime already retired).
+        self.close_rlm_children().await
+    }
+
+    /// Close this session's supervisor-backed RLM children (TS
+    /// `closeChildSessions` through `disposeHostedSubagentRuntimes`).
+    /// Runs at every runtime teardown that ends the session - the
+    /// replacement retire, `kill`, and the worker `shutdown` - because
+    /// the TS daemon closes resident children on every session close and
+    /// at the replacement teardown, cascading to grandchildren through
+    /// each child worker's own close.
+    async fn close_rlm_children(&self) -> anyhow::Result<()> {
+        let children = self
+            .agent_engine
+            .as_ref()
+            .and_then(|engine| engine.children.clone());
+        match children {
+            Some(children) => children.close_children().await,
+            None => Ok(()),
+        }
     }
 
     /// Wait until the replacement teardown can retire the runtime: no
@@ -2621,7 +2676,7 @@ impl Worker {
         // The status line re-seeds from the moved-to session's persisted
         // verdict (TS `summarizer.forget` + `seed` on the replacement).
         self.status_runner.seed_from_session();
-        let (rlm_depth, summary) = {
+        let (rlm_depth, summary, child_script) = {
             let mut core = self
                 .core
                 .lock()
@@ -2635,13 +2690,17 @@ impl Worker {
                 .and_then(SessionFile::rlm_depth)
                 .unwrap_or(0);
             core.rlm_depth = rlm_depth;
-            (rlm_depth, self.summary_locked(&core))
+            let child_script = core.child_script.clone();
+            (rlm_depth, self.summary_locked(&core), child_script)
         };
         // No thinking flag rides the rebind (the create command's level is
         // already resolved on the engine), and the TS replacement runtime
         // carries no inherited max-depth: the moved-to session's persisted
         // chat override, the global setting, the env, or the default
-        // resolve it (`_resolveRlmMaxDepth` precedence).
+        // resolve it (`_resolveRlmMaxDepth` precedence). The harness's
+        // child engine file rides along: TS children inherit the
+        // replacement runtime's `sessionConfig`, which the runtime keeps
+        // across its swaps.
         if let Err(error) = self
             .engine
             .configure_rlm_identity(crate::engine::RlmSessionIdentity {
@@ -2651,6 +2710,7 @@ impl Worker {
                 session_id: Some(summary.session_id.clone()),
                 session_file: summary.session_file.clone(),
                 thinking: None,
+                child_script,
             })
         {
             eprintln!("pa-daemon: replacement identity rebind failed: {error:#}");
@@ -3142,6 +3202,13 @@ impl Worker {
 
     async fn handle_kill(&self) -> DaemonResponse {
         self.side_questions.abort_all();
+        // TS `closeSessionOnce("killed")` cascades the close to the
+        // session's resident children before the session's own archive
+        // and dispose; a close failure is swallowed here exactly like the
+        // daemon-mode kill handler's `.catch(() => undefined)`.
+        if let Err(error) = self.close_rlm_children().await {
+            eprintln!("pa-daemon: RLM child close at kill failed: {error:#}");
+        }
         // `session archived` (schema v1) + the session-ended finalization:
         // kill disposes the session like the TS dispose callback does.
         self.engine.archive_session_telemetry().await;
@@ -5716,6 +5783,7 @@ mod turn_stream_tests {
             rlm_child_id: None,
             parent_active_session_id: None,
             parent_session_id: None,
+            child_script: None,
             service_tier: None,
             steering_mode: "all".to_string(),
             follow_up_mode: "all".to_string(),

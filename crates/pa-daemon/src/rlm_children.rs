@@ -139,6 +139,12 @@ struct ChildRecord {
     /// Terminal error text (TS `run.error`): the cancel reason for a
     /// cancelled run, the failure text for a failed one.
     error: Option<String>,
+    /// The parent session closed while this child ran (a replacement
+    /// teardown or a session close): the settle watcher exits without a
+    /// notice — TS closes the child with the parent (`closeChildSessions`)
+    /// and no terminal notice is owed to a session that is being torn
+    /// down.
+    closed_by_parent: bool,
 }
 
 impl ChildRecord {
@@ -247,6 +253,20 @@ impl SupervisorChildSessions {
             }
         }
         false
+    }
+
+    /// Close every tracked child session with the parent session (TS
+    /// `closeChildSessions`, the daemon host's
+    /// `disposeRlmSubagentRuntimes` for the replacement teardown, and the
+    /// `closeSessionOnce` cascade every session close runs). The ruling:
+    /// a parent that replaces or closes its runtime disposes its
+    /// supervisor-backed children - a plain stop, not a delete (no
+    /// `rlmLedgerDelete` marker, so the spawn edge and the passive roster
+    /// row survive like TS), no terminal notice (the parent session is
+    /// going away), and each child's own close cascades to its children
+    /// through the child worker's kill handler.
+    pub async fn close_children(&self) -> Result<()> {
+        self.inner.close_children_inner().await
     }
 
     /// Replace the parent identity (the worker session sets it once its own
@@ -360,6 +380,7 @@ impl SupervisorChildSessions {
                 notice_delivered: false,
                 prompt_admitted: true,
                 error: None,
+                closed_by_parent: false,
             })));
     }
 
@@ -545,6 +566,10 @@ impl SupervisorChildSessionsInner {
         }
         if let Some(script) = &identity.child_script {
             config["script"] = json!(script);
+            // The scripted engine rides the identity down the recursion
+            // (the TS child runtime inherits the parent's sessionConfig, so
+            // a harness child spawns harness grandchildren the same way).
+            config["childScript"] = json!(script);
         }
         // Runtime metadata mirrors the TS subagent runtime identity; a
         // depth-0 resident session carries none (it is a plain root session).
@@ -788,6 +813,14 @@ impl SupervisorChildSessionsInner {
     async fn watch_child_settle(&self, record: &Arc<Mutex<ChildRecord>>) {
         let mut unreachable_polls: u32 = 0;
         loop {
+            // The parent's session closed with this child running (a
+            // replacement teardown or a session close): the child dies with
+            // the parent (TS `closeChildSessions`) and no notice is owed to
+            // the torn-down session - the watch ends without polling the
+            // killed child.
+            if record.lock().await.closed_by_parent {
+                return;
+            }
             let active_session_id = record.lock().await.active_session_id.clone();
             // One bounded idle-wait slice: a slice that times out while the
             // child still runs re-slices; the returned slice means the child
@@ -994,6 +1027,45 @@ impl SupervisorChildSessionsInner {
         Ok("not_found")
     }
 
+    /// A child whose session is already gone is a completed no-op (the TS
+    /// `sessions.has` early return); every other close failure is kept and
+    /// returned with the remaining children still closed - TS
+    /// `closeChildSessions` walks all children and rethrows the first
+    /// error.
+    async fn close_children_inner(&self) -> Result<()> {
+        let children = self.children.lock().await.clone();
+        let mut close_error: Option<anyhow::Error> = None;
+        for record in &children {
+            {
+                let mut record = record.lock().await;
+                record.closed_by_parent = true;
+                record.notice_delivered = true;
+            }
+            let active_session_id = record.lock().await.active_session_id.clone();
+            if let Err(error) = self.kill_child(&active_session_id).await {
+                if unknown_session(&error).is_some() {
+                    // Already gone: TS `closeSessionOnce`'s `sessions.has`
+                    // check turns a missing child into a no-op success.
+                    self.children
+                        .lock()
+                        .await
+                        .retain(|candidate| !Arc::ptr_eq(candidate, record));
+                    continue;
+                }
+                close_error.get_or_insert(error);
+                continue;
+            }
+            self.children
+                .lock()
+                .await
+                .retain(|candidate| !Arc::ptr_eq(candidate, record));
+        }
+        match close_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// The one record matching a selector, or the TS selector errors
     /// (`No direct RLM {kind} matches ...` / `... is ambiguous ...`).
     async fn resolve_record(
@@ -1049,6 +1121,19 @@ impl CreatedChild {
             summary_rlm_depth: summary.get("rlmDepth").and_then(Value::as_u64),
         })
     }
+}
+
+/// The already-gone marker inside a close failure (the supervisor's
+/// `Unknown active session` route failure): TS `closeSessionOnce` treats a
+/// missing child session as a completed no-op, so a close walking a child
+/// that died earlier must not fail.
+fn unknown_session(error: &anyhow::Error) -> Option<()> {
+    error.chain().find_map(|cause| {
+        cause
+            .to_string()
+            .starts_with("Unknown active session:")
+            .then_some(())
+    })
 }
 
 /// The plain text of a custom row's content (the notice turn's model
@@ -1124,6 +1209,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 notice_delivered: false,
                 prompt_admitted: false,
                 error: None,
+                closed_by_parent: false,
             };
             let record = Arc::new(Mutex::new(record));
             this.children.lock().await.push(Arc::clone(&record));
@@ -1144,6 +1230,13 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let turn_generation = *this.turn_done.subscribe().borrow();
             tokio::spawn(async move {
                 watcher_this.wait_turn_done(turn_generation).await;
+                // The parent session closed before the prompt admitted (a
+                // replacement teardown or a session close between the spawn
+                // and the turn boundary): the child is closed with the
+                // parent, so the detached task prompt never fires.
+                if watcher_record.lock().await.closed_by_parent {
+                    return;
+                }
                 watcher_record.lock().await.prompt_admitted = true;
                 if let Err(error) = watcher_this
                     .prompt_child(&child_active_session_id, &prompt)
@@ -1362,11 +1455,24 @@ mod watch_tests {
     /// `follow_up` commands routed to the parent (the terminal-notice
     /// deliveries). `idle_delay_ms` paces `wait_for_idle` so a test can act
     /// while the child is still "running".
+    /// How the fake supervisor answers a child `kill`.
+    enum FakeKill {
+        Success,
+        /// The child session is gone (the route failure a supervisor
+        /// answers for a non-resident child).
+        UnknownSession,
+        /// The kill fails for a real reason (a stuck worker).
+        Failure,
+    }
+
     async fn spawn_fake_supervisor(
         socket: std::path::PathBuf,
         follow_up_tx: mpsc::UnboundedSender<Value>,
         idle_delay_ms: u64,
+        kill_tx: mpsc::UnboundedSender<Value>,
+        kill_behavior: FakeKill,
     ) {
+        let kill_behavior = std::sync::Arc::new(kill_behavior);
         let listener = bind_transport(&socket).await.unwrap();
         tokio::spawn(async move {
             loop {
@@ -1374,6 +1480,8 @@ mod watch_tests {
                     return;
                 };
                 let follow_up_tx = follow_up_tx.clone();
+                let kill_tx = kill_tx.clone();
+                let kill_behavior = std::sync::Arc::clone(&kill_behavior);
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.split();
                     let mut reader = BufReader::new(reader);
@@ -1422,6 +1530,26 @@ mod watch_tests {
                                 command_type,
                                 Some(json!({ "text": "the child final answer" })),
                             ),
+                            "kill" => {
+                                let _ = kill_tx.send(command.clone());
+                                match *kill_behavior {
+                                    FakeKill::Success => {
+                                        response_success(Some(&id), command_type, None)
+                                    }
+                                    FakeKill::UnknownSession => response_failure(
+                                        Some(&id),
+                                        command_type,
+                                        "Unknown active session: child-live",
+                                        None,
+                                    ),
+                                    FakeKill::Failure => response_failure(
+                                        Some(&id),
+                                        command_type,
+                                        "kill refused by the fake supervisor",
+                                        None,
+                                    ),
+                                }
+                            }
                             "follow_up" => {
                                 let _ = follow_up_tx.send(command.clone());
                                 response_success(
@@ -1446,12 +1574,21 @@ mod watch_tests {
     async fn sessions_with_fake_supervisor(
         follow_up_tx: mpsc::UnboundedSender<Value>,
         idle_delay_ms: u64,
-    ) -> SupervisorChildSessions {
+        kill_behavior: FakeKill,
+    ) -> (SupervisorChildSessions, mpsc::UnboundedReceiver<Value>) {
         let socket = std::env::temp_dir().join(format!(
             "pa-rlm-watch-{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
-        spawn_fake_supervisor(socket.clone(), follow_up_tx, idle_delay_ms).await;
+        let (kill_tx, kill_rx) = mpsc::unbounded_channel();
+        spawn_fake_supervisor(
+            socket.clone(),
+            follow_up_tx,
+            idle_delay_ms,
+            kill_tx,
+            kill_behavior,
+        )
+        .await;
         let link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
         let sessions =
             SupervisorChildSessions::new(link, std::env::temp_dir(), "parent-live".to_string());
@@ -1462,7 +1599,7 @@ mod watch_tests {
             cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
             ..ParentIdentity::with_default_depth()
         });
-        sessions
+        (sessions, kill_rx)
     }
 
     async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
@@ -1483,7 +1620,8 @@ mod watch_tests {
     #[tokio::test]
     async fn a_settled_child_without_a_reply_delivers_the_terminal_notice() {
         let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
-        let sessions = sessions_with_fake_supervisor(follow_up_tx, 0).await;
+        let (sessions, _kill_rx) =
+            sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success).await;
         let handle = spawn_child(&sessions).await;
         // The worker releases the detached prompt at its turn boundary.
         sessions.notify_turn_done();
@@ -1510,6 +1648,110 @@ mod watch_tests {
         assert!(extra.is_err(), "no second notice may arrive");
     }
 
+    /// One child row exists and is running before the close tests run.
+    async fn one_running_child(sessions: &SupervisorChildSessions) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let entries = sessions.list_subagents().await.expect("child roster");
+            if let Some(row) = entries.first() {
+                assert_eq!(row.status, "running");
+                return;
+            }
+            assert!(Instant::now() < deadline, "child row never appeared");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `close_children` (TS `closeChildSessions` at the replacement
+    /// teardown / session close): every tracked child is stopped through
+    /// the supervisor - a plain stop, no delete marker, so the ledger edge
+    /// and passive roster row survive - the registry empties, and no
+    /// terminal notice is owed to the closing parent session.
+    #[tokio::test]
+    async fn close_children_stops_the_child_and_clears_the_roster() {
+        let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+        // A long idle keeps the child mid-run while the close fires, so the
+        // settle watcher is parked instead of raced.
+        let (sessions, mut kill_rx) =
+            sessions_with_fake_supervisor(follow_up_tx, 10_000, FakeKill::Success).await;
+        spawn_child(&sessions).await;
+        sessions.notify_turn_done();
+        one_running_child(&sessions).await;
+
+        sessions.close_children().await.expect("close children");
+
+        // The stop carried no delete marker: the spawn edge survives (TS
+        // `closeSessionOnce` archives; only `recordRlmSubagentDeletion`
+        // tombstones).
+        let kill = kill_rx
+            .recv()
+            .await
+            .expect("the close must stop the child through the supervisor");
+        assert_eq!(kill["type"], "kill");
+        assert!(
+            !kill.to_string().contains("rlmLedgerDelete"),
+            "the replacement close is a stop, not a delete"
+        );
+        // The registry the replacement session reads starts empty.
+        let entries = sessions.list_subagents().await.expect("child roster");
+        assert!(
+            entries.is_empty(),
+            "the closed child stays listed: {entries:?}"
+        );
+        // No terminal notice is delivered to the closing parent session.
+        let extra = tokio::time::timeout(Duration::from_millis(300), follow_up_rx.recv()).await;
+        assert!(extra.is_err(), "a closed child must not deliver a notice");
+    }
+
+    /// A child whose session is already gone is a completed no-op (the TS
+    /// `sessions.has` early return in `closeSessionOnce`), not a close
+    /// failure: the registry drops it and the close succeeds.
+    #[tokio::test]
+    async fn close_children_treats_an_already_gone_child_as_a_no_op() {
+        let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+        let (sessions, _kill_rx) =
+            sessions_with_fake_supervisor(follow_up_tx, 10_000, FakeKill::UnknownSession).await;
+        spawn_child(&sessions).await;
+        sessions.notify_turn_done();
+        one_running_child(&sessions).await;
+
+        sessions
+            .close_children()
+            .await
+            .expect("an already-gone child must not fail the close");
+
+        let entries = sessions.list_subagents().await.expect("child roster");
+        assert!(
+            entries.is_empty(),
+            "the gone child stays listed: {entries:?}"
+        );
+    }
+
+    /// A real close failure propagates and keeps the child tracked, so the
+    /// caller (the replacement teardown) fails exactly like TS
+    /// `teardownForReplacement` rethrowing `disposeHostedSubagentRuntimes`.
+    #[tokio::test]
+    async fn close_children_keeps_a_failed_child_tracked() {
+        let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+        let (sessions, _kill_rx) =
+            sessions_with_fake_supervisor(follow_up_tx, 10_000, FakeKill::Failure).await;
+        spawn_child(&sessions).await;
+        sessions.notify_turn_done();
+        one_running_child(&sessions).await;
+
+        let error = sessions
+            .close_children()
+            .await
+            .expect_err("a real close failure must propagate");
+        assert!(
+            format!("{error:#}").contains("kill refused"),
+            "the close error must surface the kill failure: {error:#}"
+        );
+
+        let entries = sessions.list_subagents().await.expect("child roster");
+        assert_eq!(entries.len(), 1, "the failed child stays tracked for retry");
+    }
+
     /// A child that sent an agent message back gets no terminal notice: the
     /// reply is the parent's report (TS `_parentReplyCount`).
     #[tokio::test]
@@ -1517,7 +1759,8 @@ mod watch_tests {
         let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
         // A slow idle wait keeps the child "running" while the test marks
         // the reply.
-        let sessions = sessions_with_fake_supervisor(follow_up_tx, 250).await;
+        let (sessions, _kill_rx) =
+            sessions_with_fake_supervisor(follow_up_tx, 250, FakeKill::Success).await;
         let handle = spawn_child(&sessions).await;
         assert!(!handle.rlm_child_id.is_empty());
         sessions.mark_replied("child-live").await;

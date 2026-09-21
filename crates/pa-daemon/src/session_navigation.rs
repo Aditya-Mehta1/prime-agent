@@ -313,7 +313,12 @@ impl Worker {
             // (the TS `releaseUncommittedLease` fallthrough).
             Err(response) => return response,
         };
-        self.teardown_for_replacement().await;
+        // TS `teardownForReplacement` rethrows: a failed retire (the
+        // session's own kernel dispose, or a child close) fails the
+        // replacement command with the old runtime already torn down.
+        if let Err(error) = self.teardown_for_replacement().await {
+            return response_failure(None, command, &format!("{error:#}"), None);
+        }
         if let Some(cwd) = target.cwd.as_deref() {
             self.rebind_worker_cwd(cwd);
         }

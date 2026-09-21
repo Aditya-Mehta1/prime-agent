@@ -182,6 +182,11 @@ pub struct RlmSessionIdentity {
     pub session_id: Option<String>,
     pub session_file: Option<String>,
     pub thinking: Option<String>,
+    /// Verification seam: children of this session spawn with a scripted
+    /// engine file (the TS child runtime inherits the parent's
+    /// `sessionConfig`; the harness analog carries the create's
+    /// `childScript` down the recursion). Product sessions carry `None`.
+    pub child_script: Option<String>,
 }
 
 /// The turn behavior a worker session runs.

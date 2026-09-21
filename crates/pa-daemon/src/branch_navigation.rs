@@ -541,7 +541,9 @@ impl Worker {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
-        self.teardown_for_replacement().await;
+        if let Err(error) = self.teardown_for_replacement().await {
+            return response_failure(None, "fork", &format!("{error:#}"), None);
+        }
         match self.tree_navigation.replace_with_fork(forked).await {
             Ok(()) => {
                 // The fork is a whole-runtime replacement (TS
