@@ -9,7 +9,11 @@ report the release version from a scratch cwd with `PI_PACKAGE_DIR` unset
 
 Usage:
     python3 scripts/release/verify_release.py \
-        --dist-dir <dir> --version <x.y.z> --target <triple>
+        --dist-dir <dir> --version <x.y.z> --target <triple> [--sha <commit>]
+
+`--sha` verifies the continuous-build stamping: the archive must also carry a
+`package.json` manifest, the binary must report `<version>-continuous.<sha>`,
+and manifest.json must record the commit.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import tempfile
 from pathlib import Path
 
 # Must mirror STAGED_ENTRIES in assemble_artifacts.py and §5 of the design doc.
+# Continuous builds additionally stage the package.json version manifest.
 EXPECTED_TOP_LEVEL = {
     "prime-agent",
     "prime-agent-runtime",
@@ -34,6 +39,10 @@ EXPECTED_TOP_LEVEL = {
     "LICENSE",
     "README.md",
 }
+CONTINUOUS_EXTRA_TOP_LEVEL = {"package.json"}
+
+# Same shape as `continuous_version` in assemble_artifacts.py.
+CONTINUOUS_SUFFIX = "continuous"
 
 
 def sha256_file(path: Path) -> str:
@@ -61,7 +70,15 @@ def main() -> int:
     parser.add_argument("--dist-dir", required=True, type=Path)
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument("--sha", default=None,
+                         help="commit SHA the tarball must be stamped with")
     args = parser.parse_args()
+    if args.sha is not None:
+        args.sha = args.sha.lower()
+
+    expected_top_level = EXPECTED_TOP_LEVEL | (
+        CONTINUOUS_EXTRA_TOP_LEVEL if args.sha else set()
+    )
 
     archive_name = f"prime-agent-{args.version}-{args.target}.tar.gz"
     archive = args.dist_dir / archive_name
@@ -71,10 +88,10 @@ def main() -> int:
     # 1. Deterministic tarball shape: exact top-level payload, no link entries.
     with tarfile.open(archive) as tar:
         members = tar.getmembers()
-        if top_level_members(tar) != EXPECTED_TOP_LEVEL:
+        if top_level_members(tar) != expected_top_level:
             fail(
                 f"tarball top-level entries {sorted(top_level_members(tar))} "
-                f"!= designed payload {sorted(EXPECTED_TOP_LEVEL)}"
+                f"!= designed payload {sorted(expected_top_level)}"
             )
         for member in members:
             if member.issym() or member.islnk():
@@ -99,6 +116,8 @@ def main() -> int:
         fail(f"manifest.json has no entry for {archive_name}")
     if entries[archive_name]["sha256"] != archive_sha:
         fail(f"manifest.json sha256 mismatch for {archive_name}")
+    if args.sha is not None and manifest.get("commit") != args.sha:
+        fail(f"manifest.json commit is {manifest.get('commit')!r}, expected {args.sha!r}")
 
     # 3. The staged binary reports the release version from a scratch cwd with
     #    PI_PACKAGE_DIR unset: shipped artifacts never depend on it.
@@ -132,8 +151,14 @@ def main() -> int:
         if run.returncode != 0:
             fail(f"staged prime-agent --version failed: {run.stderr.strip()}")
         version_out = run.stdout.strip()
-        if version_out != args.version:
-            fail(f"staged prime-agent reports {version_out!r}, expected {args.version!r}")
+        expected_version = (
+            f"{args.version}-{CONTINUOUS_SUFFIX}.{args.sha}" if args.sha else args.version
+        )
+        if version_out != expected_version:
+            fail(
+                f"staged prime-agent reports {version_out!r}, "
+                f"expected {expected_version!r}"
+            )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

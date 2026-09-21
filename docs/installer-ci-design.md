@@ -65,9 +65,13 @@ The GitHub token on this box lacks the `workflow` scope. Therefore:
   `ci/workflows/`** — neither this lane's token nor the orchestrator's can push or merge
   anything under `.github/workflows/` without `workflow` scope (pushes are rejected with
   `refusing to allow an OAuth App to create or update workflow ... without 'workflow' scope`;
-  same operational constraint PR #76 documented). `ci/workflows/README.md` records the
-  promotion step: `git mv ci/workflows/*.yml .github/workflows/`.
-- Until scope is granted the workflows do not execute on GitHub; CI is enforced **locally**
+  the same operational constraint PR #76 documented; re-verified 2026-09-21 — Kevin's new
+  workflow-scoped token lives on HIS Mac, not on this box). Activation is the operator step
+  `make activate-workflows` (ci/workflows/README.md): run from a machine whose push
+  credential has the scope, it moves `continuous.yml` + `release.yml` to `.github/workflows/`
+  and pushes main. Pasting the staged files through the GitHub web UI is the
+  scope-free equivalent.
+- Until promotion the workflows do not execute on GitHub; CI is enforced **locally**
   via `make` gates that run the exact same steps the workflows define.
 - Every workflow step has a 1:1 local target (§9). When scope is granted, the promotion move
   is the only change — no workflow content edits are needed.
@@ -271,6 +275,9 @@ New Makefile targets (existing `make check` unchanged):
   cargo-deny is not installed).
 - `make actionlint` — validates the committed workflow files (fails loudly if actionlint
   is missing).
+- `make continuous-dry-run [RUNTIME_DIR=<path>]` — the continuous-channel mirror:
+  `--sha HEAD` stamping, the `package.json` payload entry, and the
+  `<version>-continuous.<sha>` livecheck (`continuous.yml` build job).
 - `make release-dry-run [RUNTIME_DIR=<path>] [VERSION=<x.y.z>]` — the release verifier,
   host-only:
   1. `cargo build --release --locked` (workspace version vs requested version asserted).
@@ -313,7 +320,8 @@ if a static-linked Linux target is wanted later it slots in as another matrix en
 |---|---|
 | `docs/installer-ci-design.md` | this document |
 | `ci/workflows/ci.yml` | PR/push gates (fmt/clippy/test/deny), read-only; promoted to `.github/workflows/` on scope grant |
-| `ci/workflows/release.yml` | tag-check -> build matrix -> promotion -> release attach; promoted to `.github/workflows/` on scope grant |
+| `ci/workflows/release.yml` | tag-check -> build matrix -> promotion -> release attach; activated via `make activate-workflows` |
+| `ci/workflows/continuous.yml` | rolling `continuous` release on every push to main (§13); activated via `make activate-workflows` |
 | `deny.toml` | cargo-deny advisories + license allowlist |
 | `scripts/release/assemble_artifacts.py` | staging + deterministic tar + SHA256SUMS + manifest (TS-parity manifest fields) |
 | `packaging/homebrew/Casks/prime-agent.rb` | cask sketch (living draft until we have a tap) |
@@ -344,3 +352,38 @@ Open items (operator decisions, non-blocking):
    on it.
 2. **Notarization** (already non-goal v1): the workflow reserves the step; cert landing
    is an operator dependency.
+
+## 13. Continuous channel (rolling prebuilt binaries for coworkers)
+
+`ci/workflows/continuous.yml` (staged, same promotion constraint as §3) is the
+coworker-sharing channel Kevin asked for (2026-09-21): a compiled install for
+every push to `main`.
+
+- Trigger: pushes to `main` only (never tags, never PRs); `concurrency`
+  cancels superseded builds.
+- Build job: the same 4-target matrix as the release pipeline
+  (`cargo build --release --locked`, assembler, artifact upload), with the
+  commit stamped via `assemble_artifacts.py --sha ${GITHUB_SHA}`: the tarball
+  carries a `package.json` manifest whose `version` is
+  `<workspace-version>-continuous.<sha>`, so `prime-agent --version` reports
+  the exact commit. The archive names keep the bare version so the rolling
+  release overwrites assets in place; a workspace version bump renames them
+  (the publish job drops the stale names).
+- Publish job: `contents: write` only (no environment, no secrets beyond the
+  job token); verifies build-to-publish hash continuity, merges the per-target
+  `SHA256SUMS`/`manifest.json`, force-moves the `continuous` tag to the
+  triggering commit, and republishes via `softprops/action-gh-release@v2` with
+  `make_latest: false`, `prerelease: true`, and a "Built from `<sha>` —
+  `<subject>`" body.
+- Supply chain: the SBOM/attestation gates stay on the tag pipeline (§7);
+  the continuous channel is a convenience channel, not the release authority.
+- Local mirror: `make continuous-dry-run`.
+- Consumer docs: README.md "Continuous builds" (per-platform install
+  one-liners). Note the `macos-13` Intel runner label was retired by GitHub;
+  both workflows use `macos-15-intel` for `x86_64-apple-darwin` now.
+- Activation (operator step, after the lane merges): `make activate-workflows`
+  from a workflow-scoped machine (Kevin's Mac) moves the file to
+  `.github/workflows/continuous.yml` and pushes main. Post-activation
+  verification: `gh workflow list --repo kevinjosethomas/prime-agent-rs`
+  shows `continuous` (and `release`) active; the next push to `main` publishes
+  the first `continuous` release.

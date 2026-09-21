@@ -1,9 +1,12 @@
 # Release pipeline for the prime-agent Rust rewrite.
 #
-# This workflow is byte-final but staged at ci/workflows/ (not .github/workflows/)
-# because the dev box's GitHub token has no `workflow` scope; see
-# ci/workflows/README.md for the promotion step. It is INERT until then. The
-# equivalent end-to-end check runs locally via `make release-dry-run`.
+# This workflow is byte-final but staged at ci/workflows/ (not
+# .github/workflows/) because the dev box's GitHub token has no `workflow`
+# scope; see ci/workflows/README.md for the promotion step
+# (`make activate-workflows`). It is INERT until then. The equivalent
+# end-to-end check runs locally via `make release-dry-run`. When enabling:
+# configure the `release` environment protection rules (required reviewers,
+# tag-pattern restriction) — that is an operator step.
 #
 # Publish/build separation (docs/installer-ci-design.md §6):
 #   - trigger: `v<semver>` tags only; PRs can never reach this workflow.
@@ -70,7 +73,7 @@ jobs:
           - target: aarch64-apple-darwin
             runs-on: macos-14
           - target: x86_64-apple-darwin
-            runs-on: macos-13
+            runs-on: macos-15-intel  # macos-13 is retired; this is the Intel runner now
           # Windows ships when the platform trait impls land:
           # - target: x86_64-pc-windows-msvc
           #   runs-on: windows-2022
