@@ -670,6 +670,26 @@ impl SessionUi {
         self.return_to_agents_view && self.subagent_counts.total > 0
     }
 
+    /// Hand the focus to the subagent summary line (TS
+    /// `focusSubagentSummary`, shared by `app.subagents.focus` and the
+    /// editor's move-below-prompt hook): the tray override label blocks
+    /// the hand-off — the armed Ctrl+C exit hint, and the streaming
+    /// follow-up-queue hint while a draft sits in the editor (TS
+    /// `getTrayOverrideLabel`) — and a non-selectable line never takes
+    /// it. The inline pickers never reach this point: they own the whole
+    /// key dispatch before the editor path (TS `isInlinePickerOpen`).
+    fn focus_subagents_summary(&mut self, view: &mut AgentView) -> bool {
+        if self.tray_override().is_some()
+            || (self.turn_active && !view.editor.get_text().trim().is_empty())
+            || !self.subagents_selectable()
+        {
+            return false;
+        }
+        self.subagents_focused = true;
+        self.update_subagent_summary(view);
+        true
+    }
+
     /// Open the scoped agents view from the focused summary line (TS
     /// `openScopedAgentsView` -> `returnToAgentsView("scoped_agents_view")`):
     /// the session detaches and the agents view reopens scoped to this
@@ -3727,13 +3747,81 @@ impl SessionUi {
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
         };
-        // The dispatch order below mirrors TS `CustomEditor.handleInput`:
-        // paste image, then `app.input.clear`, then `app.exit` (only when
-        // the editor is empty; otherwise ctrl+d falls through to the
-        // editor's delete-char-forward), then the app actions in
-        // registration order (`app.clear` first, `app.tools.expand` next).
-        // Every match goes through the effective bindings, so a user
+        // The dispatch order below mirrors the TS key pipeline: the
+        // transcript viewport keys (`tui.ts` consumes them before the
+        // focused component in fullscreen), then the focused subagent
+        // summary line (`SubagentSummaryLine.handleInput` owns every key
+        // while focused), then `CustomEditor.handleInput` — paste image,
+        // `app.input.clear`, `app.exit` (only when the editor is empty;
+        // otherwise ctrl+d falls through to the editor's
+        // delete-char-forward), then the app actions in registration
+        // order (`app.clear` first, `app.tools.expand` next). Every match
+        // goes through the effective bindings, so a user
         // `keybindings.json` override moves both the handler and the hint.
+        // Transcript viewport keys (TS tui.ts consumes them before the
+        // editor in fullscreen): page scroll, top, follow.
+        let (page_up, page_down, to_top, follow) = {
+            let kb = view.editor.keybindings();
+            (
+                kb.matches(&id, "tui.viewport.pageUp"),
+                kb.matches(&id, "tui.viewport.pageDown"),
+                kb.matches(&id, "tui.viewport.top"),
+                kb.matches(&id, "tui.viewport.follow"),
+            )
+        };
+        if page_up {
+            view.scroll_by(-(view.page_size() as isize));
+            self.track_scroll("page_up", view.is_following());
+            self.dirty = true;
+            return Ok(());
+        }
+        if page_down {
+            view.scroll_by(view.page_size() as isize);
+            self.track_scroll("page_down", view.is_following());
+            self.dirty = true;
+            return Ok(());
+        }
+        if to_top {
+            view.scroll_to_top();
+            self.track_scroll("top", view.is_following());
+            self.dirty = true;
+            return Ok(());
+        }
+        if follow {
+            view.scroll_to_bottom();
+            self.track_scroll("follow", view.is_following());
+            self.dirty = true;
+            return Ok(());
+        }
+        // The subagent summary line owns focus while focused (TS
+        // `SubagentSummaryLine.handleInput`): confirm/open opens the
+        // scoped agents view, up/cancel/back returns to the editor,
+        // expand cycles the conversation detail and KEEPS the focus, and
+        // every other key falls through after releasing the focus (TS
+        // `onChatAction` -> `focusEditor` -> the editor handles it).
+        if self.subagents_focused {
+            let kb = view.editor.keybindings();
+            if kb.matches(&id, "tui.select.confirm") || kb.matches(&id, "app.agents.open") {
+                self.open_scoped_agents_view(view);
+                return Ok(());
+            }
+            if kb.matches(&id, "tui.select.up")
+                || kb.matches(&id, "tui.select.cancel")
+                || kb.matches(&id, "app.agents.back")
+            {
+                self.subagents_focused = false;
+                self.update_subagent_summary(view);
+                self.dirty = true;
+                return Ok(());
+            }
+            if kb.matches(&id, "app.tools.expand") {
+                view.detail = view.detail.next();
+                self.dirty = true;
+                return Ok(());
+            }
+            self.subagents_focused = false;
+            self.update_subagent_summary(view);
+        }
         // Image paste (TS `app.clipboard.pasteImage`, default ctrl+v):
         // reads the clipboard image and inserts its marker into the
         // editor. The editor's own ctrl+v is unbound otherwise, so the
@@ -3852,70 +3940,6 @@ impl SessionUi {
             self.dirty = true;
             return Ok(());
         }
-        // Transcript viewport keys (TS tui.ts consumes them before the
-        // editor in fullscreen): page scroll, top, follow.
-        let (page_up, page_down, to_top, follow) = {
-            let kb = view.editor.keybindings();
-            (
-                kb.matches(&id, "tui.viewport.pageUp"),
-                kb.matches(&id, "tui.viewport.pageDown"),
-                kb.matches(&id, "tui.viewport.top"),
-                kb.matches(&id, "tui.viewport.follow"),
-            )
-        };
-        if page_up {
-            view.scroll_by(-(view.page_size() as isize));
-            self.track_scroll("page_up", view.is_following());
-            self.dirty = true;
-            return Ok(());
-        }
-        if page_down {
-            view.scroll_by(view.page_size() as isize);
-            self.track_scroll("page_down", view.is_following());
-            self.dirty = true;
-            return Ok(());
-        }
-        if to_top {
-            view.scroll_to_top();
-            self.track_scroll("top", view.is_following());
-            self.dirty = true;
-            return Ok(());
-        }
-        if follow {
-            view.scroll_to_bottom();
-            self.track_scroll("follow", view.is_following());
-            self.dirty = true;
-            return Ok(());
-        }
-        // The subagent summary line owns focus while focused (TS
-        // `SubagentSummaryLine.handleInput`): confirm/open opens the scoped
-        // agents view, up/cancel/back returns to the editor, expand cycles
-        // the conversation detail, and every other key falls through to the
-        // editor after releasing the focus.
-        if self.subagents_focused {
-            let kb = view.editor.keybindings();
-            if kb.matches(&id, "tui.select.confirm") || kb.matches(&id, "app.agents.open") {
-                self.open_scoped_agents_view(view);
-                return Ok(());
-            }
-            if kb.matches(&id, "tui.select.up")
-                || kb.matches(&id, "tui.select.cancel")
-                || kb.matches(&id, "app.agents.back")
-            {
-                self.subagents_focused = false;
-                self.update_subagent_summary(view);
-                self.dirty = true;
-                return Ok(());
-            }
-            if kb.matches(&id, "app.tools.expand") {
-                view.detail = view.detail.next();
-                self.subagents_focused = false;
-                self.dirty = true;
-                return Ok(());
-            }
-            self.subagents_focused = false;
-            self.update_subagent_summary(view);
-        }
         // TS `app.subagents.focus` (default alt+a): the summary line takes
         // focus when it is selectable.
         if view
@@ -3923,10 +3947,7 @@ impl SessionUi {
             .keybindings()
             .matches(&id, "app.subagents.focus")
         {
-            if self.subagents_selectable() {
-                self.subagents_focused = true;
-                self.update_subagent_summary(view);
-            }
+            self.focus_subagents_summary(view);
             self.dirty = true;
             return Ok(());
         }
@@ -4022,6 +4043,25 @@ impl SessionUi {
                     }
                 }
             }
+            self.dirty = true;
+            return Ok(());
+        }
+        // TS `CustomEditor.handleInput`'s move-below-prompt hook
+        // (`onMoveBelowPrompt` -> `focusSubagentSummary`): Down at the end
+        // of the prompt — no autocomplete open, no history browse, the
+        // cursor at the last line's end — hands the focus to the subagent
+        // summary line when it is selectable; every other Down falls
+        // through to the editor's cursor motion (a non-selectable line
+        // never takes it).
+        if view
+            .editor
+            .keybindings()
+            .matches(&id, "tui.editor.cursorDown")
+            && !view.editor.is_showing_autocomplete()
+            && !view.editor.is_history_navigation_active()
+            && view.editor.is_cursor_at_end()
+            && self.focus_subagents_summary(view)
+        {
             self.dirty = true;
             return Ok(());
         }

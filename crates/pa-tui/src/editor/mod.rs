@@ -249,6 +249,15 @@ impl Editor {
         (self.cursor_line, self.cursor_col)
     }
 
+    /// The cursor sits at the end of the last logical line (TS
+    /// `CustomEditor.isCursorAtEnd`): the position from which the
+    /// move-below-prompt hook can hand the focus to the surface below the
+    /// editor (the subagent summary line).
+    pub fn is_cursor_at_end(&self) -> bool {
+        let last = self.lines.len() - 1;
+        self.cursor_line == last && self.cursor_col == self.lines[last].chars().count()
+    }
+
     pub fn get_paste_snapshot(&self) -> (Vec<(usize, String)>, usize) {
         let mut pastes: Vec<(usize, String)> =
             self.pastes.iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -346,7 +355,9 @@ impl Editor {
         }
     }
 
-    fn is_history_navigation_active(&self) -> bool {
+    /// History browsing holds the editor (TS `isHistoryNavigationActive`):
+    /// the state that parks the move-below-prompt hand-off.
+    pub fn is_history_navigation_active(&self) -> bool {
         self.history_index > -1
     }
 
@@ -571,12 +582,48 @@ mod tests {
         e.add_to_history("second prompt");
         e.handle_input("up");
         assert_eq!(e.get_text(), "second prompt");
+        assert!(e.is_history_navigation_active());
         e.handle_input("up");
         assert_eq!(e.get_text(), "first prompt");
         e.handle_input("down");
         assert_eq!(e.get_text(), "second prompt");
         e.handle_input("down");
         assert_eq!(e.get_text(), "");
+        assert!(!e.is_history_navigation_active());
+    }
+
+    /// TS `CustomEditor.isCursorAtEnd`: the move-below-prompt hook fires
+    /// only from the last logical line's end — the common just-typed
+    /// position (and the empty prompt), never mid-line or above the last
+    /// line.
+    #[test]
+    fn is_cursor_at_end_tracks_the_last_lines_end() {
+        // The empty prompt is at the end (col 0 of the empty last line).
+        let mut e = ed();
+        assert!(e.is_cursor_at_end());
+        // Mid-line on the only line: not at the end.
+        e.set_text("hello");
+        e.handle_input("left");
+        assert!(!e.is_cursor_at_end());
+        // Back to the line end: at the end again.
+        e.handle_input("right");
+        assert!(e.is_cursor_at_end());
+        // The end of a non-last line: not at the end.
+        e.set_text("a\nb");
+        assert_eq!(e.get_cursor(), (1, 1));
+        e.handle_input("up");
+        assert_eq!(e.get_cursor(), (0, 1));
+        assert!(!e.is_cursor_at_end());
+        e.handle_input("home");
+        assert_eq!(e.get_cursor(), (0, 0));
+        assert!(!e.is_cursor_at_end());
+        e.handle_input("end");
+        assert_eq!(e.get_cursor(), (0, 1));
+        assert!(!e.is_cursor_at_end());
+        // The last line's end: at the end.
+        e.handle_input("down");
+        assert_eq!(e.get_cursor(), (1, 1));
+        assert!(e.is_cursor_at_end());
     }
 
     #[test]

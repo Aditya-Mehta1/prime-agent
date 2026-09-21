@@ -1,0 +1,36 @@
+                                                       f20-worker  $0.00
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.1.0
+  ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/panel-nav/scripts/battery/runs/20260921T201206Z/rust/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+  f20 child task: reply with the fixture summary
+
+
+ f20 child fixture reply
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage  depth 1                                                                                      mock-1 · 110 (0%)

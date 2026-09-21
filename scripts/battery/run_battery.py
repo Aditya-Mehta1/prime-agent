@@ -70,6 +70,25 @@ FLOW_LANES = {
     "f23_keybindings": "keybindings",
 }
 
+# Per-step lane overrides: a flow whose steps cross several surfaces can
+# own one gap per step (the flow-level tag would mis-own the rest).
+# f20's keyboard-path steps (proven 2026-09-21, run 20260921T201206Z):
+# the reattached transcript's rebuilt python cell renders TS's `waiting
+# for code` phase (TS's rebuild never replays the streamed code partials,
+# so the rebuilt cell is codeless; Rust keeps the code in the rebuilt card
+# and renders the settled row) — the tool-card replay surface; the child
+# transcript's opening row is TS's `◆ Agent message received · from
+# parent <name>` (the child session file persists the [task from parent]
+# message with the agent_message custom type; Rust's child admission
+# writes it as a plain user message) — the child-admission persistence
+# surface. The keyboard path itself (focus, open, drill-in, back) passes
+# on both sides.
+FLOW_STEP_LANES = {
+    ("f20_subagents", "reattached"): "ipython-replay",
+    ("f20_subagents", "panel-focused"): "ipython-replay",
+    ("f20_subagents", "child-transcript"): "child-task-message",
+}
+
 # Heavy flows: opt-in by name (`--flows f12_scale_resume`) plus
 # PA_BATTERY_HEAVY=1; they measure transcript-scale resume, not parity, and
 # would inflate a normal battery run's wall time.
@@ -3919,7 +3938,7 @@ class Battery:
                 "visual",
                 f"{step}: frames differ TS vs Rust (see frame-diff-{step}.txt)",
                 evidence=diff_path,
-                lane=FLOW_LANES.get(flow),
+                lane=FLOW_STEP_LANES.get((flow, step), FLOW_LANES.get(flow)),
             )
 
     @staticmethod
@@ -4833,7 +4852,11 @@ class Battery:
         subagent summary line above the editor (live running counts, then the
         child's `RLM child status` no-reply terminal notice), and the scoped
         agents view opened from the focused summary line listing the child by
-        name. Frame diff TS vs Rust at each key moment."""
+        name — then the full main-chat keyboard path (the live-dogfood
+        ruling): back into the session through the view, Down at the end of
+        the prompt focuses the panel, Enter reopens the scoped view, Enter
+        drills into the child transcript, agents-back returns to the view.
+        Frame diff TS vs Rust at each key moment."""
         flow = "f20_subagents"
         reply = "f20 parent fixture reply"
         child_reply = "f20 child fixture reply"
@@ -5004,9 +5027,98 @@ class Battery:
                     f"(child-queue requests: {len(child_queued)}, misrouted child: {len(misrouted_child)}, misrouted parent: {len(misrouted_parent)})",
                     evidence=side.root / flow / "01-spawn.txt",
                 )
+            # The keyboard path from the MAIN CHAT (the live-dogfood ruling):
+            # the panel takes focus with Down at the end of the prompt, Enter
+            # opens the scoped view, Enter drills into the child transcript,
+            # and the agents-back key returns to the view. The route back to
+            # the session runs through the view: the scoped view's parent
+            # key pops the scope, and the global view's parent row reopens
+            # the transcript.
+            B.tmux_send(view, "Left", enter=False)
+            time.sleep(1.0)
+            B.tmux_send(view, "battery-f20")
+            time.sleep(1.0)
+            B.tmux_send(view, "Enter", enter=False)
+            reattached = B.tmux_wait_text(view, "f20 seed turn", timeout=60)
+            if "f20 seed turn" not in reattached:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the parent row did not reopen the session from the global view",
+                    evidence=side.root / flow / "07-scoped-agents-settled.txt",
+                )
+                B.tmux_kill(view)
+                continue
+            side.evidence(flow, "08-reattached.txt", reattached)
+            settled4 = self.settle_frame(view, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "09-reattached-settled.txt", settled4)
+            frames[side.name]["reattached"] = settled4
+            # Down at the end of the empty prompt hands the focus to the
+            # panel: the `↓ select` hint flips to the focused open pair (TS
+            # `onMoveBelowPrompt` -> `focusSubagentSummary`).
+            B.tmux_send(view, "Down", enter=False)
+            time.sleep(1.0)
+            focused = B.tmux_capture(view)
+            side.evidence(flow, "10-panel-focused.txt", focused)
+            frames[side.name]["panel-focused"] = focused
+            if "Enter/→ open" in focused and "subagents" in focused:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: Down at the end of the prompt focuses the subagent panel (the hint flips to the focused open pair)",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: Down at the end of the prompt did not focus the subagent panel",
+                    evidence=side.root / flow / "10-panel-focused.txt",
+                )
+            B.tmux_send(view, "Enter", enter=False)
+            scoped2 = B.tmux_wait_text(view, child_name, timeout=60)
+            side.evidence(flow, "11-scoped-again.txt", scoped2)
+            # Enter on the child row drills into the child's transcript
+            # (`[task from parent]` is the child's own user row; it never
+            # renders in the parent, whose tool rows carry only the spawn
+            # code).
+            B.tmux_send(view, "Enter", enter=False)
+            drilled = B.tmux_wait_text(view, "task from parent", timeout=60)
+            side.evidence(flow, "12-child-transcript.txt", drilled)
+            settled5 = self.settle_frame(view, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "13-child-transcript-settled.txt", settled5)
+            frames[side.name]["child-transcript"] = settled5
+            if child_reply in settled5:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: Enter on the child row drills into the child transcript",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: Enter on the child row did not open the child transcript",
+                    evidence=side.root / flow / "13-child-transcript-settled.txt",
+                )
+            # The agents-back key (empty editor) returns to the view.
+            B.tmux_send(view, "Left", enter=False)
+            backed = B.tmux_wait_text(view, child_name, timeout=60)
+            side.evidence(flow, "14-back-to-view.txt", backed)
+            settled6 = self.settle_frame(view, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "15-back-to-view-settled.txt", settled6)
+            frames[side.name]["back-to-view"] = settled6
+            if child_name in settled6:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the agents-back key returns from the child transcript to the view",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow, "visual",
+                    f"{side.name}: the agents-back key did not return to the view",
+                    evidence=side.root / flow / "15-back-to-view-settled.txt",
+                )
             B.tmux_kill(view)
             self.copy_sessions(side, flow)
-        for step in ("spawn", "child-status", "scoped-agents"):
+        for step in ("spawn", "child-status", "scoped-agents", "reattached", "panel-focused", "child-transcript", "back-to-view"):
             self.frame_diff(
                 flow, step,
                 {name: frames[name].get(step, "") for name in ("ts", "rust")},
