@@ -174,7 +174,9 @@ function templateLiteralSurface(content) {
 	const spans = [];
 	maskJsSyntax(content, spans);
 	if (spans.length === 0) return undefined;
-	const chars = Array.from(content, (char) => (char === "\n" ? "\n" : " "));
+	// UTF-16 units, not code points: mask spans are UTF-16 offsets, and an astral
+	// character before a template literal must not shift the revealed spans.
+	const chars = content.split("").map((char) => (char === "\n" ? "\n" : " "));
 	for (const [start, end] of spans) for (let cursor = start; cursor < end; cursor += 1) chars[cursor] = content[cursor];
 	return chars.join("");
 }
