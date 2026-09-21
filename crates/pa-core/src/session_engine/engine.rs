@@ -317,7 +317,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if compaction_settings.agent_callable.unwrap_or(true) {
         turn_boundary.register_compact_handlers(&mut handlers, keep_recent_tokens);
     }
-    let local_harness_dir = wiring
+    // The session's artifact dir (TS `getSessionArtifactDir`; the daemon
+    // worker owns persistence outside the session manager, so its
+    // conversation-log path implies the same tree). One resolution feeds
+    // the harness digest below and the kernel snapshot wiring.
+    let session_artifact_dir: Option<PathBuf> = wiring
         .session
         .lock()
         .await
@@ -326,8 +330,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             config
                 .conversation_log_path
                 .as_deref()
-                .and_then(super::harness_digest::local_harness_dir_for_log)
+                .and_then(super::harness_digest::session_artifact_dir_for_log)
         });
+    let local_harness_dir =
+        crate::refinement::get_local_harness_state_dir(session_artifact_dir.as_deref());
     // The refine surface gate (TS `_autoRefineAllowedForSession`): depth 0
     // with a local harness state dir — the sessions whose `refine.*` host
     // requests register, and the only sessions the compact-trigger
@@ -360,12 +366,48 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             },
         ) as crate::kernel::provisioner::KernelBootstrapResultHandler
     });
+    // Kernel namespace snapshots (TS `_ipythonKernelSnapshotDir`): the
+    // provisioner saves the Python namespace to the session's artifact
+    // dir (a debounced flush after successful executions plus a final
+    // flush on dispose) and revives it on the next boot of the same
+    // session, so a resumed session continues where it left off. The
+    // `hasSnapshot` probe (TS `existsSync(snapshotPathIn(dir))`) drives
+    // the resume prewarm below.
+    let has_snapshot = session_artifact_dir
+        .as_ref()
+        .is_some_and(|dir| crate::kernel::state_snapshot::snapshot_path_in(dir).exists());
+    // The restore-notice mailbox (TS `deliverAs: "nextTurn"`): a boot's
+    // `onRestore` fires from a background task that can settle before
+    // the AgentSession exists (the resume prewarm starts at build), so
+    // the row parks in a mailbox the session adopts once constructed and
+    // shares afterwards.
+    let restore_rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
+        pa_types::session::CustomMessage,
+    >::new()));
+    let on_restore = {
+        let restore_rows = std::sync::Arc::clone(&restore_rows);
+        Some(std::sync::Arc::new(
+            move |result: &crate::kernel::state_snapshot::RestoreResult| {
+                // TS `_onIpythonStateRestored`: the notice only fires
+                // for a genuine revive (the provisioner suppresses the
+                // callback when no snapshot existed), and it rides the
+                // next admitted turn ahead of its prompt.
+                let row = super::state_restore_notice::notice_message(result);
+                restore_rows
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(row);
+            },
+        ) as crate::kernel::provisioner::RestoreCallback)
+    };
     let provisioner = super::runtime_wiring::kernel_provisioner(
         session_id,
         handlers,
         python_skills,
         cwd.clone(),
         &config.agent_dir,
+        session_artifact_dir,
+        on_restore,
         on_bootstrap_result,
     );
     let mut tools = config.tools.clone();
@@ -426,15 +468,17 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // session (depth 0 — the session gate TS applies at
     // `this._prewarmIpythonKernel = config.prewarmIpythonKernel && rlmDepth
     // === 0`) boots its kernel in the background once the tool registry
-    // shows `ipython` active. Failures are swallowed there and surface on
-    // the next `ensure()`, and an already-started kernel short-circuits it,
-    // so the lazy first-call start stays the fallback. The TS `hasSnapshot`
-    // arm (prewarm a resumed session so its namespace revives before the
-    // first turn) has nothing to do here yet: the session path wires
-    // `snapshot_dir: None`, so no Rust session can arrive with a snapshot
-    // to restore.
-    if config.prewarm_ipython_kernel.unwrap_or(false)
-        && config.rlm_depth.unwrap_or(0) == 0
+    // shows `ipython` active. The TS `hasSnapshot` arm ORs in: a resumed
+    // session whose artifact dir carries a kernel snapshot prewarms even
+    // when the config flag is off (and at any depth — only the config
+    // operand is depth-gated), so its namespace revives before the first
+    // turn and the `ipython_state_restored` notice lands ahead of it.
+    // Failures are swallowed there and surface on the next `ensure()`, and
+    // an already-started kernel short-circuits it, so the lazy first-call
+    // start stays the fallback.
+    let prewarm_configured =
+        config.prewarm_ipython_kernel.unwrap_or(false) && config.rlm_depth.unwrap_or(0) == 0;
+    if (prewarm_configured || has_snapshot)
         && active_tool_names.iter().any(|name| name == "ipython")
     {
         provisioner.prewarm();
@@ -489,17 +533,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // the interfaces the digest may reference.
     let digest_context = super::harness_digest::HarnessDigestContext {
         global_dir: crate::refinement::get_global_harness_state_dir(&config.agent_dir),
-        local_dir: wiring
-            .session
-            .lock()
-            .await
-            .get_session_artifact_dir()
-            .or_else(|| {
-                config
-                    .conversation_log_path
-                    .as_deref()
-                    .and_then(super::harness_digest::local_harness_dir_for_log)
-            }),
+        local_dir: local_harness_dir,
         include_ipython: active_tool_names.iter().any(|name| name == "ipython"),
         include_shell_examples: active_tool_names.iter().any(|name| name == "bash"),
         include_refine: resources.skills.iter().any(|skill| {
@@ -608,6 +642,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         std::sync::Arc::downgrade(&provisioner),
     ));
     session.set_kernel_state_probe(Some(kernel_state_probe));
+    // The restore-notice mailbox becomes the session's next-turn queue:
+    // rows parked by a boot that settled mid-build merge in, and later
+    // restores (a lazy first-call boot) push straight into the live
+    // session's queue.
+    session.adopt_next_turn_rows(restore_rows);
 
     // Bind the turn-boundary runtime the `compact.*`/`refine.*` handlers
     // probe (turn-active state, usage estimate, compaction preparation).

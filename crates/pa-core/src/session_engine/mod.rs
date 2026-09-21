@@ -34,6 +34,7 @@ pub mod runtime_wiring;
 pub mod session_commands;
 pub mod side_question;
 pub mod slash_commands;
+pub mod state_restore_notice;
 pub mod telemetry;
 pub mod tool_bridge;
 pub mod turn_boundary;
@@ -139,7 +140,7 @@ pub struct AgentSession {
     /// carries ahead of its own prompt row (the CLI `--goal` seed's
     /// continuation context, pushed at construction; taken by the next
     /// prompt or injected turn, exactly like the TS prepared-messages take).
-    pending_next_turn_rows: tokio::sync::Mutex<Vec<pa_types::session::CustomMessage>>,
+    pending_next_turn_rows: std::sync::Arc<std::sync::Mutex<Vec<pa_types::session::CustomMessage>>>,
 }
 
 impl AgentSession {
@@ -189,7 +190,7 @@ impl AgentSession {
             auto_refine: refine::AutoRefineGates::default(),
             compact_auto_refine: std::sync::Mutex::default(),
             kernel_state: None,
-            pending_next_turn_rows: tokio::sync::Mutex::new(Vec::new()),
+            pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -640,7 +641,40 @@ impl AgentSession {
     /// `_pendingNextTurnMessages.push`): the row rides the turn's prompt
     /// messages ahead of the prompt's own user row.
     pub async fn queue_next_turn_row(&self, message: pa_types::session::CustomMessage) {
-        self.pending_next_turn_rows.lock().await.push(message);
+        self.pending_next_turn_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(message);
+    }
+
+    /// Adopt a shared next-turn mailbox (the engine's restore-notice
+    /// seam): rows a kernel boot already parked before the session existed
+    /// merge in, and later pushes land in the same queue the next admitted
+    /// turn drains. The kernel provisioner outlives the construction order
+    /// (its restore fires from a background boot), so the notice needs a
+    /// mailbox shared across the build boundary rather than a callback
+    /// bound to a session that does not exist yet.
+    pub fn adopt_next_turn_rows(
+        &mut self,
+        shared: std::sync::Arc<std::sync::Mutex<Vec<pa_types::session::CustomMessage>>>,
+    ) {
+        let own_rows: Vec<_> = {
+            let mut own = self
+                .pending_next_turn_rows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            own.drain(..).collect()
+        };
+        {
+            let mut next = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The shared mailbox is authoritative: rows parked pre-build
+            // (a restore that finished during construction) come first,
+            // then anything this session queued before adoption.
+            next.extend(own_rows);
+        }
+        self.pending_next_turn_rows = shared;
     }
 
     /// Drain the queued next-turn rows (TS `_takePendingNextTurnMessages`):
@@ -649,7 +683,7 @@ impl AgentSession {
     pub async fn take_next_turn_rows(&self) -> Vec<pa_agent::types::AgentMessage> {
         self.pending_next_turn_rows
             .lock()
-            .await
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain(..)
             .filter_map(|row| session_message_to_loop(&SessionAgentMessage::Custom(row)))
             .collect()

@@ -121,12 +121,15 @@ pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
 /// the kernel-resident tools (bash/edit) run there, and a runtime whose
 /// session cwd differs from the process cwd (a daemon worker switched onto
 /// another session file) must spawn the kernel in the session's cwd.
+#[allow(clippy::too_many_arguments)] // one wiring funnel, same style as AgentSession::from_session_arc
 pub fn kernel_provisioner(
     session_id: String,
     handlers: HostRequestHandlers,
     python_skills: Vec<KernelPythonSkill>,
     cwd: std::path::PathBuf,
     agent_dir: &std::path::Path,
+    snapshot_dir: Option<std::path::PathBuf>,
+    on_restore: Option<crate::kernel::provisioner::RestoreCallback>,
     on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
 ) -> Arc<KernelProvisioner> {
     let mut env = HashMap::with_capacity(1);
@@ -144,9 +147,12 @@ pub fn kernel_provisioner(
             session_id: Some(session_id),
             host_handlers: handlers,
             python_skills,
-            snapshot_dir: None,
+            // Only persistent sessions (which have an artifact dir) get a
+            // revivable snapshot, TS `snapshotDir` (the session artifact
+            // dir).
+            snapshot_dir,
             ready_gate: None,
-            on_restore: None,
+            on_restore,
             on_bootstrap_result,
         },
     ))

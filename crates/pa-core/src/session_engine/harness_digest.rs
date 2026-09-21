@@ -221,17 +221,21 @@ pub fn latest_context_digest(messages: &[AgentMessage]) -> Option<String> {
     latest.map(|(_, digest)| digest.to_string())
 }
 
-/// Session-local harness state directory implied by a conversation-log path
+/// Session artifact directory implied by a conversation-log path
 /// (`dirname(dirname(file))/session-artifacts/<id>`, TS
-/// `getSessionArtifactPathForFile`); used when the caller owns persistence.
-pub fn local_harness_dir_for_log(log: &std::path::Path) -> Option<PathBuf> {
+/// `getSessionArtifactPathForFile`); used when the caller owns persistence
+/// outside the session manager (the daemon worker's in-memory session).
+pub fn session_artifact_dir_for_log(log: &std::path::Path) -> Option<PathBuf> {
     let id = log.file_stem()?.to_string_lossy().to_string();
     let artifacts_root = log.parent()?.parent()?.join("session-artifacts");
-    Some(
-        artifacts_root
-            .join(id)
-            .join(crate::refinement::HARNESS_STATE_DIR_NAME),
-    )
+    Some(artifacts_root.join(id))
+}
+
+/// Session-local harness state directory implied by a conversation-log path
+/// (the artifact dir plus the harness subdir); used when the caller owns
+/// persistence.
+pub fn local_harness_dir_for_log(log: &std::path::Path) -> Option<PathBuf> {
+    session_artifact_dir_for_log(log).map(|dir| dir.join(crate::refinement::HARNESS_STATE_DIR_NAME))
 }
 
 /// Session message view of the digest entries (resume context rebuild).
