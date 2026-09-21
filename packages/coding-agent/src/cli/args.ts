@@ -22,6 +22,7 @@ export interface Args {
 	version?: boolean;
 	mode?: Mode;
 	daemonSocket?: string;
+	daemonPort?: number;
 	noSession?: boolean;
 	fork?: string;
 	sessionDir?: string;
@@ -118,6 +119,18 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--daemon-socket") {
 			if (hasRequiredOptionValue(args, i, arg, result)) {
 				result.daemonSocket = args[++i];
+			}
+		} else if (arg === "--daemon-port") {
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				const port = Number(args[++i]);
+				if (!Number.isInteger(port) || port < 1 || port > 65535) {
+					result.diagnostics.push({
+						type: "error",
+						message: `Invalid --daemon-port "${args[i]}": expected an integer between 1 and 65535`,
+					});
+				} else {
+					result.daemonPort = port;
+				}
 			}
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;

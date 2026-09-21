@@ -136,6 +136,7 @@ import {
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
+import { checkDaemonTcpLineAuth, loadOrCreateDaemonTcpToken, resolveDaemonTcpPort } from "./daemon-tcp.js";
 import {
 	DaemonWorkerAuthenticationError,
 	DaemonWorkerClient,
@@ -418,6 +419,8 @@ interface DaemonSupervisorOptions {
 	socketPath?: string;
 	defaultSessionConfig: AgentSessionRuntimeConfig;
 	descriptorDir?: string;
+	/** Explicit `--daemon-port` override; env and settings resolve inside the supervisor. */
+	tcpPort?: number;
 }
 
 interface PersistedSupervisorConfig {
@@ -732,6 +735,9 @@ export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions):
 
 export class DaemonSupervisor {
 	private server?: Server;
+	/** Optional token-authenticated TCP listener; never set unless a port resolves. */
+	private tcpServer?: Server;
+	private tcpPort?: number;
 	private readonly ready: Promise<void>;
 	private markReady: () => void = () => {};
 	private rejectReady: (error: Error) => void = () => {};
@@ -823,6 +829,7 @@ export class DaemonSupervisor {
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
+		this.tcpPort = resolveDaemonTcpPort(options.tcpPort, this.settingsManager.getDaemonPort());
 	}
 
 	async start(): Promise<void> {
@@ -866,6 +873,7 @@ export class DaemonSupervisor {
 			restrictDaemonSocketPath(this.socketPath);
 
 			this.registerSignalHandlers();
+			await this.startTcpListener();
 			const ownedSessionFiles = new Set(
 				[...this.workers.values()]
 					.flatMap((worker) => [worker.descriptor.sessionFile, worker.descriptor.createCommand.sessionPath])
@@ -933,6 +941,43 @@ export class DaemonSupervisor {
 			this.server?.once("listening", onListening);
 			this.server?.listen(this.socketPath);
 		});
+	}
+
+	/**
+	 * Optional TCP listener for tailnet peers. Enabled only when `tcpPort`
+	 * resolved (CLI flag > env > settings) at construction. Serves the same
+	 * JSONL protocol and command dispatch as the unix socket; the only
+	 * difference is that every command line must carry the per-machine token.
+	 * Binding failures (busy port, corrupt token file) fail startup loudly
+	 * instead of leaving a silently unreachable mesh daemon.
+	 */
+	private async startTcpListener(): Promise<void> {
+		const port = this.tcpPort;
+		if (port === undefined) {
+			return;
+		}
+		const agentDir = this.defaultSessionConfig.agentDir;
+		if (!agentDir) {
+			throw new Error("Daemon supervisor config is missing agentDir");
+		}
+		const tokenRecord = loadOrCreateDaemonTcpToken(agentDir);
+		const server = createServer((socket) => this.handleConnection(socket, { tcpAuthToken: tokenRecord.token }));
+		await new Promise<void>((resolveListen, rejectListen) => {
+			const onError = (error: Error) => {
+				server.off("listening", onListening);
+				rejectListen(error);
+			};
+			const onListening = () => {
+				server.off("error", onError);
+				resolveListen();
+			};
+			server.once("error", onError);
+			server.once("listening", onListening);
+			server.listen({ port, host: "0.0.0.0" });
+		});
+		this.tcpServer = server;
+		server.on("error", (error) => this.log(`Daemon TCP listener error: ${error.message}`));
+		this.log(`Prime Agent daemon TCP listener listening on 0.0.0.0:${port} (token file: ${tokenRecord.tokenPath})`);
 	}
 
 	private log(message: string): void {
@@ -1582,7 +1627,7 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private handleConnection(socket: Socket): void {
+	private handleConnection(socket: Socket, connectionOptions: { tcpAuthToken?: string } = {}): void {
 		const client: DaemonSocketClient = {
 			id: createActiveSessionId(),
 			socket,
@@ -1623,7 +1668,15 @@ export class DaemonSupervisor {
 			() => client.socket.destroy(),
 		);
 
-		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
+		client.detachInput = attachJsonlLineReader(socket, (line) => {
+			if (
+				connectionOptions.tcpAuthToken !== undefined &&
+				!this.authorizeDaemonTcpLine(client, line, connectionOptions.tcpAuthToken)
+			) {
+				return;
+			}
+			void this.handleLine(client, line);
+		});
 		let cleaned = false;
 		const cleanup = () => {
 			if (cleaned) {
@@ -1662,6 +1715,23 @@ export class DaemonSupervisor {
 				);
 			}
 		});
+	}
+
+	/**
+	 * Auth gate for TCP connections. Each line must carry the per-machine token;
+	 * a refused line gets a correlatable failure response and the socket is
+	 * ended. Failures are logged and never propagate to the listener.
+	 */
+	private authorizeDaemonTcpLine(client: DaemonSocketClient, line: string, expectedToken: string): boolean {
+		const verdict = checkDaemonTcpLineAuth(line, expectedToken);
+		if (verdict.ok) {
+			return true;
+		}
+		const commandName = verdict.command ?? "tcp_auth";
+		this.log(`Refused TCP ${commandName} command (${verdict.reason})`);
+		this.write(client, failure(verdict.id, commandName, "TCP authentication failed", { code: "tcp_auth_failed" }));
+		client.socket.end();
+		return false;
 	}
 
 	private cancelOwnedWorkerCleanup(clientId: string): void {
@@ -7234,6 +7304,20 @@ export class DaemonSupervisor {
 				resolveClose();
 			}
 		});
+		const tcpServer = this.tcpServer;
+		this.tcpServer = undefined;
+		const tcpServerClosed = new Promise<void>((resolveClose) => {
+			if (!tcpServer?.listening) {
+				resolveClose();
+				return;
+			}
+			try {
+				tcpServer.close(() => resolveClose());
+			} catch (error) {
+				this.reportCleanupFailure("daemon tcp server", error);
+				resolveClose();
+			}
+		});
 		for (const client of this.clients) {
 			client.attachedActiveSessionIds.clear();
 			await this.runCleanupStep(`daemon client input ${client.id}`, () => client.detachInput());
@@ -7275,6 +7359,7 @@ export class DaemonSupervisor {
 		this.catalogOpeningWorkers.clear();
 		await this.runCleanupStep("daemon catalog", () => this.catalog.stop());
 		await this.runCleanupStep("daemon server", () => serverClosed);
+		await this.runCleanupStep("daemon tcp server", () => tcpServerClosed);
 		await this.runCleanupStep("daemon socket", () => this.cleanupSocket());
 		await this.runCleanupStep("supervisor cache", () => {
 			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });

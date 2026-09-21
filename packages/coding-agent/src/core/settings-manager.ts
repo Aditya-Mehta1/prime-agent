@@ -259,6 +259,13 @@ export interface Settings {
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 	/** Log per-request provider timing phases to the diagnostic log. Default: false */
 	requestTiming?: boolean;
+	/**
+	 * TCP port for the optional daemon mesh listener (read from the global
+	 * scope only). When set, the daemon listens on 0.0.0.0:<port> in addition
+	 * to the unix socket, requiring the per-machine token on every command.
+	 * Default: unset - no TCP listener.
+	 */
+	daemonPort?: number;
 }
 
 export interface AgentTracesSettings {
@@ -906,6 +913,11 @@ export class SettingsManager {
 
 	getRlmMaxDepth(): number | undefined {
 		return this.globalSettings.rlmMaxDepth;
+	}
+
+	getDaemonPort(): number | undefined {
+		const port: unknown = this.globalSettings.daemonPort;
+		return typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535 ? port : undefined;
 	}
 
 	setRlmMaxDepth(maxDepth: number): void {

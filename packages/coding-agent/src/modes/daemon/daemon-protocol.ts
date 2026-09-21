@@ -1036,7 +1036,9 @@ export type DaemonErrorInfo =
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| { code: "session_recovering"; activeSessionId: string }
 	| { code: "update_restarting" }
-	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
+	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
+	/** TCP listener refused a command line whose per-machine token was missing or wrong. */
+	| { code: "tcp_auth_failed" };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";

@@ -326,8 +326,11 @@ Normally the package manager's global modules location is queried using `root -g
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
+| `daemonPort` | number | - | TCP port for the optional daemon mesh listener. When set, the daemon also listens on `0.0.0.0:<port>` for remote agents. |
 
 `idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold.
+
+`daemonPort` is a global daemon policy read only from `~/.prime/agent/settings.json`. The TCP listener speaks the same JSONL protocol as the unix socket and is disabled when unset. The `--daemon-port` CLI flag and `PRIME_AGENT_DAEMON_PORT` env var override it (flag > env > setting). Every command line sent over TCP must carry the per-machine identity token in a top-level `auth: { token }` field; the token is generated on first daemon start and stored in `~/.prime/agent/daemon-tcp-token.json` (mode `0600`).
 
 ### Sessions
 
