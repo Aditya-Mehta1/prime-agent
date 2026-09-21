@@ -105,6 +105,13 @@ pub struct AgentSessionEngine {
     /// across a turn's admission, so goal checks inside emit callbacks
     /// (which may run in async context) must not lock it.
     goal_runtime: std::sync::Mutex<Option<GoalRuntimeHandles>>,
+    /// The session's live agent handle (TS `AgentSession.agent`): the eager
+    /// turn-abort funnel's target. Mirrored from the core session at build
+    /// time for the same reason as the goal runtime handles — a running
+    /// turn holds the core session's mutex across its admission, so an
+    /// abort request from the worker must reach the agent's run controller
+    /// without locking it.
+    turn_agent: std::sync::Mutex<Option<std::sync::Arc<pa_agent::agent::Agent>>>,
     /// The worker-owned session file (conversation-log path), set at create.
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection. Starts from the process fallback
@@ -298,6 +305,7 @@ impl AgentSessionEngine {
             mcp,
             published_goal: std::sync::Mutex::new(None),
             goal_runtime: std::sync::Mutex::new(None),
+            turn_agent: std::sync::Mutex::new(None),
             session_file,
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
@@ -373,6 +381,10 @@ impl AgentSessionEngine {
     /// branch and the session would start off the moved branch's entries.
     async fn adopt_built_session(&self, built: &CoreSessionEngine) -> anyhow::Result<()> {
         self.mirror_goal_runtime(built);
+        // The eager-abort target rides the same mirror (see
+        // [`Self::turn_agent`]).
+        *self.turn_agent.lock().expect("turn agent lock") =
+            Some(std::sync::Arc::clone(built.session.agent()));
         // A `set_rlm_max_depth` that landed before the build parks its
         // durable entry; the built session owns the store now.
         {
@@ -463,6 +475,7 @@ impl AgentSessionEngine {
         let _build = self.session_build.lock().await;
         let built = self.session.lock().await.take();
         *self.goal_runtime.lock().expect("goal runtime lock") = None;
+        *self.turn_agent.lock().expect("turn agent lock") = None;
         *self.published_goal.lock().expect("published goal lock") = None;
         if let Some(engine) = built {
             // The session's telemetry ends with it (the TS dispose
@@ -2109,6 +2122,18 @@ impl SessionEngine for AgentSessionEngine {
             },
         };
         self.run_turns(turn_prompt, aborted, &mut emit);
+    }
+
+    fn abort_in_flight_turn(&self) {
+        // TS `requestAbort` ends with `this.agent.abort()`: the agent's
+        // active-run controller aborts, every loop await rejects, and the
+        // in-flight provider fetch cancels. No run in flight (or a
+        // not-yet-built session) aborts nothing, like the TS optional
+        // chain.
+        let agent = self.turn_agent.lock().expect("turn agent lock").clone();
+        if let Some(agent) = agent {
+            agent.abort();
+        }
     }
 }
 
@@ -5029,6 +5054,110 @@ fn faux_model_from_script(script: &str) -> anyhow::Result<Model> {
     let parsed = pa_ai::faux::script::parse_faux_script(&script).map_err(anyhow::Error::msg)?;
     let registration = pa_ai::faux::script::register_faux_provider_from_script(&parsed);
     Ok(registration.get_model())
+}
+
+/// The eager turn abort (TS `requestAbort`'s closing `this.agent.abort()`):
+/// an abort that lands while the provider response is pending — the
+/// compaction flow's interrupt-and-settle wait, the `abort` command, kill,
+/// shutdown — cancels the in-flight fetch immediately instead of at the
+/// next streamed event. The turn settles on its aborted message with
+/// EMPTY_USAGE (TS `createAbortedAssistantMessage` with no partial), so the
+/// aborted turn's usage never reaches the goal accounting.
+#[test]
+fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(
+            json!({
+                "engine": "faux",
+                "responses": [{ "text": "held reply", "delayMs": 60000 }],
+            })
+            .to_string(),
+        ),
+        supervisor_link: None,
+        telemetry_disabled: None,
+    })
+    .unwrap();
+    let engine = std::sync::Arc::new(engine);
+    let events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> = Default::default();
+    let turn_engine = std::sync::Arc::clone(&engine);
+    let turn_events = std::sync::Arc::clone(&events);
+    let turn = std::thread::spawn(move || {
+        turn_engine.run_prompt(
+            0,
+            PromptRequest {
+                images: Vec::new(),
+                message: "hello".to_string(),
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: None,
+            },
+            &|| false,
+            &mut |event| {
+                turn_events.lock().unwrap().push(event);
+                true
+            },
+        );
+    });
+    // Wait until the turn is live (the agent run started) so the abort
+    // lands mid-provider-wait, the window TS's requestAbort owns.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let agent = engine.turn_agent.lock().expect("turn agent lock").clone();
+        if let Some(agent) = agent {
+            let state = engine.runtime.block_on(agent.state());
+            if state.is_streaming {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn never started streaming"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let started = std::time::Instant::now();
+    engine.abort_in_flight_turn();
+    // The fetch cancels now (TS aborts the fetch, not the next event): the
+    // turn settles far inside the 60s hold.
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+    let waiter = std::thread::spawn(move || {
+        turn.join().unwrap();
+        let _ = settled_tx.send(());
+    });
+    settled_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the aborted turn settles immediately, not after the 60s hold");
+    waiter.join().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // The aborted turn settles on the aborted message with EMPTY usage —
+    // the accounting input the goal accounting's aborted guard sees, so
+    // the aborted turn's usage is not counted (TS parity).
+    let events = events.lock().unwrap();
+    let assistant = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            EngineEvent::AssistantMessage(message) => Some(message.clone()),
+            _ => None,
+        })
+        .expect("an assistant message settled");
+    assert_eq!(assistant["stopReason"], json!("aborted"));
+    assert_eq!(assistant["errorMessage"], json!("Request was aborted"));
+    assert_eq!(assistant["usage"]["totalTokens"], json!(0));
+    assert_eq!(assistant["usage"]["input"], json!(0));
+    assert_eq!(assistant["usage"]["output"], json!(0));
 }
 
 /// A driver loop test harness: faux script + collected events. Holds the

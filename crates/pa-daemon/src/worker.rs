@@ -2438,6 +2438,9 @@ impl Worker {
             core.shutdown_requested = true;
             core.abort_requested = true;
         }
+        // TS `shutdown` closes through `session.abort()` -> `requestAbort()`:
+        // the in-flight turn's fetch cancels now, not at its next event.
+        self.engine.abort_in_flight_turn();
         self.work_notify.notify_one();
         // TS `shutdown` closes every session through `closeSession` ->
         // `session.abort()` (which awaits the in-flight turn and compaction)
@@ -2522,6 +2525,10 @@ impl Worker {
             if !busy {
                 return;
             }
+            // The parked flag gates the turn's events; the engine abort
+            // cancels the in-flight fetch (TS `requestAbort` -> `agent.abort()`)
+            // so the settle does not wait out a pending provider response.
+            self.engine.abort_in_flight_turn();
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(50),
                 self.idle_notify.notified(),
@@ -2666,6 +2673,9 @@ impl Worker {
         // TS `requestAbort()` also aborts the compaction in flight (manual
         // and automatic): the interrupt key cancels a compacting session.
         self.compaction.abort();
+        // `requestAbort()` closes with `this.agent.abort()`: the in-flight
+        // turn's fetch cancels now, not at its next streamed event.
+        self.engine.abort_in_flight_turn();
         response_success(None, "abort", None)
     }
 
@@ -3069,6 +3079,8 @@ impl Worker {
         // The same TS `requestAbort()` suspension as the bare `abort`.
         core.queued_input_suspended = true;
         drop(core);
+        // And the same eager agent abort.
+        self.engine.abort_in_flight_turn();
         response_success(None, "abort_and_clear_queue", cleared.data)
     }
 
@@ -3127,6 +3139,10 @@ impl Worker {
         self.work_notify.notify_one();
         self.compaction.abort();
         self.tree_navigation.abort();
+        // The `session.abort()` the close awaits cancels the in-flight
+        // fetch immediately (`requestAbort` -> `agent.abort()`), so the
+        // settle below does not wait out a pending provider response.
+        self.engine.abort_in_flight_turn();
         self.await_session_work_settled().await;
         // The runtime dispose of the TS close path
         // (`closeSessionOnce` -> `runtime.dispose()` ->

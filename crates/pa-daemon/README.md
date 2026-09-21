@@ -126,6 +126,15 @@ Prompt attachments: the `prompt`/`steer`/`follow_up` wire `images` array
 as multimodal user content (images on a queued prompt do not survive a
 worker respawn - the recovery journal keeps the text lanes only, the TS
 command-recovery shape).
+Eager turn abort (TS `requestAbort`'s closing `agent.abort()`): every
+worker abort surface — `abort`/`abort_and_clear_queue`, the compaction and
+branch-navigation interrupt-and-settle waits, shutdown, kill, and the
+`cancel_prompt_admission` cancel-owned arm — funnels through
+`SessionEngine::abort_in_flight_turn` (the engine's build-time agent
+mirror), so an abort landing mid-provider-wait cancels the in-flight fetch
+immediately and the aborted turn settles on its zero-usage aborted message
+(the usage-accounting parity of the #238 adjacent gap 3 fix; the transport
+half is pa-core's provider-adapter cancellation token).
 Queued-input suspension (TS `_sessionInputPumpSuspended`, the #227/#233
 ruling — see PORTING-NOTES.md): `abort`/`abort_and_clear_queue`/manual
 `compact` suspend queued-input admission indefinitely; while suspended a

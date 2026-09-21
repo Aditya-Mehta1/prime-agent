@@ -879,18 +879,13 @@ class Battery:
                 if message.get("customType") == "goal_context":
                     details = message.get("details") or {}
                     # The context's "tokens used" line carries the
-                    # per-side goal accounting at mint time: the Rust
-                    # worker's mid-turn compact abort reaches the
-                    # provider request only at the next streamed event
-                    # (TS `requestAbort` cancels the fetch immediately),
-                    # so a compact that lands mid-provider-wait lets the
-                    # aborted turn's usage through on Rust and not on TS
-                    # — the pre-existing late-abort gap (PORTING-NOTES).
-                    # The line is normalized; every other byte of the
-                    # continuation context stays compared.
-                    content = self.normalize_goal_context_text(
-                        str(message.get("content"))
-                    )
+                    # per-side goal accounting at mint time and compares
+                    # verbatim now: the mid-turn compact abort cancels the
+                    # in-flight fetch immediately on both sides (TS
+                    # `requestAbort` -> `agent.abort()`; the Rust
+                    # `abort_in_flight_turn` funnel), so the aborted
+                    # turn's usage is not counted on either.
+                    content = str(message.get("content"))
                     rows.append(
                         {
                             "type": event_type,
@@ -934,13 +929,6 @@ class Battery:
                         }
                     )
         return rows
-
-    def normalize_goal_context_text(self, text: str) -> str:
-        """Normalize the goal-continuation context's per-side accounting
-        line (the late-abort gap's leaked aborted-turn usage on the Rust
-        side — see the goal-continue projection) while comparing every
-        other byte."""
-        return re.sub(r"- tokens used: \d+", "- tokens used: <tokens>", text)
 
     def last_user_text(self, request: dict) -> str:
         """The text of a provider request's last user-role message (string
@@ -2165,9 +2153,7 @@ class Battery:
                 goal_requests[side.name] = [
                     {
                         "model": request.get("body", {}).get("model"),
-                        "last_user_text": self.normalize_goal_context_text(
-                            self.last_user_text(request)
-                        ),
+                        "last_user_text": self.last_user_text(request),
                     }
                     for request in self.new_mock_requests(side, mark)
                     if request.get("body", {}).get("model") == "mock-1"

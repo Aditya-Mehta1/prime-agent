@@ -2326,18 +2326,36 @@ NOT this lane's surface — reported for their owning lanes):
   the session header; the Rust worker file does not (engine-side digest
   rows exist at cold-context boundaries only). Visible in the f7 session
   captures; no behavioral effect on this lane's window.
-- The Rust worker's mid-turn compact abort is lazy: TS `compact()` ->
+- The Rust worker's mid-turn compact abort is eager (lane
+  `eager-abort`, the #238 adjacent gap 3 fix): TS `compact()` ->
   `abort()` -> `requestAbort()` cancels the in-flight provider fetch
-  immediately, while the Rust compaction's `wait_for_turn_end` only sets
-  `abort_requested` — the engine's provider request is cancelled at the
-  next streamed event (the emit probe). A compact that lands while the
-  provider response is pending (the battery's `delayMs` hold) lets the
-  response complete on Rust: the aborted turn's assistant usage reaches
-  the goal accounting (+30 tokens in the f7 goal-continue fixture) and
-  TS records nothing. The f7 goal-continue projection normalizes the
-  continuation context's "tokens used" line for this (every other byte
-  stays compared); the abort-propagation fix belongs to the
-  compaction-abort/turn-abort lane.
+  immediately through `this.agent.abort()`, while the Rust compaction's
+  `wait_for_turn_end` originally only set `abort_requested` — the engine's
+  provider request was cancelled at the next streamed event (the emit
+  probe), so a compact landing mid-provider-wait (the battery's `delayMs`
+  hold) let the response complete on Rust and the aborted turn's assistant
+  usage reach the goal accounting (+30 tokens in the f7 goal-continue
+  fixture) where TS recorded nothing. The fix is two-layered: the worker's
+  abort surfaces (`abort`, `abort_and_clear_queue`, the compaction and
+  branch-navigation interrupt-and-settle waits, shutdown, kill, and the
+  `cancel_prompt_admission` cancel-owned arm) all funnel through
+  `SessionEngine::abort_in_flight_turn()` (the agent mirror the engine
+  sets at session build, because the core session's mutex stays held
+  across a turn's admission), which aborts the agent's active-run
+  controller — every loop await rejects and the fetch cancels; and the
+  provider adapter passes a CancellationToken into pa-ai's stream
+  options (`StreamOptions::signal`, the TS fetch AbortSignal), cancelled
+  by `ModelStream::close` (the `closeIterator` abort callback) and the
+  stream's drop, so the HTTP request dies at the transport instead of
+  finishing detached behind the pump. The aborted turn settles on its
+  aborted message with EMPTY_USAGE (TS `createAbortedAssistantMessage`
+  with no partial) and the goal accounting's aborted guard skips it, so
+  the f7 goal-continue projection now compares the continuation context's
+  "tokens used" line verbatim (the normalization is removed). Verifiers:
+  the pa-core stream-seam test (a held faux fetch cancels on close and
+  settles on the aborted message) and the pa-daemon engine test
+  (`abort_in_flight_turn` mid-provider-wait settles the turn inside the
+  60s hold with zero usage).
 
 - lane `replacement-rebinds`: the two #237 pre-existing replacement-surface
   residues — the switch cwd rebind and the fork schedule rebind (TS

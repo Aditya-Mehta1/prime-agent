@@ -469,6 +469,10 @@ impl TreeNavigation {
             if !busy {
                 return;
             }
+            // The interrupt-and-settle loop, like the compaction flow's:
+            // the engine abort cancels the in-flight fetch now (TS
+            // `requestAbort` -> `agent.abort()`).
+            self.engine.abort_in_flight_turn();
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(50),
                 self.idle_notify.notified(),

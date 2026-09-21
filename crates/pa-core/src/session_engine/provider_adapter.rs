@@ -78,11 +78,18 @@ fn stream_once(
         messages,
         tools: Some(tools),
     };
+    // The turn's abort signal reaches the transport (TS passes the run's
+    // AbortController signal into the stream options, so the fetch itself
+    // cancels): the in-flight request races this token, and the loop's
+    // abort paths fire it through [`ModelStream::close`] (TS
+    // `closeIterator`) or the stream's drop, long before the response
+    // would settle on its own.
+    let cancel = tokio_util::sync::CancellationToken::new();
     let stream_options = pa_ai::types::SimpleStreamOptions {
         base: pa_ai::types::StreamOptions {
             temperature: options.temperature,
             max_tokens: options.max_tokens,
-            signal: None,
+            signal: Some(cancel.clone()),
             api_key,
             transport: None,
             service_tier: None,
@@ -126,7 +133,7 @@ fn stream_once(
     });
     // Keep the pump task alive as long as the stream lives.
     let (forwarder, consumer) = (forwarder, consumer);
-    Ok(consumer_pump(forwarder, consumer))
+    Ok(consumer_pump(forwarder, consumer, cancel))
 }
 
 /// A stream adapter pinned to one target: the headless runtimes (print and
@@ -243,17 +250,32 @@ pub fn convert_stream_event(
 fn consumer_pump(
     forwarder: tokio::task::JoinHandle<()>,
     consumer: pa_agent::stream::AssistantMessageEventStream,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Box<dyn ModelStream> {
     Box::new(PumpedStream {
         _forwarder: forwarder,
         stream: consumer,
+        cancel,
     })
 }
 
-/// A ModelStream whose lifetime keeps the pa-ai pump task alive.
+/// A ModelStream whose lifetime keeps the pa-ai pump task alive and owns
+/// the fetch's cancellation token (the transport half of the turn-abort:
+/// the token cancels the in-flight request exactly where TS's fetch
+/// AbortSignal fires).
 struct PumpedStream {
     _forwarder: tokio::task::JoinHandle<()>,
     stream: pa_agent::stream::AssistantMessageEventStream,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for PumpedStream {
+    fn drop(&mut self) {
+        // A dropped consumer stops reading events, so the in-flight fetch
+        // behind the pump cancels instead of running to completion
+        // detached (TS: the fetch dies with its iterator).
+        self.cancel.cancel();
+    }
 }
 
 impl ModelStream for PumpedStream {
@@ -267,6 +289,13 @@ impl ModelStream for PumpedStream {
         &mut self,
     ) -> pa_agent::BoxFut<'_, anyhow::Result<pa_agent::types::AssistantMessage>> {
         self.stream.result()
+    }
+
+    /// Close/cancel the underlying stream (TS `iterator.return()` passed as
+    /// `closeIterator` to the abort race): the in-flight fetch cancels
+    /// immediately. Idempotent — the token's cancelled state is sticky.
+    fn close(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -309,5 +338,59 @@ mod tests {
                 rest: Default::default(),
             }))
         );
+    }
+
+    /// The turn-abort cancels the in-flight fetch at the seam: a delayed
+    /// faux response holds the request mid-wait; `ModelStream::close`
+    /// (the loop's `closeIterator` abort callback, fired the moment the
+    /// run's signal aborts) cancels the fetch NOW, so the stream settles
+    /// on the aborted message instead of waiting out the provider hold.
+    #[tokio::test]
+    async fn closing_the_stream_cancels_a_held_fetch_immediately() {
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                api: Some("held-fetch-close-test".to_string()),
+                ..Default::default()
+            });
+        let model = registration.get_model();
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Delayed {
+            message: pa_ai::faux::faux_assistant_text_message(
+                "held reply",
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ),
+            delay_ms: 60_000,
+        }]);
+        let target = Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
+            api_key: None,
+            model: model.clone(),
+        })));
+        let stream_fn = switchable_stream_fn(target);
+        let mut stream = stream_fn(
+            pa_agent::types::Model::unknown(),
+            LlmContext::default(),
+            StreamRequestOptions::default(),
+        )
+        .await
+        .expect("stream start");
+        // The hold keeps the response pending; abort the turn (the agent
+        // loop's close-on-abort path) mid-wait.
+        stream.close();
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("the closed stream settles immediately, not after the 60s hold")
+            .expect("stream result");
+        assert_eq!(settled.stop_reason, pa_agent::types::StopReason::Aborted);
+        assert_eq!(
+            settled.error_message.as_deref(),
+            Some("Request was aborted")
+        );
+        // The aborted turn records no usage (TS EMPTY_USAGE on a mid-wait
+        // abort: no partial message ever streamed).
+        let usage = settled.usage;
+        assert_eq!(usage.total_tokens, 0);
+        assert_eq!(usage.input, 0);
+        assert_eq!(usage.output, 0);
+        assert_eq!(usage.cost.total, 0.0);
+        registration.unregister();
     }
 }

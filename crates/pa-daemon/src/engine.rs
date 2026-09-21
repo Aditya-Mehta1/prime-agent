@@ -201,6 +201,15 @@ pub trait SessionEngine: Send + Sync {
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     );
 
+    /// Abort the in-flight turn eagerly (TS `requestAbort`'s closing
+    /// `this.agent.abort()`): the live run's provider fetch cancels
+    /// immediately, not at the next streamed event, and the aborted turn
+    /// settles on its aborted message (empty usage mid-wait). The worker's
+    /// abort surfaces call this after parking their cancel flag, so the
+    /// aborted turn's events stay gated. Engines without a real agent
+    /// loop have nothing in flight and keep the default no-op.
+    fn abort_in_flight_turn(&self) {}
+
     /// Run one side question: a second LLM turn over a clone of the
     /// conversation with the serialized previous turns replayed, excluded
     /// from the session history. `signal` aborts the run; `sink` receives

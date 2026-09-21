@@ -156,6 +156,13 @@ impl CompactionManager {
             if !busy {
                 return;
             }
+            // The parked flag gates the turn's events; the engine abort
+            // cancels the in-flight provider fetch immediately (TS
+            // `compact()` -> `abort()` -> `requestAbort()` ->
+            // `agent.abort()`), so the interrupt does not wait out a
+            // pending provider response and the aborted turn settles on
+            // its zero-usage aborted message.
+            self.engine.abort_in_flight_turn();
             // The turn runner notifies when the queue drains; the timeout is
             // a backstop so a missed notification cannot hang a compact.
             let _ =

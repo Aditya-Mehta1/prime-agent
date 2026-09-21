@@ -1,0 +1,10 @@
+{"activeSessionId":"28dfd20c65a9","busy":true,"operation":"create","recordedAt":"2026-09-21T04:49:36.569Z","sessionFile":"/home/ubuntu/lane-worktrees/eager-abort/scripts/battery/runs/20260921T044911Z/rust/agent/sessions/01a0c24c-5117-76e4-9bd6-4ae7644312c9.jsonl","sessionId":"01a0c24c-5117-76e4-9bd6-4ae7644312c9"}
+{"active_session_id":"28dfd20c65a9","follow_up":[],"recorded_at":"2026-09-21T04:49:36.616Z","steering":["suspension seed turn with enough history for the compaction to summarize"],"type":"queue_snapshot","version":1}
+{"active_session_id":"28dfd20c65a9","follow_up":[],"recorded_at":"2026-09-21T04:49:36.772Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"28dfd20c65a9","follow_up":[],"recorded_at":"2026-09-21T04:49:36.792Z","steering":["steer resumes the suspension"],"type":"queue_snapshot","version":1}
+{"active_session_id":"28dfd20c65a9","follow_up":[],"recorded_at":"2026-09-21T04:49:36.926Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"28dfd20c65a9","follow_up":[],"recorded_at":"2026-09-21T04:49:36.934Z","steering":["plain prompt after the steer resumed the session"],"type":"queue_snapshot","version":1}
+{"active_session_id":"28dfd20c65a9","follow_up":[],"recorded_at":"2026-09-21T04:49:37.047Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"28dfd20c65a9","follow_up":[],"recorded_at":"2026-09-21T04:49:37.051Z","steering":["plain prompt after resume_queue cleared the suspension"],"type":"queue_snapshot","version":1}
+{"active_session_id":"28dfd20c65a9","follow_up":[],"recorded_at":"2026-09-21T04:49:37.187Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"28dfd20c65a9","busy":false,"operation":"shutdown","recordedAt":"2026-09-21T04:49:51.549Z","sessionFile":"/home/ubuntu/lane-worktrees/eager-abort/scripts/battery/runs/20260921T044911Z/rust/agent/sessions/01a0c24c-5117-76e4-9bd6-4ae7644312c9.jsonl","sessionId":"01a0c24c-5117-76e4-9bd6-4ae7644312c9"}

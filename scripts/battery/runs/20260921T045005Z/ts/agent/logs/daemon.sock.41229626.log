@@ -1,0 +1,39 @@
+[2026-09-21T04:50:05.594Z] supervisor: Prime Agent daemon supervisor 37efa7b3-1220-4a57-9048-3556e6cef2f0 listening on /home/ubuntu/lane-worktrees/eager-abort/scripts/battery/runs/20260921T045005Z/ts/daemon.sock
+[2026-09-21T04:50:05.783Z] supervisor: Session worker 0c0bb8a44027 stderr: Prime Agent daemon listening on /tmp/vbat20260921T045005Z-ts/prime-agent-1000/worker-412296269c0e-0c0bb8a44027.sock
+[2026-09-21T04:50:07.581Z] supervisor: Session worker 87e49417d9b7 stderr: Prime Agent daemon listening on /tmp/vbat20260921T045005Z-ts/prime-agent-1000/worker-412296269c0e-87e49417d9b7.sock
+[2026-09-21T04:50:24.712Z] supervisor: Session worker 20b438a2e992 stderr: Prime Agent daemon listening on /tmp/vbat20260921T045005Z-ts/prime-agent-1000/worker-412296269c0e-20b438a2e992.sock
+[2026-09-21T04:50:25.837Z] supervisor: Session worker 39170c33779f stderr: Prime Agent daemon listening on /tmp/vbat20260921T045005Z-ts/prime-agent-1000/worker-412296269c0e-39170c33779f.sock
+[2026-09-21T04:50:27.055Z] supervisor: Session worker 5b58d93668dc stderr: Prime Agent daemon listening on /tmp/vbat20260921T045005Z-ts/prime-agent-1000/worker-412296269c0e-5b58d93668dc.sock
+[2026-09-21T04:50:27.221Z] supervisor: Session worker 5b58d93668dc stderr: daemon command "compact" failed: Error: Session is too short to compact — try again once it grows
+[2026-09-21T04:50:27.221Z] supervisor: Session worker 5b58d93668dc stderr:     at _performCompaction (/$bunfs/root/prime-agent:2256:2495)
+[2026-09-21T04:50:27.221Z] supervisor: Session worker 5b58d93668dc stderr:     at compact (/$bunfs/root/prime-agent:2256:941)
+[2026-09-21T04:50:27.221Z] supervisor: Session worker 5b58d93668dc stderr:     at async handleCommand (/$bunfs/root/prime-agent:2181:89202)
+[2026-09-21T04:50:27.221Z] supervisor: Session worker 5b58d93668dc stderr:     at async handleLine (/$bunfs/root/prime-agent:2181:62568)
+[2026-09-21T04:50:27.221Z] supervisor: Session worker 5b58d93668dc stderr:     at processTicksAndRejections (native:7:39)
+[2026-09-21T04:50:27.226Z] supervisor: Session worker 5b58d93668dc stderr: daemon command "prompt_and_wait" failed: Error: Cannot admit a session action while queued session input is suspended.
+[2026-09-21T04:50:27.226Z] supervisor: Session worker 5b58d93668dc stderr:     at _assertSessionActionAdmissionAvailable (/$bunfs/root/prime-agent:2253:8126)
+[2026-09-21T04:50:27.226Z] supervisor: Session worker 5b58d93668dc stderr:     at _prompt (/$bunfs/root/prime-agent:2247:11158)
+[2026-09-21T04:50:27.226Z] supervisor: Session worker 5b58d93668dc stderr:     at promptUntilAccepted (/$bunfs/root/prime-agent:2247:3835)
+[2026-09-21T04:50:27.227Z] supervisor: Session worker 5b58d93668dc stderr:     at promptAndWait (/$bunfs/root/prime-agent:2247:4181)
+[2026-09-21T04:50:27.227Z] supervisor: Session worker 5b58d93668dc stderr:     at handleCommand (/$bunfs/root/prime-agent:2181:73548)
+[2026-09-21T04:50:27.227Z] supervisor: Session worker 5b58d93668dc stderr:     at handleLine (/$bunfs/root/prime-agent:2181:62568)
+[2026-09-21T04:50:27.227Z] supervisor: Session worker 5b58d93668dc stderr:     at processTicksAndRejections (native:7:39)
+[2026-09-21T04:50:27.350Z] supervisor: Session worker 5b58d93668dc stderr: daemon command "prompt_and_wait" failed: Error: Cannot admit a session action while queued session input is suspended.
+[2026-09-21T04:50:27.350Z] supervisor: Session worker 5b58d93668dc stderr:     at _assertSessionActionAdmissionAvailable (/$bunfs/root/prime-agent:2253:8126)
+[2026-09-21T04:50:27.350Z] supervisor: Session worker 5b58d93668dc stderr:     at _prompt (/$bunfs/root/prime-agent:2247:11158)
+[2026-09-21T04:50:27.350Z] supervisor: Session worker 5b58d93668dc stderr:     at promptUntilAccepted (/$bunfs/root/prime-agent:2247:3835)
+[2026-09-21T04:50:27.350Z] supervisor: Session worker 5b58d93668dc stderr:     at promptAndWait (/$bunfs/root/prime-agent:2247:4181)
+[2026-09-21T04:50:27.350Z] supervisor: Session worker 5b58d93668dc stderr:     at handleCommand (/$bunfs/root/prime-agent:2181:73548)
+[2026-09-21T04:50:27.350Z] supervisor: Session worker 5b58d93668dc stderr:     at handleLine (/$bunfs/root/prime-agent:2181:62568)
+[2026-09-21T04:50:27.350Z] supervisor: Session worker 5b58d93668dc stderr:     at processTicksAndRejections (native:7:39)
+[2026-09-21T04:50:28.275Z] supervisor: Session worker 5dc06e848531 stderr: Prime Agent daemon listening on /tmp/vbat20260921T045005Z-ts/prime-agent-1000/worker-412296269c0e-5dc06e848531.sock
+[2026-09-21T04:50:53.499Z] supervisor: Session worker 004317959ecf stderr: Prime Agent daemon listening on /tmp/vbat20260921T045005Z-ts/prime-agent-1000/worker-412296269c0e-004317959ecf.sock
+[2026-09-21T04:51:01.209Z] supervisor: Session worker 282b2f193924 stderr: Prime Agent daemon listening on /tmp/vbat20260921T045005Z-ts/prime-agent-1000/worker-412296269c0e-282b2f193924.sock
+[2026-09-21T04:51:32.279Z] supervisor: Session worker 282b2f193924 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-21T04:51:32.279Z] supervisor: Session worker 0c0bb8a44027 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-21T04:51:32.299Z] supervisor: Session worker 004317959ecf stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-21T04:51:32.306Z] supervisor: Session worker 87e49417d9b7 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-21T04:51:32.307Z] supervisor: Session worker 5b58d93668dc stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-21T04:51:32.318Z] supervisor: Session worker 5dc06e848531 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-21T04:51:32.318Z] supervisor: Session worker 39170c33779f stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-21T04:51:32.359Z] supervisor: Session worker 20b438a2e992 stderr: shutting down (exit 0); closing 0 active session(s)

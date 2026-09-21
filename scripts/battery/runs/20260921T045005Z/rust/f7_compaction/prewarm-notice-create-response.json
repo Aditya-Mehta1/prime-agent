@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "ac34b07ef90b",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-21T04:51:16.705Z",
+  "cwd": "/home/ubuntu/lane-worktrees/eager-abort/scripts/battery/runs/20260921T045005Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "ac34b07ef90b",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T04:51:16.716Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T04:51:16.716Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/eager-abort/scripts/battery/runs/20260921T045005Z/rust/agent/sessions/01a0c24d-d861-72d8-ac81-ae8e19210ccd.jsonl",
+  "sessionId": "01a0c24d-d861-72d8-ac81-ae8e19210ccd",
+  "sessionName": "battery-ipython-prewarm",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1699525,
+  "workerState": "ready"
+ },
+ "id": "batt-c1",
+ "success": true,
+ "type": "response"
+}

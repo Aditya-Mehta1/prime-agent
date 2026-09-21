@@ -741,10 +741,38 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
                     // The harness pacing delay holds the stream closed
                     // before the first delta: in-flight states (loaders,
                     // spinners) stay visible for the harness's capture
-                    // window.
+                    // window. The token races the hold, so a turn abort
+                    // mid-wait cancels the request like the real transport
+                    // (the fetch dies before any event streams).
                     FauxResponseStep::Delayed { message, delay_ms } => {
                         if delay_ms > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            let hold =
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms));
+                            let cancelled =
+                                match options.as_ref().and_then(|options| options.signal.clone()) {
+                                    Some(signal) => tokio::select! {
+                                        _ = hold => false,
+                                        _ = signal.cancelled() => true,
+                                    },
+                                    None => {
+                                        hold.await;
+                                        false
+                                    }
+                                };
+                            if cancelled {
+                                // The real providers' abort path: the request
+                                // dies mid-flight (ProviderError::Aborted),
+                                // the stream settles on the aborted message.
+                                let mut partial = message.clone();
+                                partial.content = Vec::new();
+                                let aborted = create_aborted_message(&partial);
+                                writer.push(AssistantMessageEvent::Error {
+                                    reason: ErrorStopReason::Aborted,
+                                    error: aborted.clone(),
+                                });
+                                writer.end(Some(aborted));
+                                return;
+                            }
                         }
                         Ok(message)
                     }

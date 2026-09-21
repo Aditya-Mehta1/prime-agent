@@ -518,6 +518,11 @@ impl Worker {
                 if cancel_owned {
                     let mut core = self.core.lock().unwrap();
                     core.abort_requested = true;
+                    drop(core);
+                    // The TS controller abort cancels the committed turn's
+                    // in-flight fetch immediately (`requestAbort` ->
+                    // `agent.abort()`).
+                    self.engine.abort_in_flight_turn();
                 }
                 response_success(
                     None,

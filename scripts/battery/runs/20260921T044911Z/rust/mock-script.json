@@ -1,0 +1,1 @@
+{"responses": [{"text": "statusline filler"}], "queues": [{"name": "suspension", "matchModels": ["mock-1"], "responses": [{"text": "seed reply"}, {"text": "the suspension compaction summary"}, {"text": "steered reply after resumption"}, {"text": "plain reply after resumption"}, {"text": "plain reply after resume_queue"}]}]}
