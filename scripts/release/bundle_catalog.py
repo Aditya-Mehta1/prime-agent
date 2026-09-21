@@ -319,9 +319,89 @@ def fixture_service(index: int, transport_kind: str, auth_strategy: str,
     }
 
 
+def fixture_special_services() -> list:
+    """Hand-shaped entries exercising the paste-flow and builtin-shadow
+    semantics (spec §1.2/§3.6) that the runtime lane's tests consume:
+
+    - a pasteable bearer-token service whose two alternative credential
+      field ids share one credentialSet (alias names, one credential);
+    - a bearer-token service with TWO distinct credential sets (fail-closed:
+      NOT pasteable — no single credential resolves);
+    - a requires-setup api-key service (kind "api-key" field);
+    - the legacy builtin ids (linear, notion) with legacyBuiltin: true.
+    """
+    def entry(server, label, auth, setup, **extra):
+        service = fixture_service(
+            99, "http", auth, setup, "user-setup", False)
+        service.update({
+            "server": server,
+            "label": label,
+            "url": f"https://mcp-{server}.example.com/mcp",
+            "description": f"Synthetic fixture MCP service for offline builds.",
+            "setup": setup,
+        })
+        service["transport"] = {"type": "http", "url": service["url"]}
+        service.update(extra)
+        return service
+
+    def field(field_id, label, kind, credential_set):
+        return {
+            "id": field_id,
+            "label": label,
+            "required": True,
+            "kind": kind,
+            "credentialSet": credential_set,
+        }
+
+    paste_setup = {
+        "status": "requires-setup",
+        "readiness": "user-setup",
+        "reason": "Paste a fixture personal access token.",
+        "requirement": "bearer-token",
+        "fields": [
+            field("FIXTURE_PAT_TOKEN", "Fixture personal access token",
+                  "bearer-token", "fixture-pat"),
+            field("FIXTURE_PERSONAL_ACCESS_TOKEN", "Fixture personal access token (alias)",
+                  "bearer-token", "fixture-pat"),
+        ],
+    }
+    two_cred_setup = {
+        "status": "requires-setup",
+        "readiness": "user-setup",
+        "reason": "Requires two distinct credentials (never pasteable).",
+        "requirement": "bearer-token",
+        "fields": [
+            field("FIXTURE_CLIENT_ID", "Fixture client id", "client-id", "fixture-cred-a"),
+            field("FIXTURE_CLIENT_SECRET", "Fixture client secret",
+                  "client-secret", "fixture-cred-b"),
+        ],
+    }
+    api_key_setup = {
+        "status": "requires-setup",
+        "readiness": "user-setup",
+        "reason": "Requires a fixture API key.",
+        "requirement": "api-key",
+        "fields": [
+            field("FIXTURE_API_KEY", "Fixture API key", "api-key", "fixture-api-key"),
+        ],
+    }
+    return [
+        entry("fixture-paste-single", "Fixture Pasteable (single credential)",
+              "api_key", paste_setup),
+        entry("fixture-paste-multi-cred", "Fixture Two-Credential (not pasteable)",
+              "api_key", two_cred_setup),
+        entry("fixture-api-key", "Fixture API Key (requires-setup)", "api_key", api_key_setup),
+        entry("linear", "Linear", "oauth", {"status": "ready", "readiness": "oauth-ready"},
+              legacyBuiltin=True, service="linear", category="Developer tools"),
+        entry("notion", "Notion", "oauth", {"status": "ready", "readiness": "oauth-ready"},
+              legacyBuiltin=True, service="notion", category="Developer tools"),
+    ]
+
+
 def fixture_mcp_services() -> list:
     """68 services covering every transport kind, auth strategy, setup
-    status, readiness value, and verification status."""
+    status, readiness value, and verification status, plus the special
+    paste-flow/builtin-shadow entries the runtime lane consumes."""
     entries = []
     # (transport, auth, setup status, readiness, verified) round-robin so the
     # full shape matrix is exercised deterministically.
@@ -336,7 +416,7 @@ def fixture_mcp_services() -> list:
             matrix[index % len(matrix)]
         entries.append(fixture_service(
             index, transport_kind, auth_strategy, setup_status, readiness, verified))
-    return entries
+    return entries + fixture_special_services()
 
 
 def fixture_counts(entries: list) -> dict:

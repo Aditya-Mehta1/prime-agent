@@ -160,8 +160,9 @@ class ValidationGates(unittest.TestCase):
             # The verify command (no small-fixture waiver) agrees.
             verify = run_cli(BUNDLER, ["verify", "--out", str(out)])
             self.assertEqual(verify.returncode, 0, verify.stderr)
-            self.assertEqual(json.loads(verify.stdout)["mcpServices"]["services"],
-                             bundle_catalog.MIN_MCP_SERVICES)
+            self.assertGreaterEqual(
+                json.loads(verify.stdout)["mcpServices"]["services"],
+                bundle_catalog.MIN_MCP_SERVICES)
 
     def test_fixture_shapes_match_the_catalog_contract(self):
         bodies = bundle_catalog.fixture_catalog_bodies()
@@ -250,6 +251,30 @@ class ValidationGates(unittest.TestCase):
                     self.assertRaises(SystemExit):
                 bundle_catalog.validate_bundled_catalog_dir(out / "nowhere")
             self.assertIn("Missing bundled catalog asset", captured.getvalue())
+
+    def test_fixture_covers_paste_flow_and_builtin_shapes(self):
+        """The special entries the runtime MCP lane consumes: one shared
+        credentialSet alias pair (pasteable), two distinct credential sets
+        (never pasteable), an api-key setup field, and the legacy builtins."""
+        plugins = json.loads(
+            bundle_catalog.fixture_catalog_bodies()["mcp-services.bundled.json"])
+        by_server = {entry["server"]: entry for entry in plugins["entries"]}
+        pasteable = by_server["fixture-paste-single"]
+        sets = {field["credentialSet"] for field in pasteable["setup"]["fields"]}
+        self.assertEqual(len(pasteable["setup"]["fields"]), 2)
+        self.assertEqual(sets, {"fixture-pat"})  # alias names, one credential
+        multi = by_server["fixture-paste-multi-cred"]
+        sets = {field["credentialSet"] for field in multi["setup"]["fields"]}
+        self.assertEqual(len(sets), 2)  # fail-closed: NOT pasteable
+        api_key = by_server["fixture-api-key"]
+        self.assertEqual(api_key["setup"]["fields"][0]["kind"], "api-key")
+        for builtin in ("linear", "notion"):
+            self.assertTrue(by_server[builtin]["legacyBuiltin"])
+        # Counts stay derived: total counts every entry including specials.
+        self.assertEqual(plugins["counts"]["total"], len(plugins["entries"]))
+        self.assertEqual(
+            plugins["counts"]["total"],
+            bundle_catalog.MIN_MCP_SERVICES + 5)
 
     def test_small_fixture_verify_waiver(self):
         with tempfile.TemporaryDirectory() as tmp:
