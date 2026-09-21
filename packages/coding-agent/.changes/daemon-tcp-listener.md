@@ -1,0 +1,1 @@
+- Added an opt-in daemon TCP listener for tailnet mesh connections: `--daemon-port <n>` (or `PRIME_AGENT_DAEMON_PORT` / settings `daemonPort`) listens on `0.0.0.0:<port>` alongside the unix socket, serving the same protocol with per-machine token auth. No behavior change when unset.
