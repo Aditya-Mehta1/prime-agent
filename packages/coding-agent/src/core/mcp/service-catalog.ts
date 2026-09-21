@@ -6,8 +6,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 import type { LocalCatalogLoadResult, McpServiceEntry, McpServiceSetupField } from "@earendil-works/pi-ai/mcp";
 import {
 	createMcpOAuthProvider,
@@ -15,6 +14,7 @@ import {
 	parseMcpServiceCatalogFile,
 	SERVICE_CATALOG,
 } from "@earendil-works/pi-ai/mcp";
+import { getPackageDir, isBunBinary } from "../../config.js";
 import type { AuthCredential, AuthStorage } from "../auth-storage.js";
 import { CatalogCache } from "../model-catalog-cache.js";
 import type { McpServerConfig } from "../settings-manager.js";
@@ -171,7 +171,11 @@ let remoteMcpCache: CatalogCache<readonly McpServiceEntry[]> | undefined;
 let remoteMcpLoadedFromBundle: readonly McpServiceEntry[] | undefined;
 
 function packagedMcpCatalogPath(): string {
-	return join(dirname(fileURLToPath(import.meta.url)), "..", "..", PACKAGED_MCP_SERVICE_CATALOG_FILE);
+	const packageDir = getPackageDir();
+	const source = !isBunBinary && existsSync(join(packageDir, "src"));
+	return source
+		? resolve(packageDir, "catalog", PACKAGED_MCP_SERVICE_CATALOG_FILE)
+		: resolve(packageDir, ...(isBunBinary ? [] : ["dist"]), PACKAGED_MCP_SERVICE_CATALOG_FILE);
 }
 
 function loadBundledRemoteMcpCatalog(): readonly McpServiceEntry[] {

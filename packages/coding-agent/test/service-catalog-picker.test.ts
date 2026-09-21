@@ -1316,6 +1316,8 @@ describe("ENG-6108 service catalog picker chain", () => {
 				});
 				await f.store.flush();
 			}
+			await Promise.resolve();
+			vi.mocked(fetch).mockClear();
 			const done = f.mode.showServiceCatalogPicker("http-proof");
 			const catalog = f.picker();
 			expect(stripAnsi(catalog.render(100).join("\n"))).toContain("Enter manage saved account");

@@ -199,10 +199,11 @@ export class McpManager {
 		for (const service of this.services) {
 			if (service.transport.type !== "http" || !service.transport.url) continue;
 			const usesOAuth = service.authStrategy === "oauth" || service.authStrategy === "unknown";
+			const record = this.connectionStore.get(service.serviceId);
 			const eligibility = mcpLoginEligibility({
 				connectionId: service.serviceId,
 				service,
-				record: this.connectionStore.get(service.serviceId),
+				record,
 				credential: this.authStorage.get(this.providerId(service.serviceId)),
 			});
 			// Token services authenticate with a pasted static token credential:
@@ -214,7 +215,7 @@ export class McpManager {
 				label: service.label,
 				config: {
 					type: "http",
-					url: eligibility.endpoint ?? service.transport.url,
+					url: record && eligibility.endpoint ? eligibility.endpoint : service.transport.url,
 					...(usesOAuth ? { oauth: true } : {}),
 					...(staticToken ? { credentialSource: "static-token" as const } : {}),
 				},
@@ -250,7 +251,7 @@ export class McpManager {
 				label: `${service.label} (${record.connectionId})`,
 				config: {
 					type: "http",
-					url: eligibility.endpoint ?? service.transport.url,
+					url: eligibility.endpoint ?? record.endpoint,
 					...(usesOAuth ? { oauth: true } : {}),
 					...(staticToken ? { credentialSource: "static-token" as const } : {}),
 				},
