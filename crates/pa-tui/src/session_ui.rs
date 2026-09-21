@@ -2401,7 +2401,7 @@ impl SessionUi {
                 // so `/new` sessions start on it too (TS settings default).
                 self.model_selection.provider = Some(provider.to_string());
                 self.model_selection.model = Some(model_id.to_string());
-                self.refresh_model_label(view).await;
+                self.refresh_model_label(model_id, view).await;
                 self.note(&format!("Model: {model_id}"), view);
             }
             Err(error) => {
@@ -2468,8 +2468,12 @@ impl SessionUi {
     }
 
     /// Refresh the chrome model label after a live switch (TS
-    /// `applyModelSwitchUiState` reads the state and patches the footer).
-    async fn refresh_model_label(&mut self, view: &mut AgentView) {
+    /// `applySelectedModel` reads the state and patches the footer via
+    /// `applyModelSwitchUiState`): the state's model wins, and a state
+    /// that omits it falls back to the picked model (`state.model ??
+    /// fallbackModel`) — the switch already succeeded, so the label must
+    /// move even when the worker's summary cannot re-resolve the model.
+    async fn refresh_model_label(&mut self, picked_model_id: &str, view: &mut AgentView) {
         let state = self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -2481,13 +2485,13 @@ impl SessionUi {
             )
             .await;
         if let Ok(data) = state {
-            if let Some(model_id) = data
+            let model_id = data
                 .get("model")
                 .and_then(|model| model.get("id"))
                 .and_then(Value::as_str)
-            {
-                view.chrome.model_id = Some(model_id.to_string());
-            }
+                .map(str::to_string)
+                .unwrap_or_else(|| picked_model_id.to_string());
+            view.chrome.model_id = Some(model_id);
             self.dirty = true;
         }
     }

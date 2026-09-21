@@ -841,3 +841,55 @@ ipython-prewarm 15s settle window (box at load 13-17 with ~94 leaked
 lane daemons; passes in the runs it lands in). Residue NOT fixed here:
 the `DaemonOutbound::Response` tagged-enum arm is never serialized
 (tag-first vs TS id-first would diverge if it ever goes on the wire).
+
+## SetModel resolver + status-bar refresh — the dogfood model bugs (2026-09-21)
+
+Root cause (both live dogfood symptoms, Kevin's repro): the daemon fed the
+model resolver the auth-scoped `available` list where TS resolves against the
+full catalog.
+
+- `resolveCliModel` (TS) uses `modelRegistry.getAll()` — "use *all* models
+  here, not just models with pre-configured auth. This allows --api-key to be
+  used for first-time setup". The daemon's `resolve_registry_model` passed
+  `registry.get_available()` instead, so a session whose worker had no visible
+  provider credential (the dogfood daemon: no PRIME_API_KEY in its env chain,
+  empty auth.json, no models.json) failed every flagged-model resolution with
+  "No models available. Check your installation or add models to
+  models.json." (resolver.rs's all_models-empty branch) — including the turn
+  after a `/model` pick.
+- The run-start credential check (`_validateCanStartAgentRun`) was not
+  ported: TS fails such a turn BEFORE the provider request with the
+  login-guidance message ("No API key found for <provider>..." / the OAuth
+  stale variant); the Rust turn had no equivalent gate.
+- `refresh_model_label` adopted the label only from `get_state`'s `model.id`;
+  TS `applyModelSwitchUiState` falls back to the picked model
+  (`state.model ?? fallbackModel`), so a worker summary that cannot
+  re-resolve the model left the footer label stale.
+
+Fixes: `resolve_registry_model` passes `registry.get_all()`; `run_model_turn`
+ports the TS preflight (create-config apiKey covers the TS runtime-key
+candidate; the scripted faux seam has no credentials); `refresh_model_label`
+falls back to the picked model.
+
+A pick against a credential-less worker still fails with "Model not found"
+(TS parity — the Sep-16 dogfood log shows the TS daemon failing the private
+pick "Model not found: prime-inference/internal/glm-5.3-fast" identically);
+the label stays because nothing switched, on both products.
+
+Known follow-up (out of lane): the TUI's error row wraps daemon rejections
+("the daemon rejected the set_model request: ...") where TS `showError`
+renders the bare message; the `request_ok` wrapper text is a wider
+client-parity surface.
+
+Verifiers: `tui_flagged_model_turn_reports_the_ts_preflight_error_without_credentials`
+(the dogfood env: hermetic worker, no credentials — pick fails with the TS
+row, the flagged model resolves, the turn fails with the TS preflight
+message, no "No models available", the label holds) and
+`tui_model_pick_refreshes_the_label_and_the_next_turn_resolves` (a models.json
+pick refreshes the footer label and the post-switch turn reaches the
+provider); `protocol_breadth_parity.py` (incl. the set_model close-out) ALL
+MATCH; battery f17_slash_model + f22_provider_failover: 0 gaps, 12 checks,
+frames identical. Sandbox gates: fmt, clippy -D warnings, cargo test
+--workspace (86 suites) green. The `--all-targets` compile break in
+pa-daemon's test engines (#251's second `rebuild_session_context` impl) is
+fixed in-lane so the lib tests run at all.

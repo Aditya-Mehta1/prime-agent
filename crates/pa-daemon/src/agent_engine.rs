@@ -615,11 +615,16 @@ impl AgentSessionEngine {
                 )
             });
         };
-        let resolved = pa_core::models::resolve_cli_model(
-            selection.provider.as_deref(),
-            model_name,
-            &available,
-        );
+        // TS `resolveCliModel` resolves against `modelRegistry.getAll()`
+        // — the full catalog, not the auth-configured list ("use *all*
+        // models here, not just models with pre-configured auth. This
+        // allows --api-key to be used for first-time setup"): a saved or
+        // switched model keeps resolving when no provider credential is
+        // visible to the worker, and the turn's run-start auth validation
+        // reports the missing credential with the TS message instead.
+        let all: Vec<Model> = registry.get_all().to_vec();
+        let resolved =
+            pa_core::models::resolve_cli_model(selection.provider.as_deref(), model_name, &all);
         if let Some(error) = resolved.error {
             anyhow::bail!("{error}");
         }
@@ -2257,6 +2262,46 @@ impl AgentSessionEngine {
                 }
             }
         };
+        // TS `_validateCanStartAgentRun`: a resolved model whose provider
+        // has no configured credential fails the run before the provider
+        // request, with the login-guidance message. The create-config key
+        // covers the TS runtime-key candidate (`setRuntimeApiKey`), and the
+        // scripted faux seam has no credentials at all.
+        if self.config.faux_script.is_none() && self.current_selection().api_key.is_none() {
+            let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
+            let mut registry = pa_core::models::ModelRegistry::create(
+                auth,
+                self.config.agent_dir.join("models.json"),
+            );
+            registry.load_private_authorization_from_cache();
+            if !registry.has_configured_auth(&model) {
+                let uses_oauth = registry
+                    .auth
+                    .get_all()
+                    .credential(&model.provider)
+                    .is_some_and(|credential| {
+                        matches!(credential, pa_core::auth::AuthCredential::Oauth { .. })
+                    });
+                let message = if uses_oauth {
+                    format!(
+                        "Authentication failed for \"{}\". Credentials may have expired or network is unavailable.\n\nRun /login to update credentials.",
+                        model.provider
+                    )
+                } else {
+                    let docs = pa_core::packages::docs_path();
+                    format!(
+                        "No API key found for {}.\n\nUse /login to log into a provider via OAuth or API key. See:\n  {}\n  {}",
+                        model.provider,
+                        docs.join("providers.md").display(),
+                        docs.join("models.md").display()
+                    )
+                };
+                return TurnResult::Error {
+                    error: message,
+                    assistant: None,
+                };
+            }
+        }
         let agent = match self.session_agent(&model) {
             Ok(agent) => agent,
             Err(error) => {

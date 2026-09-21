@@ -1800,3 +1800,227 @@ async fn tui_prompts_queued_behind_a_turn_render_the_queue_strip() {
     );
     drop(supervisor);
 }
+
+/// The live-dogfood failure pair (Kevin's repro, 2026-09-21): a session
+/// created with an explicit `--provider`/`--model` on a worker whose
+/// registry has no configured credentials — the auth-scoped `available`
+/// list is empty while the bundled catalog still carries the flagged
+/// model. The pre-fix turn failed with "No models available" (the daemon
+/// fed the resolver the auth-scoped list; TS `resolveCliModel` uses
+/// `getAll()`), and a `/model` pick failed with "Model not found" leaving
+/// the status label stale. The fixed contract is TS parity: the flagged
+/// model resolves from the full catalog, the turn fails at the run-start
+/// auth validation with the TS login-guidance message
+/// (`_validateCanStartAgentRun`), and the failed pick keeps the label
+/// (nothing switched — the TS daemon fails the same pick the same way).
+#[tokio::test]
+async fn tui_flagged_model_turn_reports_the_ts_preflight_error_without_credentials() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    // The dogfood layout: no models.json, no stored credentials, and the
+    // hermetic supervisor strips every ambient provider key, so the
+    // worker's auth-scoped catalog is empty while the bundled catalog
+    // carries the flagged model. The picker catalog is a client-side
+    // snapshot (the same seam the composition root injects).
+    let glm: pa_types::ai::Model = serde_json::from_value(serde_json::json!({
+        "id": "z-ai/glm-5.3", "name": "GLM 5.3", "api": "openai-completions",
+        "provider": "prime-inference", "baseUrl": "https://inference.example/v1",
+        "reasoning": true, "input": ["text"],
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 128000, "maxTokens": 8192
+    }))
+    .expect("catalog entry");
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: None,
+        model_selection: pa_tui::interactive::ModelSelection {
+            provider: Some("prime-inference".to_string()),
+            model: Some("z-ai/glm-5.3".to_string()),
+            ..Default::default()
+        },
+        model_catalog: vec![glm],
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        show_images: true,
+        fullscreen_mouse: true,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            pa_tui::interactive::HeadlessStep::Submit("/model".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("glm".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
+            pa_tui::interactive::HeadlessStep::Submit("hello".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 60_000 },
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("Model not found: ") && rendered.contains("z-ai/glm-5.3"),
+        "the pick against the empty auth-scoped catalog fails with the TS message (label keeps the resolved model):\n{rendered}"
+    );
+    assert!(
+        rendered.contains("No API key found for prime-inference"),
+        "the turn resolves the flagged model from the full catalog and fails at the run-start auth validation with the TS message:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("No models available"),
+        "the auth-blind turn resolution must not report the resolver's empty-catalog error:\n{rendered}"
+    );
+    let last = outcome.frames.last().expect("a final frame");
+    assert!(
+        last.contains("z-ai/glm-5.3 ·"),
+        "the footer label holds the resolved flagged model (the failed pick switched nothing):\n{last}"
+    );
+    drop(supervisor);
+}
+
+/// The dogfood acceptance for a pick that CAN apply: a models.json provider
+/// (its inline key configures auth) carries two models, the session starts
+/// on the first, and a `/model` pick of the second must move the footer
+/// label immediately and leave the next turn resolving the switched model
+/// (the turn reaches the provider; the dead endpoint's retry banner is the
+/// proof the run started, not a resolution failure).
+#[tokio::test]
+async fn tui_model_pick_refreshes_the_label_and_the_next_turn_resolves() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    std::fs::write(
+        agent_dir.join("models.json"),
+        serde_json::json!({
+            "providers": {
+                "test-provider": {
+                    "api": "openai-completions",
+                    "baseUrl": "http://127.0.0.1:9/v1",
+                    "apiKey": "sk-test",
+                    "models": [
+                        { "id": "mock-1", "name": "Mock 1", "api": "openai-completions",
+                          "baseUrl": "http://127.0.0.1:9/v1", "contextWindow": 128000,
+                          "maxTokens": 4096 },
+                        { "id": "mock-2", "name": "Mock 2", "api": "openai-completions",
+                          "baseUrl": "http://127.0.0.1:9/v1", "contextWindow": 128000,
+                          "maxTokens": 4096 }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write models.json");
+    // Retries off (settings default is a 3-attempt retry chain whose
+    // countdown holds the turn busy past the headless idle window): the
+    // post-switch turn fails once at the dead endpoint and settles.
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        serde_json::json!({ "retry": { "enabled": false } }).to_string(),
+    )
+    .expect("write settings.json");
+    let supervisor = spawn_supervisor(dir.path());
+    // The client-side catalog snapshot over the same registry scope as the
+    // daemon's (hermetic auth; the models.json key is the only configured
+    // credential).
+    let auth = pa_core::auth::AuthStorage::in_memory_without_env(
+        Default::default(),
+        std::sync::Arc::new(pa_core::auth::NoOAuth),
+    );
+    let mut registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
+    registry.load_private_authorization_from_cache();
+    let catalog: Vec<pa_types::ai::Model> = registry.get_available().into_iter().cloned().collect();
+    assert_eq!(
+        catalog.len(),
+        2,
+        "both models.json models resolve available"
+    );
+    let options = pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: None,
+        model_selection: Default::default(),
+        model_catalog: catalog,
+        model_configured_providers: ["test-provider".to_string()].into_iter().collect(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        show_images: true,
+        fullscreen_mouse: true,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            pa_tui::interactive::HeadlessStep::Submit("/model".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("mock-2".to_string()),
+            pa_tui::interactive::HeadlessStep::Type("\n".to_string()),
+            pa_tui::interactive::HeadlessStep::Submit("turn after the switch".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 90_000 },
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("Model: mock-2"),
+        "the pick applied through the daemon set_model switch:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("No models available"),
+        "the switched model must resolve for the next turn:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Error: Connection error."),
+        "the post-switch turn reached the dead provider (not a resolution failure):\n{rendered}"
+    );
+    let last = outcome.frames.last().expect("a final frame");
+    assert!(
+        last.contains("mock-2 ·"),
+        "the footer label refreshed to the picked model:\n{last}"
+    );
+    drop(supervisor);
+}
