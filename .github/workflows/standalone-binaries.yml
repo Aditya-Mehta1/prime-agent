@@ -72,17 +72,12 @@ jobs:
         working-directory: source
         run: npm ci
 
-      - name: Require PRIME_CATALOG_REPO_TOKEN
-        env:
-          PRIME_CATALOG_REPO_TOKEN: ${{ secrets.PRIME_CATALOG_REPO_TOKEN }}
-        run: test -n "$PRIME_CATALOG_REPO_TOKEN" || { echo "Missing required secret PRIME_CATALOG_REPO_TOKEN for PrimeIntellect-ai/prime-agent-catalog." >&2; exit 1; }
-
       - name: Checkout catalog assets
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: PrimeIntellect-ai/prime-agent-catalog
           ref: main
-          token: ${{ secrets.PRIME_CATALOG_REPO_TOKEN }}
+          token: ${{ secrets.PRIME_CATALOG_REPO_TOKEN || github.token }}
           path: prime-agent-catalog
           persist-credentials: false
 
