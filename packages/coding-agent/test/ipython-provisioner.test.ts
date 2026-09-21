@@ -242,10 +242,12 @@ describe("IpythonKernelProvisioner", () => {
 		try {
 			const first = await provisioner.ensure();
 			expect(countRuns()).toBe(1);
-			await provisioner.stopKernel({ snapshot: true });
-			expect(existsSync(marker)).toBe(true);
 			writeFileSync(snapshotPathIn(snapshotDir), "{}");
+			// Not awaited: the follow-up ensure() must wait for the snapshot flush itself.
+			const stopping = provisioner.stopKernel({ snapshot: true });
 			const revived = await provisioner.ensure();
+			expect(existsSync(marker)).toBe(true);
+			await stopping;
 			expect(countRuns()).toBe(2);
 			expect(revived).not.toBe(first);
 			expect(provisioner.lastRestore?.restored).toEqual([]);
