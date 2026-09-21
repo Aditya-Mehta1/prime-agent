@@ -34,7 +34,7 @@ permissions: {}
 
 concurrency:
   group: continuous-main
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
