@@ -1847,6 +1847,12 @@ class RecursiveForceRmGuardTest(unittest.IsolatedAsyncioTestCase):
         # detection level (executing it would aim at the filesystem root).
         words = bash_module._scan_shell_words("unset HOME; rm -rf \"$HOME/x\"")
         self.assertTrue(bash_module._command_reassigns_env(words, "HOME"))
+        # A plus-option (`declare +x`) keeps the builtin's argument list open,
+        # so the assignment after it still reassigns.
+        for command in ["declare +x HOME=/; rm -rf \"$HOME/x\"", "declare +x PWD=/; rm -rf \"$PWD/x\""]:
+            words = bash_module._scan_shell_words(command)
+            name = "HOME" if "HOME=" in command else "PWD"
+            self.assertTrue(bash_module._command_reassigns_env(words, name), command)
 
     async def test_refuses_exec_prefixed_script_runners(self):
         # `exec ./s.sh` and friends keep heredoc bodies live too.

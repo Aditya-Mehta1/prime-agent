@@ -5167,8 +5167,8 @@ def _command_reassigns_env(words: list[_RmShellWord], name: str) -> bool:
         if builtin_args:
             if token == name:
                 return True  # `unset PWD`, `export PWD`
-            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", token) or token.startswith("-"):
-                continue  # another assignment or option keeps the argument list
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", token) or token.startswith(("-", "+")):
+                continue  # another assignment or option (`-x`, `+x`) keeps the argument list
             assignment_slot = builtin_args = False
             continue
         if token in _EXPORT_COMMANDS or token == "unset":
