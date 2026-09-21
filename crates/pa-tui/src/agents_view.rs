@@ -960,12 +960,6 @@ impl AgentsViewMode {
         // TS `renderRow`: `${"  ".repeat(depth)}${icon} ${title}` padded to
         // the name column, then the model and activity cells, then the dim
         // cost/age details.
-        let named = row
-            .summary
-            .get("sessionName")
-            .and_then(Value::as_str)
-            .map(|name| !name.trim().is_empty())
-            .unwrap_or(false);
         let indent = "  ".repeat(row.depth);
         let indent_width = str_width(&indent);
         let mut line: Line = Vec::new();
@@ -985,15 +979,12 @@ impl AgentsViewMode {
             &row.title,
             layout.name_width.saturating_sub(2 + indent_width),
         );
+        // Session titles render uniformly (no bold for named sessions);
+        // explicit product decision — differs from TS `styleRowTitle`, which
+        // bolds explicit session names.
         line.push(crate::Span::styled(
             title.clone(),
-            if named {
-                theme
-                    .fg_style(ThemeColor::Text)
-                    .add_modifier(ratatui::style::Modifier::BOLD)
-            } else {
-                theme.fg_style(ThemeColor::Text)
-            },
+            theme.fg_style(ThemeColor::Text),
         ));
         line.push(crate::Span::styled(
             " ".repeat(
