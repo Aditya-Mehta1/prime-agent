@@ -1,0 +1,5 @@
+ts: turn with tail 'turn-one-settled' rendered in 1.15s (3 segment markers seen mid-turn)
+ts: turn with tail 'turn-two-settled' rendered in 1.82s (3 segment markers seen mid-turn)
+rust: turn with tail 'turn-one-settled' rendered in 0.93s (4 segment markers seen mid-turn)
+rust: turn with tail 'turn-two-settled' rendered in 0.45s (2 segment markers seen mid-turn)
+PASS rust kept up: turn 1: ts 1.15s vs rust 0.93s, turn 2: ts 1.82s vs rust 0.45s

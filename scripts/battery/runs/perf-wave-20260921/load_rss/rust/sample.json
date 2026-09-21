@@ -1,0 +1,133 @@
+{
+ "total_kb": 802852,
+ "by_role_kb": {
+  "daemon": 32176,
+  "other": 11792,
+  "interactive": 136932,
+  "worker": 516196,
+  "kernel": 105756
+ },
+ "processes": [
+  {
+   "pid": 33686,
+   "role": "daemon",
+   "rss_kb": 32176,
+   "argv": [
+    "/opt/repo/repo/target/release/prime-agent",
+    "--mode",
+    "daemon",
+    "--daemon-socket",
+    "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/daemon.sock"
+   ]
+  },
+  {
+   "pid": 33698,
+   "role": "other",
+   "rss_kb": 11792,
+   "argv": [
+    "tmux",
+    "new-session",
+    "-d",
+    "-x",
+    "120",
+    "-y"
+   ]
+  },
+  {
+   "pid": 33699,
+   "role": "interactive",
+   "rss_kb": 37292,
+   "argv": [
+    "/opt/repo/repo/target/release/prime-agent",
+    "--daemon-socket",
+    "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/daemon.sock",
+    "--provider",
+    "prime-inference",
+    "--model"
+   ]
+  },
+  {
+   "pid": 33710,
+   "role": "worker",
+   "rss_kb": 161348,
+   "argv": [
+    "/opt/repo/repo/target/release/prime-agent",
+    "worker"
+   ]
+  },
+  {
+   "pid": 33737,
+   "role": "interactive",
+   "rss_kb": 51436,
+   "argv": [
+    "/opt/repo/repo/target/release/prime-agent",
+    "--daemon-socket",
+    "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/daemon.sock",
+    "--provider",
+    "prime-inference",
+    "--model"
+   ]
+  },
+  {
+   "pid": 33748,
+   "role": "worker",
+   "rss_kb": 181184,
+   "argv": [
+    "/opt/repo/repo/target/release/prime-agent",
+    "worker"
+   ]
+  },
+  {
+   "pid": 33776,
+   "role": "interactive",
+   "rss_kb": 48204,
+   "argv": [
+    "/opt/repo/repo/target/release/prime-agent",
+    "--daemon-socket",
+    "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/daemon.sock",
+    "--provider",
+    "prime-inference",
+    "--model"
+   ]
+  },
+  {
+   "pid": 33787,
+   "role": "worker",
+   "rss_kb": 173664,
+   "argv": [
+    "/opt/repo/repo/target/release/prime-agent",
+    "worker"
+   ]
+  },
+  {
+   "pid": 34127,
+   "role": "kernel",
+   "rss_kb": 35108,
+   "argv": [
+    "/root/.prime/agent/kernel-venv/bin/python",
+    "-m",
+    "rlm.repl"
+   ]
+  },
+  {
+   "pid": 34139,
+   "role": "kernel",
+   "rss_kb": 35636,
+   "argv": [
+    "/root/.prime/agent/kernel-venv/bin/python",
+    "-m",
+    "rlm.repl"
+   ]
+  },
+  {
+   "pid": 34150,
+   "role": "kernel",
+   "rss_kb": 35012,
+   "argv": [
+    "/root/.prime/agent/kernel-venv/bin/python",
+    "-m",
+    "rlm.repl"
+   ]
+  }
+ ]
+}

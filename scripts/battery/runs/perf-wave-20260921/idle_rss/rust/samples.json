@@ -1,0 +1,170 @@
+[
+ {
+  "total_kb": 175688,
+  "by_role_kb": {
+   "interactive": 41468,
+   "daemon": 32952,
+   "worker": 58980,
+   "kernel": 42288
+  },
+  "processes": [
+   {
+    "pid": 31333,
+    "role": "interactive",
+    "rss_kb": 41468,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/idle/sock-0.sock",
+     "--provider",
+     "prime-inference",
+     "--model"
+    ]
+   },
+   {
+    "pid": 31344,
+    "role": "daemon",
+    "rss_kb": 32952,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/idle/sock-0.sock"
+    ]
+   },
+   {
+    "pid": 31354,
+    "role": "worker",
+    "rss_kb": 58980,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "worker"
+    ]
+   },
+   {
+    "pid": 31664,
+    "role": "kernel",
+    "rss_kb": 42288,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   }
+  ],
+  "trial": 0
+ },
+ {
+  "total_kb": 169492,
+  "by_role_kb": {
+   "interactive": 53180,
+   "daemon": 33000,
+   "worker": 41960,
+   "kernel": 41352
+  },
+  "processes": [
+   {
+    "pid": 32068,
+    "role": "interactive",
+    "rss_kb": 53180,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/idle/sock-1.sock",
+     "--provider",
+     "prime-inference",
+     "--model"
+    ]
+   },
+   {
+    "pid": 32079,
+    "role": "daemon",
+    "rss_kb": 33000,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/idle/sock-1.sock"
+    ]
+   },
+   {
+    "pid": 32090,
+    "role": "worker",
+    "rss_kb": 41960,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "worker"
+    ]
+   },
+   {
+    "pid": 32399,
+    "role": "kernel",
+    "rss_kb": 41352,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   }
+  ],
+  "trial": 1
+ },
+ {
+  "total_kb": 149128,
+  "by_role_kb": {
+   "interactive": 42548,
+   "daemon": 19124,
+   "worker": 43132,
+   "kernel": 44324
+  },
+  "processes": [
+   {
+    "pid": 32806,
+    "role": "interactive",
+    "rss_kb": 42548,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/idle/sock-2.sock",
+     "--provider",
+     "prime-inference",
+     "--model"
+    ]
+   },
+   {
+    "pid": 32817,
+    "role": "daemon",
+    "rss_kb": 19124,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/idle/sock-2.sock"
+    ]
+   },
+   {
+    "pid": 32827,
+    "role": "worker",
+    "rss_kb": 43132,
+    "argv": [
+     "/opt/repo/repo/target/release/prime-agent",
+     "worker"
+    ]
+   },
+   {
+    "pid": 33145,
+    "role": "kernel",
+    "rss_kb": 44324,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   }
+  ],
+  "trial": 2
+ }
+]

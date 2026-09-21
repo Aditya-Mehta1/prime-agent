@@ -27,7 +27,15 @@ windows-cross:
 # not under .github/ yet).
 actionlint:
 	@command -v actionlint >/dev/null 2>&1 || { echo "actionlint not installed (see rhysd/actionlint releases)"; exit 1; }
-	actionlint ci/workflows/ci.yml ci/workflows/release.yml
+	actionlint ci/workflows/ci.yml ci/workflows/release.yml ci/workflows/benchmark.yml
+
+# Perf wave + regression gate (benchmark.yml job, the local mirror): runs the
+# TS binary and a fresh release build side by side in a fresh Prime sandbox
+# (both sides on one quiet machine, the methodology BENCHMARKS.md requires)
+# and gates the rust medians against scripts/battery/perf-baseline.json.
+# PA_BENCH_NO_SANDBOX=1 runs it on the bare runner instead.
+perf-wave:
+	scripts/battery/ci_perf_wave.sh
 
 # Local mirror of the release build-job gates (docs/installer-ci-design.md §9):
 # release build against the committed lockfile, deterministic tarball assembly,

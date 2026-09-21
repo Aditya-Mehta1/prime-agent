@@ -1,0 +1,6 @@
+{
+ "create_s": 0.105,
+ "prompt_to_cell_s": 0.606,
+ "create_to_first_cell_s": 0.711,
+ "prompt_success": true
+}

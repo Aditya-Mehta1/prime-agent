@@ -11,6 +11,7 @@ Local gates mirror every workflow step today:
     make deny             # cargo-deny advisories + licenses (ci.yml deny job)
     make windows-cross    # cfg-hygiene: cross-target check + clippy -D warnings (ci.yml windows-cross job)
     make actionlint       # validates the staged workflow files
+    make perf-wave        # the TS-vs-Rust perf wave + regression gate (benchmark.yml)
     make release-dry-run  # local mirror of the release build-job gates (release.yml)
 
 The `windows` job runs on a real `windows-latest` runner (portable tests plus
@@ -19,7 +20,7 @@ Linux-only.
 
 ## Promotion (once the token gains `workflow` scope)
 
-    git mv ci/workflows/ci.yml ci/workflows/release.yml .github/workflows/
+    git mv ci/workflows/ci.yml ci/workflows/release.yml ci/workflows/benchmark.yml .github/workflows/
     git rm ci/workflows/README.md
 
 Nothing else changes — the files are inert until Actions is enabled anyway.

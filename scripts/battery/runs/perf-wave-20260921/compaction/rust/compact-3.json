@@ -1,0 +1,15 @@
+{
+ "id": "kc3",
+ "type": "response",
+ "command": "compact",
+ "success": true,
+ "data": {
+  "summary": "compaction summary 3\n\n---\n\n**Turn Context (split turn):**\n\ncompaction summary 3",
+  "firstKeptEntryId": "e39ec462",
+  "tokensBefore": 110,
+  "details": {
+   "readFiles": [],
+   "modifiedFiles": []
+  }
+ }
+}
