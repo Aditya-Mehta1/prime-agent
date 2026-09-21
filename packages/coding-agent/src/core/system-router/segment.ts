@@ -25,6 +25,8 @@ export interface RouterSegmentOptions {
 	policy?: ProviderRetryPolicy;
 	/** Defaults to a StdioRouterEnvironment built from the spec. */
 	env?: RouterSegmentEnvironment;
+	/** External abort (host shutdown): ends the run failed("aborted"). */
+	signal?: AbortSignal;
 }
 
 /**
@@ -47,6 +49,25 @@ export async function runRouterSegment(
 			...(spec.environment.stdio.init !== undefined ? { init: spec.environment.stdio.init } : {}),
 		});
 	const segmentStartedAt = Date.now();
+	if (options.signal?.aborted) {
+		// Disposal can win the race before the segment starts: do not even
+		// spawn the adapter for an already-aborted run.
+		return {
+			status: "failed",
+			reason: "aborted",
+			summary: "Router aborted before the segment started.",
+			steps: 0,
+			executed: 0,
+			refused: 0,
+			trace: [],
+			model: {
+				provider: options.model.provider,
+				id: options.model.id,
+				thinkingLevel: routerThinkingLevel(options.model),
+			},
+			usage: { inputTokens: 0, outputTokens: 0 },
+		};
+	}
 	try {
 		let environment: Awaited<ReturnType<RouterSegmentEnvironment["init"]>>;
 		try {
@@ -91,6 +112,7 @@ export async function runRouterSegment(
 				thinkingLevel: routerThinkingLevel(options.model),
 			},
 			gate: spec.gate,
+			...(options.signal ? { signal: options.signal } : {}),
 			maxSteps: spec.maxSteps,
 			// The loop's deadline covers the remaining segment budget after init.
 			timeoutMs: loopBudgetMs,

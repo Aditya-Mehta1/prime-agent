@@ -4050,12 +4050,17 @@ export class AgentSession {
 					"system-router",
 				);
 				const auth = await this._getRequiredRequestAuth(model);
+				// Disposal aborts the segment instead of leaving the adapter
+				// subprocess and the action loop running until the segment budget
+				// expires past the host-request drain timeout.
+				const disposeSignal = this._sessionActionCommitDisposeAbortController.signal;
 				const result = await runRouterSegment(spec, {
 					model: auth.requestModel,
 					apiKey: auth.apiKey,
 					headers: auth.headers,
 					sessionId: this.sessionId,
 					policy: providerRetryPolicy(this.settingsManager),
+					signal: disposeSignal,
 				});
 				return result as unknown as Record<string, unknown>;
 			}

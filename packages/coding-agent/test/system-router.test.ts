@@ -49,7 +49,7 @@ const PRESS_ACTIONS: Record<string, RouterActionSpec> = {
 	},
 };
 
-class FakeEnvironment implements RouterEnvironment {
+class FakeEnvironment implements RouterSegmentEnvironment {
 	resetCalls = 0;
 	closeCalls = 0;
 	observeCalls = 0;
@@ -63,6 +63,13 @@ class FakeEnvironment implements RouterEnvironment {
 	constructor(observations: string[], executionResults: string[] = []) {
 		this.observations = observations.map((text) => ({ text }));
 		this.executionResults = executionResults;
+	}
+
+	initCalls = 0;
+
+	async init(): Promise<Record<string, unknown> | undefined> {
+		this.initCalls += 1;
+		return undefined;
 	}
 
 	async reset(): Promise<void> {
@@ -110,6 +117,7 @@ interface LoopOverrides {
 	timeoutMs?: number;
 	actions?: Record<string, RouterActionSpec>;
 	gate?: { read?: number; write?: number; destructive?: number; finish?: number };
+	signal?: AbortSignal;
 }
 
 function runLoop(env: RouterEnvironment, overrides: LoopOverrides = {}) {
@@ -121,6 +129,7 @@ function runLoop(env: RouterEnvironment, overrides: LoopOverrides = {}) {
 		decide: overrides.decide ?? scriptedDecide([decision({ action: "press_a", confidence: 0.9 })]),
 		model,
 		...(overrides.gate ? { gate: overrides.gate } : {}),
+		...(overrides.signal ? { signal: overrides.signal } : {}),
 		maxSteps: overrides.maxSteps ?? 10,
 		timeoutMs: overrides.timeoutMs ?? 30_000,
 	});
@@ -145,6 +154,7 @@ describe("parseSystemRouterRunSpec", () => {
 			{ ...valid, environment: { stdio: { command: ["node", "a.mjs"], init: { romPath: "/x" } } } },
 			null,
 		],
+		["non-string model", { ...valid, model: 3 }, "model must be a non-empty string"],
 		["non-object payload", null, "payload must be an object"],
 		["empty goal", { ...valid, goal: " " }, "goal must be a non-empty string"],
 		["missing environment", { goal: "g" }, "environment must be an object with a stdio adapter"],
@@ -307,6 +317,11 @@ describe("parseDecision", () => {
 		["prose braces then choice", 'a {x} b {"action":"press_a","confidence":1}', { action: "press_a", confidence: 1 }],
 		["draft then choice", 'a {"t":1} b {"action":"press_a","confidence":1}', { action: "press_a", confidence: 1 }],
 		["refusal from the first object", 'x {"t":1} then {"action":"press_a"}', { parseError: "unknown action null" }],
+		[
+			"unclosed brace before the choice",
+			'a { b {"action":"press_a","confidence":1}',
+			{ action: "press_a", confidence: 1 },
+		],
 		[
 			"missing confidence",
 			'{"action":"press_a"}',
@@ -618,6 +633,7 @@ describe("runSystemRouterLoop", () => {
 		expect(executeFailure.status).toBe("failed");
 		expect(executeFailure.reason).toBe("environment_error");
 		expect(executeFailure.summary).toContain("button jammed");
+		expect(executeFailure.trace[0]?.result).toContain("outcome unknown");
 
 		const crashEnv = new FakeEnvironment(["x"]);
 		const crash = await runLoop(crashEnv, {
@@ -652,6 +668,18 @@ describe("runSystemRouterLoop", () => {
 		});
 		expect(aborted.status).toBe("failed");
 		expect(aborted.reason).toBe("aborted");
+	});
+
+	it("reports aborted instead of done when the signal fires during the decision", async () => {
+		const controller = new AbortController();
+		const result = await runLoop(new FakeEnvironment(["x"]), {
+			decide: async () => {
+				controller.abort();
+				return decision({ action: FINISH_ACTION, confidence: 1 });
+			},
+			signal: controller.signal,
+		});
+		expect(result.reason).toBe("aborted");
 	});
 
 	it("closes the environment even when the loop fails", async () => {
@@ -795,6 +823,22 @@ describe("runRouterSegment wiring", () => {
 			initError ? "environment adapter init failed: rom not found" : "no action space",
 		);
 		expect(log).toEqual(["init", "close"]);
+	});
+
+	it("passes an abort signal through to the loop without resetting", async () => {
+		const spec = parseSystemRouterRunSpec({
+			goal: "g",
+			actions: { a: { description: "P" } },
+			environment: { stdio: { command: ["true"] } },
+		});
+		const early = new FakeEnvironment(["x"]);
+		await runRouterSegment(spec, { model, env: early, signal: AbortSignal.abort() });
+		expect(early.initCalls).toBe(0);
+		const controller = new AbortController();
+		const late = new FakeEnvironment(["x"]);
+		late.init = async () => void controller.abort();
+		await runRouterSegment(spec, { model, env: late, signal: controller.signal });
+		expect(late.resetCalls).toBe(0);
 	});
 });
 

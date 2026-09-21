@@ -149,6 +149,12 @@ export function parseSystemRouterRunSpec(payload: unknown): ParsedSystemRouterRu
 	}
 	const actions = parseActionSpace(payload.actions);
 	const gate = parseGate(payload.gate);
+	// A malformed selector (present but not a non-empty string) must fail the
+	// run: silently falling back to the default model would incur usage on a
+	// model the caller did not select.
+	if (payload.model !== undefined && (typeof payload.model !== "string" || !payload.model.trim())) {
+		throw new Error("system_router.run model must be a non-empty string when provided");
+	}
 	return {
 		goal,
 		...(actions ? { actions } : {}),

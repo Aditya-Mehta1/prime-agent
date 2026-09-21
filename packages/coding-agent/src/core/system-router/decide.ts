@@ -30,6 +30,8 @@ export interface RouterDecisionRequest {
 	prompt: string;
 	/** Base64 PNG screenshot; included only when the action model accepts images. */
 	image?: string;
+	/** Aborted when the segment ends; provider retries and sleeps stop. */
+	signal?: AbortSignal;
 }
 
 export interface RouterDecisionOutcome {
@@ -129,7 +131,12 @@ function objectCandidatesFromText(trimmed: string): Record<string, unknown>[] {
 				}
 			}
 		}
-		if (close === -1) return candidates;
+		if (close === -1) {
+			// An unclosed prose `{` must not end the scan: retry from the next
+			// open brace so a later complete object is still recovered.
+			scanFrom = trimmed.indexOf("{", scanFrom + 1);
+			continue;
+		}
 		try {
 			const parsed: unknown = JSON.parse(trimmed.slice(scanFrom, close + 1));
 			if (isJsonObject(parsed)) candidates.push(parsed);
@@ -289,7 +296,7 @@ export function createModelDecisionFunction(context: RouterDecisionContext): Rou
 						sessionId: context.sessionId,
 					},
 				),
-			{ policy: context.policy },
+			{ policy: context.policy, signal: request.signal },
 		);
 		const usage = {
 			inputTokens: message.usage?.input,

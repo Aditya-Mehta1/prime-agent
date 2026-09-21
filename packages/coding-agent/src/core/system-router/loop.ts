@@ -102,6 +102,10 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 	// A late deadline resolution must never surface as an unhandled rejection; it never rejects,
 	// but attach a handler anyway so the invariant is structural, not incidental.
 	void deadline.catch(() => {});
+	// A decision that loses the deadline race keeps running detached; its
+	// signal stops the provider retry sleeps so no extra model requests run
+	// past the segment's wall-clock budget.
+	const decisionAbort = new AbortController();
 
 	const trace: RouterStepTrace[] = [];
 	const history: string[] = [];
@@ -131,6 +135,10 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 
 	try {
 		byName = validateAndCompileActionSpace(options.actions);
+		// A pre-aborted signal must not mutate the external environment first.
+		if (options.signal?.aborted) {
+			return finish("failed", "aborted", "Router aborted before reset.");
+		}
 		try {
 			const resetResult = await raceDeadline(() => options.env.reset(options.goal), deadlineAt, deadline);
 			if (resetResult === "deadline") {
@@ -191,6 +199,7 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 						options.decide({
 							prompt,
 							...(observation.image ? { image: observation.image } : {}),
+							signal: decisionAbort.signal,
 						}),
 					deadlineAt,
 					deadline,
@@ -299,7 +308,11 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 				continue;
 			}
 
-			// The gate passed.
+			// The gate passed. An abort during the in-flight decision must not
+			// be reported as successful work (e.g. finish after a shutdown signal).
+			if (options.signal?.aborted) {
+				return finish("failed", "aborted", "Router aborted during the current step.");
+			}
 			refusalStreak = 0;
 			if (action.name === FINISH_ACTION) {
 				trace.push({
@@ -407,11 +420,28 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 					deadline,
 				);
 			} catch (error) {
-				return finish(
-					"failed",
-					"environment_error",
-					`Environment failed executing ${action.name} at step ${step}: ${error instanceof Error ? error.message : String(error)}`,
-				);
+				// The dispatch may have reached the adapter before the rejection
+				// (e.g. a request timeout after the write): count the execution and
+				// record the unknown outcome like the deadline branch, instead of
+				// letting a supervisor retry a possibly-applied action.
+				executed += 1;
+				const message = `Environment failed executing ${action.name} at step ${step}: ${error instanceof Error ? error.message : String(error)} (outcome unknown)`;
+				trace.push({
+					step,
+					timestampMs: decisionStarted,
+					latencyMs,
+					action: action.name,
+					params: decision.params,
+					confidence: decision.confidence,
+					gate: { threshold, verdict: "pass" },
+					observationDigest: digest,
+					observationChars: observation.text.length,
+					result: message,
+					terminal: false,
+					thinkingLevel: options.model.thinkingLevel,
+					...(decision.usage ? { usage: decision.usage } : {}),
+				});
+				return finish("failed", "environment_error", message);
 			}
 			if (executionResult === "deadline") {
 				// The dispatch already reached the adapter and the request is
@@ -474,6 +504,7 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 		);
 	} finally {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
+		decisionAbort.abort();
 		// Adapter cleanup must not extend the segment the way the old
 		// unbounded waits did: hand close() the remaining budget plus the
 		// bounded grace, never the old 2.5s.

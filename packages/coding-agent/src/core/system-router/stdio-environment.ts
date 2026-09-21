@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import { signalProcessGroupOrProcess, spawnHidden } from "../../utils/child-process.js";
+import { signalProcessGroupIfHeld, signalProcessGroupOrProcess, spawnHidden } from "../../utils/child-process.js";
 import { killOrphanProcess } from "../orphan-process-journal.js";
 import {
 	isRecord,
@@ -230,6 +230,10 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 		if (child.exitCode !== null || child.signalCode !== null) {
 			// The adapter already exited; its exit event was handled at exit time.
 			this.failAll(new Error("environment adapter closed"));
+			// A group can outlive its leader: a launcher that exited with its
+			// descendants still running (e.g. a container) gets the relayed stop
+			// while the exited leader anchors the pgid against reuse.
+			if (child.pid !== undefined) signalProcessGroupIfHeld(child.pid, "SIGTERM");
 			return;
 		}
 		const budgetEndsAt =
