@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.9.6] - 2026-09-21
+
+- Added an optional `modelOverride` run field: when set, prompt and continuation runs use that model (with its own thinking level and service tier) while `state.model` keeps identifying the session model; failures are tagged with the model that served the run.
+
 ## [0.9.4] - 2026-09-08
 
 - Removed the unused `maxRetryDelayMs` agent option; retry delays are owned by the session retry loop.
