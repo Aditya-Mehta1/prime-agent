@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const root = resolve(import.meta.dirname, "..");
+const MIN_REASON_LENGTH = 12;
+const baselinePath = resolve(import.meta.dirname, "test-policy-baseline.json");
 const testFilePattern =
 	/(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)vitest\.config\.[cm]?[jt]s$|^prime-agent-runtime\/test\/.*\.py$/;
 
@@ -49,7 +52,15 @@ function walkFiles(dir, out = []) {
 	return out;
 }
 
-function maskJsSyntax(content) {
+/**
+ * Blank out strings, comments, and regex literals so the line scanners see
+ * executable code only. `templateSpans`, when passed, collects the
+ * `[start, end)` ranges of template-literal bodies: test files generate child
+ * processes from template strings, and that generated source is executable
+ * test code the scanners must still see.
+ */
+function maskJsSyntax(content, templateSpans) {
+	let templateStart = -1;
 	let quote;
 	let escaped = false;
 	let lineComment = false;
@@ -93,6 +104,7 @@ function maskJsSyntax(content) {
 		if (quote) {
 			if (quote === "`" && !escaped && char === "$" && next === "{") {
 				masked += "  ";
+				templateSpans?.push([templateStart, index]);
 				templateExpressions.push(1);
 				lastCodeChar = "";
 				quote = undefined;
@@ -102,7 +114,10 @@ function maskJsSyntax(content) {
 			masked += char === "\n" ? "\n" : " ";
 			if (escaped) escaped = false;
 			else if (char === "\\") escaped = true;
-			else if (char === quote) quote = undefined;
+			else if (char === quote) {
+				if (quote === "`") templateSpans?.push([templateStart, index]);
+				quote = undefined;
+			}
 			continue;
 		}
 		if (templateExpressions.length > 0) {
@@ -113,6 +128,7 @@ function maskJsSyntax(content) {
 					templateExpressions.pop();
 					lastCodeChar = "";
 					quote = "`";
+					templateStart = index + 1;
 					masked += " ";
 					continue;
 				}
@@ -140,6 +156,7 @@ function maskJsSyntax(content) {
 		} else if (char === '"' || char === "'" || char === "`") {
 			masked += " ";
 			quote = char;
+			if (char === "`") templateStart = index + 1;
 			lastCodeChar = "string";
 		} else {
 			masked += char;
@@ -147,6 +164,19 @@ function maskJsSyntax(content) {
 		}
 	}
 	return masked;
+}
+
+/**
+ * Keep only template-literal bodies, blanked elsewhere, so the same scanners
+ * can run over test code that is embedded in generated child-process sources.
+ */
+function templateLiteralSurface(content) {
+	const spans = [];
+	maskJsSyntax(content, spans);
+	if (spans.length === 0) return undefined;
+	const chars = Array.from(content, (char) => (char === "\n" ? "\n" : " "));
+	for (const [start, end] of spans) for (let cursor = start; cursor < end; cursor += 1) chars[cursor] = content[cursor];
+	return chars.join("");
 }
 
 function maskPythonSyntax(content) {
@@ -299,7 +329,7 @@ function changedTestFiles(base) {
 	);
 }
 
-function scan(content, path = "") {
+export function scan(content, path = "", embedded = false) {
 	const lines = content.split("\n");
 	const maskedContent = path.endsWith(".py") ? maskPythonSyntax(content) : maskJsSyntax(content);
 	const maskedLines = maskedContent.split("\n");
@@ -309,7 +339,7 @@ function scan(content, path = "") {
 	const add = (category, line, detail, explicitTitle = title) => {
 		const previous = lines[line - 2]?.trim() ?? "";
 		const suppression = previous.match(/^(?:\/\/|#) test-policy: allow ([a-z-]+) -- (.+)$/);
-		if (suppression?.[1] === category && suppression[2].trim().length >= 12) return;
+		if (suppression?.[1] === category && suppression[2].trim().length >= MIN_REASON_LENGTH) return;
 		violations.push({ category, detail, identity: `${category}\0${explicitTitle}\0${detail}`, line, title: explicitTitle });
 	};
 
@@ -511,6 +541,11 @@ function scan(content, path = "") {
 		}
 	}
 
+	if (!embedded && !path.endsWith(".py")) {
+		const embeddedSource = templateLiteralSurface(content);
+		if (embeddedSource) violations.push(...scan(embeddedSource, path, true));
+	}
+
 	if (isVitestConfig) {
 		const findClosingBrace = (opening) => {
 			let depth = 0;
@@ -555,6 +590,45 @@ function scan(content, path = "") {
 	}
 
 	return violations;
+}
+
+/**
+ * Every unsuppressed match in the whole test tree, grouped per file and
+ * category. The delta check only looks at changed files, so the wall-clock
+ * polls, sleeps, and conditional tests that predate the policy stay invisible
+ * and permanent; freezing them here makes the debt reviewable and one-way.
+ */
+function currentDebt() {
+	const debt = {};
+	const paths = [...walkFiles(resolve(root, "packages")), ...walkFiles(resolve(root, "prime-agent-runtime", "test"))].sort();
+	for (const path of paths) {
+		const byCategory = {};
+		for (const violation of scan(readFileSync(resolve(root, path), "utf8"), path)) {
+			byCategory[violation.category] = (byCategory[violation.category] ?? 0) + 1;
+		}
+		const categories = Object.keys(byCategory).sort();
+		if (categories.length > 0) debt[path] = Object.fromEntries(categories.map((category) => [category, byCategory[category]]));
+	}
+	return debt;
+}
+
+export function debtFailures(frozen, current) {
+	const failures = [];
+	for (const path of [...new Set([...Object.keys(frozen), ...Object.keys(current)])].sort()) {
+		const categories = [...new Set([...Object.keys(frozen[path] ?? {}), ...Object.keys(current[path] ?? {})])].sort();
+		for (const category of categories) {
+			const was = frozen[path]?.[category] ?? 0;
+			const now = current[path]?.[category] ?? 0;
+			if (now === was) continue;
+			const title = now > was ? "frozen test-policy debt" : "stale test-policy debt";
+			const detail =
+				now > was
+					? `${now} ${category} matches exceed the frozen ${was}`
+					: `${now} ${category} matches are below the frozen ${was}; record the win with \`npm run check:test-policy -- --update-baseline\``;
+			failures.push({ path, line: 0, category, title, detail });
+		}
+	}
+	return failures;
 }
 
 function counts(violations) {
@@ -632,34 +706,61 @@ function changedLineStats(base) {
 	return stats;
 }
 
-const base = resolveBase();
-const failures = [];
-const lineStats = changedLineStats(base);
-if (lineStats && lineStats.testAdded - lineStats.testDeleted > lineStats.sourceAdded) {
-	failures.push({
-		path: "<test-line-budget>",
-		line: 0,
-		category: "excess-test-lines",
-		title: "changed test LOC",
-		detail: `net test additions ${lineStats.testAdded - lineStats.testDeleted} exceed source additions ${lineStats.sourceAdded}`,
-	});
-}
-for (const path of changedTestFiles(base)) {
-	const current = scan(readFileSync(resolve(root, path), "utf8"), path);
-	const oldContent = base ? git(["show", `${base}:${path}`], true) : "";
-	const allowed = counts(oldContent ? scan(oldContent, path) : []);
-	const seen = new Map();
-	for (const violation of current) {
-		const count = (seen.get(violation.identity) ?? 0) + 1;
-		seen.set(violation.identity, count);
-		if (count > (allowed.get(violation.identity) ?? 0)) failures.push({ path, ...violation });
-	}
+/**
+ * A recorded, reviewable escape from the test-line budget. The budget blocks
+ * silent test bloat, but it also blocks fix PRs whose only honest pin costs
+ * more lines than the one-line production fix, so authors dropped load-bearing
+ * pins to fit. A `Test-Budget-Exception: <reason>` line in any commit of the
+ * change turns the overrun into a warning that CI prints.
+ */
+export function parseBudgetException(commitMessages) {
+	const reason = commitMessages.match(/^Test-Budget-Exception:[ \t]*(\S.*)$/m)?.[1]?.trim();
+	return reason && reason.length >= MIN_REASON_LENGTH ? reason : undefined;
 }
 
-if (failures.length > 0) {
-	console.error("New test-policy violations:\n");
-	for (const failure of failures) console.error(`${failure.path}:${failure.line} [${failure.category}] ${failure.title}: ${failure.detail}`);
-	console.error("\nUse a deterministic signal, deferred promise, fake timer, or unconditional local fixture instead.");
-	process.exit(1);
+function main() {
+	const debt = currentDebt();
+	if (process.argv.includes("--update-baseline")) {
+		const rows = Object.entries(debt).map(([path, categories]) => `\t${JSON.stringify(path)}: ${JSON.stringify(categories)}`);
+		writeFileSync(baselinePath, `{\n${rows.join(",\n")}\n}\n`);
+		console.log(`Froze test-policy debt for ${Object.keys(debt).length} files in ${relative(root, baselinePath)}.`);
+		return;
+	}
+	const base = resolveBase();
+	const failures = debtFailures(JSON.parse(readFileSync(baselinePath, "utf8")), debt);
+	const warnings = [];
+	const lineStats = changedLineStats(base);
+	if (lineStats && lineStats.testAdded - lineStats.testDeleted > lineStats.sourceAdded) {
+		const detail = `net test additions ${lineStats.testAdded - lineStats.testDeleted} exceed source additions ${lineStats.sourceAdded}`;
+		const exception = parseBudgetException(base ? git(["log", "--format=%B", `${base}..HEAD`], true) : "");
+		if (exception) warnings.push(`<test-line-budget> [excess-test-lines] ${detail}; allowed by Test-Budget-Exception: ${exception}`);
+		else failures.push({ path: "<test-line-budget>", line: 0, category: "excess-test-lines", title: "changed test LOC", detail });
+	}
+	for (const path of changedTestFiles(base)) {
+		const current = scan(readFileSync(resolve(root, path), "utf8"), path);
+		const oldContent = base ? git(["show", `${base}:${path}`], true) : "";
+		const allowed = counts(oldContent ? scan(oldContent, path) : []);
+		const seen = new Map();
+		for (const violation of current) {
+			const count = (seen.get(violation.identity) ?? 0) + 1;
+			seen.set(violation.identity, count);
+			if (count > (allowed.get(violation.identity) ?? 0)) failures.push({ path, ...violation });
+		}
+	}
+
+	for (const warning of warnings) console.warn(`Test-policy warning: ${warning}`);
+	if (failures.length > 0) {
+		console.error("New test-policy violations:\n");
+		for (const failure of failures) console.error(`${failure.path}:${failure.line} [${failure.category}] ${failure.title}: ${failure.detail}`);
+		if (failures.some((failure) => failure.category === "excess-test-lines")) {
+			console.error(
+				'\nCut redundant test lines, or record why the pin is worth its size with a "Test-Budget-Exception: <reason>" line in a commit message.',
+			);
+		}
+		console.error("\nUse a deterministic signal, deferred promise, fake timer, or unconditional local fixture instead.");
+		process.exit(1);
+	}
+	console.log(`Test policy check passed${base ? ` against ${base}` : ""}.`);
 }
-console.log(`Test policy check passed${base ? ` against ${base}` : ""}.`);
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main();

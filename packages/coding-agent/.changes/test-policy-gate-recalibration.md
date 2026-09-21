@@ -1,0 +1,1 @@
+- Recalibrated `npm run check:test-policy`: the test-line budget now accepts a recorded `Test-Budget-Exception: <reason>` commit trailer instead of forcing authors to drop load-bearing tests, the scanner reads test code embedded in generated child-process template strings, and `scripts/test-policy-baseline.json` freezes the pre-policy matches so they can only go down.
