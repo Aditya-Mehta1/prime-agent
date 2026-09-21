@@ -168,18 +168,6 @@ jobs:
             printf 'commit it was built from.\n'
           } > release-body.md
           cat release-body.md
-      - name: Move the rolling `continuous` tag to this commit
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          git config user.name "prime-agent-ci"
-          git config user.email "ci@users.noreply.github.com"
-          # Checkout persists no credentials; the job token (contents: write)
-          # authenticates the push through an explicit header.
-          auth="Authorization: Basic $(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 -w0)"
-          git tag -fa continuous -m "Rolling continuous build" "${GITHUB_SHA}"
-          git -c "http.https://github.com/.extraheader=${auth}" push --force origin refs/tags/continuous
       - name: Drop stale assets (a workspace version bump renames the archives)
         env:
           GH_TOKEN: ${{ github.token }}
