@@ -52,31 +52,23 @@ export async function runRouterSegment(
 	if (options.signal?.aborted) {
 		// Disposal can win the race before the segment starts: do not even
 		// spawn the adapter for an already-aborted run.
-		return {
-			status: "failed",
-			reason: "aborted",
-			summary: "Router aborted before the segment started.",
-			steps: 0,
-			executed: 0,
-			refused: 0,
-			trace: [],
-			model: {
-				provider: options.model.provider,
-				id: options.model.id,
-				thinkingLevel: routerThinkingLevel(options.model),
-			},
-			usage: { inputTokens: 0, outputTokens: 0 },
-		};
+		return segmentAbortedResult(options.model, "Router aborted before the segment started.");
 	}
 	try {
 		let environment: Awaited<ReturnType<RouterSegmentEnvironment["init"]>>;
 		try {
 			// The segment timeout bounds the whole segment, adapter init included.
-			environment = await raceInitAgainstSegmentTimeout(env.init(), spec.timeoutMs, segmentStartedAt);
+			environment = await raceInitAgainstSegmentTimeout(
+				env.init(),
+				spec.timeoutMs,
+				segmentStartedAt,
+				options.signal,
+			);
 		} catch (error) {
 			// Timeout errors keep the budget message (System 2 may raise the
 			// timeout); an adapter failure must not masquerade as one.
 			if (error instanceof RouterSegmentInitTimeoutError) throw error;
+			if (error instanceof RouterSegmentAbortedError) throw error;
 			throw new Error(`environment adapter init failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		// Init can win the race in the same tick the budget expires; a
@@ -119,6 +111,13 @@ export async function runRouterSegment(
 			historySteps: spec.historySteps,
 			observationChars: spec.observationChars,
 		});
+	} catch (error) {
+		// An external abort during init unwinds as the aborted result, not a
+		// rejected host request; every other error keeps surfacing.
+		if (error instanceof RouterSegmentAbortedError) {
+			return segmentAbortedResult(options.model, "Router aborted during adapter init.");
+		}
+		throw error;
 	} finally {
 		// The loop closes the env on its own paths; this guards the window
 		// between init and the loop so the adapter process never leaks. The
@@ -134,8 +133,31 @@ export async function runRouterSegment(
 /** Timeout marker: keeps the budget message; other init errors are adapter failures. */
 class RouterSegmentInitTimeoutError extends Error {}
 
+/** Abort marker: the external signal fired before the loop took over. */
+class RouterSegmentAbortedError extends Error {}
+
+/** The failed("aborted") result for a segment that never recorded a step. */
+function segmentAbortedResult(model: Model<Api>, summary: string): SystemRouterRunResult {
+	return {
+		status: "failed",
+		reason: "aborted",
+		summary,
+		steps: 0,
+		executed: 0,
+		refused: 0,
+		trace: [],
+		model: { provider: model.provider, id: model.id, thinkingLevel: routerThinkingLevel(model) },
+		usage: { inputTokens: 0, outputTokens: 0 },
+	};
+}
+
 /** Race adapter init against the segment budget without leaking a late rejection. */
-async function raceInitAgainstSegmentTimeout<T>(work: Promise<T>, timeoutMs: number, startedAt: number): Promise<T> {
+async function raceInitAgainstSegmentTimeout<T>(
+	work: Promise<T>,
+	timeoutMs: number,
+	startedAt: number,
+	signal?: AbortSignal,
+): Promise<T> {
 	const remaining = timeoutMs - (Date.now() - startedAt);
 	if (remaining <= 0) {
 		void work.catch(() => {});
@@ -158,11 +180,26 @@ async function raceInitAgainstSegmentTimeout<T>(work: Promise<T>, timeoutMs: num
 	});
 	void timeout.catch(() => {});
 	void work.catch(() => {});
+	// An external abort must end the init wait immediately (the segment budget
+	// can be far away); its rejection is handled like the timeout's.
+	let onAbort: (() => void) | undefined;
+	const abort = new Promise<never>((_, reject) => {
+		if (signal?.aborted) {
+			reject(new RouterSegmentAbortedError());
+			return;
+		}
+		if (signal) {
+			onAbort = () => reject(new RouterSegmentAbortedError());
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
+	});
+	void abort.catch(() => {});
 	try {
-		return await Promise.race([work, timeout]);
+		return await Promise.race([work, timeout, abort]);
 	} catch (error) {
 		throw error instanceof Error ? error : new Error(String(error));
 	} finally {
 		if (timer) clearTimeout(timer);
+		if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 	}
 }

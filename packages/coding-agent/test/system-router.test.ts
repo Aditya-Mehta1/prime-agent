@@ -673,13 +673,41 @@ describe("runSystemRouterLoop", () => {
 	it("reports aborted instead of done when the signal fires during the decision", async () => {
 		const controller = new AbortController();
 		const result = await runLoop(new FakeEnvironment(["x"]), {
-			decide: async () => {
+			decide: async (request) => {
 				controller.abort();
+				// The in-flight decision's retries stop with the external signal.
+				expect((request as { signal?: AbortSignal }).signal?.aborted).toBe(true);
 				return decision({ action: FINISH_ACTION, confidence: 1 });
 			},
 			signal: controller.signal,
 		});
 		expect(result.reason).toBe("aborted");
+	});
+
+	it("reports aborted instead of done when the signal fires during observe", async () => {
+		const controller = new AbortController();
+		const env = new FakeEnvironment(["x"]);
+		env.observe = async () => {
+			controller.abort();
+			return { text: "x", terminal: true };
+		};
+		const result = await runLoop(env, { signal: controller.signal });
+		expect(result.reason).toBe("aborted");
+	});
+
+	it("reports the timeout instead of done when the deadline passes during observe", async () => {
+		const env = new FakeEnvironment(["x"]);
+		env.observe = async () => {
+			vi.setSystemTime(new Date(Date.now() + 30_000));
+			return { text: "x", terminal: true };
+		};
+		vi.useFakeTimers();
+		try {
+			const result = await runLoop(env);
+			expect(result.reason).toBe("timeout");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("closes the environment even when the loop fails", async () => {
@@ -830,6 +858,7 @@ describe("runRouterSegment wiring", () => {
 			goal: "g",
 			actions: { a: { description: "P" } },
 			environment: { stdio: { command: ["true"] } },
+			timeoutMs: 60,
 		});
 		const early = new FakeEnvironment(["x"]);
 		await runRouterSegment(spec, { model, env: early, signal: AbortSignal.abort() });
@@ -839,6 +868,13 @@ describe("runRouterSegment wiring", () => {
 		late.init = async () => void controller.abort();
 		await runRouterSegment(spec, { model, env: late, signal: controller.signal });
 		expect(late.resetCalls).toBe(0);
+		const pending = new FakeEnvironment(["x"]);
+		pending.init = () => new Promise(() => {});
+		const pendingController = new AbortController();
+		const pendingRun = runRouterSegment(spec, { model, env: pending, signal: pendingController.signal });
+		pendingController.abort();
+		expect((await pendingRun).reason).toBe("aborted");
+		expect(pending.resetCalls).toBe(0);
 	});
 });
 

@@ -283,9 +283,20 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 					]);
 					if (child.exitCode === null && child.signalCode === null) {
 						signalProcessGroupOrProcess(pid, "SIGKILL");
+					} else {
+						// The leader exited from the relayed SIGTERM: descendants that
+						// ignored it still get the enforced kill while the leader's
+						// zombie anchors the pgid against reuse.
+						signalProcessGroupIfHeld(pid, "SIGKILL");
 					}
 				}
 			}
+		} else if (child.pid !== undefined) {
+			// The leader exited during the graceful close wait (it answered the
+			// close request, or crashed first): its group can still hold
+			// descendants (a launcher's child), so relay the stop while the
+			// exited leader anchors the pgid against reuse.
+			signalProcessGroupIfHeld(child.pid, "SIGTERM");
 		}
 		this.failAll(new Error("environment adapter closed"));
 	}

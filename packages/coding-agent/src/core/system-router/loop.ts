@@ -106,6 +106,10 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 	// signal stops the provider retry sleeps so no extra model requests run
 	// past the segment's wall-clock budget.
 	const decisionAbort = new AbortController();
+	// Disposal must stop in-flight decision retries immediately, not at the
+	// next step boundary: the external signal aborts the decision calls too.
+	const abortInFlightDecision = () => decisionAbort.abort();
+	options.signal?.addEventListener("abort", abortInFlightDecision, { once: true });
 
 	const trace: RouterStepTrace[] = [];
 	const history: string[] = [];
@@ -174,6 +178,18 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 					"incomplete",
 					"timeout",
 					`Stopped at step ${step}: the segment timeout of ${options.timeoutMs}ms elapsed.`,
+				);
+			}
+			// A terminal observation must not outrank an abort that fired during
+			// observe(), or the wall clock passing the deadline mid-observe.
+			if (options.signal?.aborted) {
+				return finish("failed", "aborted", "Router aborted while observing the current step.");
+			}
+			if (Date.now() >= deadlineAt) {
+				return finish(
+					"incomplete",
+					"timeout",
+					`Stopped at step ${step}: the segment timeout of ${options.timeoutMs}ms elapsed while observing.`,
 				);
 			}
 			if (observation.terminal) {
@@ -504,6 +520,7 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 		);
 	} finally {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
+		options.signal?.removeEventListener("abort", abortInFlightDecision);
 		decisionAbort.abort();
 		// Adapter cleanup must not extend the segment the way the old
 		// unbounded waits did: hand close() the remaining budget plus the
