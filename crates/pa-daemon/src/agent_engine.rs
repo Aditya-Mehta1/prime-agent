@@ -932,6 +932,52 @@ impl SessionEngine for AgentSessionEngine {
             .unwrap_or(Value::Null)
     }
 
+    fn mint_post_compaction_goal_continuation(&self) -> Option<crate::engine::GoalContinuation> {
+        // The mirrored goal runtime holds the driver and the session's
+        // persistence handle (the core session's own lock stays held
+        // across a turn's admission); the driver and session locks are
+        // async, so the mint runs on the engine runtime like every other
+        // engine call that touches the session.
+        let handles = self
+            .goal_runtime
+            .lock()
+            .expect("goal runtime lock")
+            .clone()?;
+        let continuation = self.runtime.block_on(async {
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            // The mint persists the `thread_goal_state` entry (TS
+            // `_setGoalState`) and consumes one continuation slot; an
+            // inactive or objective-less goal mints nothing.
+            let message = driver.next_continuation_message(&mut session)?;
+            Some(crate::engine::PromptRequest {
+                message: message.content.text().to_string(),
+                images: Vec::new(),
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: Some(crate::session_commands::custom_message_value(&message)),
+            })
+        })?;
+        // TS `_setGoalState` emits `goal_update` on every state change:
+        // the mint moved `continuationsUsed`, so the state changed unless
+        // the published baseline already matches (impossible for a fresh
+        // count, but the comparison keeps the dedupe contract).
+        let goal = self.current_goal_state()?;
+        let goal_update = {
+            let mut published = self.published_goal.lock().expect("published goal lock");
+            if published.as_ref() == Some(&goal) {
+                None
+            } else {
+                *published = Some(goal.clone());
+                Some(serde_json::to_value(&goal).unwrap_or(Value::Null))
+            }
+        };
+        Some(crate::engine::GoalContinuation {
+            request: continuation,
+            goal_update,
+        })
+    }
+
     fn autonomous_status(
         &self,
     ) -> std::pin::Pin<
@@ -3219,6 +3265,73 @@ pub(crate) mod tests {
                 events.push(event);
                 true
             },
+        );
+    }
+
+    /// The post-compaction goal-continue mint (TS `compact()`'s
+    /// `didCompact` + active-goal branch -> `resumeQueuedWork()` ->
+    /// `_maybeResumeGoalContinuationAfterRlmWork`): an active goal's
+    /// mint consumes one continuation slot, persists the state change
+    /// (the wire state read reflects it), and returns the queued
+    /// follow-up turn — the continuation prompt text carrying the durable
+    /// goal-context row — plus the `goal_update` payload of the state
+    /// change. A goal that is not active mints nothing.
+    #[test]
+    fn post_compaction_goal_continuation_mint() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, _engine_dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "goal turn reply"}] }),
+            1,
+        );
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(
+            &engine,
+            "/goal ship the post-compact continue".to_string(),
+            &mut events,
+        );
+        // The goal-start continuation turn ran (TS `/goal` start does not
+        // consume a continuation slot — only driver mints do), the goal
+        // active.
+        assert_eq!(engine.goal_state_value()["status"], "active");
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 0);
+        let minted = engine
+            .mint_post_compaction_goal_continuation()
+            .expect("active goal mints the continuation");
+        let message = minted.request.message;
+        assert!(
+            message.contains("[goal: continuation]"),
+            "unexpected continuation text: {message}"
+        );
+        assert!(
+            message.contains("ship the post-compact continue"),
+            "the continuation context lost the objective: {message}"
+        );
+        let row = minted
+            .request
+            .custom_message
+            .expect("the goal-context row rides the turn");
+        assert_eq!(row["customType"], "goal_context");
+        assert_eq!(row["role"], "custom");
+        assert_eq!(row["content"], json!(message));
+        assert_eq!(row["details"]["kind"], "continuation");
+        assert_eq!(row["details"]["continuationsUsed"], 1);
+        // The state change persisted (TS `_setGoalState`): the wire state
+        // read reflects the mint, and the `goal_update` payload carries
+        // the same state.
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
+        let goal_update = minted.goal_update.expect("the mint moved the state");
+        assert_eq!(goal_update["status"], "active");
+        assert_eq!(goal_update["continuationsUsed"], 1);
+        // A mint over a paused goal produces nothing (TS checks the
+        // active status at the resume site).
+        let mut pause_events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "/goal pause".to_string(), &mut pause_events);
+        assert_eq!(engine.goal_state_value()["status"], "paused");
+        assert!(
+            engine.mint_post_compaction_goal_continuation().is_none(),
+            "a paused goal minted a continuation"
         );
     }
 

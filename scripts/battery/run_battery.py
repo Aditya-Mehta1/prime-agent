@@ -820,6 +820,147 @@ class Battery:
                     )
         return rows
 
+    def goal_continue_projection(self, events: list) -> list:
+        """The post-compact goal-continue wire window (the #234 residue):
+        from the manual compaction's start, the compaction pair, the
+        mint's `goal_update`, the continuation turn's goal-context row and
+        its assistant rows, and the completion's `goal_update` — in order.
+        Ids, timestamps, usage, and token counts differ per side, so the
+        projected fields are the ones the TS branch owns: the event
+        sequence, the goal state's status/objective/continuation count,
+        and the row contents."""
+        rows = []
+        seen_goal_updates: list = []
+        started = False
+        for frame in events:
+            if not isinstance(frame, dict) or frame.get("type") != "session_event":
+                continue
+            event = frame.get("event") or {}
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("type")
+            if event_type == "compaction_start":
+                started = True
+            if not started:
+                continue
+            if event_type == "compaction_start":
+                rows.append({"type": "compaction_start", "reason": event.get("reason")})
+            elif event_type == "compaction_end":
+                rows.append(
+                    {
+                        "type": "compaction_end",
+                        "reason": event.get("reason"),
+                        "hasResult": bool(event.get("result")),
+                        "errorMessage": event.get("errorMessage"),
+                    }
+                )
+            elif event_type == "goal_update":
+                goal = event.get("goal") or {}
+                # Usage-accounting goal_updates repeat the projected
+                # state of the mint's goal_update (tokensUsed is
+                # per-side); the Rust engine checks the goal state after
+                # each forwarded event, so the repeat's position inside
+                # the turn is drain-timing while TS emits it at the
+                # turn's stop hook — repeats carry no new projected
+                # information and dedupe.
+                projected = {
+                    "type": "goal_update",
+                    "status": goal.get("status"),
+                    "objective": goal.get("objective"),
+                    "continuationsUsed": goal.get("continuationsUsed"),
+                }
+                if projected not in seen_goal_updates:
+                    seen_goal_updates.append(projected)
+                    rows.append(projected)
+            elif event_type in ("message_start", "message_end"):
+                message = event.get("message") or {}
+                if not isinstance(message, dict):
+                    continue
+                if message.get("customType") == "goal_context":
+                    details = message.get("details") or {}
+                    # The context's "tokens used" line carries the
+                    # per-side goal accounting at mint time: the Rust
+                    # worker's mid-turn compact abort reaches the
+                    # provider request only at the next streamed event
+                    # (TS `requestAbort` cancels the fetch immediately),
+                    # so a compact that lands mid-provider-wait lets the
+                    # aborted turn's usage through on Rust and not on TS
+                    # — the pre-existing late-abort gap (PORTING-NOTES).
+                    # The line is normalized; every other byte of the
+                    # continuation context stays compared.
+                    content = self.normalize_goal_context_text(
+                        str(message.get("content"))
+                    )
+                    rows.append(
+                        {
+                            "type": event_type,
+                            "customType": "goal_context",
+                            "content": content,
+                            "details": {
+                                key: details.get(key)
+                                for key in ("kind", "status", "objective", "continuationsUsed")
+                            },
+                        }
+                    )
+                elif message.get("role") == "assistant":
+                    if event_type == "message_start":
+                        # A streamed assistant's start content is volatile
+                        # (TS carries the settled message at start, the
+                        # Rust loop streams it in) — only the settled end
+                        # row is the parity claim.
+                        rows.append({"type": "message_start"})
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        text = chr(10).join(
+                            part.get("text", "")
+                            for part in content
+                            if isinstance(part, dict) and part.get("text")
+                        )
+                        tools = sorted(
+                            part.get("name", "")
+                            for part in content
+                            if isinstance(part, dict) and part.get("type") == "toolCall"
+                        )
+                    else:
+                        text = content or ""
+                        tools = []
+                    rows.append(
+                        {
+                            "type": event_type,
+                            "assistant_text": text,
+                            "tool_calls": tools,
+                            "stopReason": message.get("stopReason"),
+                        }
+                    )
+        return rows
+
+    def normalize_goal_context_text(self, text: str) -> str:
+        """Normalize the goal-continuation context's per-side accounting
+        line (the late-abort gap's leaked aborted-turn usage on the Rust
+        side — see the goal-continue projection) while comparing every
+        other byte."""
+        return re.sub(r"- tokens used: \d+", "- tokens used: <tokens>", text)
+
+    def last_user_text(self, request: dict) -> str:
+        """The text of a provider request's last user-role message (string
+        or content-part form): the continuation prompt of a goal turn, or
+        the summarizer instruction of a compaction request."""
+        for message in reversed(request.get("body", {}).get("messages") or []):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return chr(10).join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("text")
+                )
+            return ""
+        return ""
+
     def ensure_daemon(self, side: B.Side) -> None:
         """A daemon must be listening on the side socket; start one if not."""
         try:
@@ -1443,14 +1584,28 @@ class Battery:
                 # ipython tool use) has no running kernel and no notice row;
                 # the turn-in-between shape exercises the update mode on both
                 # sides regardless).
+                # Model-routed queue (the suspension section's pattern):
+                # the session's mock-1 turns and the compact's summarizer
+                # draw their scripted replies in order while the daemon
+                # status-line model falls through to the default filler —
+                # a status-line request racing the default queue otherwise
+                # consumes a scripted response and misaligns the cursor
+                # (observed as the flaky iterative gap).
                 side.mock.set_responses(
-                    [
-                        {"text": "seed reply"},
-                        {"text": "second reply"},
-                        {"text": "the first compaction summary"},
-                        {"text": "third reply"},
-                        {"text": "the second compaction summary"},
-                    ]
+                    [{"text": "statusline filler"}],
+                    queues=[
+                        {
+                            "name": "iterative",
+                            "matchModels": ["mock-1"],
+                            "responses": [
+                                {"text": "seed reply"},
+                                {"text": "second reply"},
+                                {"text": "the first compaction summary"},
+                                {"text": "third reply"},
+                                {"text": "the second compaction summary"},
+                            ],
+                        }
+                    ],
                 )
                 for index, message in enumerate(
                     (
@@ -1501,7 +1656,14 @@ class Battery:
                 )
                 side.evidence_json(flow, "iterative-compact-two-response.json", compact_two)
                 wire.close()
-                requests = self.new_mock_requests(side, mark)
+                # Session-model requests only (the status-line model's
+                # requests fall through to the filler queue and are not
+                # part of the two-call comparison).
+                requests = [
+                    request
+                    for request in self.new_mock_requests(side, mark)
+                    if request.get("body", {}).get("model") == "mock-1"
+                ]
                 iterative_requests[side.name] = [
                     {
                         "user_text": [
@@ -1812,6 +1974,287 @@ class Battery:
                     ],
                 )
 
+        # Post-compact goal continuation (the #234 residue): a manual
+        # daemon `compact` on a session with an ACTIVE goal schedules the
+        # continuation TS's `compact()` didCompact branch owns
+        # (`_goalContinuationAwaitsRlmWork ||= !hasQueuedMessages()` ->
+        # `resumeQueuedWork()` mints the owed goal continuation ->
+        # `_schedulePostCompactionContinue()` drives it). The goal driver
+        # never rests on an active goal (each settled turn mints the next
+        # continuation), so the compact lands mid-turn: the fixture fires
+        # the compact while the goal-start continuation turn streams (a
+        # delayed mock reply), the compact aborts it, and both sides must
+        # then mint and run the post-compact continuation turn — the
+        # mint's `goal_update` (one continuation used, still active), the
+        # durable goal-context row, and the continuation's model turn,
+        # ended by a scripted `goal.complete()` so the run freezes
+        # deterministically. The wire window from `compaction_start` and
+        # the mock's request texts are compared byte-equal; `tokensBefore`
+        # and usage are excluded (per-side token estimates).
+        goal_wire: dict[str, list | None] = {}
+        goal_compact: dict[str, dict] = {}
+        goal_requests: dict[str, list] = {}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            settings_path = side.agent_dir / "settings.json"
+            prior_settings = (
+                settings_path.read_text() if settings_path.exists() else None
+            )
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "compaction": {"keepRecentTokens": 10, "reserveTokens": 1000},
+                        "autoRefine": {"enabled": False},
+                    }
+                )
+            )
+            try:
+                wire = B.Wire(side.daemon_socket)
+                create = wire.request(
+                    "gc1",
+                    {
+                        "type": "create",
+                        "name": "battery-goal-continue",
+                        "config": self.session_config(side),
+                    },
+                    timeout=120,
+                )
+                side.evidence_json(flow, "goal-create-response.json", create)
+                session_id = (
+                    create.get("data", {}).get("activeSessionId")
+                    or create.get("data", {}).get("id")
+                    or ""
+                )
+                if create.get("success") is not True:
+                    self.record(
+                        flow,
+                        "protocol",
+                        f"{side.name}: goal-continue session create failed: {json.dumps(create)[:300]}",
+                    )
+                    wire.close()
+                    continue
+                # An attached client sees the compaction events and the
+                # continuation turn; the prompting connection carries the
+                # command responses.
+                attacher = B.Wire(side.daemon_socket)
+                attach = attacher.request(
+                    "ga1",
+                    {"type": "attach", "activeSessionId": session_id},
+                    timeout=60,
+                )
+                side.evidence_json(flow, "goal-attach-response.json", attach)
+                # Model-routed queue (the suspension section's pattern):
+                # the session's mock-1 turns and the compact's summarizer
+                # draw their scripted replies in order; the dashboard
+                # status-line model falls through to the default filler.
+                # The split-turn prefix call rides its own content-matched
+                # queue: the Rust engine branch carries the injected
+                # custom turn as a user row TS does not (the pre-existing
+                # injected-turn representation gap, documented in
+                # PORTING-NOTES), so a short-session cut splits on Rust
+                # where TS cuts whole — the matched queue keeps the
+                # session-model cursor aligned across the extra call (the
+                # queue is unused on the TS side).
+                side.mock.set_responses(
+                    [{"text": "statusline filler"}],
+                    queues=[
+                        {
+                            "name": "goal-split-prefix",
+                            "match": ["PREFIX of a turn that was too large to keep"],
+                            "responses": [
+                                {"text": "the split turn prefix filler summary"}
+                            ],
+                        },
+                        {
+                            "name": "goal-continue",
+                            "matchModels": ["mock-1"],
+                            "responses": [
+                                {"text": "seed reply one"},
+                                {"text": "seed reply two"},
+                                {"text": "seed reply three"},
+                                # The goal-start continuation turn: the
+                                # reply is held mid-stream so the compact
+                                # lands while the turn is in flight (TS
+                                # compact() aborts first).
+                                {"text": "goal turn reply", "delayMs": 1500},
+                                # The compact's summarizer.
+                                {"text": "the post-compact goal continuation summary"},
+                                # The post-compact continuation turn:
+                                # the scripted kernel call completes the
+                                # goal, so the driver freezes after one
+                                # continuation (no infinite loop).
+                                {
+                                    "toolCall": {
+                                        "name": "ipython",
+                                        "arguments": {
+                                            "code": "import goal; await goal.complete()"
+                                        },
+                                    }
+                                },
+                                {"text": "final reply after the goal completed"},
+                            ],
+                        }
+                    ],
+                )
+                # Several turns of history: the compaction's cut must
+                # land with messages to summarize on both sides (a
+                # one-turn session skips "Session is too short to
+                # compact", which is the suspension scenario's shape).
+                seed_text = (
+                    "goal continue seed turn with enough history for the "
+                    "compaction to summarize "
+                ) * 8
+                for index in range(1, 4):
+                    seed = wire.request(
+                        f"gs{index}",
+                        {
+                            "type": "prompt_and_wait",
+                            "activeSessionId": session_id,
+                            "message": f"{seed_text}turn {index}",
+                        },
+                        timeout=240,
+                    )
+                    side.evidence_json(flow, f"goal-seed-{index}-response.json", seed)
+                attacher.drain(3.0)
+                attacher.events.clear()
+                # The mark rides before the goal turn: its request, the
+                # compact's summarizer, and the continuation's model turn
+                # are the requests past it.
+                mark = len(side.mock.requests())
+                # `/goal <objective>`: the session command starts the
+                # goal and its continuation turn runs immediately (fire
+                # without waiting; the reply is delayed mid-stream).
+                goal_start = wire.request(
+                    "gp1",
+                    {
+                        "type": "prompt",
+                        "activeSessionId": session_id,
+                        "message": "/goal land the post-compact continuation parity row",
+                    },
+                    timeout=120,
+                )
+                side.evidence_json(flow, "goal-start-response.json", goal_start)
+                # Let the goal-start continuation turn reach the provider
+                # (the delayed reply holds it mid-turn), then compact: the
+                # abort cuts the in-flight turn and the compaction runs.
+                time.sleep(0.6)
+                compact = wire.request(
+                    "gk1",
+                    {"type": "compact", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                side.evidence_json(flow, "goal-compact-response.json", compact)
+                # The summary stays out of the projection: the Rust
+                # split-turn merged summary carries the injected-turn
+                # representation gap's prefix filler (PORTING-NOTES); the
+                # goal-continue window comparison below owns the compacted
+                # surface's parity.
+                goal_compact[side.name] = {
+                    "success": compact.get("success"),
+                    "error": compact.get("error"),
+                    "hasTokensBefore": "tokensBefore" in (compact.get("data") or {}),
+                }
+                # The post-compaction continue drives the continuation
+                # turn; settle it (the goal-complete tool call and the
+                # post-tool reply run inside one turn).
+                settled = wire.request(
+                    "gwi1",
+                    {"type": "wait_for_idle", "activeSessionId": session_id},
+                    timeout=240,
+                )
+                side.evidence_json(flow, "goal-wait-idle-response.json", settled)
+                attacher.drain(8.0)
+                side.evidence_json(flow, "goal-attach-events.json", attacher.events)
+                goal_wire[side.name] = self.goal_continue_projection(attacher.events)
+                side.evidence_json(flow, "goal-wire-projection.json", goal_wire[side.name])
+                # The session-model requests only: the daemon's
+                # status-line model (its own id) fires at turn
+                # boundaries outside this differential's surface.
+                # The split-turn prefix call (the injected-turn
+                # representation gap's extra summarizer call, served by
+                # the matched queue) is excluded: it exists only on the
+                # Rust side and its comparison belongs to the
+                # injected-turn lane.
+                goal_requests[side.name] = [
+                    {
+                        "model": request.get("body", {}).get("model"),
+                        "last_user_text": self.normalize_goal_context_text(
+                            self.last_user_text(request)
+                        ),
+                    }
+                    for request in self.new_mock_requests(side, mark)
+                    if request.get("body", {}).get("model") == "mock-1"
+                    and "PREFIX of a turn that was too large to keep"
+                    not in self.last_user_text(request)
+                ]
+                side.evidence_json(flow, "goal-mock-requests.json", goal_requests[side.name])
+                wire.close()
+                attacher.close()
+                self.copy_sessions(side, flow)
+            finally:
+                if prior_settings is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(prior_settings)
+        if goal_wire.get("ts") is not None and goal_wire.get("rust") is not None:
+            if goal_wire["ts"] == goal_wire["rust"] and goal_wire["ts"]:
+                self.record(
+                    flow,
+                    "behavior",
+                    "post-compact goal continuation identical (compaction pair, minted goal_update, goal-context row, continuation turn, completion): "
+                    f"{json.dumps(goal_wire['ts'])[:400]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"post-compact goal continuation differs: ts={json.dumps(goal_wire.get('ts'))[:600]} "
+                    f"rust={json.dumps(goal_wire.get('rust'))[:600]}",
+                    evidence=[
+                        side.root / flow / "goal-wire-projection.json"
+                        for side in self.sides.values()
+                    ],
+                )
+            if goal_requests.get("ts") == goal_requests.get("rust") and goal_requests.get("ts"):
+                self.record(
+                    flow,
+                    "behavior",
+                    "post-compact goal continuation model requests identical (goal-start turn, summarizer, continuation prompt): "
+                    f"{json.dumps(goal_requests['ts'])[:400]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"post-compact goal continuation model requests differ: ts={json.dumps(goal_requests.get('ts'))[:600]} "
+                    f"rust={json.dumps(goal_requests.get('rust'))[:600]}",
+                    evidence=[
+                        side.root / flow / "goal-mock-requests.json"
+                        for side in self.sides.values()
+                    ],
+                )
+            if goal_compact.get("ts") == goal_compact.get("rust"):
+                self.record(
+                    flow,
+                    "behavior",
+                    "post-compact goal compact response identical (success, tokensBefore present): "
+                    f"{json.dumps(goal_compact['ts'])[:200]}",
+                    gap=False,
+                )
+            else:
+                self.record(
+                    flow,
+                    "behavior",
+                    f"post-compact goal compact responses differ: ts={json.dumps(goal_compact.get('ts'))[:300]} "
+                    f"rust={json.dumps(goal_compact.get('rust'))[:300]}",
+                    evidence=[
+                        side.root / flow / "goal-compact-response.json"
+                        for side in self.sides.values()
+                    ],
+                )
+
         # Durable compaction-entry wire-diff: both sides write a
         # `compaction` row to the session file (TS `appendCompaction`). The
         # compared shape is the TS `CompactionEntry` record minus
@@ -1828,6 +2271,13 @@ class Battery:
             rows: list[dict] = []
             sessions_dir = side.root / flow / "sessions"
             for path in sorted(sessions_dir.glob("*.jsonl")) if sessions_dir.exists() else []:
+                # The goal-continue session is excluded: its compaction
+                # row carries the pre-existing split-turn divergence of the
+                # injected-turn representation gap (PORTING-NOTES); the
+                # goal-continue window comparison owns that session's
+                # compacted surface.
+                if "battery-goal-continue" in path.read_text():
+                    continue
                 for line in path.read_text().splitlines():
                     try:
                         entry = json.loads(line)

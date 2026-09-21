@@ -313,18 +313,27 @@ impl GoalDriver {
         }
     }
 
-    /// Build the next continuation context, consuming one continuation slot.
-    pub fn next_continuation_message(&mut self) -> Option<CustomMessage> {
+    /// Build the next continuation context, consuming one continuation
+    /// slot. The state change persists (TS `_getGoalContinuationMessages`
+    /// and `_maybeResumeGoalContinuationAfterRlmWork` both run the mint
+    /// through `_setGoalState`, which appends the `thread_goal_state`
+    /// entry before the continuation turn is admitted).
+    pub fn next_continuation_message(
+        &mut self,
+        session: &mut SessionManager,
+    ) -> Option<CustomMessage> {
         if self.state.status != GoalStatus::Active || self.state.objective.is_none() {
             return None;
         }
-        self.state = normalize_goal_state(GoalState {
-            continuations_used: self.state.continuations_used + 1,
-            last_reason: None,
-            last_error: None,
-            updated_at: Some(now_millis()),
-            ..self.state.clone()
-        });
+        self.set_state(
+            session,
+            GoalState {
+                continuations_used: self.state.continuations_used + 1,
+                last_reason: None,
+                last_error: None,
+                ..self.state.clone()
+            },
+        );
         create_goal_context_message(&self.state, GoalContextKind::Continuation).ok()
     }
 
@@ -481,17 +490,24 @@ mod tests {
         let mut session = persisted_session();
         let mut driver = GoalDriver::new();
         driver.start(&mut session, "work", None).unwrap();
-        let first = driver.next_continuation_message().unwrap();
+        let first = driver.next_continuation_message(&mut session).unwrap();
         let UserContent::Text(text) = &first.content else {
             panic!("expected text content");
         };
         assert!(text.contains("- status: active"));
         assert_eq!(driver.state().continuations_used, 1);
-        assert!(driver.next_continuation_message().is_some());
+        assert!(driver.next_continuation_message(&mut session).is_some());
         assert_eq!(driver.state().continuations_used, 2);
         // Inactive goals produce no continuations.
         driver.pause(&mut session, "Paused by user");
-        assert!(driver.next_continuation_message().is_none());
+        assert!(driver.next_continuation_message(&mut session).is_none());
+        // The mint persists the state change: the session branch's latest
+        // goal-state entry carries the incremented count.
+        driver.start(&mut session, "work again", None).unwrap();
+        driver.next_continuation_message(&mut session).unwrap();
+        assert_eq!(driver.state().continuations_used, 1);
+        let reloaded = GoalDriver::load_persisted(&session);
+        assert_eq!(reloaded.state().continuations_used, 1);
     }
 
     /// TS `_resumeGoal` semantics: resume continues the same goal (same

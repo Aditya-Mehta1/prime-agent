@@ -2612,10 +2612,24 @@ impl Worker {
             .compaction
             .run(custom_instructions, &self.idle_notify)
             .await;
+        // The TS `compact()` `didCompact` + active-goal branch
+        // (agent-session.ts): with `this._goalState.status === "active"`
+        // and the run not aborted,
+        //   this._goalContinuationAwaitsRlmWork ||= !this.agent.hasQueuedMessages();
+        //   this.resumeQueuedWork();
+        //   if (this.agent.hasQueuedMessages()) this._schedulePostCompactionContinue();
+        // `resumeQueuedWork()` delivers the owed goal continuation (a
+        // queued follow-up) and clears the queued-input suspension; the
+        // scheduled continue then drives the queued turn once idle. The
+        // worker mirror: mint the continuation only when no queued work
+        // parked (`agent.hasQueuedMessages()` spans both lanes — TS's
+        // `||=` sets the owed flag exactly there), queue it behind the
+        // still-set suspension, and let the resume site below clear the
+        // #234 gate and wake the turn runner — the runner IS the
+        // scheduled continue, and the queued continuation crosses the
+        // suspension gate only through this resume site.
+        let mut goal_continue_scheduled = false;
         if let crate::engine::CompactionOutcome::Compacted { .. } = &outcome {
-            // TS `compact()`'s `didCompact` branch resumes queued work when
-            // a goal is active (`this._goalState.status === "active"`),
-            // so goal continuations keep flowing after a compact.
             let goal_active = self
                 .engine
                 .goal_state_value()
@@ -2623,7 +2637,58 @@ impl Worker {
                 .and_then(Value::as_str)
                 == Some("active");
             if goal_active {
+                let has_queued = {
+                    let core = self.core.lock().unwrap();
+                    !core.steering.is_empty() || !core.follow_up.is_empty()
+                };
+                if !has_queued {
+                    // The engine call takes the engine session lock and
+                    // blocks on the engine runtime, so it runs on a
+                    // blocking thread like every other engine call; a
+                    // join failure leaves the continuation un-minted
+                    // (logged, never silent) — the session still resumes.
+                    let engine = std::sync::Arc::clone(&self.engine);
+                    let continuation = tokio::task::spawn_blocking(move || {
+                        engine.mint_post_compaction_goal_continuation()
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "pa-daemon: post-compaction goal continuation mint failed: {error}"
+                        );
+                        None
+                    });
+                    if let Some(continuation) = continuation {
+                        // The mint's `goal_update` surfaces at the moment
+                        // the state changes (TS `_setGoalState` ->
+                        // `_emitGoalUpdate`), before the continuation
+                        // turn is admitted.
+                        if let Some(goal) = continuation.goal_update {
+                            self.emit_worker_event(json!({
+                                "type": "goal_update",
+                                "goal": goal,
+                            }));
+                        }
+                        {
+                            let mut core = self.core.lock().unwrap();
+                            core.follow_up.push_back(QueuedItem {
+                                message: continuation.request.message,
+                                custom_message: continuation.request.custom_message,
+                                agent_message: None,
+                                queue_key: None,
+                                admission_id: None,
+                                images: continuation.request.images,
+                                done: None,
+                            });
+                        }
+                    }
+                }
+                // The resume site: clears the suspension and wakes the
+                // runner, which drains the queued continuation (or the
+                // already-parked queued work) as the post-compaction
+                // continue's turn.
                 self.resume_queued_input();
+                goal_continue_scheduled = true;
             }
         }
         match outcome {
@@ -2635,16 +2700,26 @@ impl Worker {
                 // for the next turn boundary when work is queued), and
                 // the outcome surfaces through the same rows the
                 // `refine` command emits.
-                // The engine round runs on a blocking thread like every
-                // other engine call (it takes the engine session lock and
-                // blocks on the engine runtime).
+                // The goal-continue branch defers like TS
+                // `_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction
+                // = true)` -> `_compactAutoRefinePending = true`: a
+                // continuation (or parked queued work) is about to run,
+                // so the review services at that turn's quiescent boundary
+                // instead of interleaving before it — skip the immediate
+                // consume and leave the trigger armed.
                 let engine = std::sync::Arc::clone(&self.engine);
-                let refined =
+                let refined = if goal_continue_scheduled {
+                    Ok(None)
+                } else {
+                    // The engine round runs on a blocking thread like
+                    // every other engine call (it takes the engine session
+                    // lock and blocks on the engine runtime).
                     tokio::task::spawn_blocking(move || engine.consume_compact_auto_refine())
                         .await
                         .unwrap_or_else(|error| {
                             Err(anyhow::anyhow!("auto-refinement task failed: {error}"))
-                        });
+                        })
+                };
                 match refined {
                     Ok(Some(result)) => {
                         let outcome_row =
@@ -4665,6 +4740,207 @@ mod tests {
         assert!(
             plain.success,
             "still suspended after resume_queue: {plain:?}"
+        );
+    }
+
+    /// A scripted goal session's dispatch worker (the goal section feeds
+    /// `goal_state_value` and the post-compaction mint).
+    async fn goal_dispatch_worker(goal: serde_json::Value) -> std::sync::Arc<Worker> {
+        let dir = std::env::temp_dir().join(format!("pa-worker-goal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "goal-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "responses": ["ack"],
+                "goal": goal,
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "goal" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        worker
+    }
+
+    /// The session events seen by an attached client since `mark`, in wire
+    /// order (the frames carry one `event` payload each).
+    fn session_events_since(
+        subscription: &mut tokio::sync::broadcast::Receiver<Arc<OutboundFrame>>,
+    ) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Ok(frame) = subscription.try_recv() {
+            if frame.outbound_type == "session_event" {
+                if let Ok(outbound) = serde_json::from_slice::<Value>(&frame.payload) {
+                    events.push(outbound["event"].clone());
+                }
+            }
+        }
+        events
+    }
+
+    /// TS `compact()`'s `didCompact` + active-goal branch: a successful
+    /// compact on a session with an active goal mints the owed goal
+    /// continuation (`resumeQueuedWork()`'s
+    /// `_maybeResumeGoalContinuationAfterRlmWork` — the minted follow-up
+    /// with the goal-context row), clears the queued-input suspension, and
+    /// the scheduled continue drives the turn: the continuation runs
+    /// (agent rows on the wire), the queue drains, and the session is
+    /// admitted for plain prompts again (the resume site crossed the #234
+    /// suspension gate).
+    #[tokio::test]
+    async fn compact_with_active_goal_schedules_the_continue() {
+        let worker = goal_dispatch_worker(json!({
+            "status": "active",
+            "objective": "land the post-compact continue",
+            "message": "[goal: continuation]\n\nkeep pursuing the goal",
+        }))
+        .await;
+        let mut subscription = worker.events.subscribe();
+        let compact = worker
+            .dispatch("compact", &json!({ "activeSessionId": "goal-session" }))
+            .await;
+        assert!(compact.success, "scripted compact failed: {compact:?}");
+        // The scheduled continue drives the continuation turn; the idle
+        // wait settles only after it ran.
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "never went idle: {idle:?}");
+        let events = session_events_since(&mut subscription);
+        // The mint's `goal_update` surfaces at the moment the state
+        // changed, then the continuation turn: the goal-context custom row
+        // plus its model turn (the scripted engine's rows).
+        let goal_updates: Vec<&Value> = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("goal_update"))
+            .collect();
+        assert_eq!(goal_updates.len(), 1, "events: {events:?}");
+        assert_eq!(goal_updates[0]["goal"]["status"], "active");
+        let custom_rows: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_start")
+                    && event["message"]["customType"] == "goal_context"
+            })
+            .collect();
+        assert_eq!(custom_rows.len(), 1, "events: {events:?}");
+        assert_eq!(
+            custom_rows[0]["message"]["content"],
+            "[goal: continuation]\n\nkeep pursuing the goal"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("turn_end")),
+            "the continuation turn never ran: {events:?}"
+        );
+        // The resume site crossed the #234 suspension gate: a plain prompt
+        // is admitted again.
+        let plain = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "goal-session", "message": "after the continue" }),
+            )
+            .await;
+        assert!(plain.success, "still suspended: {plain:?}");
+    }
+
+    /// Queued work parked at compact time owns the continue (TS's `||=`
+    /// sets the owed-continuation flag only when the agent has NO queued
+    /// messages): no fresh goal continuation is minted, the resume site
+    /// releases the parked work, and the parked turn runs instead.
+    #[tokio::test]
+    async fn compact_with_active_goal_and_parked_work_skips_the_mint() {
+        let worker = goal_dispatch_worker(json!({
+            "status": "active",
+            "objective": "land the post-compact continue",
+        }))
+        .await;
+        let mut subscription = worker.events.subscribe();
+        {
+            // Park one queued follow-up behind the suspension gate, like a
+            // steer that arrived mid-compact-window.
+            let mut core = worker.core.lock().unwrap();
+            core.queued_input_suspended = true;
+            core.follow_up.push_back(QueuedItem {
+                message: "parked queued work".to_string(),
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+            });
+        }
+        let compact = worker
+            .dispatch("compact", &json!({ "activeSessionId": "goal-session" }))
+            .await;
+        assert!(compact.success, "scripted compact failed: {compact:?}");
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "never went idle: {idle:?}");
+        let events = session_events_since(&mut subscription);
+        // The parked item's turn ran (its user row), not a minted
+        // continuation (no goal_context row, no goal_update).
+        assert!(
+            events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_start")
+                    && event["message"]["role"] == "user"
+                    && event["message"]["content"] == "parked queued work"
+            }),
+            "the parked item never ran: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_start")
+                    && event["message"]["customType"] == "goal_context"
+            }),
+            "a continuation was minted over the parked work: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("goal_update")),
+            "a mint emitted a goal_update: {events:?}"
+        );
+    }
+
+    /// Only an ACTIVE goal schedules the continue (TS checks
+    /// `this._goalState.status === "active"`): a paused goal leaves the
+    /// post-compact suspension set and mints nothing.
+    #[tokio::test]
+    async fn compact_with_paused_goal_never_continues() {
+        let worker = goal_dispatch_worker(json!({
+            "status": "paused",
+            "objective": "land the post-compact continue",
+        }))
+        .await;
+        let mut subscription = worker.events.subscribe();
+        let compact = worker
+            .dispatch("compact", &json!({ "activeSessionId": "goal-session" }))
+            .await;
+        assert!(compact.success, "scripted compact failed: {compact:?}");
+        let rejected = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "goal-session", "message": "hi" }),
+            )
+            .await;
+        assert_eq!(rejected.error.as_deref(), Some(QUEUED_INPUT_SUSPENDED));
+        let events = session_events_since(&mut subscription);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("goal_update")),
+            "a paused goal minted a continuation: {events:?}"
         );
     }
 

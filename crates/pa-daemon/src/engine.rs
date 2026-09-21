@@ -122,6 +122,25 @@ pub enum EngineEvent {
     },
 }
 
+/// The post-compaction goal continuation (TS `compact()`'s `didCompact` +
+/// active-goal branch: `resumeQueuedWork()` ->
+/// `_maybeResumeGoalContinuationAfterRlmWork` mints the owed
+/// continuation, and `_schedulePostCompactionContinue()` drives it): the
+/// follow-up turn to admit — the continuation prompt text with the
+/// durable goal-context row as the injected custom message — plus the
+/// `goal_update` payload for the mint's state change when it moved the
+/// engine's published baseline (TS `_setGoalState` -> `_emitGoalUpdate`).
+#[derive(Debug, Clone)]
+pub struct GoalContinuation {
+    /// The continuation turn request (TS `_createPreparedTurnAction`
+    /// "followUp": the normalized continuation text, the goal-context
+    /// custom message, `resumeIfIdle: true`).
+    pub request: PromptRequest,
+    /// The `goal_update` event's `goal` payload, `None` when an
+    /// unchanged state stays silent.
+    pub goal_update: Option<Value>,
+}
+
 /// RLM recursion identity carried by a session's create command: the
 /// session's depth in the recursion tree, its bound, its working directory
 /// and persistence ids, and the default thinking level children inherit.
@@ -155,6 +174,19 @@ pub trait SessionEngine: Send + Sync {
     /// Engines without thread goals report the empty state.
     fn goal_state_value(&self) -> Value {
         serde_json::to_value(pa_core::goals::empty_goal_state()).unwrap_or(Value::Null)
+    }
+
+    /// Mint the owed post-compaction goal continuation (TS `compact()`'s
+    /// `didCompact` + active-goal branch: `resumeQueuedWork()`'s
+    /// `_maybeResumeGoalContinuationAfterRlmWork` — `continuationsUsed`
+    /// increments, the state change persists, and the continuation
+    /// context message becomes a queued follow-up the scheduled continue
+    /// drives). `None` when the engine mints nothing: no session, no
+    /// active goal, or an engine without goal continuations. The worker
+    /// owns the queue and the #234 suspension gate, so this only produces
+    /// the turn; the resume site admits it.
+    fn mint_post_compaction_goal_continuation(&self) -> Option<GoalContinuation> {
+        None
     }
 
     /// Run one prompt. `prompt_index` counts accepted prompts for this
@@ -731,6 +763,19 @@ pub struct ScriptedEngine {
     side_question: SideQuestionScript,
     compaction: CompactionScript,
     branch_summary: CompactionScript,
+    goal: Option<ScriptedGoal>,
+}
+
+/// A scripted thread goal (the post-compaction goal-continue fixture):
+/// `{"goal": {"status": "active", "objective": "...", "message": "..."}}`.
+/// The scripted state answers `goal_state_value`; the mint returns the
+/// follow-up turn (`message` is the continuation prompt text, defaulting
+/// to the objective) with the goal-context custom row as the injected
+/// message.
+#[derive(Debug)]
+struct ScriptedGoal {
+    state: Value,
+    message: String,
 }
 
 /// Scripted compaction results, consumed one per run in order; when the
@@ -806,11 +851,35 @@ impl ScriptedEngine {
                 next: std::sync::atomic::AtomicUsize::new(0),
             })
             .unwrap_or_default();
+        let goal = script
+            .get("goal")
+            .filter(|goal| !goal.is_null())
+            .map(|goal| ScriptedGoal {
+                state: goal.get("state").cloned().unwrap_or_else(|| {
+                    json!({
+                        "active": goal.get("status").and_then(Value::as_str) == Some("active"),
+                        "status": goal.get("status").cloned().unwrap_or(json!("idle")),
+                        "objective": goal.get("objective").cloned().unwrap_or(Value::Null),
+                        "continuationsUsed": 0,
+                    })
+                }),
+                message: goal
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "[goal: continuation]\n\n{}",
+                            goal.get("objective").and_then(Value::as_str).unwrap_or("")
+                        )
+                    }),
+            });
         Ok(ScriptedEngine {
             responses,
             side_question,
             compaction,
             branch_summary,
+            goal,
         })
     }
 
@@ -858,6 +927,43 @@ impl SessionEngine for ScriptedEngine {
     /// id rides on the message rows only.
     fn model_metadata(&self) -> Option<Value> {
         None
+    }
+
+    /// The scripted thread goal's state, or the empty state (no goal
+    /// section scripted).
+    fn goal_state_value(&self) -> Value {
+        self.goal
+            .as_ref()
+            .map(|goal| goal.state.clone())
+            .unwrap_or_else(|| {
+                serde_json::to_value(pa_core::goals::empty_goal_state()).unwrap_or(Value::Null)
+            })
+    }
+
+    /// The scripted post-compaction mint: one continuation turn built from
+    /// the goal section (the goal-context row as the injected message).
+    fn mint_post_compaction_goal_continuation(&self) -> Option<crate::engine::GoalContinuation> {
+        let goal = self.goal.as_ref()?;
+        Some(crate::engine::GoalContinuation {
+            request: crate::engine::PromptRequest {
+                message: goal.message.clone(),
+                images: Vec::new(),
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: Some(json!({
+                    "role": "custom",
+                    "customType": "goal_context",
+                    "content": goal.message,
+                    "display": true,
+                    "details": {
+                        "kind": "continuation",
+                        "objective": goal.state.get("objective").cloned().unwrap_or(Value::Null),
+                    },
+                    "timestamp": crate::util::now_ms(),
+                })),
+            },
+            goal_update: Some(goal.state.clone()),
+        })
     }
 
     fn run_prompt(

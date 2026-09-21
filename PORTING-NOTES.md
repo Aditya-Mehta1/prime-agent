@@ -2155,6 +2155,7 @@ the worker process too, so a missing dispose leaves an orphaned kernel that
 the diff catches). The seam itself is pinned by the pa-core
 `kernel_teardown.rs` dispose tests from #235.
 
+
 - lane `replacement-kernel`: replacement-flow kernel dispose (TS
   `teardownForReplacement` ruling per flow).
   TS ground truth (`packages/coding-agent/src/core/agent-session-runtime.ts`):
@@ -2211,3 +2212,127 @@ the diff catches). The seam itself is pinned by the pa-core
   (`agent_engine::replacement_teardown_retires_the_session_and_the_funnel_adopts_the_branch`)
   and the worker flow ruling
   (`session_navigation::tests::replacement_flows_retire_only_on_a_prepared_file`).
+
+## Post-compaction goal continue (post-compact-continue lane, the #234 residue)
+
+TS ground truth (agent-session.ts `compact()`'s `didCompact` finally arm):
+
+- On a successful manual compact whose own abort signal is not aborted,
+  with `_goalState.status === "active"`:
+  `this._goalContinuationAwaitsRlmWork ||= !this.agent.hasQueuedMessages();`
+  `this.resumeQueuedWork();`
+  `if (this.agent.hasQueuedMessages()) this._schedulePostCompactionContinue();`
+- `resumeQueuedWork()` clears the #227/#233 queued-input suspension first,
+  then `_maybeResumeGoalContinuationAfterRlmWork()` mints the owed goal
+  continuation when the flag is set and the goal is active with an
+  objective: `continuationsUsed + 1`, the state change persists
+  (`_setGoalState` -> `thread_goal_state`), `_emitGoalUpdate` fires, and
+  the continuation context message (customType `goal_context`,
+  "continuation") is admitted as a `followUp` prepared turn action with
+  `resumeIfIdle: true`.
+- `_schedulePostCompactionContinue()` is the scheduled continue: a runner
+  that waits for agent idle / retry / refine quiescence / the
+  queued-work-resume checkpoint, then drives `agent.continue()` over the
+  queued follow-up — this is how the goal keeps driving across a compact.
+- TS `agent.hasQueuedMessages()` spans BOTH the steering and follow-up
+  queues; the `||=` sets the owed flag only when neither has items, so
+  already-parked queued work owns the continue instead of a fresh mint.
+- The compact-trigger auto-refine defers behind the continuation (TS
+  `_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction = true)`
+  -> `_compactAutoRefinePending = true`): the review services at the
+  continuation turn's quiescent boundary, not before it.
+
+Rust port (pa-daemon worker `handle_compaction`): the compact success arm
+checks `engine.goal_state_value().status == "active"`; with no queued work
+parked (both lanes empty), the worker mints the continuation through the
+new `SessionEngine::mint_post_compaction_goal_continuation` (the real
+engine mirrors the goal runtime handles, runs the pa-core
+`GoalDriver::next_continuation_message` mint on the engine runtime — the
+pa-core mint now persists the state change like every other driver
+mutation — and returns the follow-up turn request plus the mint's
+`goal_update` payload, deduped against the engine's published baseline),
+emits the `goal_update`, queues the item on the follow-up lane BEHIND the
+still-set suspension, then resumes: `resume_queued_input()` clears the
+gate and wakes the turn runner, which drains the continuation as the
+scheduled continue's turn (the runner IS the scheduled continue — it
+waits on the same idle/settle discipline). Parked queued work skips the
+mint (`||=` mirror) and owns the resume. The compact-trigger auto-refine
+defers when the goal branch ran (the trigger stays armed and services at
+the continuation turn's boundary).
+
+Scope rulings (parity boundaries, same class as #234's):
+
+- The TS compact-with-active-goal branch also runs for the `/compact`
+  session command and the ACP compaction arms; #234 scoped the
+  suspension to the daemon worker's `compact` wire command (the TUI
+  submits `/compact` as a steer with `resumeIfIdle`, so the interactive
+  flow crosses the same resume site), and this lane mirrors that scope:
+  the goal continue lives on the worker `compact` command. The
+  engine-side `/compact` execution path has no worker queue surface; it
+  stays with the goal-continuation-loop lane.
+- The TS mint's `_hasUnsettledRlmQuiescenceWork()` gate (defer the
+  continuation while child runs are unsettled) has no Rust equivalent
+  yet: nothing in the Rust port sets the owed-continuation flag at turn
+  end (the TS goal-continuation loop hook `_getGoalContinuationMessages`
+  is not wired — its own lane). The compact branch is the only mint
+  site today, and it sets the owed flag itself, so the gate cannot fire;
+  wiring the deferral belongs with the goal-continuation loop.
+- `tokensBefore`/usage stay out of the wire differential (per-side token
+  estimates, the #182 compact_parity normalization).
+
+Verifiers: pa-daemon worker unit tests (compact + active goal schedules
+the continue and the suspension clears; queued work skips the mint; a
+paused goal never continues), an AgentSessionEngine unit test for the
+real mint (persistence, goal-context row, deduped `goal_update`, paused
+mint refusal), and the f7 post-compact goal-continuation differential
+(a goal session compacted mid-turn: the wire window from
+`compaction_start` — compaction pair, minted `goal_update`,
+`goal_context` row, continuation turn, `goal.complete()` freeze — plus the
+mock's model requests byte-compared TS vs Rust).
+
+Adjacent gaps surfaced by the f7 goal-continue differential (pre-existing,
+NOT this lane's surface — reported for their owning lanes):
+
+- Injected-custom turns double-represent in the engine branch: the daemon
+  engine runs an injected custom row's turn on the raw text as a plain
+  user prompt (`run_turns(text)` -> `prompt_with_images` -> the loop's
+  user message), so the ENGINE session branch carries BOTH the custom
+  entry (persisted via the session-command/injected emit) AND a user
+  message with the same text; TS's followUp runs the turn ON the custom
+  message and appends only the custom entry. The wire rows and the model
+  requests match (the worker persists the custom row, and the custom text
+  rides the request as the user role), but the compaction walk sees the
+  extra user row: its ~256-token estimate shifts the keep-recent crossing
+  and the TS-verbatim pull-back then lands the cut mid-turn — a
+  short-session compact splits on Rust where TS cuts whole (observed in
+  the f7 goal-continue fixture: Rust made the split-turn prefix
+  summarizer call, TS one history call). The harness accommodates it
+  (a content-matched queue serves the split-prefix call so the scripted
+  cursor stays aligned; the goal session's durable row is excluded from
+  the pre-existing durable sweep, whose own comparison the goal window
+  owns). Fix: pass the custom message to the loop for injected turns
+  (the injected-turn representation lane).
+- The daemon worker never mirrors the engine's `thread_goal_state`
+  entries into its own session file (the engine session is in-memory;
+  `set_session_file` only feeds the system prompt): a started goal — and
+  this lane's minted continuation count — survive in the engine but not
+  the durable file a rebuild would replay. TS has one store, so
+  `/goal` state is durable there. (Goal durability across worker
+  recovery: the goal-continuation-loop / worker-recovery lanes.)
+- The TS session file carries a `harness_digest` custom row right after
+  the session header; the Rust worker file does not (engine-side digest
+  rows exist at cold-context boundaries only). Visible in the f7 session
+  captures; no behavioral effect on this lane's window.
+- The Rust worker's mid-turn compact abort is lazy: TS `compact()` ->
+  `abort()` -> `requestAbort()` cancels the in-flight provider fetch
+  immediately, while the Rust compaction's `wait_for_turn_end` only sets
+  `abort_requested` — the engine's provider request is cancelled at the
+  next streamed event (the emit probe). A compact that lands while the
+  provider response is pending (the battery's `delayMs` hold) lets the
+  response complete on Rust: the aborted turn's assistant usage reaches
+  the goal accounting (+30 tokens in the f7 goal-continue fixture) and
+  TS records nothing. The f7 goal-continue projection normalizes the
+  continuation context's "tokens used" line for this (every other byte
+  stays compared); the abort-propagation fix belongs to the
+  compaction-abort/turn-abort lane.
+

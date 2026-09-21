@@ -134,7 +134,17 @@ and the lanes park. Resume sites: a prompt carrying `streamingBehavior`,
 `steer`/`follow_up`, `resume_queue` (even on the empty queue), an applied
 `mutate_queued_message`, a cron/heartbeat fire, and a successful compact
 with an active goal. Agent-message delivery is rejected while suspended
-and idle (TS `acceptAgentMessagePrompt` runs with `resumeIfIdle: false`). Platform wall
+and idle (TS `acceptAgentMessagePrompt` runs with `resumeIfIdle: false`).
+The compact-with-active-goal resume is also the TS post-compaction
+continue (agent-session.ts `compact()`'s `didCompact` branch): with no
+queued work parked, the worker mints the owed goal continuation through
+the engine (`SessionEngine::mint_post_compaction_goal_continuation`, the
+`_maybeResumeGoalContinuationAfterRlmWork` mint — the follow-up lane item
+with the durable goal-context row), emits the mint's `goal_update`, then
+resumes: the parked continuation crosses the suspension gate through the
+resume site and the turn runner drives it (the `_schedulePostCompactionContinue`
+schedule). The compact-trigger auto-refine defers behind that continuation
+(TS `_compactAutoRefinePending`), servicing at its turn boundary. Platform wall
 (`platform`): per-OS endpoint naming and socket identity; the transport itself
 is the shared trait in `pa_types::platform::transport`, and the private-frame
 codec plus command planes are the shared wire contract in
