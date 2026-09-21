@@ -117,17 +117,17 @@ pub struct AgentView {
     /// true): image blocks render their metadata rows when set, their
     /// `[Image: ...]` text placeholders otherwise.
     pub show_images: bool,
-    scroll_top: usize,
+    pub(crate) scroll_top: usize,
     following: bool,
     /// The transcript-tail offset of the last composed frame (TS
     /// `lastMaxScroll`): scroll deltas page from here, not from zero.
-    last_max_scroll: usize,
+    pub(crate) last_max_scroll: usize,
     /// Rows of the terminal the editor should lay out against.
     terminal_rows: u16,
     /// Cursor cell within the last dock render: (dock row, column).
     dock_cursor: Option<(usize, usize)>,
     /// Window height of the last composed frame (cursor positioning).
-    window_rows: usize,
+    pub(crate) window_rows: usize,
     /// Plain text of the last frame's rows: OSC zone-marker emission only
     /// re-emits rows whose content changed (mirroring the TS renderer,
     /// which writes a row's marker sequences when it rewrites that row).
@@ -147,6 +147,12 @@ pub struct AgentView {
     /// this, so suspend/resume/exit cycles never duplicate the transcript
     /// in terminal scrollback.
     flushed_frame: Vec<String>,
+    /// Rows of the last composed frame (frame-selection geometry; TS
+    /// `lastFrameVisibleHeight`).
+    pub(crate) frame_rows: usize,
+    /// In-app mouse text selection (TS `FullscreenViewport`'s selection
+    /// state): anchor/head points, the mode, and the frame snapshot.
+    pub(crate) selection: crate::selection::SelectionState,
 }
 
 impl AgentView {
@@ -184,6 +190,8 @@ impl AgentView {
             layout_width: 0,
             layout_detail: Detail::Overview,
             flushed_frame: Vec::new(),
+            frame_rows: 0,
+            selection: crate::selection::SelectionState::default(),
         }
     }
 
@@ -963,7 +971,9 @@ impl AgentView {
         // The onboarding splash covers the pane (TS `showOverlay` 100%):
         // no top bar, transcript, or prompt dock behind it.
         if let Some(screen) = &self.onboarding {
-            return screen.render(&self.theme, width, height);
+            let frame = screen.render(&self.theme, width, height);
+            self.frame_rows = frame.len();
+            return frame;
         }
         // The `/model` and `/effort` pickers mount in the editor dock (TS
         // `showConfigurationMenu` replaces the editor container), like the
@@ -1028,8 +1038,13 @@ impl AgentView {
         self.window_rows = window_height;
         let mut frame: Vec<Line> = Vec::with_capacity(height);
         frame.push(pad_row(top, width));
-        for line in &transcript[start..(start + window_height).min(transcript.len())] {
-            frame.push(pad_row(line.clone(), width));
+        self.note_transcript_text(&transcript);
+        for (window_index, line) in transcript[start..(start + window_height).min(transcript.len())]
+            .iter()
+            .enumerate()
+        {
+            let row = self.highlight_transcript_row(line, start + window_index);
+            frame.push(pad_row(row, width));
         }
         while frame.len() < height.saturating_sub(dock.len()) {
             frame.push(vec![Span::raw(" ".repeat(width))]);
@@ -1050,6 +1065,8 @@ impl AgentView {
                 *row = composite_follow_hint(row, &label, width);
             }
         }
+        self.frame_rows = frame.len();
+        self.apply_frame_selection(&mut frame, width);
         frame
     }
 

@@ -208,6 +208,15 @@ The interactive transcript viewport's first scroll action per client run
 | `action` | string | `page_up` / `page_down` / `top` / `follow` |
 | `resumed_following` | boolean | the action resumed tail-following |
 
+### `tui selection used`
+
+The interactive transcript viewport's first in-app mouse selection copy per
+client run (adoption; later copies in the same run are not reported).
+
+| property | type | notes |
+|---|---|---|
+| `lines` | number | the copied text's line count |
+
 ### `tui image pasted`
 
 An image was pasted into the input editor from the clipboard and attached

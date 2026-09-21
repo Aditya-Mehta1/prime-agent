@@ -50,6 +50,7 @@ pub mod osc133;
 pub(crate) mod prompt_highlight;
 pub mod queued;
 pub(crate) mod search_input;
+pub mod selection;
 pub mod session;
 pub mod session_ui;
 pub mod snapshot;

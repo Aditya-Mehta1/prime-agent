@@ -177,6 +177,17 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         })
     }
 
+    fn selection_used(&self, lines: usize) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("lines", serde_json::Value::from(lines as u64));
+            client.track("tui selection used", properties);
+            let _ = client.shutdown().await;
+        })
+    }
     fn client_exit(
         &self,
         reason: &'static str,

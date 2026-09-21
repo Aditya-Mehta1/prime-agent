@@ -1,13 +1,14 @@
-//! Headless e2e for the mouse-wheel scroll surface: a mock supervisor
+//! Headless e2e for the in-app mouse selection surface: a mock supervisor
 //! serves one attached session with a long snapshot transcript, and the
-//! headless harness feeds byte-identical SGR mouse sequences through the
-//! same decode-and-dispatch path the terminal's wheel reports take.
+//! headless harness feeds byte-identical SGR mouse reports (press, drag,
+//! release) through the same decode-and-dispatch path a terminal's mouse
+//! takes.
 //!
 //! Verifies the TS parity contract of `tui.ts`'s `handleFullscreenInput`
-//! wheel branch: wheel up/down scroll the transcript window three lines
-//! per turn, the wheel is consumed without scrolling while a picker owns
-//! the frame, and no scroll happens when the `terminal.fullscreenMouse`
-//! setting disabled tracking (reports consumed either way).
+//! selection branches: a press-drag-release over transcript rows copies the
+//! spanned text (the run's recorded `copies` stand in for the OSC 52
+//! write a terminal receives), a dock press starts a frame selection, and
+//! a plain click without a drag copies nothing.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -32,9 +33,19 @@ use pa_tui::interactive::{
 };
 use serde_json::{json, Value};
 
-/// The SGR wheel-up / wheel-down press reports a real terminal sends.
-const WHEEL_UP: &str = "\x1b[<64;10;10M";
-const WHEEL_DOWN: &str = "\x1b[<65;10;10M";
+/// The SGR reports a real terminal sends with ?1002+?1006 tracking active:
+/// a left press, a left drag (button 0 + the motion bit 32), and a release.
+fn press(col: usize, row: usize) -> String {
+    format!("\x1b[<0;{col};{row}M")
+}
+
+fn drag(col: usize, row: usize) -> String {
+    format!("\x1b[<32;{col};{row}M")
+}
+
+fn release(col: usize, row: usize) -> String {
+    format!("\x1b[<0;{col};{row}m")
+}
 
 struct MockSupervisor {
     listener: UnixListener,
@@ -242,14 +253,10 @@ fn options(socket: PathBuf, fullscreen_mouse: bool) -> InteractiveOptions {
 }
 
 /// Run the headless plan against a fresh mock supervisor and return the
-/// captured frames. Holds the run lock: mouse tracking is process-global.
-fn run_plan(steps: Vec<HeadlessStep>, fullscreen_mouse: bool) -> Vec<String> {
+/// captured frames and selection copies. Holds the run lock: mouse
+/// tracking is process-global.
+fn run_plan(steps: Vec<HeadlessStep>, fullscreen_mouse: bool) -> (Vec<String>, Vec<String>) {
     let _guard = run_lock();
-    // The ambient TMUX variable makes the startup check add its extended-keys
-    // notice to the transcript, which shifts the paused-frame geometry the
-    // assertions below reason about; scrub it so the run is the same inside
-    // tmux (a dev box) and out (the gate sandbox).
-    std::env::remove_var("TMUX");
     let dir = tempfile::TempDir::new().expect("temp dir");
     let socket = dir.path().join("tui.sock");
     let supervisor = MockSupervisor::bind(&socket);
@@ -271,119 +278,146 @@ fn run_plan(steps: Vec<HeadlessStep>, fullscreen_mouse: bool) -> Vec<String> {
         ))
         .expect("interactive run");
     let _ = handle.join();
-    outcome.frames
+    (outcome.frames, outcome.copies)
 }
 
-/// Wheel turns scroll the transcript: up pauses tail-following (the frame
-/// shows the follow hint) and scrolls far enough to drop the newest
-/// message from the window; wheel-down turns scroll back and reaching the
-/// bottom resumes following.
+/// The last frame holding a needle and the needle's (row, column) within
+/// it — the rendered coordinates a mouse press targets.
+fn locate<'a>(frames: &'a [String], needle: &str) -> Option<(usize, usize, usize, &'a str)> {
+    frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            let rows: Vec<&str> = frame.split('\n').collect();
+            let row = rows.iter().position(|r| r.contains(needle))?;
+            let col = rows[row].find(needle)?;
+            Some((index, row, col, frame.as_str()))
+        })
+        .next_back()
+}
+
+/// The transcript window at the top after `ScrollTop`: the splash rows sit
+/// at 2-8, the first user message's text at row 11 (`  row 0`), its spacer
+/// rows at 12-13, and the first assistant answer at row 14 — the layout
+/// the selection coordinates below target (the geometry is asserted, not
+/// assumed, before each drag).
+fn top_layout() -> (usize, usize, usize, usize, usize, usize) {
+    let probe = run_plan(vec![HeadlessStep::ScrollTop], true).0;
+    let (_, row0, col0, _) = locate(&probe, "row 0").expect("row 0 rendered at the top");
+    let (_, answer_row, answer_col, _) =
+        locate(&probe, "answer 1").expect("answer 1 rendered below row 0");
+    let (_, ctx_row, ctx_col, _) =
+        locate(&probe, "Collapsed mode").expect("the prompt-context row rendered");
+    (row0, col0, answer_row, answer_col, ctx_row, ctx_col)
+}
+
 #[test]
-fn wheel_turns_scroll_the_transcript() {
+fn press_drag_release_copies_the_spanned_transcript_text() {
+    let (row0, col0, ..) = top_layout();
+    assert_eq!(
+        (row0, col0),
+        (11, 2),
+        "the first user message renders at 11:2"
+    );
+    // Drag across the first user message's text: press at its first text
+    // column, drag to its end, release — the copy is the text slice.
     let steps = vec![
-        // One wheel-up turn: three lines up — the tail pauses.
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        // Enough further turns to scroll the newest messages out of the
-        // window (each user/assistant pair renders several rows): eighteen
-        // lines up clears the bottom rows of the tail.
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        // Wheel-down turns scroll back: the window returns to the tail and
-        // following resumes (extra turns clamp at the bottom).
-        HeadlessStep::Mouse(WHEEL_DOWN.to_string()),
-        HeadlessStep::Mouse(WHEEL_DOWN.to_string()),
-        HeadlessStep::Mouse(WHEEL_DOWN.to_string()),
-        HeadlessStep::Mouse(WHEEL_DOWN.to_string()),
-        HeadlessStep::Mouse(WHEEL_DOWN.to_string()),
-        HeadlessStep::Mouse(WHEEL_DOWN.to_string()),
-        HeadlessStep::Mouse(WHEEL_DOWN.to_string()),
+        // Mount the window at the transcript top: the probe layout is the
+        // press target only while the view sits there.
+        HeadlessStep::ScrollTop,
+        HeadlessStep::Mouse(press(col0 + 1, row0 + 1)),
+        HeadlessStep::Mouse(drag(col0 + 6, row0 + 1)),
+        HeadlessStep::Mouse(release(col0 + 6, row0 + 1)),
     ];
-    let frames = run_plan(steps, true);
-    assert!(!frames.is_empty(), "frames were captured");
-    let all = frames.join("\n");
-    assert!(
-        all.contains("answer 39"),
-        "the snapshot transcript's tail rendered:\n{all}"
+    let (_, copies) = run_plan(steps, true);
+    assert_eq!(copies, vec!["row 0".to_string()], "the dragged text copied");
+}
+
+/// A drag spanning several rows copies each row's slice — the anchor's row
+/// from the anchor column, the spacer rows as empty lines, the head's row
+/// up to the head column (TS `extractSelectionText`).
+#[test]
+fn multi_row_drag_copies_each_line() {
+    let (row0, col0, answer_row, answer_col, ..) = top_layout();
+    assert_eq!(
+        answer_row - row0,
+        3,
+        "two spacer rows sit between the messages"
     );
-    assert!(
-        all.contains("to follow"),
-        "wheel-up paused tail-following (the follow hint rendered):\n{all}"
-    );
-    // Scrolling up moved the window: the deepest paused frame (all six
-    // wheel-up turns applied) dropped the newest rows from the window,
-    // and scrolling back down restored them.
-    let paused = frames
-        .iter()
-        .rfind(|frame| frame.contains("to follow"))
-        .expect("a paused frame");
-    assert!(
-        !paused.contains("answer 39"),
-        "the scrolled-up window dropped the newest rows:\n{paused}"
-    );
-    let tail = frames
-        .iter()
-        .rfind(|frame| !frame.contains("to follow") && frame.contains("row 38"))
-        .expect("a resumed tail frame");
-    assert!(
-        tail.contains("row 38"),
-        "wheel-down returned the window to the tail:\n{tail}"
+    let steps = vec![
+        // Mount the window at the transcript top: the probe layout is the
+        // press target only while the view sits there.
+        HeadlessStep::ScrollTop,
+        HeadlessStep::Mouse(press(col0 + 1, row0 + 1)),
+        HeadlessStep::Mouse(drag(answer_col + 8, answer_row + 1)),
+        HeadlessStep::Mouse(release(answer_col + 8, answer_row + 1)),
+    ];
+    let (_, copies) = run_plan(steps, true);
+    // `  row 0` from column 2; two blank spacer rows; ` answer 1` up to
+    // column 8 — ` answer` after the trailing trim (the leading pad is
+    // TS-faithful: only the trailing side trims).
+    assert_eq!(
+        copies,
+        vec!["row 0\n\n\n answer".to_string()],
+        "the spanned rows copied with their column slices"
     );
 }
 
-/// The wheel is consumed without scrolling while the `/model` picker owns
-/// the frame (the TS overlay-focus gate).
+/// A press-release without any drag copies nothing (TS: the anchor and head
+/// coincide, so the release takes the clear branch).
 #[test]
-fn wheel_is_ignored_while_a_picker_owns_the_frame() {
+fn click_without_drag_copies_nothing() {
+    let (row0, col0, ..) = top_layout();
     let steps = vec![
-        HeadlessStep::Submit("/model".to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        )),
+        // Mount the window at the transcript top: the probe layout is the
+        // press target only while the view sits there.
+        HeadlessStep::ScrollTop,
+        HeadlessStep::Mouse(press(col0 + 1, row0 + 1)),
+        HeadlessStep::Mouse(release(col0 + 1, row0 + 1)),
     ];
-    let frames = run_plan(steps, true);
-    let all = frames.join("\n");
-    assert!(
-        all.contains("row 38"),
-        "the transcript tail stayed mounted through the picker cycle:\n{all}"
+    let (_, copies) = run_plan(steps, true);
+    assert!(copies.is_empty(), "a click never copies: {copies:?}");
+}
+
+/// A press on the dock (outside the transcript window) starts a frame
+/// selection over the row's visible span (TS `beginFrameSelection`): the
+/// drag's columns copy from the rendered row.
+#[test]
+fn dock_press_drag_copies_the_frame_region() {
+    let (_, _, _, _, ctx_row, ctx_col) = top_layout();
+    assert_eq!(
+        (ctx_row, ctx_col),
+        (25, 66),
+        "the context row renders at 25:66"
     );
-    // The picker cycled without any paused frame: every frame that shows
-    // the transcript still sits at the tail.
-    assert!(
-        !all.contains("to follow"),
-        "the wheel never scrolled behind the picker:\n{all}"
-    );
-    let tail = frames.last().expect("a frame after the picker closed");
-    assert!(
-        tail.contains("row 38"),
-        "the post-picker frame is the unscrolled tail:\n{tail}"
-    );
+    let steps = vec![
+        // Mount the window at the transcript top: the probe layout is the
+        // press target only while the view sits there.
+        HeadlessStep::ScrollTop,
+        HeadlessStep::Mouse(press(ctx_col + 1, ctx_row + 1)),
+        HeadlessStep::Mouse(drag(ctx_col + 7, ctx_row + 1)),
+        HeadlessStep::Mouse(release(ctx_col + 7, ctx_row + 1)),
+    ];
+    let (_, copies) = run_plan(steps, true);
+    assert_eq!(copies, vec!["Collap".to_string()], "the dock span copied");
 }
 
 /// With the `terminal.fullscreenMouse` setting off, tracking never enables
-/// and wheel reports are consumed without scrolling.
+/// and the press-drag-release reports are consumed without a selection.
 #[test]
-fn wheel_reports_are_consumed_when_tracking_is_disabled() {
+fn selection_reports_are_consumed_when_tracking_is_disabled() {
+    let (row0, col0, ..) = top_layout();
     let steps = vec![
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
-        HeadlessStep::Mouse(WHEEL_UP.to_string()),
+        // Mount the window at the transcript top: the probe layout is the
+        // press target only while the view sits there.
+        HeadlessStep::ScrollTop,
+        HeadlessStep::Mouse(press(col0 + 1, row0 + 1)),
+        HeadlessStep::Mouse(drag(col0 + 6, row0 + 1)),
+        HeadlessStep::Mouse(release(col0 + 6, row0 + 1)),
     ];
-    let frames = run_plan(steps, false);
-    let all = frames.join("\n");
+    let (_, copies) = run_plan(steps, false);
     assert!(
-        !all.contains("to follow"),
-        "no scroll with tracking disabled:\n{all}"
-    );
-    let tail = frames.last().expect("a frame");
-    assert!(
-        tail.contains("row 38"),
-        "the tail frame stayed at the bottom:\n{tail}"
+        copies.is_empty(),
+        "no copy with tracking disabled: {copies:?}"
     );
 }

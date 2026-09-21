@@ -4,9 +4,11 @@ UI against the installed TS prime-agent binary in tmux.
 
 Drives both binaries to the same defined states (fresh start, one turn with a
 tool call, a second turn rendering a markdown table and links, thinking
-visible via Ctrl+O, the working spinner mid-turn, and the mouse-wheel
-scroll/follow cycle driven by byte-identical SGR wheel reports) at 120x36
-and 220x50, captures the rendered
+visible via Ctrl+O, the working spinner mid-turn, the mouse-wheel
+scroll/follow cycle driven by byte-identical SGR wheel reports, and the
+in-app mouse selection: a press-drag-release over rendered transcript
+text whose OSC 52 clipboard copy is byte-compared from the pane's raw
+output) at 120x36 and 220x50, captures the rendered
 panes with escape sequences, normalizes volatile content, and reports
 per-state frame diffs. Exit code is non-zero when any state differs.
 
@@ -20,6 +22,7 @@ no kill-server; sessions are killed individually at the end.
 """
 
 import argparse
+import base64
 import difflib
 import json
 import os
@@ -149,6 +152,9 @@ STATES = [
     ("f_kernel_boot", "python-kernel boot: the tool-owned loader note mid-turn"),
     ("h_mouse_scrolled", "mouse wheel-up: SGR reports scroll the transcript off the tail"),
     ("i_mouse_follow", "mouse wheel-down: back at the tail, following resumed"),
+    ("j_mouse_selected", "mouse press-drag: the spanned transcript row renders selected"),
+    ("k_mouse_copied", "mouse release: the selection cleared, the spanned text copied out"),
+    ("l_mouse_copy", "the OSC 52 clipboard sequence the release emitted"),
 ]
 
 # SGR wheel press reports, the bytes a real terminal emits with ?1002+?1006
@@ -164,6 +170,11 @@ WHEEL_DOWN_HEX = "1b 5b 3c 36 35 3b 31 30 3b 31 30 4d".split()
 MOUSE_WHEEL_UP_TURNS = 6
 MOUSE_WHEEL_DOWN_TURNS = 8
 
+# The transcript text the selection states drag across (the second turn's
+# answer): located per binary in the rendered pane, dragged from its first
+# cell to its last, so the OSC 52 copy is exactly this string.
+SELECTION_NEEDLE = "Here is the status board:"
+
 
 def send_wheel_report(session, report_hex, turns):
     """Send `turns` SGR wheel reports, spaced so each arrives as its own
@@ -171,6 +182,46 @@ def send_wheel_report(session, report_hex, turns):
     for _ in range(turns):
         tmux("send-keys", "-t", session, "-H", *report_hex)
         time.sleep(0.1)
+
+
+def sgr_hex(sequence):
+    """The `send-keys -H` hex form of one raw byte sequence."""
+    return [f"{byte:02x}" for byte in sequence.encode("latin1")]
+
+
+def send_mouse_report(session, sequence):
+    """Send one raw SGR mouse report into the pane's stdin."""
+    tmux("send-keys", "-t", session, "-H", *sgr_hex(sequence))
+
+
+def mouse_press(col, row):
+    """SGR left-button press at a one-based terminal cell."""
+    return f"\x1b[<0;{col};{row}M"
+
+
+def mouse_drag(col, row):
+    """SGR left-button motion (button 0 + the motion bit) — a held drag."""
+    return f"\x1b[<32;{col};{row}M"
+
+
+def mouse_release(col, row):
+    """SGR left-button release at a one-based terminal cell."""
+    return f"\x1b[<0;{col};{row}m"
+
+
+def locate_plain(pane_text, needle):
+    """The needle's (row, column) in a plain (escape-free) pane capture."""
+    for row, line in enumerate(pane_text.split("\n")):
+        col = line.find(needle)
+        if col >= 0:
+            return row, col
+    return None
+
+
+def osc52_copies(raw):
+    """The OSC 52 clipboard sequences (ESC ] 52 ; c ; <base64> BEL) a pane's
+    raw output stream carried, in order."""
+    return re.findall("\x1b\]52;c;([A-Za-z0-9+/=]+)\x07", raw)
 
 
 def tmux(*args, check=True):
@@ -241,6 +292,17 @@ def normalize(frame, root):
         "(\x1b\[38;2;[0-9;]+m)?\x1b\[48;2;34;34;38m[^\n]*",
         lambda m: re.sub("\x1b\[[0-9;]*m", "", m.group(0)),
         frame,
+    )
+    # Reverse-video rows (the in-app mouse-selection highlight, the follow
+    # hint): the TS writer strips the span's styling and resets before and
+    # after it while ratatui's diff places its reset bundle at the row end,
+    # so identical reversed rows differ in escape placement alone. Those
+    # rows compare by visible text.
+    frame = re.sub(
+        "^[^\n]*\x1b\[7m[^\n]*$",
+        lambda m: re.sub("\x1b\[[0-9;]*m", "", m.group(0)),
+        frame,
+        flags=re.MULTILINE,
     )
     # Selector list rows (the `› ` cursor prefix): same writer variance for
     # the accent cursor and the bold selected row.
@@ -372,24 +434,23 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir, session
     frames["d_spinner"] = capture(session)
 
     # (f) kernel boot: the first ipython call boots the python kernel
-    # (one-time, ~30s in the fresh sandbox HOME). While it runs, the tool
+    # (one-time, ~30s in a fresh sandbox HOME). While it runs, the tool
     # owns the loader note and both binaries render the same row
     # ("⠹ › setting up python kernel (one-time, ~30s)…" plus elapsed): TS
     # via the extension-UI setWorkingMessage request, Rust from the same
-    # stage text carried by the tool's `starting` partials. The phase lasts
-    # as long as the venv bootstrap, so poll for the note and capture
-    # inside the window (spinner frames and elapsed seconds normalize).
-    deadline = time.time() + 240
+    # stage text carried by the tool's `starting` partials. The session-create
+    # prewarm moved the boot ahead of the prompt on a warm box (the
+    # runtime sidecar's venv is already installed), so the note is
+    # best-effort: poll for a bounded window and capture inside it; a
+    # warm boot has no note to show and the state is skipped on both
+    # sides (spinner frames and elapsed seconds normalize).
+    deadline = time.time() + 20
     while time.time() < deadline:
         pane = capture(session, escape=False)
         if "setting up python kernel" in pane:
+            frames["f_kernel_boot"] = capture(session)
             break
         time.sleep(0.5)
-    else:
-        raise TimeoutError(
-            f"session {session} never showed the kernel-setup loader note"
-        )
-    frames["f_kernel_boot"] = capture(session)
 
     # (b) idle after the turn: the final answer rendered AND the loader row
     # is gone (the spinner line disappears once the turn ends).
@@ -463,6 +524,63 @@ def run_session(binary, sandbox, shared_cwd, script_path, size, out_dir, session
     time.sleep(1.0)
     frames["i_mouse_follow"] = capture(session)
 
+    # (j-k-l) in-app mouse selection: byte-identical SGR press/drag/release
+    # reports drag across the second turn's answer text; the pane's raw
+    # output stream (pipe-pane) records the OSC 52 clipboard copy the
+    # release emits. The needle's rendered cell is located per binary so
+    # both drag the same rendered text (the frames already compare equal
+    # at this point, so the cells match).
+    plain = capture(session, escape=False)
+    located = locate_plain(plain, SELECTION_NEEDLE)
+    if located is None:
+        raise TimeoutError(
+            f"session {session} never showed the selection needle {SELECTION_NEEDLE!r}"
+        )
+    needle_row, needle_col = located
+    pane_raw = os.path.join(sandbox["tmp"], "pane-osc52.raw")
+    if os.path.exists(pane_raw):
+        os.remove(pane_raw)
+    tmux("pipe-pane", "-t", session, f"cat > {pane_raw}")
+    send_mouse_report(session, mouse_press(needle_col + 1, needle_row + 1))
+    time.sleep(0.3)
+    send_mouse_report(session, mouse_drag(needle_col + 1 + len(SELECTION_NEEDLE), needle_row + 1))
+    time.sleep(0.5)
+    frames["j_mouse_selected"] = capture(session)
+    selected = capture(session)
+    needle_prefix = selected.split("\n")[needle_row] if needle_row < len(
+        selected.split("\n")
+    ) else ""
+    if "\x1b[7m" + SELECTION_NEEDLE not in needle_prefix:
+        raise AssertionError(
+            f"session {session} did not render the dragged text reversed mid-drag"
+        )
+    send_mouse_report(session, mouse_release(needle_col + 1 + len(SELECTION_NEEDLE), needle_row + 1))
+    time.sleep(0.5)
+    tmux("pipe-pane", "-t", session)
+    frames["k_mouse_copied"] = capture(session)
+    released = frames["k_mouse_copied"]
+    needle_prefix = released.split("\n")[needle_row] if needle_row < len(
+        released.split("\n")
+    ) else ""
+    if "\x1b[7m" + SELECTION_NEEDLE in needle_prefix:
+        raise AssertionError(
+            f"session {session} kept the selection highlighted after the release"
+        )
+    with open(pane_raw, "rb") as f:
+        raw = f.read().decode("latin1")
+    copies = osc52_copies(raw)
+    if not copies:
+        raise AssertionError(
+            f"session {session} never emitted an OSC 52 copy for the release"
+        )
+    decoded = base64.b64decode(copies[-1]).decode("utf-8")
+    if decoded != SELECTION_NEEDLE:
+        raise AssertionError(
+            f"session {session} copied {decoded!r} for the release, expected "
+            f"{SELECTION_NEEDLE!r}"
+        )
+    frames["l_mouse_copy"] = f"\x1b]52;c;{copies[-1]}\x07"
+
     # Exit: ctrl+c aborts a running turn, a second press exits when idle.
     tmux("send-keys", "-t", session, "C-c")
     time.sleep(0.5)
@@ -531,6 +649,17 @@ def main():
                 "rust", sandboxes["rust"], shared_cwd, script_path, size, out_dir, args.session_prefix
             )
             for state, _ in STATES:
+                # A best-effort state (the kernel-boot note) skips only
+                # when BOTH sides skipped it; one side showing what the
+                # other lacks is a divergence like any other.
+                if state not in ts_frames or state not in rust_frames:
+                    if state not in ts_frames and state not in rust_frames:
+                        print(f"SKIP {state}-{size[0]}x{size[1]} (absent on both sides)")
+                        continue
+                    missing = "ts" if state not in ts_frames else "rust"
+                    failures.append(f"{state}-{size[0]}x{size[1]}")
+                    print(f"FAIL {state}-{size[0]}x{size[1]} (absent on {missing})")
+                    continue
                 ts_norm = normalize(ts_frames[state], base)
                 rust_norm = normalize(rust_frames[state], base)
                 name = f"{state}-{size[0]}x{size[1]}"

@@ -41,6 +41,9 @@ use tokio::sync::mpsc;
 /// How long the Ctrl+C exit hint arms the second-press exit (TS
 /// `EXIT_HINT_DURATION_MS`).
 const CTRL_C_EXIT_HINT_MS: u64 = 2_000;
+/// TS `SELECTION_AUTO_SCROLL_DELAY_MS`: how long a drag must hold the
+/// window edge before the auto-scroll starts.
+const SELECTION_AUTO_SCROLL_DELAY: Duration = Duration::from_millis(150);
 /// Cap on any daemon request awaited on the key-handling path: the UI loop
 /// must stay responsive to Ctrl+C while a submission travels (the TS loop
 /// never blocks on these — aborts are fire-and-forget, submissions resolve
@@ -264,6 +267,25 @@ pub(crate) struct SessionUi {
     suspend_requested: bool,
     /// Whether this run already reported its first suspend cycle.
     suspend_adoption_emitted: bool,
+    /// The armed selection auto-scroll (TS `selectionAutoScroll*`): a drag
+    /// holding the pointer at the window edge scrolls the transcript while
+    /// it lasts.
+    selection_auto_scroll: Option<SelectionAutoScroll>,
+    /// Whether this run already reported its first selection copy.
+    selection_adoption_emitted: bool,
+    /// Texts copied out by finished selections this run (headless runs
+    /// have no terminal to write OSC 52 to; the verifier reads these).
+    pub(crate) copies: Vec<String>,
+}
+
+/// One armed auto-scroll (TS `selectionAutoScrollTimer` state): the drag's
+/// last position and when the scroll window opened.
+#[derive(Debug, Clone)]
+struct SelectionAutoScroll {
+    direction: isize,
+    row: usize,
+    col: usize,
+    started: Instant,
 }
 
 impl SessionUi {
@@ -347,6 +369,9 @@ impl SessionUi {
             escape_repeat_until: None,
             suspend_requested: false,
             suspend_adoption_emitted: false,
+            selection_auto_scroll: None,
+            selection_adoption_emitted: false,
+            copies: Vec::new(),
         };
         session
             .attach_session(&active_session_id)
@@ -2353,31 +2378,169 @@ impl SessionUi {
         Ok(())
     }
 
-    /// A mouse report (TS `handleFullscreenInput`'s wheel branch): wheel
-    /// turns scroll the transcript window by three lines; while a picker,
-    /// selector, or loader owns the frame (the TS overlay-focus gate) or
-    /// tracking is inactive, reports are consumed without scrolling. Click,
-    /// drag, and release reports are consumed too — the selection surface is
-    /// not ported yet.
+    /// A mouse report (TS `handleFullscreenInput`'s selection branches):
+    /// wheel turns scroll the transcript window by three lines; a left
+    /// press starts a selection (transcript, or the dock's frame surface
+    /// when the press is outside the window), a drag extends it with
+    /// edge auto-scroll, and a release copies the spanned text out
+    /// through OSC 52. Reports are consumed even while a picker, selector,
+    /// or loader owns the frame (the TS overlay-focus gate) — the wheel
+    /// never scrolls behind one, but its rows select; while tracking is
+    /// inactive every report is consumed without a dispatch. The onboarding
+    /// pane replaces the whole frame, so its runs consume reports without
+    /// a selection surface (a known deviation from the TS inline block).
     pub(crate) fn handle_mouse(&mut self, event: crate::mouse::MouseEvent, view: &mut AgentView) {
         if !crate::mouse_tracking::active() {
             return;
         }
-        // TS `isFullscreenOverlayFocused`: the wheel never scrolls while an
-        // overlay (the `/model` and `/effort` pickers, the `/tree` and
-        // `/fork` selectors, the `/share` loader) owns the frame.
-        if view.model_picker.is_some()
+        if view.onboarding.is_some() {
+            return;
+        }
+        // TS `isFullscreenOverlayFocused`: the `/model` and `/effort`
+        // pickers, the `/tree` and `/fork` selectors, and the `/share`
+        // loader own the frame like the TS overlays.
+        let overlay_focused = view.model_picker.is_some()
             || view.effort_picker.is_some()
             || view.tree_selector.is_some()
             || view.fork_selector.is_some()
-            || view.share_loader.is_some()
-        {
+            || view.share_loader.is_some();
+        // Wheel turns scroll only on the session surface; a pane owns the
+        // frame, the turn is consumed without scrolling.
+        if let Some(delta) = crate::mouse::wheel_scroll_delta(&event) {
+            if !overlay_focused {
+                view.scroll_by(delta);
+                self.dirty = true;
+            }
             return;
         }
-        if let Some(delta) = crate::mouse::wheel_scroll_delta(&event) {
-            view.scroll_by(delta);
-            self.dirty = true;
+        // Screen cells are one-based in the report (TS passes `event.y - 1`).
+        let row = event.y.saturating_sub(1) as usize;
+        let col = event.x.saturating_sub(1) as usize;
+        let left_press = event.press && event.button == crate::mouse::BUTTON_LEFT;
+        if overlay_focused {
+            // TS tries the frame surface first while an overlay owns the
+            // frame (its rows are the selectable spans), then the window.
+            self.stop_selection_auto_scroll();
+            if left_press && !event.motion {
+                if !view.begin_frame_selection(row, col) {
+                    view.begin_selection(row, col);
+                }
+                self.dirty = true;
+            } else if left_press && event.motion {
+                view.extend_active_selection(row, col);
+                self.dirty = true;
+            } else if !event.press && view.has_selection() {
+                let text = view.end_active_selection();
+                if let Some(text) = text {
+                    self.copy_selection(&text, view);
+                }
+                self.dirty = true;
+            } else if !event.press {
+                view.clear_selection();
+            }
+            return;
         }
+        if left_press && !event.motion {
+            self.stop_selection_auto_scroll();
+            // TS `beginSelection` then the `beginFrameSelection` fallback.
+            if !view.begin_selection(row, col) {
+                view.begin_frame_selection(row, col);
+            }
+            self.dirty = true;
+        } else if left_press && event.motion {
+            view.extend_active_selection(row, col);
+            self.update_selection_auto_scroll(view, row, col);
+            self.dirty = true;
+        } else if !event.press && view.has_selection() {
+            self.stop_selection_auto_scroll();
+            let text = view.end_active_selection();
+            if let Some(text) = text {
+                self.copy_selection(&text, view);
+            }
+            self.dirty = true;
+        } else if !event.press {
+            self.stop_selection_auto_scroll();
+            view.clear_selection();
+        }
+    }
+
+    /// Copy a finished selection out (TS `copySelection` +
+    /// `copyFullscreenSelection`): OSC 52 works locally, over SSH, and
+    /// through tmux (`set-clipboard`), so the write goes straight to the
+    /// terminal; a headless run has no terminal and records the text for
+    /// its verifier instead. A successful copy surfaces the
+    /// "Copied selection to clipboard" status row (TS `showStatus`), a
+    /// failed write the failure row (TS `showError`).
+    fn copy_selection(&mut self, text: &str, view: &mut AgentView) {
+        let lines = text.lines().count().max(1);
+        self.copies.push(text.to_string());
+        self.track_selection(lines);
+        if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            self.note("Copied selection to clipboard", view);
+            return;
+        }
+        use base64::Engine;
+        use std::io::Write;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let mut out = std::io::stdout();
+        match out.write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes()) {
+            Ok(()) => {
+                let _ = out.flush();
+                self.note("Copied selection to clipboard", view);
+            }
+            Err(error) => {
+                self.error_row(&format!("Failed to copy selection: {error}"), view);
+            }
+        }
+    }
+
+    /// Arm, re-aim, or disarm the selection auto-scroll for a drag position
+    /// (TS `updateSelectionAutoScroll`).
+    fn update_selection_auto_scroll(&mut self, view: &AgentView, row: usize, col: usize) {
+        match view.selection_auto_scroll_direction(row) {
+            Some(direction) => match &mut self.selection_auto_scroll {
+                Some(armed) if armed.direction == direction => {
+                    armed.row = row;
+                    armed.col = col;
+                }
+                _ => {
+                    self.selection_auto_scroll = Some(SelectionAutoScroll {
+                        direction,
+                        row,
+                        col,
+                        started: Instant::now(),
+                    })
+                }
+            },
+            None => self.selection_auto_scroll = None,
+        }
+    }
+
+    /// Stop the selection auto-scroll (TS `stopSelectionAutoScroll`): every
+    /// non-drag input and each scroll edge case disarms it.
+    pub(crate) fn stop_selection_auto_scroll(&mut self) {
+        self.selection_auto_scroll = None;
+    }
+
+    /// One idle tick of the selection auto-scroll (the run loop's 50 ms arm
+    /// stands in for TS's timer): after the 150 ms hold window, each tick
+    /// scrolls one line set and re-aims the head onto the edge row; the
+    /// drag ending, the edge direction changing, or the scroll clamping
+    /// disarms the driver.
+    pub(crate) fn selection_auto_scroll_tick(&mut self, view: &mut AgentView) {
+        let Some(armed) = self.selection_auto_scroll.clone() else {
+            return;
+        };
+        if Instant::now().duration_since(armed.started) < SELECTION_AUTO_SCROLL_DELAY {
+            return;
+        }
+        if view.selection_auto_scroll_direction(armed.row) != Some(armed.direction)
+            || !view.scroll_selection(armed.direction, armed.col)
+        {
+            self.selection_auto_scroll = None;
+            return;
+        }
+        self.dirty = true;
     }
 
     /// A bracketed paste (TS routes terminal paste into the focused input):
@@ -2766,6 +2929,21 @@ impl SessionUi {
         if let Some(telemetry) = self.telemetry.clone() {
             tokio::spawn(async move {
                 telemetry.scroll_used(action, resumed_following).await;
+            });
+        }
+    }
+
+    /// Report the run's first selection copy (`tui selection used`),
+    /// fire-and-forget like the scroll event: the release never waits on
+    /// the telemetry flush. `lines` is the copied text's line count.
+    fn track_selection(&mut self, lines: usize) {
+        if self.selection_adoption_emitted {
+            return;
+        }
+        self.selection_adoption_emitted = true;
+        if let Some(telemetry) = self.telemetry.clone() {
+            tokio::spawn(async move {
+                telemetry.selection_used(lines).await;
             });
         }
     }

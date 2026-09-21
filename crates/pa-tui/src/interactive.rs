@@ -64,7 +64,8 @@ pub struct ModelSelection {
 }
 
 /// Adoption telemetry for interactive-view interactions (schema v1 events
-/// `tui scroll used` and `tui exit`). pa-tui stays pa-types-only, so the
+/// `tui scroll used`, `tui selection used`, and `tui exit`). pa-tui stays
+/// pa-types-only, so the
 /// composition root implements this against the telemetry client.
 /// The seam is object-safe (held as `Arc<dyn InteractionTelemetry>` in the
 /// options and session UI), so the async methods return boxed futures with an
@@ -77,6 +78,9 @@ pub trait InteractionTelemetry: Send + Sync {
         action: &'static str,
         resumed_following: bool,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// The run's first selection copy (`tui selection used`): `lines` is
+    /// the copied text's line count.
+    fn selection_used(&self, lines: usize) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// A builtin client command was submitted (`agent command used`):
     /// `command` is the canonical name (`model`, `effort`, ...). Session
     /// commands report through the session telemetry instead.
@@ -422,6 +426,9 @@ pub struct InteractiveOutcome {
     pub agents_view_scope: Option<crate::agents_view::AgentsViewScope>,
     /// `/resume <selector>` requested this session next.
     pub selection_request: Option<SessionSelection>,
+    /// Texts copied out by finished mouse selections (headless runs have
+    /// no terminal for OSC 52; the verifiers read these).
+    pub copies: Vec<String>,
 }
 
 /// Inputs consumed by the UI loop. Terminal keys arrive one event at a time;
@@ -606,6 +613,7 @@ pub async fn run_interactive(
                 // or pending selection applies.
                 return_to_agents_view: false,
                 selection_request: None,
+                copies: Vec::new(),
             });
         }
     }
@@ -657,6 +665,9 @@ pub async fn run_interactive(
             session.dirty = true;
             match input {
                 UiInput::Key(key) => {
+                    // TS stops the selection auto-scroll on every
+                    // non-mouse input (`handleFullscreenInput`).
+                    session.stop_selection_auto_scroll();
                     session.handle_key(key, &mut view, &mut running).await?;
                     // TS `handleCtrlZ` (`app.suspend`, default ctrl+z):
                     // hand the terminal to the shell and stop the process
@@ -688,6 +699,7 @@ pub async fn run_interactive(
                     }
                 }
                 UiInput::Paste(text) => {
+                    session.stop_selection_auto_scroll();
                     session.handle_paste(&text, &mut view);
                 }
                 // A mouse report reaches the transcript scroll dispatch
@@ -705,6 +717,7 @@ pub async fn run_interactive(
                     session.materialize_editor_autocomplete(&mut view);
                 }
                 UiInput::Submit(text) => {
+                    session.stop_selection_auto_scroll();
                     // A terminal-suspending client command (`/mcp login`):
                     // the auth flow prompts on the plain terminal.
                     let suspended = session.needs_terminal_suspension(&text);
@@ -725,8 +738,12 @@ pub async fn run_interactive(
                     }
                 }
                 UiInput::HeadlessDone => headless_done = true,
-                UiInput::ScrollTop => view.scroll_to_top(),
+                UiInput::ScrollTop => {
+                    session.stop_selection_auto_scroll();
+                    view.scroll_to_top();
+                }
                 UiInput::Resize => {
+                    session.stop_selection_auto_scroll();
                     // The editor lays its window out against the new row
                     // count; the branch's dirty flag repaints the frame at
                     // the new geometry.
@@ -1014,6 +1031,12 @@ pub async fn run_interactive(
                 // a typed command plus Enter in one burst submits as typed
                 // and the dropdown opens only once typing pauses).
                 session.materialize_editor_autocomplete(&mut view);
+                // The same tick drives the selection auto-scroll (TS's
+                // 150 ms hold + 50 ms interval timer): a drag holding the
+                // window edge keeps scrolling while no other input
+                // arrives, which is the only time this arm runs at that
+                // cadence.
+                session.selection_auto_scroll_tick(&mut view);
             }
         }
 
@@ -1091,6 +1114,7 @@ pub async fn run_interactive(
         return_to_agents_view: preserve_alt_screen,
         agents_view_scope: session.scoped_agents_view.take(),
         selection_request: session.pending_selection,
+        copies: std::mem::take(&mut session.copies),
     };
     session.client.close();
     // A handoff (agents view, `/resume <selector>`) lets the process keep
