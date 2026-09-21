@@ -42,6 +42,10 @@
 			"types": "./dist/providers/openai-responses.d.ts",
 			"import": "./dist/providers/openai-responses.js"
 		},
+		"./sail-responses": {
+			"types": "./dist/providers/sail-responses.d.ts",
+			"import": "./dist/providers/sail-responses.js"
+		},
 		"./oauth": {
 			"types": "./dist/oauth.d.ts",
 			"import": "./dist/oauth.js"

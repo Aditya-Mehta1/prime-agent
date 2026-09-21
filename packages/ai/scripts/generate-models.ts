@@ -1479,7 +1479,71 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 	}
 }
 
+async function fetchSailModels(): Promise<Model<"sail-responses">[]> {
+	// Rates and context: https://docs.sailresearch.com/models and /pricing,
+	// checked 2026-09-20. Keep output conservative until larger runs are verified.
+	const entries: (Pick<Model<"sail-responses">, "id" | "name" | "cost" | "thinkingLevelMap"> & {
+		asapCost: Model<"sail-responses">["cost"];
+	})[] = [
+		{
+			id: "zai-org/GLM-5.3",
+			name: "GLM 5.3",
+			cost: { input: 0.4, output: 1.8, cacheRead: 0.08, cacheWrite: 0 },
+			asapCost: { input: 0.98, output: 3.08, cacheRead: 0.18, cacheWrite: 0 },
+			// Sail rejects reasoning=none; low is GLM-5.3's lowest native tier.
+			thinkingLevelMap: { off: null, minimal: null, xhigh: "xhigh", max: "max" },
+		},
+		{
+			id: "zai-org/GLM-5.3-Flash",
+			name: "GLM 5.3 Flash",
+			cost: { input: 0.05, output: 0.18, cacheRead: 0.01, cacheWrite: 0 },
+			asapCost: { input: 0.11, output: 0.35, cacheRead: 0.02, cacheWrite: 0 },
+		},
+	];
+	const models = entries.flatMap(({ asapCost, ...entry }) =>
+		["sail-asap", "sail"].map((provider): Model<"sail-responses"> => ({
+			...entry,
+			name: `${entry.name} (${provider === "sail-asap" ? "ASAP" : "Flex"})`,
+			cost: provider === "sail-asap" ? asapCost : entry.cost,
+			api: "sail-responses",
+			provider,
+			baseUrl: "https://api.sailresearch.com/v1",
+			reasoning: true,
+			input: ["text"],
+			contextWindow: 1000000,
+			maxTokens: 8192,
+			featured: true,
+		})),
+	);
+	if (process.env.SAIL_API_KEY) {
+		const response = await fetch("https://api.sailresearch.com/v1/models", {
+			headers: { Authorization: `Bearer ${process.env.SAIL_API_KEY}` },
+		});
+		if (!response.ok) throw new Error(`Sail model catalog returned HTTP ${response.status}`);
+		const catalog: unknown = await response.json();
+		if (!isRecord(catalog) || !Array.isArray(catalog.data)) throw new Error("Invalid Sail model catalog");
+		const available = new Set(catalog.data.filter(isRecord).map((item) => item.id));
+		for (const model of models) {
+			if (!available.has(model.id)) throw new Error(`Sail model is unavailable: ${model.id}`);
+		}
+	}
+	return models;
+}
+
 async function generateModels() {
+	// Refresh Sail without churning unrelated provider snapshots.
+	if (process.argv.includes("--provider=sail")) {
+		const models = await fetchSailModels();
+		const providers = Object.fromEntries(
+			["sail-asap", "sail"].map((provider) => [
+				provider,
+				Object.fromEntries(models.filter((model) => model.provider === provider).map((model) => [model.id, model])),
+			]),
+		);
+		writeFileSync(join(packageRoot, "src/models.generated.ts"), renderModelsFile({ ...EXISTING_MODELS, ...providers }));
+		console.log("Generated Sail models in src/models.generated.ts");
+		return;
+	}
 	// Fetch models from both sources
 	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras
 	// OpenRouter: xAI and other providers (excluding Anthropic, Google, OpenAI)
@@ -2259,6 +2323,7 @@ async function generateModels() {
 
 	const primeInferenceModels = await fetchPrimeInferenceModels();
 	allModels.push(...primeInferenceModels);
+	allModels.push(...await fetchSailModels());
 
 	const azureOpenAiModels: Model<Api>[] = allModels
 		.filter((model) => model.provider === "openai" && model.api === "openai-responses")

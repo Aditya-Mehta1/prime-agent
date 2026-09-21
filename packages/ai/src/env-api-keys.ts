@@ -103,6 +103,8 @@ function getApiKeyEnvVars(provider: string): readonly string[] | undefined {
 		openai: "OPENAI_API_KEY",
 		"azure-openai-responses": "AZURE_OPENAI_API_KEY",
 		"prime-inference": "PRIME_API_KEY",
+		sail: "SAIL_API_KEY",
+		"sail-asap": "SAIL_API_KEY",
 		deepseek: "DEEPSEEK_API_KEY",
 		google: "GEMINI_API_KEY",
 		"google-vertex": "GOOGLE_CLOUD_API_KEY",

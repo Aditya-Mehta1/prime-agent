@@ -21,6 +21,7 @@ export type {
 export type { OpenAICompletionsOptions } from "./providers/openai-completions.js";
 export type { OpenAIResponsesOptions } from "./providers/openai-responses.js";
 export * from "./providers/register-builtins.js";
+export type { SailResponsesOptions } from "./providers/sail-responses.js";
 export * from "./session-resources.js";
 export * from "./stream.js";
 export * from "./types.js";

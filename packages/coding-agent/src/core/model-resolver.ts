@@ -37,6 +37,8 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"azure-openai-responses": "gpt-5.4",
 	"openai-codex": "gpt-5.5",
 	"prime-inference": PRIME_INFERENCE_DEFAULT_MODEL_ID,
+	"sail-asap": "zai-org/GLM-5.3-Flash",
+	sail: "zai-org/GLM-5.3-Flash",
 	deepseek: "deepseek-v4-pro",
 	google: "gemini-3.1-pro-preview",
 	"google-vertex": "gemini-3.1-pro-preview",

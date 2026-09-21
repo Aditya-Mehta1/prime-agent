@@ -19,6 +19,7 @@ import type { MistralOptions } from "./mistral.js";
 import type { OpenAICodexResponsesOptions } from "./openai-codex-responses.js";
 import type { OpenAICompletionsOptions } from "./openai-completions.js";
 import type { OpenAIResponsesOptions } from "./openai-responses.js";
+import type { SailResponsesOptions } from "./sail-responses.js";
 
 interface LazyProviderModule<
 	TApi extends Api,
@@ -111,6 +112,9 @@ let openAICompletionsProviderModulePromise:
 	| undefined;
 let openAIResponsesProviderModulePromise:
 	| Promise<LazyProviderModule<"openai-responses", OpenAIResponsesOptions, SimpleStreamOptions>>
+	| undefined;
+let sailResponsesProviderModulePromise:
+	| Promise<LazyProviderModule<"sail-responses", SailResponsesOptions, SimpleStreamOptions>>
 	| undefined;
 let bedrockProviderModuleOverride:
 	| LazyProviderModule<"bedrock-converse-stream", BedrockOptions, SimpleStreamOptions>
@@ -320,6 +324,16 @@ function loadBedrockProviderModule(): Promise<
 	return bedrockProviderModulePromise;
 }
 
+function loadSailResponsesProviderModule(): Promise<
+	LazyProviderModule<"sail-responses", SailResponsesOptions, SimpleStreamOptions>
+> {
+	sailResponsesProviderModulePromise ||= import("./sail-responses.js").then((provider) => ({
+		stream: provider.streamSailResponses,
+		streamSimple: provider.streamSimpleSailResponses,
+	}));
+	return sailResponsesProviderModulePromise;
+}
+
 export const streamAnthropic = createLazyStream(loadAnthropicProviderModule);
 export const streamSimpleAnthropic = createLazySimpleStream(loadAnthropicProviderModule);
 export const streamAzureOpenAIResponses = createLazyStream(loadAzureOpenAIResponsesProviderModule);
@@ -336,10 +350,18 @@ export const streamOpenAICompletions = createLazyStream(loadOpenAICompletionsPro
 export const streamSimpleOpenAICompletions = createLazySimpleStream(loadOpenAICompletionsProviderModule);
 export const streamOpenAIResponses = createLazyStream(loadOpenAIResponsesProviderModule);
 export const streamSimpleOpenAIResponses = createLazySimpleStream(loadOpenAIResponsesProviderModule);
+export const streamSailResponses = createLazyStream(loadSailResponsesProviderModule);
+export const streamSimpleSailResponses = createLazySimpleStream(loadSailResponsesProviderModule);
 const streamBedrockLazy = createLazyStream(loadBedrockProviderModule);
 const streamSimpleBedrockLazy = createLazySimpleStream(loadBedrockProviderModule);
 
 export function registerBuiltInApiProviders(): void {
+	registerApiProvider({
+		api: "sail-responses",
+		stream: streamSailResponses,
+		streamSimple: streamSimpleSailResponses,
+	});
+
 	registerApiProvider({
 		api: "anthropic-messages",
 		stream: streamAnthropic,

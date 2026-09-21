@@ -26,7 +26,7 @@ if [[ -n "${SAIL_API_KEY:-}" ]]; then
   trap - EXIT
 fi
 if [[ ! -e "$STATE/settings.json" ]]; then
-  printf '%s\n' '{"subagentDefaultModel":"sail/deepseek-ai/DeepSeek-V4-Flash-0731"}' > "$STATE/settings.json"
+  printf '%s\n' '{"defaultProvider":"sail-asap","defaultModel":"zai-org/GLM-5.3-Flash","subagentDefaultModel":"sail/zai-org/GLM-5.3-Flash"}' > "$STATE/settings.json"
 fi
 mkdir -p "$HOME/.local/bin"
 if [[ ! -e "$COMMAND" ]]; then
