@@ -6009,6 +6009,7 @@ export class AgentDaemon {
 				...(agent.sessionPath ? { sessionPath: canonicalSessionPath(agent.sessionPath) } : {}),
 				...(agent.rlmChildId ? { rlmChildId: agent.rlmChildId } : {}),
 				...(remote ? { activeSessionId: agent.activeSessionId } : {}),
+				...(agent.remoteHost ? { remoteHost: agent.remoteHost } : {}),
 				cwd: agent.cwd,
 			});
 		};

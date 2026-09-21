@@ -843,3 +843,83 @@ describe("daemon supervisor passive subagent topology", () => {
 		}
 	});
 });
+
+describe("daemon supervisor remote mesh routing", () => {
+	const meshHost = () => ({
+		tailnetHost: "milk.tailnet.ts.net",
+		online: true,
+		daemon: true,
+		sessions: [
+			{
+				id: "remote-active",
+				sessionId: "remote-session",
+				activeSessionId: "remote-active",
+				sessionName: "remote-agent",
+				lifecycle: "live" as const,
+				activity: "idle" as const,
+				cwd: "/remote/project",
+				messageCount: 3,
+				attachedClients: 0,
+				rlmDepth: 0,
+			},
+		],
+	});
+
+	it("routes remote sibling sends through the mesh transport", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-remote-send-"));
+		tempDirs.push(directory);
+		const deliveries: { host: { tailnetHost: string }; message: string; fromRelationship?: string }[] = [];
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+			remoteAgentMesh: {
+				source: { listRemoteAgents: async () => [meshHost()] },
+				transport: {
+					sendAgentMessage: async (delivery) => {
+						deliveries.push(delivery);
+						return {
+							id: "agentmsg_receipt",
+							source: "agent_message",
+							target: { activeSessionId: "remote-active", sessionId: "remote-session" },
+							message: delivery.message,
+							deliveryStatus: "delivered",
+						};
+					},
+				},
+			},
+		}) as unknown as SupervisorInternals & {
+			remoteAgentMeshState?: { refresh(): Promise<boolean> };
+		};
+		const resident = worker("local", [
+			summary({
+				id: "local-active",
+				activeSessionId: "local-active",
+				sessionId: "local-session",
+				sessionName: "local-agent",
+				rlmDepth: 0,
+			}),
+		]);
+		supervisor.workers.set("local", resident);
+		seedSupervisorRoster(supervisor, resident);
+		// Roster queries populate the mesh cache; the send resolves against it.
+		await supervisor.remoteAgentMeshState!.refresh();
+
+		const response = (await supervisor.handleCommand(
+			{ id: "client", attachedActiveSessionIds: new Set<string>() },
+			{
+				type: "send_message",
+				targetActiveSessionId: "remote-agent",
+				fromActiveSessionId: "local-active",
+				agentOrigin: true,
+				message: "hello over the tailnet",
+			},
+		)) as { success: boolean; data: { deliveryStatus: string } };
+		expect(response.success).toBe(true);
+		expect(response.data.deliveryStatus).toBe("delivered");
+		expect(deliveries[0]).toMatchObject({
+			host: { tailnetHost: "milk.tailnet.ts.net" },
+			message: "hello over the tailnet",
+			fromRelationship: "sibling",
+		});
+	});
+});

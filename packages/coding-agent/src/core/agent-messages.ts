@@ -63,6 +63,8 @@ export interface AgentSessionMessageAgentSummary extends AgentSessionMessageEndp
 	cwd: string;
 	isStreaming: boolean;
 	unfinishedActionCount: number;
+	/** MagicDNS hostname when this peer runs on a remote daemon (tailnet mesh). */
+	remoteHost?: string;
 	parentActiveSessionId?: string;
 	rlmChildId?: string;
 	sessionDir?: string;
@@ -95,6 +97,8 @@ export interface AgentFamilyCatalogEntry {
 	/** Persisted transcript facts; known only for entries read from disk. */
 	messageCount?: number;
 	firstMessage?: string;
+	/** MagicDNS hostname when this entry runs on a remote daemon (tailnet mesh). */
+	remoteHost?: string;
 }
 
 export interface AgentFamilyMember {

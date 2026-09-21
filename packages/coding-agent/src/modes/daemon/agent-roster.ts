@@ -48,7 +48,7 @@ export interface WorkerRosterEntry {
 
 export interface AgentRosterEntry extends WorkerRosterEntry {
 	status: AgentRosterStatus;
-	statusLabel?: "queued" | "recovering" | "failed";
+	statusLabel?: "queued" | "recovering" | "failed" | "offline";
 	lastHeardFromAt?: string;
 	workerId?: string;
 }

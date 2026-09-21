@@ -2,16 +2,21 @@ import chalk from "chalk";
 import { formatSessionDisplayId } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 
-// Display status derived from the lifecycle + activity axes.
-type ListStatus = "working" | "idle" | "archived";
+// Display status derived from the lifecycle + activity axes, plus the remote
+// mesh reachability axis: an unreachable tailnet peer reads "offline".
+type ListStatus = "working" | "idle" | "offline" | "archived";
 
 const LIST_STATUS_ORDER: Record<ListStatus, number> = {
 	working: 0,
 	idle: 1,
-	archived: 2,
+	offline: 2,
+	archived: 3,
 };
 
 function listStatusForSummary(summary: SessionSummary): ListStatus {
+	if (summary.remoteOffline === true) {
+		return "offline";
+	}
 	if (summary.lifecycle === "archived") {
 		return "archived";
 	}
@@ -26,19 +31,26 @@ type ListRow = {
 	model: string;
 	messages: string;
 	clients: string;
+	host: string;
 };
 
 export function formatSessionListTable(sessions: readonly SessionSummary[], nowMs = Date.now()): string {
+	// The host column appears only when a remote mesh session is present, so a
+	// purely local table keeps its long-standing column layout byte-for-byte.
+	const showHost = sessions.some((session) => session.remoteHost !== undefined);
 	const rows = sortSessionsForList(sessions).map((session) => ({
 		name: session.sessionName ?? "",
 		id: formatSessionDisplayId(session.id),
 		status: listStatusForSummary(session),
 		age: formatSessionAge(session.modified, nowMs),
-		model: formatModelSelector(session.model),
+		model: formatModelSelector(session.model, session.remoteModel),
 		messages: String(session.messageCount),
 		clients: String(session.attachedClients),
+		host: session.remoteHost ?? "",
 	}));
-	return formatTable(["name", "id", "status", "age", "model", "messages", "clients"], rows, formatListCell);
+	const columns: Array<keyof ListRow> = ["name", "id", "status", "age", "model", "messages", "clients"];
+	if (showHost) columns.push("host");
+	return formatTable(columns, rows, formatListCell);
 }
 
 function sortSessionsForList(sessions: readonly SessionSummary[]): SessionSummary[] {
@@ -63,6 +75,7 @@ function formatListCell(row: ListRow, column: keyof ListRow, value: string): str
 			return chalk.red(value);
 		case "idle":
 			return chalk.blue(value);
+		case "offline":
 		case "archived":
 			return chalk.dim(value);
 	}
@@ -99,8 +112,10 @@ function formatSessionAge(modified: string | undefined, nowMs: number): string {
 	return `${Math.floor(ageWeeks / 52)}y`;
 }
 
-function formatModelSelector(model: SessionSummary["model"]): string {
-	return model ? `${model.provider}/${model.id}` : "";
+function formatModelSelector(model: SessionSummary["model"], remoteModel: SessionSummary["remoteModel"]): string {
+	if (model) return `${model.provider}/${model.id}`;
+	// Remote mesh rows carry a display-only model identity.
+	return remoteModel ? `${remoteModel.provider}/${remoteModel.modelId}` : "";
 }
 
 function formatTable<T extends Record<string, string>>(

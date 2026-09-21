@@ -1220,6 +1220,11 @@ export function getSessionStatusLabel(summary: SessionSummary, heartbeat?: Unifi
 	if (summary.statusLabel !== undefined) {
 		return summary.statusLabel;
 	}
+	// A remote mesh row the last scan could not reach reads "offline"; local
+	// runtime flags below would otherwise misreport its last known activity.
+	if (summary.remoteOffline === true) {
+		return "offline";
+	}
 	if (summary.lastHeardFromAt !== undefined) {
 		return `last heard ${formatAgeLabel(summary.lastHeardFromAt)}`;
 	}
@@ -1260,7 +1265,9 @@ export function getSessionStatusLabel(summary: SessionSummary, heartbeat?: Unifi
 		return "replied";
 	}
 	if (summary.activity === "working") {
-		return "classifying";
+		// Local rows in this state are mid-classification; remote rows only publish
+		// activity, so the honest label is the coarse one.
+		return summary.remoteHost !== undefined ? "working" : "classifying";
 	}
 	if (summary.taskState === "error") {
 		return "error";
