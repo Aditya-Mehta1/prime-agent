@@ -10,7 +10,7 @@ import {
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
-import { theme } from "../theme/theme.js";
+import { theme } from "../../../core/theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyText } from "./keybinding-hints.js";
 

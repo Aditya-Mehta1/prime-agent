@@ -13,7 +13,7 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "../../../core/keybindings.js";
-import { getEditorTheme, theme } from "../theme/theme.js";
+import { getEditorTheme, theme } from "../../../core/theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint } from "./keybinding-hints.js";
 

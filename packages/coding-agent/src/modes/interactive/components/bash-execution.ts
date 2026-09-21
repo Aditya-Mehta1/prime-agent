@@ -1,12 +1,12 @@
 import { Clickable, Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
+import { theme } from "../../../core/theme/theme.js";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	type TruncationResult,
 	truncateTail,
 } from "../../../core/tools/truncate.js";
-import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyText } from "./keybinding-hints.js";
 import { truncateToVisualLines } from "./visual-truncate.js";

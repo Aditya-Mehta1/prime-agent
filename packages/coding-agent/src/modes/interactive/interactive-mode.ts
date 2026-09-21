@@ -175,6 +175,23 @@ import {
 	captureOnboardingCompleted,
 	type TelemetryOnboardingOutcome,
 } from "../../core/telemetry.js";
+import {
+	getAvailableThemes,
+	getAvailableThemesWithPaths,
+	getEditorTheme,
+	getMarkdownTheme,
+	getThemeByName,
+	initTheme,
+	onThemeChange,
+	setRegisteredThemes,
+	setTheme,
+	setThemeInstance,
+	stopThemeWatcher,
+	Theme,
+	type ThemeColor,
+	theme,
+} from "../../core/theme/theme.js";
+import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "../../core/theme/working-icon.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_COMPACT_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
@@ -317,23 +334,6 @@ import { isOnboardingModelReady, type OnboardingStartupState, shouldRunOnboardin
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
 import { formatResumeHint } from "./resume-hint.js";
-import {
-	getAvailableThemes,
-	getAvailableThemesWithPaths,
-	getEditorTheme,
-	getMarkdownTheme,
-	getThemeByName,
-	initTheme,
-	onThemeChange,
-	setRegisteredThemes,
-	setTheme,
-	setThemeInstance,
-	stopThemeWatcher,
-	Theme,
-	type ThemeColor,
-	theme,
-} from "./theme/theme.js";
-import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-icon.js";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;

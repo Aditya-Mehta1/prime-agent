@@ -6,7 +6,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { theme } from "../theme/theme.js";
+import { theme } from "../../../core/theme/theme.js";
 import { expandCollapseHint } from "./keybinding-hints.js";
 
 export interface CollapsibleErrorOptions {

@@ -24,6 +24,15 @@ import {
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
+import {
+	getEditorTheme,
+	initTheme,
+	onThemeChange,
+	setRegisteredThemes,
+	stopThemeWatcher,
+	theme,
+} from "../../core/theme/theme.js";
+import { WORKING_ICON_INTERVAL_MS, workingIconFrame } from "../../core/theme/working-icon.js";
 import { canonicalizePath } from "../../utils/paths.js";
 import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
@@ -51,15 +60,6 @@ import { keyText } from "../interactive/components/keybinding-hints.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
 import type { InteractiveModeUiServices } from "../interactive/interactive-mode-services.js";
 import { ClientPromptStashStore } from "../interactive/prompt-stash-state.js";
-import {
-	getEditorTheme,
-	initTheme,
-	onThemeChange,
-	setRegisteredThemes,
-	stopThemeWatcher,
-	theme,
-} from "../interactive/theme/theme.js";
-import { WORKING_ICON_INTERVAL_MS, workingIconFrame } from "../interactive/theme/working-icon.js";
 import {
 	formatPackageUpdateNotice,
 	formatTmuxWarningNotice,

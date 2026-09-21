@@ -1,7 +1,7 @@
 import { type Component, type Focusable, getKeybindings, Spacer, TruncatedText } from "@earendil-works/pi-tui";
 import type { AgentHeartbeatManagementAction } from "../../../core/cron-jobs.js";
+import { theme } from "../../../core/theme/theme.js";
 import type { AgentConnectionHeartbeat } from "../../agent-connection/types.js";
-import { theme } from "../theme/theme.js";
 import { keyHint } from "./keybinding-hints.js";
 import { getMenuListLayout, MenuList, MenuPanel, MenuRow } from "./menu-panel.js";
 import { shouldTreatAsBack } from "./modal-back.js";

@@ -4,7 +4,6 @@ import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { expandCollapseHint } from "../../modes/interactive/components/keybinding-hints.js";
 import { truncateToVisualLines } from "../../modes/interactive/components/visual-truncate.js";
-import { theme } from "../../modes/interactive/theme/theme.js";
 import { spawnHidden, waitForChildProcess } from "../../utils/child-process.js";
 import {
 	getShellConfig,
@@ -14,6 +13,7 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
+import { theme } from "../theme/theme.js";
 import { previewBashCommand } from "./code-preview.js";
 import { OutputAccumulator } from "./output-accumulator.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
