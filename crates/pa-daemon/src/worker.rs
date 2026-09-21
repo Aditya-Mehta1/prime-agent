@@ -5525,7 +5525,11 @@ mod tests {
     /// budget-free loop keeps prompting until the kernel's
     /// `goal.complete()` (the scripted ipython tool call, the f18
     /// completion surface) settles the goal, and the completion's
-    /// boundary mints nothing more.
+    /// boundary mints nothing more. The completing cell needs a
+    /// bootable kernel: a sandbox gate run must provide uv and
+    /// PI_PACKAGE_DIR at the checkout (the guard inside names the
+    /// recipe when the cell fails instead of letting the loop drain
+    /// the faux script into a misleading count mismatch).
     #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
     #[tokio::test]
     async fn goal_turn_end_loop_runs_to_completion() {
@@ -5582,6 +5586,27 @@ mod tests {
         let idle = worker.dispatch("wait_for_idle", &json!({})).await;
         assert!(idle.success, "the goal loop never settled: {idle:?}");
         let events = session_events_since(&mut subscription);
+        // A gate run without the kernel environment (uv on PATH and
+        // PI_PACKAGE_DIR at the checkout — docs/parity-battery.md,
+        // "Sandbox-built rust binary + kernel runtime") fails the
+        // completing ipython cell: the goal stays active and the loop
+        // keeps minting (TS parity: goal continuations are unbounded while
+        // the goal is active) until the faux script runs dry. Fail with
+        // the diagnosis instead of the misleading continuation-count
+        // mismatch.
+        let kernel_failure = events.iter().find(|event| {
+            event.get("type").and_then(Value::as_str) == Some("message_end")
+                && event["message"]["role"] == "toolResult"
+                && event["message"]["isError"] == json!(true)
+        });
+        if let Some(failure) = kernel_failure {
+            panic!(
+                "the completing ipython cell failed — this test needs the kernel \
+                 environment (uv on PATH and PI_PACKAGE_DIR at the checkout; \
+                 docs/parity-battery.md, \"Sandbox-built rust binary + kernel \
+                 runtime\"): {failure:?}"
+            );
+        }
         // Each minted continuation ran as a queued follow-up turn: the
         // start row plus two continuation rows (the completion turn is the
         // second continuation's turn).

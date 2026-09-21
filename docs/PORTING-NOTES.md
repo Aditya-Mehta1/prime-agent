@@ -591,6 +591,19 @@ model-surface row still compares against the TS binary:
 
 ## Kernel packaging lane notes
 
+- Sandbox cargo gates for kernel-dependent tests: a sandbox build bakes the
+  build machine's source-checkout path into runtime resolution, and a bare
+  sandbox has no `uv` and no packaged sidecar — every kernel ipython cell
+  fails at startup (`kernel startup failed … uv is required …`). Gate runs
+  whose tests execute ipython cells (the pa-daemon goal-loop worker test,
+  the f18 battery flow) must install uv
+  (`curl -LsSf https://astral.sh/uv/install.sh | sh`) and export
+  `PI_PACKAGE_DIR=<repo checkout>` so the vendored `prime-agent-runtime/`
+  resolves (docs/parity-battery.md, "Sandbox-built rust binary + kernel
+  runtime"). Without it the goal-loop worker test fails with a misleading
+  continuation-count mismatch: `goal.complete()` never runs, the goal stays
+  active, and the loop (TS parity: goal continuations are unbounded while
+  the goal is active) mints until the faux script runs dry.
 - Packaged layout (TS install.sh native path + copy-binary-assets.mjs): the
   release artifact is the binary plus exe-adjacent `package.json` (the
   version manifest: `{"version", "piConfig"}`), `prime-agent-runtime/` (the
