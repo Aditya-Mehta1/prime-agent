@@ -2787,10 +2787,10 @@ export class AgentsViewMode implements Component, Focusable {
 				: row.summary.statusLabel !== undefined
 					? row.statusLabel
 					: undefined;
-		// Remote mesh rows append a dim "on <tailnet-host>" metadata suffix to the
-		// activity cell: the 28-char name cell cannot hold a MagicDNS hostname,
-		// while the activity column shows it without competing with the name.
-		const activity = [status, row.summary.summary, remoteHostLabel(row)].filter(Boolean).join(" · ");
+		// Remote mesh rows lead with a dim "on <tailnet-host>" label in the activity
+		// cell: the 28-char name cell cannot hold a MagicDNS hostname, and the label
+		// stays visible when the bounded cell truncates a long summary.
+		const activity = [status, remoteHostLabel(row), row.summary.summary].filter(Boolean).join(" · ");
 		const cells = [
 			formatTableCell(title, layout.nameWidth),
 			formatTableCell(theme.fg("muted", formatSessionModel(row)), layout.modelWidth),

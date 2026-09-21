@@ -1783,6 +1783,15 @@ describe("agents view remote mesh rows", () => {
 				"offline · on milk.tailnet.ts.net",
 			);
 
+			// A long summary must not truncate the leading host label away.
+			const long = buildAgentsViewRows([
+				remoteSummary({ summary: "investigating the regression suite across three repositories".repeat(2) }),
+			]);
+			self.rows = long;
+			const longLine = stripAnsi(invoke("renderRow", self, long[0], 120) as string);
+			expect(longLine).toContain("on milk.tailnet.ts.net");
+			expect(longLine.indexOf("on milk.tailnet.ts.net")).toBeLessThan(longLine.indexOf("investigating"));
+
 			// Local actions stay off remote rows: attach, reply, rename, delete.
 			self.rows = offline;
 			invoke("openSelected", self);

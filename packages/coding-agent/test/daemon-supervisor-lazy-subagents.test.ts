@@ -845,81 +845,77 @@ describe("daemon supervisor passive subagent topology", () => {
 });
 
 describe("daemon supervisor remote mesh routing", () => {
-	const meshHost = () => ({
-		tailnetHost: "milk.tailnet.ts.net",
-		online: true,
-		daemon: true,
-		sessions: [
-			{
-				id: "remote-active",
-				sessionId: "remote-session",
-				activeSessionId: "remote-active",
-				sessionName: "remote-agent",
-				lifecycle: "live" as const,
-				activity: "idle" as const,
-				cwd: "/remote/project",
-				messageCount: 3,
-				attachedClients: 0,
-				rlmDepth: 0,
+	// Mesh stub: every read needs a preceding refreshAwaiting, so a cold-cache supervisor refreshes first.
+	function meshStub(deliveries: unknown[]) {
+		let refreshed = false;
+		const consume = () => {
+			const ready = refreshed;
+			refreshed = false;
+			return ready;
+		};
+		const target = { sessionId: "r-s", activeSessionId: "r-a", summary: { rlmDepth: 0, rosterStatus: "idle" } };
+		return {
+			enabled: () => true,
+			refreshAwaiting: async () => {
+				refreshed = true;
 			},
-		],
-	});
+			findMessageTargets: () => (consume() ? [target] : []),
+			peerSummaries: () => (consume() ? [{ sessionName: "remote-agent" }] : []),
+			sendAgentMessage: async (delivery: { message: string }) => {
+				deliveries.push(delivery);
+				return { id: "r", target: {}, message: delivery.message, deliveryStatus: "delivered" };
+			},
+		};
+	}
 
-	it("routes remote sibling sends through the mesh transport", async () => {
-		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-remote-send-"));
+	it("resolves cold-cache peers and remote sends with saved-local precedence", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-remote-mesh-"));
 		tempDirs.push(directory);
-		const deliveries: { host: { tailnetHost: string }; message: string; fromRelationship?: string }[] = [];
+		const deliveries: unknown[] = [];
 		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
 			defaultSessionConfig: { agentDir: directory, cwd: directory },
 			descriptorDir: join(directory, "workers"),
-			remoteAgentMesh: {
-				source: { listRemoteAgents: async () => [meshHost()] },
-				transport: {
-					sendAgentMessage: async (delivery) => {
-						deliveries.push(delivery);
-						return {
-							id: "agentmsg_receipt",
-							source: "agent_message",
-							target: { activeSessionId: "remote-active", sessionId: "remote-session" },
-							message: delivery.message,
-							deliveryStatus: "delivered",
-						};
-					},
-				},
-			},
 		}) as unknown as SupervisorInternals & {
-			remoteAgentMeshState?: { refresh(): Promise<boolean> };
+			catalog: { resolve: (...a: string[]) => Promise<string> };
+			createOrReuseWorker: (c: string, m: object) => Promise<WorkerFixture>;
+			remoteAgentMeshState?: unknown;
 		};
-		const resident = worker("local", [
-			summary({
-				id: "local-active",
-				activeSessionId: "local-active",
-				sessionId: "local-session",
-				sessionName: "local-agent",
-				rlmDepth: 0,
-			}),
-		]);
+		supervisor.remoteAgentMeshState = meshStub(deliveries);
+		const resident = worker("local", [summary({ id: "l", sessionId: "l-s", rlmDepth: 0 })]);
 		supervisor.workers.set("local", resident);
 		seedSupervisorRoster(supervisor, resident);
-		// Roster queries populate the mesh cache; the send resolves against it.
-		await supervisor.remoteAgentMeshState!.refresh();
-
-		const response = (await supervisor.handleCommand(
-			{ id: "client", attachedActiveSessionIds: new Set<string>() },
-			{
-				type: "send_message",
-				targetActiveSessionId: "remote-agent",
-				fromActiveSessionId: "local-active",
-				agentOrigin: true,
-				message: "hello over the tailnet",
-			},
-		)) as { success: boolean; data: { deliveryStatus: string } };
-		expect(response.success).toBe(true);
-		expect(response.data.deliveryStatus).toBe("delivered");
-		expect(deliveries[0]).toMatchObject({
-			host: { tailnetHost: "milk.tailnet.ts.net" },
-			message: "hello over the tailnet",
-			fromRelationship: "sibling",
+		const client = { id: "sender", attachedActiveSessionIds: new Set<string>() };
+		const token = resident.descriptor.authenticationToken;
+		const send = (message: string, agentOrigin?: boolean) => ({
+			type: "send_message",
+			targetActiveSessionId: "remote-agent",
+			fromActiveSessionId: "l",
+			agentOrigin,
+			message,
 		});
+
+		// Cold cache: the sibling list itself refreshes the mesh before reading it.
+		const peers = (await supervisor.handleCommand(client, { type: "list_agent_peers", workerToken: token })) as {
+			data: { peers: { sessionName?: string }[] };
+		};
+		expect(peers.data.peers.map((peer) => peer.sessionName)).toContain("remote-agent");
+
+		// No saved local names "remote-agent": the catalog miss lets the remote sibling claim the send.
+		supervisor.catalog.resolve = vi.fn().mockRejectedValue(new Error("Unknown saved session"));
+		await supervisor.handleCommand(client, send("hi tailnet", true));
+		expect(deliveries[0]).toMatchObject({ message: "hi tailnet", fromRelationship: "sibling" });
+
+		// A saved local session shares the remote sibling's name: it wakes and wins the send.
+		const saved = summary({ id: "s", sessionId: "s", sessionName: "remote-agent", sessionFile: "/s.jsonl" });
+		const woken = worker("woken", [saved]);
+		woken.client.requestWorker.mockResolvedValue({ success: true, data: { deliveryStatus: "delivered" } });
+		supervisor.catalog.resolve = vi.fn(async () => "/s.jsonl");
+		supervisor.createOrReuseWorker = vi.fn(async () => {
+			seedSupervisorRoster(supervisor, woken);
+			return woken;
+		});
+		await supervisor.handleCommand(client, send("wake the saved local"));
+		expect(vi.mocked(supervisor.createOrReuseWorker).mock.calls[0]?.[1]).toMatchObject({ sessionPath: "/s.jsonl" });
+		expect(deliveries).toHaveLength(1);
 	});
 });
