@@ -133,8 +133,7 @@ impl SideQuestionPane {
             if let Some(message) = &turn.error_message {
                 // TS `renderAnswer`: the error row is a single-paddingX
                 // `Text` row; the `padded` prefix below supplies the pad.
-                let mut line: crate::Line = Vec::new();
-                line.push(crate::Span::styled(message.clone(), error));
+                let line: crate::Line = vec![crate::Span::styled(message.clone(), error)];
                 rendered.push(line);
             }
             if rendered.is_empty() {
@@ -146,8 +145,7 @@ impl SideQuestionPane {
                     "complete" => "No response".to_string(),
                     _ => "Thinking…".to_string(),
                 };
-                let mut line: crate::Line = Vec::new();
-                line.push(crate::Span::styled(text, user_text));
+                let line: crate::Line = vec![crate::Span::styled(text, user_text)];
                 rendered.push(line);
             }
             for line in rendered {
