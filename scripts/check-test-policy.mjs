@@ -53,10 +53,8 @@ function walkFiles(dir, out = []) {
 
 /**
  * Blank out strings, comments, and regex literals so the line scanners see
- * executable code only. `templateSpans`, when passed, collects the
- * `[start, end)` ranges of template-literal bodies: test files generate child
- * processes from template strings, and that generated source is executable
- * test code the scanners must still see.
+ * executable code only. `templateSpans` collects the `[start, end)` ranges of
+ * template-literal bodies for `templateLiteralSurface`.
  */
 function maskJsSyntax(content, templateSpans) {
 	let templateStart = -1;
@@ -165,10 +163,7 @@ function maskJsSyntax(content, templateSpans) {
 	return masked;
 }
 
-/**
- * Keep only template-literal bodies, blanked elsewhere, so the same scanners
- * can run over test code that is embedded in generated child-process sources.
- */
+/** Keep only template-literal bodies: generated child-process sources are test code too. */
 function templateLiteralSurface(content) {
 	const spans = [];
 	maskJsSyntax(content, spans);
@@ -593,12 +588,7 @@ export function scan(content, path = "", embedded = false) {
 	return violations;
 }
 
-/**
- * Every unsuppressed match in the whole test tree, grouped per file and
- * category. The delta check only looks at changed files, so the wall-clock
- * polls, sleeps, and conditional tests that predate the policy stay invisible
- * and permanent; freezing them here makes the debt reviewable and one-way.
- */
+/** Every unsuppressed match in the whole test tree, grouped per file and category. */
 function currentDebt() {
 	const debt = {};
 	const paths = [...walkFiles(resolve(root, "packages")), ...walkFiles(resolve(root, "prime-agent-runtime", "test"))].sort();
