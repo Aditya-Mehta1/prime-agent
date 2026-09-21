@@ -28,7 +28,10 @@ TS's serialized scheduling for the acp app mode).
 Supervisor process (one worker process per active session), restart/backoff
 supervision, session registry/roster + worker self-registration (session
 identity survives supervisor restarts: workers re-register with backoff and
-the roster rebuilds), append-only session store ownership (including the
+the roster rebuilds), parent-death child cleanup (`supervisor_parent_death.rs`:
+an unexpectedly exited worker's resident RLM children close with it - the
+same plain-stop semantics as the worker-side #246 close, which SIGKILL
+bypasses - via the durable create's `parentActiveSessionId` join), append-only session store ownership (including the
 compaction-entry fold for compacted message reads), client attach/detach
 (full-snapshot and chunked `session_snapshot_begin`/`chunk`/`end`
 streaming), direct-attach transport (supervisor-issued single-use tickets

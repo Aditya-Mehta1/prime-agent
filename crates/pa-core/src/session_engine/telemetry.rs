@@ -547,6 +547,17 @@ pub fn track_sessions_archived(client: &TelemetryClient, count: usize) {
     client.track("daemon event", properties);
 }
 
+/// Track the parent-death child close's `daemon event` (schema v1, kind
+/// `worker_children_closed`): how many resident RLM children the
+/// supervisor stopped with a hard-killed parent worker. A count only,
+/// never session payload.
+pub fn track_worker_children_closed(client: &TelemetryClient, count: usize) {
+    let mut properties = base_properties("daemon");
+    properties.set("kind", Value::from("worker_children_closed"));
+    properties.set("count", Value::from(count));
+    client.track("daemon event", properties);
+}
+
 /// Build the product telemetry client from settings (opt-in already
 /// resolved by the caller): PostHog sink when endpoint+key are configured
 /// (env `PRIME_AGENT_TELEMETRY_ENDPOINT`/`_API_KEY` override settings

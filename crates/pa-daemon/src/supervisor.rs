@@ -188,6 +188,19 @@ impl Supervisor {
         }
     }
 
+    /// Emit the parent-death child close's `daemon event` (schema v1,
+    /// kind `worker_children_closed`): a count only, never session
+    /// payload. Zero closes never emit (no children died with the
+    /// worker).
+    pub(crate) fn note_children_closed(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(client) = &*self.telemetry.lock().unwrap() {
+            pa_core::session_engine::telemetry::track_worker_children_closed(client, count);
+        }
+    }
+
     /// Emit a `daemon event` (best-effort, non-blocking; no-op when the
     /// daemon is opted out).
     fn note_daemon_event(&self, kind: &str, exit_reason: Option<&str>) {
@@ -470,6 +483,12 @@ impl Supervisor {
                 }
             }
             self.note_daemon_event("worker_exited", Some("crash"));
+            // A hard-killed parent bypasses every worker-side close (#246's
+            // teardowns never ran): the supervisor closes its resident RLM
+            // children here, before the restart, so a relaunched parent
+            // never resumes beside an orphaned child worker (TS children
+            // die with the in-process parent).
+            self.close_children_of_dead_parent(&resident).await;
             let failures = resident.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
             if failures > MAX_CONSECUTIVE_FAILURES {
                 let mut descriptor = resident.descriptor.lock().await;

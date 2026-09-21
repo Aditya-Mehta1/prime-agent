@@ -184,7 +184,7 @@ New v1 events (adoption backbone; lowercase-space naming kept for continuity):
 | `mcp connector used` | `server_name`, `action` (config/refresh/login) — server name ONLY | pa-core `mcp.rs` host handlers (`mcp.config`, `mcp.refresh`, optional `mcp.begin_login`) |
 | `kernel bootstrap` | `duration_ms`, `cold` (bool), `outcome` | `ReplKernelManager::start` (kernel/manager/startup.rs) |
 | `startup` | `duration_ms`, `phase_timings` (primitive map), `execution_mode` | pa-cli `run()` → first interactive frame; the `PI_STARTUP_BENCHMARK` phase timers |
-| `daemon event` | `kind` (worker_spawned/worker_exited/worker_restarted/attach/reattach/detach), plus counts only | pa-daemon supervisor worker lifecycle + attach flows |
+| `daemon event` | `kind` (worker_spawned/worker_exited/worker_restarted/attach/reattach/detach/sessions_archived/worker_children_closed), plus counts only | pa-daemon supervisor worker lifecycle + attach flows |
 | `session archived` | `duration_ms` (lifetime) | session archive path (session manager archive seam) |
 
 Prohibited by construction: any event property carrying content. Code review gate in

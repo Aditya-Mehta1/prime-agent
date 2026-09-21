@@ -2547,3 +2547,53 @@ Verifiers:
   carries no delete marker, an already-gone child is a no-op, a real
   close failure keeps the child tracked, and a closed child delivers no
   terminal notice.
+
+
+- lane `parent-death-cleanup`: supervisor parent-death child cleanup
+  (the #246 documented adjacent gap; TS parity ruling). TS ground truth
+  (`modes/daemon/daemon-mode.ts`): RLM children are hosted in the parent
+  session's process (`createRlmSubagentRuntime`), so they die WITH the
+  parent — a SIGKILLed parent takes its children down, and the durable
+  spawn ledger keeps each closed child as a passive roster row. The #246
+  Rust close (`SupervisorChildSessions::close_children`) runs inside the
+  parent worker's teardown paths (replacement, `kill`, `shutdown`), all
+  of which SIGKILL bypasses, so a hard-killed parent would leave its
+  supervisor-owned child workers running as orphans. Ruling: the
+  supervisor's worker-death monitoring is the only component that
+  observes the death, so the close ports there — on an unexpected exit
+  (`watch_worker`'s crash arm, before the restart backoff), every
+  resident worker whose durable create names the dead worker as its
+  parent stops with it. The join is the durable create's
+  `runtimeMetadata.parentActiveSessionId` against the dead worker's
+  `rootActiveSessionId` (the exact TS `getChildActiveSessionStates`
+  predicate; a depth-0 `rlm.create_session` root carries no parent link
+  and never matches, and a resumed/forked copy of the parent file under
+  another worker must not adopt another worker's children). The close
+  per child is the same wire action the #246 `close_children` issues:
+  a supervisor `kill` route with NO `rlmLedgerDelete` marker (a plain
+  stop — the ledger edge and the passive roster row survive, mirroring
+  TS `closeSessionOnce`'s no-tombstone close) plus the supervisor-side
+  kill completion (`stop_worker`: registry/roster removal + ledger
+  reseed, so the child passivates). Routing through the child worker's
+  own kill handler keeps the grandchild cascade (the kill route's
+  recursion, the TS `closeSessionOnce` cascade). Best-effort like the
+  daemon kill handler's swallowed close error: a failed close logs and
+  leaves the child resident (its durable parent link stays joinable for
+  a later pass or explicit kill); the walk never blocks the crash
+  recovery. The respawned parent replays its durable create and starts
+  with a fresh in-process registry (the #246 replacement ruling: the
+  roster starts empty; the closed children surface as passive ledger
+  rows). Telemetry: `daemon event` kind `worker_children_closed` with
+  the close count (schema additive).
+  Verifiers: `pa-daemon/tests/rlm_children_parent_death_e2e.rs` — a real
+  supervisor, a real parent worker whose kernel cell spawns the child
+  through the product `rlm.spawn` surface, a scripted child held
+  mid-run, then SIGKILL of the parent worker process (pid read from the
+  durable descriptor, environ-checked): the child's resident roster row
+  drops, its session file archives, the respawned parent's
+  `get_rlm_children` reads empty, `list --all` shows the child as a
+  passive ledger row (spawn edge intact, no delete record), while an
+  `rlm.create_session` root session SURVIVES the same hard kill. The
+  #246 replacement e2e stays green (the death close is the supervisor
+  arm of the same close semantics). Mutation-checked: disabling the
+  death close fails the e2e.
