@@ -75,21 +75,134 @@ pub(crate) fn escape_len(s: &str) -> Option<usize> {
 }
 
 pub fn str_width(s: &str) -> usize {
+    if s.is_empty() {
+        return 0;
+    }
+    // TS `isPrintableAscii` fast path: a pure printable-ASCII string is as
+    // wide as it is long, no grapheme segmentation needed.
+    if s.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return s.len();
+    }
+    if let Some(width) = width_cache().lock().unwrap().get(s) {
+        return *width;
+    }
+    use unicode_segmentation::UnicodeSegmentation;
     let mut width = 0;
     let mut rest = s;
     while !rest.is_empty() {
         match escape_len(rest) {
             Some(len) => rest = &rest[len..],
             None => {
-                let c = rest.chars().next().expect("non-empty rest");
-                width += char_width(c);
-                rest = &rest[c.len_utf8()..];
+                let g = rest.graphemes(true).next().expect("non-empty rest");
+                width += grapheme_width(g);
+                rest = &rest[g.len()..];
             }
         }
     }
+    let mut cache = width_cache().lock().unwrap();
+    // TS caps its width cache at 512 entries, evicting the oldest key; the
+    // HashMap has no insertion order, so evict an arbitrary key instead.
+    if cache.len() >= WIDTH_CACHE_SIZE {
+        if let Some(key) = cache.keys().next().cloned() {
+            cache.remove(&key);
+        }
+    }
+    cache.insert(s.to_string().into_boxed_str(), width);
     width
 }
 
+const WIDTH_CACHE_SIZE: usize = 512;
+
+fn width_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Box<str>, usize>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Box<str>, usize>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// A char that renders nothing on its own: controls and zero-width chars
+/// (unicode-width reports marks, joiners, and variation selectors as `None`).
+fn is_invisible(c: char) -> bool {
+    c.is_control() || c.width().unwrap_or(0) == 0
+}
+
+/// Width of one grapheme cluster (port of TS `graphemeWidth` in utils.ts).
+///
+/// TS measures whole clusters, not chars: RGI emoji sequences (ZWJ families,
+/// skin tones, keycaps, VS16 presentations) render 2 columns no matter how
+/// many code points they carry, regional indicators (flags, and isolated
+/// ones during streaming) render 2, halfwidth/fullwidth trailing forms add
+/// up, and all-invisible clusters render 0.
+/// True for the code-point blocks of the TS `couldBeEmoji` pre-filter (kept
+/// deliberately broad, like TS) plus the emoji-modifier skin tones.
+fn in_emoji_blocks(c: char) -> bool {
+    let cp = c as u32;
+    (0x1f000..=0x1fbff).contains(&cp)
+        || (0x2300..=0x23ff).contains(&cp)
+        || (0x2600..=0x27bf).contains(&cp)
+        || (0x2b50..=0x2b55).contains(&cp)
+}
+
+fn grapheme_width(g: &str) -> usize {
+    let mut chars = g.chars();
+    let Some(first) = chars.next() else {
+        return 0;
+    };
+    if chars.all(is_invisible) && is_invisible(first) {
+        // TS zeroWidthRegex: control / default-ignorable / mark-only cluster.
+        return 0;
+    }
+    // Regional indicators render as flag emoji even when isolated (the
+    // streamed halves of a flag pair drift alone during streaming).
+    if ('\u{1f1e6}'..='\u{1f1ff}').contains(&first) {
+        return 2;
+    }
+    if g.chars().count() <= 1 {
+        return char_width(first);
+    }
+    if is_rgi_emoji_cluster(first, g) {
+        // Approximation of the TS RGI_Emoji test: an emoji-led multi-char
+        // cluster (ZWJ family, skin tone, VS16 presentation, keycap) is
+        // one 2-column cell.
+        return 2;
+    }
+    // Base visible char plus the trailing forms TS counts: halfwidth/
+    // fullwidth forms and the Thai/Lao AM vowels; marks add nothing.
+    let mut w = char_width(first);
+    for c in g.chars().skip(1) {
+        if ('\u{ff00}'..='\u{ffef}').contains(&c) {
+            w += char_width(c);
+        } else if c == '\u{0e33}' || c == '\u{0eb3}' {
+            w += 1;
+        }
+    }
+    w
+}
+
+/// Approximation of the TS `rgiEmojiRegex` decisive test for multi-char
+/// clusters. In TS `couldBeEmoji` is only a pre-filter; a cluster renders 2
+/// columns only when the whole sequence is an RGI emoji: a ZWJ sequence of
+/// emoji parts, an emoji (or keycap base) with VS16, or an emoji with a
+/// skin-tone modifier. A letter plus combining marks must fall through here.
+fn is_rgi_emoji_cluster(first: char, g: &str) -> bool {
+    let skin_tone = |c: char| ('\u{1f3fb}'..='\u{1f3ff}').contains(&c);
+    let keycap_base = |c: char| c.is_ascii_digit() || c == '#' || c == '*';
+    if g.contains('\u{200d}') {
+        // ZWJ family/couple: every ZWJ-joined part must start with an
+        // emoji-ish base (skin tones and marks alone do not qualify).
+        return g.split('\u{200d}').all(|part| {
+            part.chars()
+                .find(|c| !is_invisible(*c))
+                .is_some_and(|base| in_emoji_blocks(base) || skin_tone(base))
+        });
+    }
+    if g.contains('\u{fe0f}') {
+        // VS16 presentation / keycap sequence.
+        return in_emoji_blocks(first) || keycap_base(first);
+    }
+    // Emoji + skin tone modifier (no VS16, no ZWJ).
+    in_emoji_blocks(first) && g.chars().skip(1).all(|c| skin_tone(c) || is_invisible(c))
+}
 pub fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| str_width(&s.content)).sum()
 }
@@ -99,7 +212,11 @@ pub fn line_width(line: &[Span]) -> usize {
 }
 
 pub fn is_whitespace_char(c: char) -> bool {
-    c.is_whitespace()
+    // TS `isWhitespaceChar` tests JS /\s/: same set as Unicode White_Space
+    // except the BOM (U+FEFF) counts as whitespace and NEL (U+0085) does
+    // not — the wrap-opportunity logic in wordWrapLine depends on the
+    // distinction (a FEFF cluster records a break opportunity).
+    c == '\u{feff}' || (c != '\u{0085}' && c.is_whitespace())
 }
 
 const PUNCTUATION: &str = "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`";
@@ -350,5 +467,20 @@ mod tests {
         assert_eq!(char_width('\u{FF9E}'), 1);
         assert_eq!(char_width('\u{FF9F}'), 1);
         assert_eq!(str_width("a\u{FF9E}b"), 3);
+    }
+
+    #[test]
+    fn multi_code_point_clusters_measure_one_cell() {
+        // Port of TS `graphemeWidth`: clusters measure whole, not per char.
+        assert_eq!(str_width("👨‍👩‍👧‍👦"), 2); // ZWJ family: one 2-col cell
+        assert_eq!(str_width("🇯🇵"), 2); // flag pair
+        assert_eq!(str_width("🇯"), 2); // isolated regional indicator
+        assert_eq!(str_width("café\u{301}"), 4); // combining mark adds nothing
+        assert_eq!(str_width("#️⃣"), 2); // keycap
+        assert_eq!(str_width("👍🏽"), 2); // skin tone
+        assert_eq!(str_width("カ\u{ff9e}"), 3); // katakana + halfwidth mark
+        assert_eq!(str_width("\u{feff}"), 0); // zero-width BOM
+        assert_eq!(str_width("\u{200d}"), 0); // lone ZWJ
+        assert_eq!(str_width("a\u{200d}b"), 2); // ZWJ does not cluster letters
     }
 }
