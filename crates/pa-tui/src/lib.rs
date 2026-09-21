@@ -53,6 +53,7 @@ pub mod onboarding;
 pub mod osc133;
 pub mod osc52;
 pub(crate) mod prompt_highlight;
+pub mod prompt_stash;
 pub mod provider_auth;
 pub mod queued;
 pub mod scoped_models;

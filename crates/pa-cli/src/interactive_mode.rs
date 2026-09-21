@@ -157,6 +157,23 @@ impl CliInteractionTelemetry {
 }
 
 impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
+    fn prompt_stash(
+        &self,
+        action: &'static str,
+        had_images: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("action", serde_json::Value::from(action));
+            properties.set("had_images", serde_json::Value::from(had_images));
+            client.track("tui prompt stash", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
     fn scroll_used(
         &self,
         action: &'static str,
@@ -278,7 +295,13 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
 /// Run the interactive TUI attached to the daemon. Returns the exit code.
 pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
     let socket_path = resolve_socket_path(options.daemon_socket.as_deref());
-    let tui_options = build_tui_options(options, socket_path)?;
+    let tui_options = build_tui_options(
+        options,
+        socket_path,
+        std::sync::Arc::new(std::sync::Mutex::new(
+            pa_tui::prompt_stash::PromptStashStore::default(),
+        )),
+    )?;
     // Telemetry disclosure (TS agent-session-services): once per
     // installation, only after onboarding marked itself shown (a first
     // interactive run belongs to the onboarding screen; the notice surfaces
@@ -490,7 +513,11 @@ pub fn resolve_socket_path(daemon_socket: Option<&str>) -> PathBuf {
         .unwrap_or_else(pa_daemon::socket::default_daemon_socket_path)
 }
 
-fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<InteractiveOptions> {
+fn build_tui_options(
+    options: &RunOptions,
+    socket_path: PathBuf,
+    prompt_stash: std::sync::Arc<std::sync::Mutex<pa_tui::prompt_stash::PromptStashStore>>,
+) -> Result<InteractiveOptions> {
     let config = &options.config;
     if options.session.fork.is_some() {
         // A fork must copy the target session into a new file before the
@@ -623,6 +650,11 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
             agent_dir: config.agent_dir.clone(),
         })),
         keybindings,
+        // The process-wide prompt stash store (TS `ClientPromptStashStore`
+        // lives in `main.ts`'s invocation scope): one store per process, so
+        // the agents-view loop (view -> chat -> view) keeps every stashed
+        // draft alive across its chat runs.
+        prompt_stash,
         // RLM depth metadata comes from the agents view when it opens a row
         // (TS `sessionDepth`/`sessionHasChildren`); a direct CLI session is
         // a root run.
@@ -993,15 +1025,23 @@ mod tests {
             r#"{ "markdown": { "codeBlockIndent": "    " } }"#,
         )
         .expect("settings.json");
-        let options = build_tui_options(&run_options(dir.path()), dir.path().join("d.sock"))
-            .expect("options");
+        let options = build_tui_options(
+            &run_options(dir.path()),
+            dir.path().join("d.sock"),
+            Default::default(),
+        )
+        .expect("options");
         assert_eq!(options.code_block_indent, "    ");
 
         // No markdown settings: the TS default.
         let bare = tempfile::TempDir::new().expect("temp dir");
         std::fs::create_dir_all(bare.path().join("agent")).expect("agent dir");
-        let options = build_tui_options(&run_options(bare.path()), bare.path().join("d.sock"))
-            .expect("options");
+        let options = build_tui_options(
+            &run_options(bare.path()),
+            bare.path().join("d.sock"),
+            Default::default(),
+        )
+        .expect("options");
         assert_eq!(options.code_block_indent, "  ");
     }
 }

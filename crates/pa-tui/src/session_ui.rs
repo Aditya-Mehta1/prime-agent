@@ -26,6 +26,7 @@ use crate::info_commands;
 use crate::interactive::{InteractiveOptions, ModelSelection, SessionSelection};
 use crate::keys::key_event_to_id;
 use crate::model_picker::{CurrentModel, ModelPicker, ModelPickerAction, ModelPickerOptions};
+use crate::prompt_stash::PromptStash;
 use crate::provider_auth::{AuthSelectorAction, AuthSelectorKind};
 use crate::queued::{QueueBrowseDirection, QueueLane};
 use crate::snapshot::{
@@ -283,6 +284,13 @@ pub(crate) struct SessionUi {
     /// defaults): hint labels and app-level handlers dispatch through this
     /// set, and `/new` runs carry it forward.
     keybindings: crate::keybindings::KeybindingsManager,
+    /// The process-wide prompt stash store (TS `ClientPromptStashStore`),
+    /// owned by the composition root and shared by every chat view of this
+    /// TUI process.
+    prompt_stash: std::sync::Arc<std::sync::Mutex<crate::prompt_stash::PromptStashStore>>,
+    /// The stable session id the prompt stash state is bound to (TS
+    /// `promptStashSessionId`).
+    stash_session_id: String,
     pub(crate) dirty: bool,
     /// The Ctrl+C exit hint (TS `ctrlCExitHintExpiresAt`): a second press
     /// inside the window terminates the client, regardless of turn state.
@@ -437,6 +445,8 @@ impl SessionUi {
             return_to_agents_view: !options.no_session,
             client_auth: options.client_auth.clone(),
             keybindings: options.keybindings.clone(),
+            prompt_stash: options.prompt_stash.clone(),
+            stash_session_id: String::new(),
             dirty: true,
             ctrl_c_hint_until: None,
             goal_view: GoalView::new(),
@@ -624,6 +634,13 @@ impl SessionUi {
             .unwrap_or(false);
         self.turn_active = streaming;
         self.streaming_index = None;
+        // TS `applyConnectionStateSnapshot` -> `bindPromptStashSession`: the
+        // stash state follows the stable id of the session now rendered.
+        // The initial attach and every in-place switch (`/switch`, `/new`)
+        // rebind through here; a rebind hydrates the session's stashed
+        // images into the paste registry.
+        let stash_session_id = self.session_id.clone();
+        self.bind_prompt_stash_session(&stash_session_id);
         Ok(())
     }
 
@@ -1087,6 +1104,170 @@ impl SessionUi {
                 .flat_map(|text| image_marker_ids(text)),
         );
         ids
+    }
+
+    // ---- Prompt stash (TS `prompt-stash-state.ts` + the interactive-mode
+    // stash call sites). One client-owned store per TUI process holds every
+    // session's stashed draft; the draft follows the session across
+    // switches. ----
+
+    /// TS `bindPromptStashSession`: the chat's stash state follows the
+    /// connected session's stable id. The previous binding releases when
+    /// it holds nothing, and the new binding's stashed images re-enter the
+    /// paste registry with their marker ids reserved (TS
+    /// `hydratePromptStash`), so a restore never mints colliding markers
+    /// and a submitted restored draft finds its image bytes.
+    fn bind_prompt_stash_session(&mut self, session_id: &str) {
+        if self.stash_session_id == session_id {
+            return;
+        }
+        let mut store = self
+            .prompt_stash
+            .lock()
+            .expect("prompt stash store poisoned");
+        if !self.stash_session_id.is_empty() {
+            store.release(&self.stash_session_id);
+        }
+        let state = store.for_session(session_id);
+        for stash in state.stash.iter().chain(state.queued_stashes.iter()) {
+            for (id, image) in &stash.images {
+                self.pasted_images.insert(*id, image.clone());
+                self.next_image_marker_id = self.next_image_marker_id.max(id + 1);
+            }
+            for id in image_marker_ids(&stash.text) {
+                self.next_image_marker_id = self.next_image_marker_id.max(id + 1);
+            }
+        }
+        self.stash_session_id = session_id.to_string();
+    }
+
+    /// TS `teardownSessionUi` -> `releasePromptStashSession`: the run's
+    /// binding ends. An empty state drops from the store; a session
+    /// holding a draft keeps it for the next view that binds the session.
+    pub(crate) fn release_prompt_stash_session(&mut self) {
+        if self.stash_session_id.is_empty() {
+            return;
+        }
+        let mut store = self
+            .prompt_stash
+            .lock()
+            .expect("prompt stash store poisoned");
+        store.release(&self.stash_session_id);
+    }
+
+    /// TS `snapshotPromptStash`: the editor draft plus the pasted images
+    /// its markers still reference. `None` for a whitespace-only draft.
+    /// Both capture paths (the agents-view handoff, the in-place switch)
+    /// stash an auto-restore head (TS `restoreOnOpen`).
+    fn snapshot_prompt_stash(&self, view: &AgentView) -> Option<PromptStash> {
+        let text = view.editor.get_text();
+        if text.trim().is_empty() {
+            return None;
+        }
+        let images: Vec<(u64, LoadedImage)> = collect_marked_images(&self.pasted_images, &text)
+            .into_iter()
+            .map(|(id, image)| (id, image.clone()))
+            .collect();
+        Some(PromptStash {
+            text,
+            images,
+            restore_on_open: true,
+        })
+    }
+
+    /// TS `stashDraftForAgentsView`: on the way to the agents view, the
+    /// live draft becomes the session's restore-on-open head — an
+    /// existing unrestored stash queues behind it and keeps its own
+    /// restore semantics. The editor dies with this view, so the draft
+    /// lives on only in the store.
+    pub(crate) fn stash_draft_for_agents_view(&mut self, view: &AgentView) {
+        let Some(draft) = self.snapshot_prompt_stash(view) else {
+            return;
+        };
+        if let Some(telemetry) = self.telemetry.clone() {
+            let had_images = !draft.images.is_empty();
+            tokio::spawn(async move {
+                telemetry.prompt_stash("agents_view", had_images).await;
+            });
+        }
+        let mut store = self
+            .prompt_stash
+            .lock()
+            .expect("prompt stash store poisoned");
+        store
+            .for_session(&self.stash_session_id)
+            .stash_draft_head(draft);
+    }
+
+    /// The in-place `/switch` capture: the draft belongs to the session
+    /// being left, so it is stashed as that session's restore head and the
+    /// editor clears — the switched-to session starts from an empty prompt
+    /// and the draft returns on a switch back.
+    fn stash_draft_for_switch(&mut self, view: &mut AgentView) {
+        let Some(draft) = self.snapshot_prompt_stash(view) else {
+            return;
+        };
+        if let Some(telemetry) = self.telemetry.clone() {
+            let had_images = !draft.images.is_empty();
+            tokio::spawn(async move {
+                telemetry.prompt_stash("session_switch", had_images).await;
+            });
+        }
+        let mut store = self
+            .prompt_stash
+            .lock()
+            .expect("prompt stash store poisoned");
+        store
+            .for_session(&self.stash_session_id)
+            .stash_draft_head(draft);
+        view.editor.set_text("");
+        self.dirty = true;
+    }
+
+    /// TS `restorePromptStashOnOpen`: the opening restore of the session's
+    /// auto-stashed draft. The restore notice lands in its own status
+    /// block: init may have posted a notice (a tmux keyboard warning, a
+    /// compaction row) that the back-to-back status rewrite would
+    /// otherwise replace.
+    pub(crate) fn restore_prompt_stash_on_open(&mut self, view: &mut AgentView) {
+        self.last_status_index = None;
+        self.restore_prompt_stash_if_editor_empty(view);
+    }
+
+    /// TS `restorePromptStashIfEditorEmpty`: the head draft returns to the
+    /// editor only when the editor is empty; the next queued draft (if
+    /// any) becomes the head. Returns whether a draft landed.
+    fn restore_prompt_stash_if_editor_empty(&mut self, view: &mut AgentView) -> bool {
+        if !view.editor.get_text().trim().is_empty() {
+            return false;
+        }
+        let stash = {
+            let mut store = self
+                .prompt_stash
+                .lock()
+                .expect("prompt stash store poisoned");
+            store
+                .for_session(&self.stash_session_id)
+                .take_head_restore_on_open()
+        };
+        let Some(stash) = stash else {
+            return false;
+        };
+        for (id, image) in &stash.images {
+            self.pasted_images.insert(*id, image.clone());
+        }
+        for id in image_marker_ids(&stash.text) {
+            self.next_image_marker_id = self.next_image_marker_id.max(id + 1);
+        }
+        view.editor.set_text(&stash.text);
+        if let Some(telemetry) = self.telemetry.clone() {
+            let had_images = !stash.images.is_empty();
+            tokio::spawn(async move {
+                telemetry.prompt_stash("restored", had_images).await;
+            });
+        }
+        self.note("Restored stashed prompt", view);
+        true
     }
 
     /// Whether the current model takes image input (TS
@@ -4095,6 +4276,10 @@ impl SessionUi {
             update_commands: self.update_commands.clone(),
             telemetry: self.telemetry.clone(),
             keybindings: self.keybindings.clone(),
+            // The `/new` run keeps this process's stash store: a draft
+            // stashed for the fresh session survives into the next chat
+            // view that binds it.
+            prompt_stash: self.prompt_stash.clone(),
             // `/new` starts a fresh root session: no depth label.
             session_rlm_depth: None,
             session_has_children: false,
@@ -4169,10 +4354,20 @@ impl SessionUi {
             self.note("already attached to that session", view);
             return Ok(());
         }
+        // The draft in the editor belongs to the session being left: stash
+        // it as that session's restore-on-reopen head and clear the editor,
+        // so the switch lands on an empty prompt (the draft returns on a
+        // switch back).
+        self.stash_draft_for_switch(view);
         match self.attach_session(&id).await {
             Ok(()) => {
                 self.rebuild_view(view);
                 self.note(&format!("switched to session {id}"), view);
+                // The switched-to session's own restore head (if one was
+                // stashed earlier) lands after the switch note, so the
+                // restore status is the row the back-to-back rewrite keeps
+                // (TS `showStatus` last-wins).
+                self.restore_prompt_stash_if_editor_empty(view);
             }
             Err(error) => {
                 self.note(&format!("switch to {id} failed: {error:#}"), view);
@@ -5140,6 +5335,23 @@ impl SessionUi {
             .matches(&id, "app.subagents.focus")
         {
             self.focus_subagents_summary(view);
+            self.dirty = true;
+            return Ok(());
+        }
+        // TS `app.session.resume` (no default key; user-bindable): open the
+        // agents view. Unlike agents-back it fires with a draft in the
+        // editor — the draft is stashed for the session on the exit path
+        // and returns when the session's chat reopens.
+        if view.editor.keybindings().matches(&id, "app.session.resume") {
+            if self.return_to_agents_view {
+                self.open_agents_view = true;
+                self.exit_requested = true;
+            } else {
+                self.note(
+                    "The agents view needs a daemon-hosted session; start normally (without --no-session) to browse sessions",
+                    view,
+                );
+            }
             self.dirty = true;
             return Ok(());
         }

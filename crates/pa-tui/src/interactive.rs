@@ -110,6 +110,15 @@ pub trait InteractionTelemetry: Send + Sync {
     /// is `resumed` (the SIGCONT continuation restored the terminal) /
     /// `failed` (the cycle errored).
     fn suspend_used(&self, outcome: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// A prompt-stash transition (`tui prompt stash`): `action` is
+    /// `agents_view` / `session_switch` (a draft stashed on the way out)
+    /// or `restored` (a stashed draft returned to the editor);
+    /// `had_images` reports whether the draft carried pasted images.
+    fn prompt_stash(
+        &self,
+        action: &'static str,
+        had_images: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Persistence for the first-run onboarding answers. The TUI crate owns
@@ -219,6 +228,12 @@ pub struct InteractiveOptions {
     /// `KeybindingsManager.create()`): every hint and key handler renders
     /// and dispatches through this set.
     pub keybindings: KeybindingsManager,
+    /// The client-owned prompt stash store shared across the chat views of
+    /// this TUI process (TS `ClientPromptStashStore`): an editor draft
+    /// left behind on a session switch returns when the session's chat
+    /// reopens. The composition root owns one store per process, so the
+    /// agents-view loop (view -> chat -> view) keeps every stashed draft.
+    pub prompt_stash: std::sync::Arc<std::sync::Mutex<crate::prompt_stash::PromptStashStore>>,
     /// The attached session's persisted RLM depth (TS `sessionDepth`):
     /// the agents view passes it when it opens a row, and a subagent
     /// session renders its `depth N` tray label.
@@ -613,6 +628,10 @@ pub async fn run_interactive(
         });
         session.dirty = true;
     }
+    // TS `restorePromptStashOnOpen`: a draft stashed on the way out (a
+    // previous chat view of this session left via the agents view or a
+    // switch) returns to the editor when its chat reopens.
+    session.restore_prompt_stash_on_open(&mut view);
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
     // Headless verification runs capture the OSC 52 clipboard channel
     // instead of writing it to the plain pipes.
@@ -1168,6 +1187,15 @@ pub async fn run_interactive(
     if renderer.is_terminal() {
         exit_guard.arm_for_exit();
     }
+    // TS `returnToAgentsView` -> `stashDraftForAgentsView` + the
+    // `teardownSessionUi` release: a handoff to the agents view (or a
+    // `/resume <selector>` chain — this build's switch surfaces) stashes
+    // the live draft for the session being left; every exit releases the
+    // run's binding (a held draft stays in the store for the next view).
+    if session.open_agents_view || session.pending_selection.is_some() {
+        session.stash_draft_for_agents_view(&view);
+    }
+    session.release_prompt_stash_session();
     // TS `shutdown` fetches the session stats while the connection is
     // alive, then prints the resume hint after teardown; pa-cli prints it
     // once the terminal is restored. Bounded best-effort.
@@ -1685,6 +1713,7 @@ mod tests {
             telemetry: None,
             keybindings: crate::keybindings::KeybindingsManager::new(),
             session_rlm_depth: None,
+            prompt_stash: Default::default(),
             session_has_children: false,
             client_settings: None,
         }

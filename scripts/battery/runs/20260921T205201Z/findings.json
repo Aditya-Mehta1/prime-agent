@@ -1,0 +1,194 @@
+[
+ {
+  "flow": "f24_prompt_stash",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: the reopened chat restored the stashed draft into the editor",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f24_prompt_stash",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: the reopened chat restored the stashed draft into the editor",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f24_prompt_stash",
+  "category": "visual",
+  "gap": true,
+  "summary": "agents-view-back: the roster frame differs \u2014 the TS binary clears the search query after the chat round trip, the Rust build keeps it (agents-view query persistence; both sides set the query before the open, see 00b-filtered.txt)",
+  "evidence": "ts/f24_prompt_stash/frame-diff-agents-view-back.txt",
+  "expectedFail": "agents-view"
+ },
+ {
+  "flow": "f24_prompt_stash",
+  "category": "visual",
+  "gap": false,
+  "summary": "typed-draft: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f24_prompt_stash",
+  "category": "visual",
+  "gap": false,
+  "summary": "restored: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f24_prompt_stash",
+  "category": "visual",
+  "gap": false,
+  "summary": "submitted: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the prompt-context hint renders the user override (X), not the default",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the override key cycled the conversation detail",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the removed default key no longer cycles the detail",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: /hotkeys documents the effective override (X row)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the ? quick-shortcut guide mounted with the effective bindings",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the submission cleared the quick-shortcut guide",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the prompt-context hint renders the user override (X), not the default",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the override key cycled the conversation detail",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the removed default key no longer cycles the detail",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: /hotkeys documents the effective override (X row)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the ? quick-shortcut guide mounted with the effective bindings",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the submission cleared the quick-shortcut guide",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "detail-hint: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "override-fired: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "default-key: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "hotkeys-guide: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "shortcut-guide: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "guide-cleared: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ }
+]

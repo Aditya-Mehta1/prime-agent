@@ -239,6 +239,7 @@ fn headless_options(socket: &Path, dir: &Path) -> pa_tui::interactive::Interacti
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
     }
 }

@@ -16,6 +16,13 @@ use std::time::{Duration, Instant};
 
 use pa_types::daemon::DaemonCommand;
 
+/// A one-pixel PNG (the clipboard seam fixture image).
+const MINIMAL_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240, 31, 0,
+    5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
 struct Supervisor {
     child: Child,
     socket: PathBuf,
@@ -397,6 +404,7 @@ async fn tui_attaches_prompts_streams_lists_and_switches() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -555,6 +563,7 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -646,6 +655,7 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -847,6 +857,7 @@ async fn tui_model_picker_applies_and_effort_reports() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -949,6 +960,7 @@ async fn tui_compact_on_a_short_session_warns_nothing_to_compact() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -1089,6 +1101,7 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -1287,6 +1300,7 @@ async fn tui_session_tree_navigates_forks_and_clones() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -1484,6 +1498,7 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -1617,6 +1632,7 @@ async fn tui_renders_and_fires_user_keybindings_from_settings() {
         // default set.
         keybindings: pa_tui::keybindings::KeybindingsManager::create(&agent_dir),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -1778,6 +1794,7 @@ async fn tui_prompts_queued_behind_a_turn_render_the_queue_strip() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };
@@ -1907,6 +1924,7 @@ async fn tui_flagged_model_turn_reports_the_ts_preflight_error_without_credentia
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
@@ -2034,6 +2052,7 @@ async fn tui_model_pick_refreshes_the_label_and_the_next_turn_resolves() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
@@ -2105,6 +2124,7 @@ fn base_options(
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
         provider_auth: None,
@@ -2417,4 +2437,466 @@ async fn tui_settings_menu_and_scoped_models_picker() {
         rendered.contains("1/") && rendered.contains("enabled (unsaved)"),
         "the scoped-models footer counted the toggle and flagged it unsaved:\n{rendered}"
     );
+}
+
+/// Prompt-stash verifier (TS `prompt-stash-state.ts` + the
+/// interactive-mode stash call sites): a draft in the editor belongs to
+/// the session it was typed in. The in-place `/switch` stashes it for the
+/// outgoing session and clears the editor (Enter after the switch submits
+/// nothing), and a switch back restores it — the restored draft is a live
+/// editor draft (Enter submits it, and only to the session it belongs to).
+#[tokio::test]
+async fn tui_prompt_stash_round_trips_across_in_place_switch() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({
+        "engine": "faux",
+        "responses": [{ "text": "stash switch reply", "delayMs": 10 }],
+    });
+    let script_path = dir.path().join("script.json");
+    let first = create_session_via_daemon(
+        &supervisor.socket,
+        &script_path,
+        &script,
+        dir.path(),
+        &session_dir,
+    )
+    .await;
+    let second = create_session_via_daemon(
+        &supervisor.socket,
+        &script_path,
+        &script,
+        dir.path(),
+        &session_dir,
+    )
+    .await;
+
+    let options = pa_tui::interactive::InteractiveOptions {
+        provider_auth: None,
+        traces: None,
+        update_commands: None,
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(script_path.clone()),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::Attach(first.clone()),
+        show_images: true,
+        fullscreen_mouse: true,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        client_settings: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        prompt_stash: Default::default(),
+        session_rlm_depth: None,
+        session_has_children: false,
+    };
+    let enter = || {
+        pa_tui::interactive::HeadlessStep::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            // A draft for session A, never submitted.
+            pa_tui::interactive::HeadlessStep::Type("f24 stash draft hello".to_string()),
+            // The switch stashes the draft for A and clears the editor.
+            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {second}")),
+            // The editor must be empty now: Enter submits nothing, and the
+            // draft never bleeds into session B.
+            enter(),
+            pa_tui::interactive::HeadlessStep::WaitMs(500),
+            // Switch back: the stashed draft returns to the editor.
+            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {first}")),
+            // The restored draft is live: Enter submits it — to session A.
+            enter(),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 100,
+        height: 30,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("Restored stashed prompt"),
+        "the switch-back restored the stashed draft:\n{rendered}"
+    );
+
+    // Daemon-side: the restored draft ran on session A, and session B
+    // never received it (the editor cleared at the switch).
+    let (client, _events) = pa_tui::daemon_client::DaemonClient::connect(&supervisor.socket)
+        .await
+        .expect("connect supervisor");
+    let last_first = client
+        .request_ok(DaemonCommand::GetLastAssistantText {
+            id: None,
+            active_session_id: first.clone(),
+            rest: Default::default(),
+        })
+        .await
+        .expect("get_last_assistant_text on the first session");
+    assert_eq!(
+        last_first["text"], "stash switch reply",
+        "the restored draft submitted to the session it belongs to"
+    );
+    let last_second = client
+        .request_ok(DaemonCommand::GetLastAssistantText {
+            id: None,
+            active_session_id: second.clone(),
+            rest: Default::default(),
+        })
+        .await
+        .expect("get_last_assistant_text on the second session");
+    assert_eq!(
+        last_second["text"],
+        serde_json::Value::Null,
+        "the stashed draft never leaked into the switched-to session"
+    );
+    client.close();
+    drop(supervisor);
+}
+
+/// Prompt-stash verifier, the agents-view handoff arm: the (user-rebound)
+/// `app.session.resume` key leaves for the agents view WITH a draft in the
+/// editor — the draft is stashed for the session, and the chat that reopens
+/// that session (the agents-view loop's next run, same process store)
+/// restores it. The restored draft submits on Enter.
+#[tokio::test]
+async fn tui_prompt_stash_survives_the_agents_view_handoff() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    // The keybindings fixture: `app.session.resume` has no default key, so
+    // the fixture binds it to a plain key exactly like the TS parity flow
+    // drives the same surface (both products fire the action while the
+    // editor carries text).
+    std::fs::write(
+        agent_dir.join("keybindings.json"),
+        r#"{ "app.session.resume": "f2" }"#,
+    )
+    .expect("write keybindings.json");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({
+        "engine": "faux",
+        "responses": [{ "text": "handoff restore reply", "delayMs": 10 }],
+    });
+    let script_path = dir.path().join("script.json");
+    let first = create_session_via_daemon(
+        &supervisor.socket,
+        &script_path,
+        &script,
+        dir.path(),
+        &session_dir,
+    )
+    .await;
+
+    // The clipboard seam fixture: the draft carries a pasted image, so the
+    // handoff must round-trip the image bytes too (the reopened chat is a
+    // fresh UI with an empty paste registry — the stash hydrates it).
+    let png_path = dir.path().join("fixture.png");
+    std::fs::write(&png_path, MINIMAL_PNG).expect("write fixture image");
+    std::env::set_var("PRIME_AGENT_TEST_CLIPBOARD_IMAGE", &png_path);
+    let prompt_stash: std::sync::Arc<std::sync::Mutex<pa_tui::prompt_stash::PromptStashStore>> =
+        Default::default();
+    let make_options = || pa_tui::interactive::InteractiveOptions {
+        provider_auth: None,
+        traces: None,
+        update_commands: None,
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(script_path.clone()),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::Attach(first.clone()),
+        show_images: true,
+        fullscreen_mouse: true,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        client_settings: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::create(&agent_dir),
+        prompt_stash: prompt_stash.clone(),
+        session_rlm_depth: None,
+        session_has_children: false,
+    };
+
+    // Run one: the draft is typed, then the resume key hands the pane to
+    // the agents view (the outcome pa-cli's agents-view loop consumes).
+    let plan_one = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            // The pasted image rides the draft into the stash.
+            pa_tui::interactive::HeadlessStep::Key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL,
+            )),
+            pa_tui::interactive::HeadlessStep::WaitMs(300),
+            pa_tui::interactive::HeadlessStep::Type(" f24 handoff draft".to_string()),
+            pa_tui::interactive::HeadlessStep::Key(KeyEvent::new(
+                KeyCode::F(2),
+                KeyModifiers::NONE,
+            )),
+        ],
+        width: 100,
+        height: 30,
+    };
+    let outcome_one = pa_tui::interactive::run_interactive(
+        make_options(),
+        pa_tui::interactive::UiMode::Headless(plan_one),
+    )
+    .await
+    .expect("interactive run one");
+    assert!(
+        outcome_one.return_to_agents_view,
+        "the resume key hands the pane to the agents view"
+    );
+
+    // Run two (the agents view reopened the session): the same process
+    // store restores the stashed draft into the fresh editor.
+    let plan_two = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::WaitMs(300),
+            // The restored draft is live: Enter submits it.
+            pa_tui::interactive::HeadlessStep::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 100,
+        height: 30,
+    };
+    let outcome_two = pa_tui::interactive::run_interactive(
+        make_options(),
+        pa_tui::interactive::UiMode::Headless(plan_two),
+    )
+    .await
+    .expect("interactive run two");
+    let rendered = outcome_two.frames.join("\n");
+    assert!(
+        rendered.contains("Restored stashed prompt"),
+        "the reopened chat restored the stashed draft:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[image #1]"),
+        "the restored draft carries its image marker:\n{rendered}"
+    );
+
+    // The persisted user message carries the image content: the fresh
+    // chat's registry held the image only through the stash hydrate.
+    let mut persisted_with_image = false;
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                persisted_with_image |= text.contains("image/png");
+            }
+        }
+    }
+    assert!(
+        persisted_with_image,
+        "the restored draft attached the stashed image bytes on submit"
+    );
+
+    // Daemon-side: the restored draft ran on the session.
+    let (client, _events) = pa_tui::daemon_client::DaemonClient::connect(&supervisor.socket)
+        .await
+        .expect("connect supervisor");
+    let last = client
+        .request_ok(DaemonCommand::GetLastAssistantText {
+            id: None,
+            active_session_id: first.clone(),
+            rest: Default::default(),
+        })
+        .await
+        .expect("get_last_assistant_text");
+    assert_eq!(
+        last["text"], "handoff restore reply",
+        "the restored draft submitted after the handoff"
+    );
+    client.close();
+    drop(supervisor);
+}
+
+/// Prompt-stash verifier, the pasted-image arm: the stashed draft carries
+/// its pasted image. The clipboard seam fixture (`PRIME_AGENT_TEST_
+/// CLIPBOARD_IMAGE`, the `script_path` verification-seam pattern) drives the
+/// real paste path; the stash must round-trip the image bytes so the
+/// restored draft's `[image #N]` marker attaches them on submit (the
+/// persisted user message carries the image content).
+#[tokio::test]
+async fn tui_prompt_stash_restores_a_pasted_image_with_the_draft() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    // A one-pixel PNG: the clipboard fixture stands in for the system
+    // clipboard (this harness has no display server).
+    let png_path = dir.path().join("fixture.png");
+    std::fs::write(&png_path, MINIMAL_PNG).expect("write fixture image");
+    // The seam only ever applies to the paste path (ctrl+v) — nothing else
+    // in this binary reads the clipboard. The var stays set for the whole
+    // test process: the parallel stash tests each reset it before their
+    // own paste, so a cross-test remove would race them.
+    std::env::set_var("PRIME_AGENT_TEST_CLIPBOARD_IMAGE", &png_path);
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({
+        "engine": "faux",
+        "responses": [{ "text": "image stash reply", "delayMs": 10 }],
+    });
+    let script_path = dir.path().join("script.json");
+    let first = create_session_via_daemon(
+        &supervisor.socket,
+        &script_path,
+        &script,
+        dir.path(),
+        &session_dir,
+    )
+    .await;
+    let second = create_session_via_daemon(
+        &supervisor.socket,
+        &script_path,
+        &script,
+        dir.path(),
+        &session_dir,
+    )
+    .await;
+
+    let options = pa_tui::interactive::InteractiveOptions {
+        provider_auth: None,
+        traces: None,
+        update_commands: None,
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.path().to_path_buf(),
+        session_dir: Some(session_dir.clone()),
+        script_path: Some(script_path.clone()),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::Attach(first.clone()),
+        show_images: true,
+        fullscreen_mouse: true,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        client_settings: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        prompt_stash: Default::default(),
+        session_rlm_depth: None,
+        session_has_children: false,
+    };
+    let ctrl_v = || {
+        pa_tui::interactive::HeadlessStep::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        ))
+    };
+    let enter = || {
+        pa_tui::interactive::HeadlessStep::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            // Paste an image (the seam fixture), then type around its
+            // marker so the draft carries the marker.
+            ctrl_v(),
+            pa_tui::interactive::HeadlessStep::WaitMs(300),
+            pa_tui::interactive::HeadlessStep::Type(" f24 image draft".to_string()),
+            // Stash on switch, restore on switch back.
+            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {second}")),
+            pa_tui::interactive::HeadlessStep::WaitMs(300),
+            pa_tui::interactive::HeadlessStep::Submit(format!("/switch {first}")),
+            pa_tui::interactive::HeadlessStep::WaitMs(300),
+            // Submit the restored draft: the marker must resolve to the
+            // stashed image bytes.
+            enter(),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 100,
+        height: 30,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("Restored stashed prompt"),
+        "the switch-back restored the image draft:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[image #1]"),
+        "the restored draft carries its image marker:\n{rendered}"
+    );
+    // The persisted user message carries the image content: the restored
+    // marker attached the stashed bytes on submit. The create response's
+    // id is the active session id, so scan the session dir for the image
+    // content (only session A received the draft).
+    let mut persisted_with_image = String::new();
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if text.contains("image/png") {
+                    persisted_with_image = text;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        !persisted_with_image.is_empty(),
+        "the submitted restored draft attached the pasted image: no session file carries image content"
+    );
+    drop(supervisor);
 }

@@ -355,6 +355,7 @@ fn child_options(socket: PathBuf) -> InteractiveOptions {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     }

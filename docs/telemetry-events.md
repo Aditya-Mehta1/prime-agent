@@ -302,6 +302,18 @@ subagent inspection surface; emitted once per open action).
 |---|---|---|
 | `children_total` | number | live RLM descendant count at open time |
 
+### `tui prompt stash`
+
+A prompt-stash transition (adoption of the session-switch draft stash, TS
+`prompt-stash-state.ts`): an editor draft stashed on the way out of a chat,
+or a stashed draft restored into a reopened chat's editor. Emitted once per
+transition; never carries prompt content.
+
+| property | type | notes |
+|---|---|---|
+| `action` | string | `agents_view` / `session_switch` (a draft stashed on the way out) / `restored` (a stashed draft returned to the editor) |
+| `had_images` | boolean | the draft carried pasted images |
+
 ## Planned events (seams not yet in the product)
 
 These stay in the catalog as planned schema v1 additions; they are NOT

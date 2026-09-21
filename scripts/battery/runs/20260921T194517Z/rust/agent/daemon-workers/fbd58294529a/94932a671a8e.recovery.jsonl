@@ -1,0 +1,6 @@
+{"activeSessionId":"94932a671a8e","sessionId":"01a0c581-30db-75f8-9a7b-9f1bcb1cc5e1","sessionFile":"/home/ubuntu/lane-worktrees/prompt-stash/scripts/battery/runs/20260921T194517Z/rust/agent/sessions/01a0c581-30db-75f8-9a7b-9f1bcb1cc5e1.jsonl","busy":true,"operation":"create","recordedAt":"2026-09-21T19:46:13.455Z"}
+{"version":1,"type":"queue_snapshot","active_session_id":"94932a671a8e","steering":["f24 seed turn of the parity battery"],"follow_up":[],"recorded_at":"2026-09-21T19:46:13.660Z"}
+{"version":1,"type":"queue_snapshot","active_session_id":"94932a671a8e","steering":[],"follow_up":[],"recorded_at":"2026-09-21T19:46:13.860Z"}
+{"version":1,"type":"queue_snapshot","active_session_id":"94932a671a8e","steering":["f24 stashed draft payload 4242"],"follow_up":[],"recorded_at":"2026-09-21T19:46:28.110Z"}
+{"version":1,"type":"queue_snapshot","active_session_id":"94932a671a8e","steering":[],"follow_up":[],"recorded_at":"2026-09-21T19:46:28.448Z"}
+{"activeSessionId":"94932a671a8e","sessionId":"01a0c581-30db-75f8-9a7b-9f1bcb1cc5e1","sessionFile":"/home/ubuntu/lane-worktrees/prompt-stash/scripts/battery/runs/20260921T194517Z/rust/agent/sessions/01a0c581-30db-75f8-9a7b-9f1bcb1cc5e1.jsonl","busy":false,"operation":"shutdown","recordedAt":"2026-09-21T19:47:08.625Z"}

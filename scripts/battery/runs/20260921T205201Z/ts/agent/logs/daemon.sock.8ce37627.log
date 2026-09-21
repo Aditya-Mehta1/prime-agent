@@ -1,0 +1,5 @@
+[2026-09-21T20:52:02.561Z] supervisor: Prime Agent daemon supervisor f6b0c67a-9eeb-4d8f-a82a-e7771dc85f49 listening on /home/ubuntu/lane-worktrees/prompt-stash/scripts/battery/runs/20260921T205201Z/ts/daemon.sock
+[2026-09-21T20:52:02.787Z] supervisor: Session worker ea9788fca6ed stderr: Prime Agent daemon listening on /tmp/vbat20260921T205201Z-ts/prime-agent-1000/worker-8ce37627c6d5-ea9788fca6ed.sock
+[2026-09-21T20:53:07.519Z] supervisor: Session worker 54184d001c75 stderr: Prime Agent daemon listening on /tmp/vbat20260921T205201Z-ts/prime-agent-1000/worker-8ce37627c6d5-54184d001c75.sock
+[2026-09-21T20:53:38.709Z] supervisor: Session worker 54184d001c75 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-21T20:53:38.873Z] supervisor: Session worker ea9788fca6ed stderr: shutting down (exit 0); closing 0 active session(s)

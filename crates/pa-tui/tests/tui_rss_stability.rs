@@ -358,6 +358,7 @@ fn interactive_session_rss_plateaus_over_long_stream() {
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
+        prompt_stash: Default::default(),
         session_has_children: false,
         client_settings: None,
     };

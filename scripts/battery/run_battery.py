@@ -51,7 +51,7 @@ ITERATIVE_SUMMARIES = ("the first compaction summary", "the second compaction su
 
 NL = chr(10)
 
-ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit", "f14_compact", "f15_a2a", "f16_refine", "f17_slash_model", "f18_goal_autonomous", "f19_heartbeat", "f20_subagents", "f21_worker_recovery", "f22_provider_failover", "f23_keybindings"]
+ALL_FLOWS = ["f1_launch", "f2_prompt", "f3_tool", "f4_commands", "f5_side_questions", "f6_attach", "f7_compaction", "f8_resume", "f9_agents_view", "f10_perf", "f11_provider_failure", "f12_scroll", "f13_ctrlc_exit", "f14_compact", "f15_a2a", "f16_refine", "f17_slash_model", "f18_goal_autonomous", "f19_heartbeat", "f20_subagents", "f21_worker_recovery", "f22_provider_failover", "f23_keybindings", "f24_prompt_stash"]
 
 # Real-surface flows (f14-f21): each drives one product surface end to end
 # (the daemon session + the attached interactive TUI), captures the frame
@@ -68,6 +68,7 @@ FLOW_LANES = {
     "f19_heartbeat": "heartbeat-tui",
     "f21_worker_recovery": "worker-recovery",
     "f23_keybindings": "keybindings",
+    "f24_prompt_stash": "prompt-stash",
 }
 
 # Per-step lane overrides: a flow whose steps cross several surfaces can
@@ -4384,7 +4385,152 @@ class Battery:
                 self.normalize_transcript_frame,
             )
 
-    def f23_keybindings(self) -> None:
+
+    def f24_prompt_stash(self) -> None:
+        """Prompt stash across session switches (TS `prompt-stash-state.ts`):
+        a draft typed into the editor survives the
+        chat -> agents view -> chat round trip inside one TUI process and
+        returns to the editor on reopen, with the TS `Restored stashed
+        prompt` status row. The switch is driven through `app.session.resume`
+        (no default key on either product): a `keybindings.json` fixture
+        binds it to `f2`, so the key fires with a draft in the editor — the
+        exact surface the stash captures. The full loop runs in one process
+        (`prime-agent agents`): open the session from the view, type the
+        draft, f2 back to the view, reopen, and the restored frame is
+        diffed TS vs Rust."""
+        flow = "f24_prompt_stash"
+        draft = "f24 stashed draft payload 4242"
+        frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
+        for side in (self.sides["ts"], self.sides["rust"]):
+            self.ensure_daemon(side)
+            self.suppress_first_run_notices(side)
+            # The keybindings fixture: `app.session.resume` bound to a
+            # plain function key (both products fire the app action while
+            # the editor carries text; f2 survives tmux encoding on both).
+            (side.agent_dir / "keybindings.json").write_text(
+                json.dumps({"app.session.resume": "f2"}, indent=1) + NL
+            )
+            # One live session to open, wire-created so its id is known.
+            made = self.create_session(side, flow, "battery-f24", "c24")
+            if not made:
+                continue
+            wire, session_id = made
+            side.mock.set_responses([{"text": "f24 roster reply"}])
+            wire.request(
+                "p24s",
+                {"type": "prompt_and_wait", "activeSessionId": session_id,
+                 "message": "f24 seed turn of the parity battery"},
+                timeout=240,
+            )
+            wire.close()
+            self.settle_mock(side)
+            # The full view<->chat loop in one process.
+            tui = f"{self.runid}-f24-{side.name}"
+            argv = [side.binary, "agents", "--daemon-socket", str(side.daemon_socket)]
+            B.tmux_launch(tui, argv, side.env, side.work_dir)
+            B.tmux_wait_text(tui, "battery-f24", timeout=45)
+            view_frame = self.settle_frame(tui, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "00-agents-view.txt", view_frame)
+            # Open the session's row: filter to it, then Enter. The typed
+            # filter must be IN the search box before Enter (both products
+            # open the selected row either way, but the query persists
+            # across the round trip — the back-frame diff covers it).
+            B.tmux_wait_text(tui, "Search sessions", timeout=30)
+            B.tmux_send(tui, "f24", enter=False)
+            filtered = B.tmux_wait_text(tui, " f24", timeout=15)
+            side.evidence(flow, "00b-filtered.txt", filtered)
+            B.tmux_send(tui, "Enter", enter=False)
+            chat_ready = B.tmux_wait_text(tui, "f24 roster reply", timeout=60)
+            side.evidence(flow, "01-opened-chat.txt", chat_ready)
+            # Type the draft (never submitted) and settle the frame.
+            B.tmux_send(tui, draft, enter=False)
+            settled_draft = self.settle_frame(tui, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "02-typed-draft.txt", settled_draft)
+            frames[side.name]["typed-draft"] = settled_draft
+            # f2 hands the pane back to the agents view: the draft rides the
+            # per-session stash.
+            B.tmux_send(tui, "f2", enter=False)
+            back = B.tmux_wait_text(tui, "battery-f24", timeout=45)
+            back = self.settle_frame(tui, quiet_s=2.0, timeout=30)
+            side.evidence(flow, "03-agents-view-back.txt", back)
+            frames[side.name]["agents-view-back"] = back
+            if draft in back:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the agents view leaked the stashed draft into the roster",
+                    evidence=side.root / flow / "03-agents-view-back.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            # Reopen the same session: the draft returns to the editor with
+            # the TS restore status row. The persisted query (both products
+            # carry it across the chat round trip) keeps the row filtered
+            # and selected, so Enter opens it.
+            B.tmux_wait_text(tui, " f24", timeout=30)
+            B.tmux_send(tui, "Enter", enter=False)
+            B.tmux_wait_text(tui, "Restored stashed prompt", timeout=60)
+            restored = self.settle_frame(tui, quiet_s=2.5, timeout=60)
+            side.evidence(flow, "04-restored-draft.txt", restored)
+            frames[side.name]["restored"] = restored
+            if draft not in restored:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the reopened chat did not restore the stashed draft into the editor",
+                    evidence=side.root / flow / "04-restored-draft.txt",
+                    lane=FLOW_LANES[flow],
+                )
+            else:
+                self.record(
+                    flow, "behavior",
+                    f"{side.name}: the reopened chat restored the stashed draft into the editor",
+                    gap=False,
+                )
+            # The restored draft is live: submitting it runs a turn.
+            B.tmux_send(tui, "Enter")
+            submitted = B.tmux_wait_text(tui, "f24 roster reply", timeout=60)
+            side.evidence(flow, "05-submitted-restored.txt", submitted)
+            frames[side.name]["submitted"] = self.settle_frame(tui, quiet_s=2.0, timeout=40)
+            B.tmux_kill(tui)
+            side.mock.set_responses([{"text": HELLO_TEXT}])
+        # The back step is a cross-surface probe: the roster frame belongs
+        # to the agents view, so a divergence there is the agents-view
+        # surface's gap, not this flow's prompt-stash surface. The observed
+        # shape (run 20260921T194517Z): both sides typed the filter and the
+        # 00b evidence shows the query set in the box before the open, but
+        # after the chat round trip the TS binary (0.9.5) shows the search
+        # box cleared while the Rust build keeps the query — the agents-view
+        # query-persistence divergence, recorded for that surface's owner.
+        ts_back = self.normalize_agents_view_frame(
+            frames["ts"].get("agents-view-back", ""), self.sides["ts"]
+        )
+        rs_back = self.normalize_agents_view_frame(
+            frames["rust"].get("agents-view-back", ""), self.sides["rust"]
+        )
+        if ts_back == rs_back:
+            self.record(
+                flow, "visual",
+                "agents-view-back: frames identical TS vs Rust (normalized)",
+                gap=False,
+            )
+        else:
+            diff_path = self.sides["ts"].root / flow / "frame-diff-agents-view-back.txt"
+            diff_path.parent.mkdir(parents=True, exist_ok=True)
+            diff_path.write_text(
+                f"--- ts (agents-view-back)\n{frames['ts'].get('agents-view-back', '')}"
+                f"\n+++ rust (agents-view-back)\n{frames['rust'].get('agents-view-back', '')}"
+            )
+            self.record(
+                flow, "visual",
+                "agents-view-back: the roster frame differs — the TS binary clears the search query after the chat round trip, the Rust build keeps it (agents-view query persistence; both sides set the query before the open, see 00b-filtered.txt)",
+                evidence=diff_path,
+                lane="agents-view",
+            )
+        for step in ("typed-draft", "restored", "submitted"):
+            self.frame_diff(
+                flow, step,
+                {name: frames[name].get(step, "") for name in ("ts", "rust")},
+                self.normalize_transcript_frame,
+            )
+
         """User-editable keybindings (roadmap item "keybinding
         customization"): a `keybindings.json` fixture rebinding
         `app.tools.expand` from ctrl+o to the plain key x. Both sides must render

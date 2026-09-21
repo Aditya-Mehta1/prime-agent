@@ -1,0 +1,6 @@
+supervisor started pid 2792542
+[2026-09-21T20:52:51.605Z] session worker 90fd1c261d5d registered (epoch 1, pid 2792547)
+[2026-09-21T20:52:51.675Z] session worker 90fd1c261d5d re-registered (epoch 2, pid 2792547)
+[2026-09-21T20:53:23.343Z] session worker 4ba8ebe61ac6 registered (epoch 1, pid 2793550)
+[2026-09-21T20:53:23.441Z] session worker 4ba8ebe61ac6 re-registered (epoch 2, pid 2793550)
+[2026-09-21T20:53:40.718Z] session worker 90fd1c261d5d stopped intentionally (status Ok(ExitStatus(unix_wait_status(0))))

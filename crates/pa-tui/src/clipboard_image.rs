@@ -280,6 +280,16 @@ if (!types.containsObject($.NSPasteboardTypePNG)) {{
 /// native-module readers that need a bundled binary are replaced by the
 /// command-line equivalents.
 pub async fn read_clipboard_image() -> Option<ClipboardImage> {
+    // Verification seam (the `script_path` pattern — the product never sets
+    // it): a harness without a display server cannot drive the real
+    // clipboard readers, so a fixture file stands in for the clipboard.
+    // Only `read_clipboard_image` honors it; the image travels the exact
+    // paste path (marker insertion, registry, wire attach) from there.
+    if let Some(path) = std::env::var_os("PRIME_AGENT_TEST_CLIPBOARD_IMAGE") {
+        return std::fs::read(path)
+            .ok()
+            .and_then(clipboard_image_from_bytes);
+    }
     if std::env::var_os("TERMUX_VERSION").is_some() {
         return None;
     }

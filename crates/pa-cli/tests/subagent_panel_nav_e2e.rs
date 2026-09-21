@@ -205,9 +205,11 @@ fn session_options(
         traces: None,
         provider_auth: None,
         update_commands: None,
+        client_settings: None,
         telemetry: None,
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: rlm_depth,
+        prompt_stash: Default::default(),
         session_has_children: has_children,
     }
 }
