@@ -76,7 +76,7 @@ impl Worker {
     /// persisting it as the global settings default. The response is the TS
     /// `SetRlmMaxDepthResult` wire object (`{ maxDepth, source,
     /// globalSaved }` plus `globalError` when the global write failed).
-    pub(crate) fn handle_set_rlm_max_depth(&self, payload: &Value) -> DaemonResponse {
+    pub(crate) async fn handle_set_rlm_max_depth(&self, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created("set_rlm_max_depth") {
             return response;
         }
@@ -89,7 +89,17 @@ impl Worker {
             );
         };
         let global = payload.get("global").and_then(Value::as_bool) == Some(true);
-        match self.engine.set_rlm_max_depth(max_depth, global) {
+        // The engine call blocks on the engine runtime (the durable
+        // `rlm_max_depth_state` write takes the engine session lock), so it
+        // runs on a blocking thread like every other engine call — a direct
+        // call from this async task would `block_on` from inside the
+        // worker's runtime and die.
+        let engine = std::sync::Arc::clone(&self.engine);
+        let result =
+            tokio::task::spawn_blocking(move || engine.set_rlm_max_depth(max_depth, global))
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("RLM max depth task failed: {error}")));
+        match result {
             Ok(result) => response_success(None, "set_rlm_max_depth", Some(result)),
             Err(error) => response_failure(None, "set_rlm_max_depth", &error.to_string(), None),
         }

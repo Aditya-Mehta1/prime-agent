@@ -4,7 +4,11 @@
     ███▄       ▗▄███▀
    ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.5
   ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+<<<<<<<< HEAD:scripts/battery/runs/20260921T191753Z/ts/f9_agents_view/03-attached-session.txt
   ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/av-selection/scripts/battery/runs/20260921T191753Z/ts/work
+========
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/utility-commands/scripts/battery/runs/20260921T182248Z/ts/work
+>>>>>>>> bdfd0884 (pa-tui: /fullscreen top-bar gate + /reload transcript rebuild (TS re-mount parity); rlm-max-depth set row plain; parity evidence + normalizer):scripts/battery/runs/20260921T182248Z/ts/utility-commands/name-set.txt
  ▟███▄  ▄▄▟███▀
  ▜█▛▀▘  ▜█▛▀▘
 

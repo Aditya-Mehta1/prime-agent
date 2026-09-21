@@ -1,0 +1,36 @@
+                                                     parity session  $0.00
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.1.0
+  ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/utility-commands/scripts/battery/runs/20260921T201747Z/rust/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+ Session name set: parity session
+
+ Session name: parity session
+
+ RLM max depth: 2 (default)
+
+ RLM max depth set: 3
+
+ Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication
+
+
+
+
+
+
+
+
+
+
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                                                 mock-1 · 0 (0%)

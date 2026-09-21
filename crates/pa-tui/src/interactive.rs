@@ -226,6 +226,11 @@ pub struct InteractiveOptions {
     /// Whether the opened session had direct children (TS
     /// `sessionHasChildren`).
     pub session_has_children: bool,
+    /// The client-process settings the interactive commands read and
+    /// persist (`/settings`, `/fullscreen`, the scoped-models save). The
+    /// composition root implements the seam over the real store; `None`
+    /// reports the commands' persistence as unavailable.
+    pub client_settings: Option<std::sync::Arc<dyn crate::client_settings::ClientSettings>>,
 }
 
 impl std::fmt::Debug for InteractiveOptions {
@@ -564,6 +569,9 @@ pub async fn run_interactive(
     // The `/share` upload task reports here; the loop folds the outcome
     // into the transcript and clears the loader.
     let (share_tx, mut share_rx) = mpsc::unbounded_channel::<crate::session_ui::ShareNote>();
+    // The `/reload` task reports here; the loop folds the client-side
+    // re-reads (keybindings, theme) and the outcome row.
+    let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<crate::session_ui::ReloadNote>();
     // The background model-catalog refresh (`get_model_catalog`) reports
     // here; the loop folds it into the picker catalog and any open picker.
     let (catalog_tx, mut catalog_rx) =
@@ -572,7 +580,8 @@ pub async fn run_interactive(
     // pair even while this loop is wedged in a daemon request, and a plain
     // std-thread watchdog enforces the exit deadline without the runtime.
     let exit_guard = ExitGuard::new();
-    let mut session = SessionUi::open(client, &options, notes_tx, share_tx, catalog_tx).await?;
+    let mut session =
+        SessionUi::open(client, &options, notes_tx, share_tx, reload_tx, catalog_tx).await?;
     session.exit_guard = exit_guard.clone();
 
     let theme = crate::app::load_theme(&options.theme);
@@ -585,6 +594,11 @@ pub async fn run_interactive(
     // The `terminal.showImages` setting rides the startup options (TS
     // `getShowImages`), resolved by the composition root.
     view.show_images = options.show_images;
+    // The persisted `terminal.fullscreen` preference seeds the runtime
+    // toggle (TS `fullscreenEnabled`); the compose gates the top bar on it.
+    if let Some(settings) = &options.client_settings {
+        view.fullscreen = settings.fullscreen();
+    }
     apply_startup_chrome(&mut view, &options);
     session.refresh_stats().await;
     // The startup catalog fetch (TS `updateAvailableProviderCount` →
@@ -842,6 +856,7 @@ pub async fn run_interactive(
             && wait_idle_deadline.is_none()
             && !session.dirty
             && !session.share_pending()
+            && !session.reload_pending()
         {
             break;
         }
@@ -947,6 +962,11 @@ pub async fn run_interactive(
             maybe_share = share_rx.recv() => {
                 if let Some(outcome) = maybe_share {
                     session.apply_share_outcome(outcome, &mut view);
+                }
+            }
+            maybe_reload = reload_rx.recv() => {
+                if let Some(outcome) = maybe_reload {
+                    session.apply_reload_outcome(outcome, &mut view).await;
                 }
             }
             maybe_catalog = catalog_rx.recv() => {
@@ -1666,6 +1686,7 @@ mod tests {
             keybindings: crate::keybindings::KeybindingsManager::new(),
             session_rlm_depth: None,
             session_has_children: false,
+            client_settings: None,
         }
     }
 

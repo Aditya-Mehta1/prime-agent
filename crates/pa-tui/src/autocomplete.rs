@@ -63,6 +63,9 @@ pub trait AutocompleteProvider: Send {
     ) -> bool {
         true
     }
+    /// Replace the hidden-command set (the model-eligibility filter). A
+    /// default no-op so providers without command listings keep working.
+    fn set_hidden_commands(&mut self, _hidden: std::collections::HashSet<String>) {}
 }
 
 /// Slash-command context (port of slash-command-context.ts): which part of
@@ -795,6 +798,10 @@ impl SlashCommandEntry {
 /// plus file/path completion.
 pub struct CombinedAutocompleteProvider {
     commands: Vec<SlashCommandEntry>,
+    /// Commands the current model filters out of the listing (TS
+    /// `getAvailableCommands` drops `/fast` when the model is not
+    /// fast-mode-eligible).
+    hidden: std::collections::HashSet<String>,
     paths: PathCompletionProvider,
 }
 
@@ -814,15 +821,26 @@ impl CombinedAutocompleteProvider {
             .collect();
         Self {
             commands,
+            hidden: Default::default(),
             paths: PathCompletionProvider { base },
         }
+    }
+
+    /// Replace the hidden-command set (the caller recomputes model
+    /// eligibility on every model switch).
+    pub fn set_hidden_commands(&mut self, hidden: std::collections::HashSet<String>) {
+        self.hidden = hidden;
     }
 
     /// The slash-name suggestions for a typed prefix (fuzzy filter over
     /// `name + aliases`, registry order preserved on ties).
     fn slash_suggestions(&self, prefix: &str) -> Vec<CompletionItem> {
         let query = prefix.strip_prefix('/').unwrap_or(prefix);
-        let commands: Vec<&SlashCommandEntry> = self.commands.iter().collect();
+        let commands: Vec<&SlashCommandEntry> = self
+            .commands
+            .iter()
+            .filter(|command| !self.hidden.contains(&command.name))
+            .collect();
         let scored = fuzzy_filter(&commands, query, |command| command.search_text());
         scored
             .into_iter()
@@ -890,6 +908,10 @@ impl CombinedAutocompleteProvider {
 }
 
 impl AutocompleteProvider for CombinedAutocompleteProvider {
+    fn set_hidden_commands(&mut self, hidden: std::collections::HashSet<String>) {
+        self.hidden = hidden;
+    }
+
     fn get_suggestions(
         &self,
         lines: &[String],
@@ -1034,6 +1056,24 @@ mod tests {
         assert_eq!(
             suggestions.items.len(),
             SlashCommandRegistry::builtin().all().len()
+        );
+    }
+
+    #[test]
+    fn hidden_commands_drop_rows_from_the_menu() {
+        let mut provider = provider("/tmp");
+        let visible = provider.get_suggestions(&["/f".to_string()], 0, 2, false);
+        let items = visible.expect("suggestions").items;
+        assert!(
+            items.iter().any(|item| item.value == "fast"),
+            "fast lists by default: {items:?}"
+        );
+        provider.set_hidden_commands(std::collections::HashSet::from(["fast".to_string()]));
+        let visible = provider.get_suggestions(&["/f".to_string()], 0, 2, false);
+        let items = visible.expect("suggestions").items;
+        assert!(
+            !items.iter().any(|item| item.value == "fast"),
+            "hidden fast drops from the menu: {items:?}"
         );
     }
 

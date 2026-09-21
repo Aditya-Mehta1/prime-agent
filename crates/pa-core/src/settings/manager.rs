@@ -131,6 +131,17 @@ impl SettingsManager {
         self.runtime_overrides = deep_merge(&self.runtime_overrides, overrides);
     }
 
+    /// Mutable global settings for the setters in sibling modules (the
+    /// TS setters mutate `globalSettings` then save).
+    pub(crate) fn global_mut(&mut self) -> &mut Settings {
+        &mut self.global
+    }
+
+    /// Persist the global scope (sibling-module setters share this).
+    pub(crate) fn save_global_scope(&mut self) -> Result<()> {
+        self.save_global()
+    }
+
     // -- persisted setters --------------------------------------------------
 
     pub fn set_default_provider(&mut self, provider: String) -> Result<()> {

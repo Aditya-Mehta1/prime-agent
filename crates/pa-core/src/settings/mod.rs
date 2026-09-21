@@ -1,6 +1,7 @@
 //! Settings subsystem: typed settings documents, global/project storage,
 //! legacy migrations, and the manager.
 
+pub(crate) mod interactive_settings;
 pub(crate) mod load;
 pub(crate) mod manager;
 pub(crate) mod merge;

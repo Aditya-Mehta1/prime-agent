@@ -236,6 +236,7 @@ fn options(socket: PathBuf, fullscreen_mouse: bool) -> InteractiveOptions {
         session: SessionSelection::New,
         initial_message: None,
         show_images: true,
+        client_settings: None,
         fullscreen_mouse,
         theme: "prime".to_string(),
         code_block_indent: "  ".to_string(),

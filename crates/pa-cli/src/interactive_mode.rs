@@ -578,7 +578,14 @@ fn build_tui_options(options: &RunOptions, socket_path: PathBuf) -> Result<Inter
         initial_message: options.initial_message.clone(),
         show_images,
         fullscreen_mouse,
-        theme: String::new(),
+        // TS startup reads the settings theme (`getTheme() || "prime"`).
+        theme: settings.get_theme().map(str::to_string).unwrap_or_default(),
+        // The client-settings seam the interactive commands persist
+        // through (`/settings`, `/fullscreen`, the scoped-models save).
+        client_settings: Some(crate::client_settings::CliClientSettings::new(
+            config.cwd.clone(),
+            config.agent_dir.clone(),
+        )),
         version: crate::config::version().to_string(),
         // The startup-model chain (PR lane): the task is built from the full
         // run options so the resolved startup model gates the notice.

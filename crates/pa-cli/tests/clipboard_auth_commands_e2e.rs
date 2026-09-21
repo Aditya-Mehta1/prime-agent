@@ -352,6 +352,7 @@ fn command_options(
         no_session: false,
         session: pa_tui::interactive::SessionSelection::Attach(session_id.to_string()),
         show_images: false,
+        client_settings: None,
         fullscreen_mouse: true,
         initial_message: None,
         theme: "prime".to_string(),

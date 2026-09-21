@@ -58,6 +58,9 @@ pub struct Reconstructed {
     /// attach re-syncs the queue strip (TS re-reads the queue after
     /// subscribe because a `session_action_update` in the gap is lost).
     pub queued: crate::queued::QueuedMessages,
+    /// The session's effective service tier (`state.serviceTier`), the
+    /// `/fast` toggle's baseline.
+    pub service_tier: Option<String>,
 }
 
 impl Reconstructed {
@@ -253,6 +256,10 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
             .unwrap_or_default(),
     };
 
+    let service_tier = state
+        .and_then(|state| state.get("serviceTier"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Reconstructed {
         chat: messages,
         model_id,
@@ -261,6 +268,7 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         goal,
         last_event_sequence,
         queued,
+        service_tier,
     }
 }
 
@@ -302,6 +310,11 @@ pub fn attach_data_from_response(data: &Value) -> anyhow::Result<AttachData> {
 pub enum TurnUpdate {
     /// `agent_start` / `turn_start`.
     TurnStarted,
+    /// `session_info_changed`: the session display name (cleared when the
+    /// event carries none).
+    SessionInfoChanged { name: Option<String> },
+    /// `service_tier_changed`: the session's effective service tier.
+    ServiceTierChanged { tier: String },
     /// `message_start` with a user message.
     UserMessage(String),
     /// `message_start`/`message_update`/`message_end` with an assistant
@@ -445,6 +458,24 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 .map(str::to_string),
         }),
         "agent_start" | "turn_start" => Some(TurnUpdate::TurnStarted),
+        // `session_info_changed { name }` (TS `session.setSessionName`):
+        // every attached client re-reads the session display name.
+        "session_info_changed" => Some(TurnUpdate::SessionInfoChanged {
+            name: event
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        // `service_tier_changed { serviceTier }` (TS fast-mode toggle):
+        // the client patches its connection state (the `/fast` status
+        // reads the tier from it).
+        "service_tier_changed" => Some(TurnUpdate::ServiceTierChanged {
+            tier: event
+                .get("serviceTier")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
         "turn_end" => Some(TurnUpdate::TurnEnded {
             error: event
                 .get("error")

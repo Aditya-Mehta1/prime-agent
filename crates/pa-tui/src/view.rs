@@ -119,6 +119,19 @@ pub struct AgentView {
     /// A `/share` gist upload in flight (TS `BorderedLoader`): while set,
     /// it replaces the editor with the cancellable loader rows.
     pub share_loader: Option<ShareLoader>,
+    /// The `/reload` box (TS `handleReloadCommand`'s `reloadBox`): a
+    /// bordered note that replaces the editor while the reload travels.
+    pub reload_box: Option<String>,
+    /// The side-question pane (TS `sideQuestionContainer`): mounted above
+    /// the prompt dock (below the queue strip) while a side conversation
+    /// is open; `None` is the main-thread state.
+    pub side_pane: Option<crate::side_question::SideQuestionPane>,
+    /// The `/settings` inline menu (TS `SettingsSelectorComponent`):
+    /// mounted in the editor dock like the tree and fork selectors.
+    pub settings_menu: Option<crate::settings_menu::SettingsMenu>,
+    /// The `/scoped-models` selector (TS `ScopedModelsSelectorComponent`):
+    /// mounted in the editor dock the same way.
+    pub scoped_models: Option<crate::scoped_models::ScopedModelsSelector>,
     /// The `?` quick-shortcut guide (TS `shortcutGuideContainer`): while
     /// set, its markdown renders at the transcript tail, above the dock;
     /// the next submission clears it (TS `clearShortcutGuide`).
@@ -127,6 +140,10 @@ pub struct AgentView {
     /// true): image blocks render their metadata rows when set, their
     /// `[Image: ...]` text placeholders otherwise.
     pub show_images: bool,
+    /// The runtime `terminal.fullscreen` preference (TS `fullscreenEnabled`):
+    /// the fullscreen compose pins the top bar; the inline surface (TS
+    /// `fullscreen rendering off`) renders without it.
+    pub fullscreen: bool,
     pub(crate) scroll_top: usize,
     following: bool,
     /// The transcript-tail offset of the last composed frame (TS
@@ -190,8 +207,13 @@ impl AgentView {
             effort_picker: None,
             mcp_view: None,
             share_loader: None,
+            reload_box: None,
+            side_pane: None,
+            settings_menu: None,
+            scoped_models: None,
             shortcut_guide: None,
             show_images: true,
+            fullscreen: true,
             scroll_top: 0,
             following: true,
             last_max_scroll: 0,
@@ -813,6 +835,11 @@ impl AgentView {
         };
         let queue_rows = crate::queued::render_queue(&self.theme, &self.queued, &browse_key, width);
         let mut lines = queue_rows;
+        // The side-question pane (TS `sideQuestionContainer`) sits between
+        // the queue strip and the prompt context.
+        if let Some(pane) = &self.side_pane {
+            lines.extend(pane.render(&self.theme, width));
+        }
         lines.extend(render_prompt_context(
             &self.detail_label(),
             &self.theme,
@@ -1077,6 +1104,9 @@ impl AgentView {
             || self.share_loader.is_some()
             || self.confirm.is_some()
             || self.provider_auth.is_some()
+            || self.reload_box.is_some()
+            || self.settings_menu.is_some()
+            || self.scoped_models.is_some()
         {
             // TS's editor container holds the prompt context (the detail
             // hint) and the editor; `showSelector` replaces only the editor
@@ -1092,12 +1122,21 @@ impl AgentView {
                 dock.extend(confirm.render(&self.theme, width));
             } else if let Some(selector) = self.provider_auth.as_mut() {
                 dock.extend(selector.render(&self.theme, width));
+            } else if let Some(message) = self.reload_box.as_ref() {
+                dock.extend(self.render_reload_box(message, width));
+            } else if let Some(menu) = self.settings_menu.as_ref() {
+                dock.extend(menu.render(&self.theme, width));
+            } else if let Some(selector) = self.scoped_models.as_ref() {
+                dock.extend(selector.render(&self.theme, width, self.editor.keybindings()));
             }
             Some(dock)
         } else {
             picker_dock
         };
-        let top = render_top_bar(&self.chrome, &self.theme, width);
+        let top = self
+            .fullscreen
+            .then(|| render_top_bar(&self.chrome, &self.theme, width));
+        let top_rows = usize::from(top.is_some());
         let transcript = self.render_transcript(width);
         let dock = selector_dock.unwrap_or_else(|| self.render_dock(width));
         let dock_height = dock
@@ -1109,8 +1148,8 @@ impl AgentView {
             dock
         };
         let window_height = height
-            .saturating_sub(1 + dock.len())
-            .max(FULLSCREEN_MIN_TRANSCRIPT_ROWS.min(height.saturating_sub(1 + dock.len())));
+            .saturating_sub(top_rows + dock.len())
+            .max(FULLSCREEN_MIN_TRANSCRIPT_ROWS.min(height.saturating_sub(top_rows + dock.len())));
         let max_scroll = transcript.len().saturating_sub(window_height);
         if self.following {
             self.scroll_top = max_scroll;
@@ -1121,7 +1160,9 @@ impl AgentView {
         let start = self.scroll_top.min(max_scroll);
         self.window_rows = window_height;
         let mut frame: Vec<Line> = Vec::with_capacity(height);
-        frame.push(pad_row(top, width));
+        if let Some(top) = top {
+            frame.push(pad_row(top, width));
+        }
         self.note_transcript_text(&transcript);
         for (window_index, line) in transcript[start..(start + window_height).min(transcript.len())]
             .iter()
@@ -1194,6 +1235,26 @@ impl AgentView {
         rows
     }
 
+    /// The `/reload` box (TS `handleReloadCommand`): DynamicBorder, blank,
+    /// the muted message, blank, DynamicBorder — the editor container's
+    /// replacement while the reload runs.
+    fn render_reload_box(&self, message: &str, width: usize) -> Vec<Line> {
+        let border = self.theme.fg_style(ThemeColor::Border);
+        let muted = self.theme.fg_style(ThemeColor::Muted);
+        let rule = "─".repeat(width.max(1));
+        let rows: Vec<Line> = vec![
+            vec![Span::styled(rule.clone(), border)],
+            vec![Span::raw(String::new())],
+            vec![
+                Span::raw(" ".to_string()),
+                Span::styled(message.to_string(), muted),
+            ],
+            vec![Span::raw(String::new())],
+            vec![Span::styled(rule, border)],
+        ];
+        rows
+    }
+
     /// Hardware cursor position within the last composed frame (0-based row,
     /// 0-based column), when the editor surface drew the cursor.
     pub fn frame_cursor(&self) -> Option<(usize, usize)> {
@@ -1205,6 +1266,9 @@ impl AgentView {
             || self.share_loader.is_some()
             || self.confirm.is_some()
             || self.provider_auth.is_some()
+            || self.reload_box.is_some()
+            || self.settings_menu.is_some()
+            || self.scoped_models.is_some()
         {
             return None;
         }

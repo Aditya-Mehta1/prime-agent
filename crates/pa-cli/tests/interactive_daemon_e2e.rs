@@ -398,6 +398,7 @@ async fn tui_attaches_prompts_streams_lists_and_switches() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -555,6 +556,7 @@ async fn ensure_daemon_running_spawns_supervisor_and_tui_attaches() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     // The interactive runtime's own launch sequence, minus the TTY: spawn
     // the real supervisor binary detached and wait for the hello handshake.
@@ -645,6 +647,7 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -845,6 +848,7 @@ async fn tui_model_picker_applies_and_effort_reports() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -946,6 +950,7 @@ async fn tui_compact_on_a_short_session_warns_nothing_to_compact() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -1085,6 +1090,7 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     let ctrl_o = || {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
@@ -1282,6 +1288,7 @@ async fn tui_session_tree_navigates_forks_and_clones() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     let key = |code: KeyCode| {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
@@ -1478,6 +1485,7 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     // 45s per turn is the throughput bound: the producer finishes each
     // turn in ~4s, so 45s tolerates real box load (sibling e2e binaries,
@@ -1610,6 +1618,7 @@ async fn tui_renders_and_fires_user_keybindings_from_settings() {
         keybindings: pa_tui::keybindings::KeybindingsManager::create(&agent_dir),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     let key = |code: KeyCode, modifiers: KeyModifiers| {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(code, modifiers))
@@ -1770,6 +1779,7 @@ async fn tui_prompts_queued_behind_a_turn_render_the_queue_strip() {
         keybindings: pa_tui::keybindings::KeybindingsManager::new(),
         session_rlm_depth: None,
         session_has_children: false,
+        client_settings: None,
     };
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -1880,6 +1890,7 @@ async fn tui_flagged_model_turn_reports_the_ts_preflight_error_without_credentia
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
+        client_settings: None,
         fullscreen_mouse: true,
         initial_message: None,
         theme: "prime".to_string(),
@@ -2006,6 +2017,7 @@ async fn tui_model_pick_refreshes_the_label_and_the_next_turn_resolves() {
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
+        client_settings: None,
         fullscreen_mouse: true,
         initial_message: None,
         theme: "prime".to_string(),
@@ -2059,4 +2071,350 @@ async fn tui_model_pick_refreshes_the_label_and_the_next_turn_resolves() {
         "the footer label refreshed to the picked model:\n{last}"
     );
     drop(supervisor);
+}
+
+/// The base options every utility-command verifier shares.
+fn base_options(
+    supervisor: &Supervisor,
+    dir: &Path,
+    session_dir: &Path,
+) -> pa_tui::interactive::InteractiveOptions {
+    pa_tui::interactive::InteractiveOptions {
+        socket_path: supervisor.socket.clone(),
+        cwd: dir.to_path_buf(),
+        session_dir: Some(session_dir.to_path_buf()),
+        script_path: Some(dir.join("script.json")),
+        model_selection: Default::default(),
+        model_catalog: Vec::new(),
+        model_configured_providers: Default::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: pa_tui::interactive::SessionSelection::New,
+        show_images: true,
+        fullscreen_mouse: true,
+        initial_message: None,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        session_has_children: false,
+        client_settings: None,
+        provider_auth: None,
+        traces: None,
+        update_commands: None,
+    }
+}
+
+/// `/name` and its `/rename` alias (TS `handleNameCommand`): the rename
+/// travels to the daemon, the session file persists the `session_info`
+/// entry (the #188/#194 rename machinery), and the no-argument form reports
+/// the current name.
+#[tokio::test]
+async fn tui_renames_session_through_slash_command() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({ "engine": "faux", "responses": [
+        { "text": "scripted reply" },
+    ] });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = base_options(&supervisor, dir.path(), &session_dir);
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            // Set through the alias: /rename resolves to /name.
+            pa_tui::interactive::HeadlessStep::Submit("/rename my session".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // The no-argument form reports the current name.
+            pa_tui::interactive::HeadlessStep::Submit("/name".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    // Verification seam: dump the captured frames for manual frame-diffing
+    // against the TS product (PA_TUI_DUMP_FRAMES=<dir>).
+    if let Ok(dir) = std::env::var("PA_TUI_DUMP_FRAMES") {
+        for (index, frame) in outcome.frames.iter().enumerate() {
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join(format!("frame-{index:03}.txt")),
+                frame,
+            );
+        }
+    }
+    assert!(
+        rendered.contains("Session name set: my session"),
+        "the /rename status row rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Session name: my session"),
+        "the /name report row rendered:\n{rendered}"
+    );
+    // The #188/#194 persistence: the session file carries the session_info
+    // entry with the name.
+    let mut saw_name = false;
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        for line in content.lines() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                if value["type"] == "session_info" && value["name"] == "my session" {
+                    saw_name = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_name,
+        "the session_info entry persisted (the /name arm reaches the rename machinery)"
+    );
+    // The daemon state reports the name (the summary the roster and the
+    // agents view read).
+    let (client, _client_events) = pa_tui::daemon_client::DaemonClient::connect(&supervisor.socket)
+        .await
+        .expect("connect");
+    let state = client
+        .request_ok(DaemonCommand::GetState {
+            id: None,
+            active_session_id: outcome.active_session_id.clone(),
+            rest: Default::default(),
+        })
+        .await
+        .expect("get_state");
+    assert_eq!(state["sessionName"], "my session");
+}
+
+/// `/btw` (and its `/side` alias): the side-question pane mounts above the
+/// dock, the daemon streams the answer, a reply follows up through the
+/// pane, and Esc closes it.
+#[tokio::test]
+async fn tui_side_question_pane_flow() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    // Two scripted answers: the first /btw turn, then the follow-up reply.
+    let script = serde_json::json!({ "engine": "faux", "responses": [
+        { "text": "Paris, obviously" },
+        { "text": "Second answer" },
+    ] });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = base_options(&supervisor, dir.path(), &session_dir);
+    let escape = pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit(
+                "/btw what is the capital of France".to_string(),
+            ),
+            // The side question runs outside the turn state; give the
+            // daemon run time to stream and settle.
+            pa_tui::interactive::HeadlessStep::WaitMs(3_000),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            // The open pane captures a plain reply as a follow-up side
+            // question (TS's side-conversation ladder).
+            pa_tui::interactive::HeadlessStep::Submit("and its largest city".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitMs(3_000),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            // A slash command inside the pane gets the TS notice turn.
+            pa_tui::interactive::HeadlessStep::Submit("/model".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitMs(500),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            // Esc returns to the main thread.
+            escape,
+            pa_tui::interactive::HeadlessStep::WaitMs(500),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    // Verification seam: dump the captured frames for manual frame-diffing
+    // against the TS product (PA_TUI_DUMP_FRAMES=<dir>).
+    if let Ok(dir) = std::env::var("PA_TUI_DUMP_FRAMES") {
+        for (index, frame) in outcome.frames.iter().enumerate() {
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join(format!("frame-{index:03}.txt")),
+                frame,
+            );
+        }
+    }
+    assert!(
+        rendered.contains("/btw  what is the capital of France"),
+        "the pane rendered the /btw header:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Paris, obviously"),
+        "the streamed answer rendered in the pane:\n{rendered}"
+    );
+    // The follow-up renders as a user-message bubble (TS `questionBubble`).
+    assert!(
+        rendered.contains("and its largest city"),
+        "the follow-up question rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Second answer"),
+        "the follow-up answer rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "Slash commands are not available in side conversations. Press esc to return to the main thread."
+        ),
+        "the in-pane slash notice rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("reply to follow up · esc to return to session"),
+        "the pane hint rendered:\n{rendered}"
+    );
+    // Esc closed the pane: the final frame shows no pane rows.
+    let last = outcome.frames.last().expect("a final frame");
+    assert!(
+        !last.contains("esc to return to session"),
+        "esc closed the pane:\n{last}"
+    );
+    // The side turns never reached the session transcript (TS: side
+    // questions are not durable): the session file has no side-question
+    // user rows.
+    let mut leaked = false;
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        leaked |= content.contains("what is the capital of France");
+    }
+    assert!(!leaked, "the side question stayed out of the session file");
+}
+
+/// `/settings` and `/scoped-models` (TS `showSettingsSelector` /
+/// `showModelsSelector`): both menus mount in the dock, the settings rows
+/// cycle, and the scoped-models picker toggles and persists through the
+/// settings seam.
+#[tokio::test]
+async fn tui_settings_menu_and_scoped_models_picker() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({ "engine": "faux", "responses": [] });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let mut options = base_options(&supervisor, dir.path(), &session_dir);
+    // A catalog entry so the scoped-models picker has rows (TS renders the
+    // empty panel otherwise).
+    options.model_catalog = vec![serde_json::from_value(serde_json::json!({
+        "id": "claude-5", "name": "Claude 5", "api": "anthropic",
+        "provider": "anthropic", "baseUrl": "", "reasoning": false,
+        "input": ["text"],
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 100000, "maxTokens": 4096
+    }))
+    .expect("model")];
+    let enter = || {
+        pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    };
+    let escape = || {
+        pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    };
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("/settings".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitMs(500),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            // Enter on the first row (Auto-compact) cycles it to false —
+            // the daemon `set_auto_compaction` switch.
+            enter(),
+            pa_tui::interactive::HeadlessStep::WaitMs(500),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            escape(),
+            pa_tui::interactive::HeadlessStep::WaitMs(300),
+            // The scoped-models selector over the catalog.
+            pa_tui::interactive::HeadlessStep::Submit("/scoped-models".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitMs(500),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            // Enter toggles the model off (session-only).
+            enter(),
+            pa_tui::interactive::HeadlessStep::WaitMs(500),
+            pa_tui::interactive::HeadlessStep::SettleIdle,
+            escape(),
+            pa_tui::interactive::HeadlessStep::WaitMs(300),
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    // Verification seam: dump the captured frames for manual frame-diffing
+    // against the TS product (PA_TUI_DUMP_FRAMES=<dir>).
+    if let Ok(dir) = std::env::var("PA_TUI_DUMP_FRAMES") {
+        for (index, frame) in outcome.frames.iter().enumerate() {
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join(format!("frame-{index:03}.txt")),
+                frame,
+            );
+        }
+    }
+    assert!(
+        rendered.contains("Auto-compact"),
+        "the settings menu rendered its first row:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Type to search · Enter/Space to change · Esc to cancel"),
+        "the settings hint rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Model Configuration"),
+        "the scoped-models selector rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Session-only."),
+        "the scoped-models save hint rendered:\n{rendered}"
+    );
+    // The daemon's startup catalog refresh replaces the seeded catalog
+    // (the same refresh `/model` rides); the footer counts the toggle
+    // against the refreshed catalog.
+    assert!(
+        rendered.contains("1/") && rendered.contains("enabled (unsaved)"),
+        "the scoped-models footer counted the toggle and flagged it unsaved:\n{rendered}"
+    );
 }

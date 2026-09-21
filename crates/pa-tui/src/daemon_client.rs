@@ -77,6 +77,12 @@ pub enum DaemonClientEvent {
         reason: String,
         update: Option<DaemonClosingUpdate>,
     },
+    /// `side_question_event`: one streamed side-question run (the `/btw`
+    /// pane tracks the run by its id).
+    SideQuestionEvent {
+        active_session_id: String,
+        event: Value,
+    },
     /// `roster_update`: live roster deltas for subscribers (the agents
     /// view): changed entries upsert by agent id, `removed` deletes, and
     /// `resync` replaces the whole roster.
@@ -114,6 +120,14 @@ pub(crate) fn client_event_from_value(value: &Value) -> Option<DaemonClientEvent
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+        }),
+        "side_question_event" => Some(DaemonClientEvent::SideQuestionEvent {
+            active_session_id: value
+                .get("activeSessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            event: value.get("event").cloned().unwrap_or(Value::Null),
         }),
         "session_list_item" => Some(DaemonClientEvent::SessionListItem {
             session: value.get("session").cloned().unwrap_or(Value::Null),

@@ -1477,7 +1477,12 @@ impl Worker {
             "extension_ui_response" => self.handle_extension_ui_response(payload),
             "cancel_rlm_child" => self.handle_cancel_rlm_child(payload).await,
             "delete_rlm_subagent" => self.handle_delete_rlm_subagent(payload).await,
-            "set_rlm_max_depth" => self.handle_set_rlm_max_depth(payload),
+            // The engine call blocks on the engine runtime (the durable
+            // `rlm_max_depth_state` write takes the engine session lock),
+            // so it runs on a blocking thread like every other engine
+            // call — a direct call would block_on from inside this async
+            // task and die.
+            "set_rlm_max_depth" => self.handle_set_rlm_max_depth(payload).await,
             "acquire_session_input_pause" => self.handle_acquire_session_input_pause(payload),
             "release_session_input_pause" => self.handle_release_session_input_pause(payload),
             "cancel_prompt_admission" => self.handle_cancel_prompt_admission(payload),
@@ -3358,6 +3363,13 @@ impl Worker {
         }
         let summary = self.summary_locked(&core);
         drop(core);
+        // TS `session.setSessionName` emits `session_info_changed` so every
+        // attached client re-reads the name (the interactive mode patches
+        // its connection state from the event).
+        self.emit_worker_event(serde_json::json!({
+            "type": "session_info_changed",
+            "name": name,
+        }));
         // The sender identity follows the live name.
         if let Ok(summary_value) = serde_json::to_value(&summary) {
             self.engine.set_session_summary(summary_value);

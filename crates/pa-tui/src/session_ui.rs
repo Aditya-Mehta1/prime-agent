@@ -79,6 +79,10 @@ enum SubmitBehavior {
 /// message (TS resolves the same promise from the gh process result).
 pub(crate) type ShareNote = Result<GistOutcome, String>;
 
+/// The `/reload` task's report: the daemon reloaded the session's live
+/// inputs, or the failure message (TS `handleReloadCommand`'s outcome).
+pub(crate) type ReloadNote = Result<(), String>;
+
 /// A landed `get_model_catalog` refresh: the full catalog and the providers
 /// with configured auth (TS `AgentConnectionModelCatalog`).
 pub(crate) struct ModelCatalogUpdate {
@@ -171,12 +175,35 @@ pub(crate) struct SessionUi {
     /// The `terminal.fullscreenMouse` setting: whether the interactive
     /// surface enables mouse tracking; carried into `/new` runs.
     fullscreen_mouse: bool,
+    /// The runtime fullscreen flag (`/fullscreen`, TS `fullscreenEnabled`):
+    /// this surface always renders on the alternate screen, so the flag
+    /// starts on and the command persists the preference (TS
+    /// `settingsManager.setFullscreen`) and reports the TS status.
+    fullscreen_enabled: bool,
+    /// The session's effective service tier (TS `connectionState.serviceTier`),
+    /// seeded from the attach state and kept live by `service_tier_changed`
+    /// events; the `/fast` toggle reads it.
+    service_tier: Option<String>,
+    /// The client-process settings seam (`/settings`, `/fullscreen`,
+    /// scoped-models save); the composition root supplies it.
+    client_settings: Option<std::sync::Arc<dyn crate::client_settings::ClientSettings>>,
+    /// The side-question run currently streaming (TS `activeSideQuestionId`):
+    /// at most one run per client, exactly like the daemon enforces.
+    active_side_question_id: Option<String>,
+    /// The next side-question local id suffix (the daemon only requires
+    /// per-client uniqueness).
+    side_question_counter: u64,
     /// A `/share` gist upload in flight (TS `BorderedLoader` + the gh
     /// spawn): aborting the task kills `gh` (kill-on-drop).
     share: Option<ShareRun>,
     /// Where the upload task reports its outcome (the run loop folds it
     /// into the transcript).
     share_notes: mpsc::UnboundedSender<ShareNote>,
+    /// A `/reload` in flight (the reload box replaces the editor while
+    /// the request travels).
+    reload: Option<tokio::task::JoinHandle<()>>,
+    /// Where the reload task reports its outcome.
+    reload_notes: mpsc::UnboundedSender<ReloadNote>,
     /// Where the background catalog refresh delivers `get_model_catalog`
     /// responses (the run loop folds them into the picker catalog).
     catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
@@ -333,6 +360,7 @@ impl SessionUi {
         options: &InteractiveOptions,
         notes: mpsc::UnboundedSender<String>,
         share_notes: mpsc::UnboundedSender<ShareNote>,
+        reload_notes: mpsc::UnboundedSender<ReloadNote>,
         catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
     ) -> Result<SessionUi> {
         let active_session_id = match &options.session {
@@ -364,7 +392,18 @@ impl SessionUi {
             last_status_index: None,
             show_images: options.show_images,
             fullscreen_mouse: options.fullscreen_mouse,
+            fullscreen_enabled: options
+                .client_settings
+                .as_ref()
+                .map(|settings| settings.fullscreen())
+                .unwrap_or(true),
+            service_tier: None,
+            client_settings: options.client_settings.clone(),
+            active_side_question_id: None,
+            side_question_counter: 0,
             share: None,
+            reload: None,
+            reload_notes,
             share_notes,
             pasted_images: Default::default(),
             next_image_marker_id: 1,
@@ -539,6 +578,7 @@ impl SessionUi {
         self.active_session_id = attach.active_session_id;
         self.session_id = reconstructed.session_id;
         self.session_name = reconstructed.session_name.clone();
+        self.service_tier = reconstructed.service_tier.clone();
         self.session_file = attach
             .snapshot
             .get("state")
@@ -752,6 +792,7 @@ impl SessionUi {
             view.working = None;
         }
         view.follow();
+        self.update_fast_filter(view);
         self.dirty = true;
     }
 
@@ -873,6 +914,19 @@ impl SessionUi {
 
     pub(crate) fn note(&mut self, text: &str, view: &mut AgentView) {
         self.note_as(text, StatusKind::Info, view);
+    }
+
+    /// A plain appended dim row (TS `chatContainer.addChild(new
+    /// Markdown/Text(...))` — `/name` and `/rlm-max-depth` report rows):
+    /// unlike `note` it never rewrites the previous status in place, so
+    /// back-to-back rows stack like the TS plain rows.
+    pub(crate) fn plain_row(&mut self, text: &str, view: &mut AgentView) {
+        view.push_entry(ChatEntry::Status {
+            text: text.to_string(),
+            kind: StatusKind::Info,
+        });
+        self.last_status_index = None;
+        self.dirty = true;
     }
 
     /// TS `showStatus` with a tone: the same back-to-back in-place rewrite
@@ -1057,6 +1111,43 @@ impl SessionUi {
         if text.is_empty() {
             return Ok(());
         }
+        // An open side-question pane captures the submission (TS's ladder
+        // order): builtin slash commands get the in-pane notice, a reply
+        // with pasted images gets the image notice, and everything else
+        // becomes a follow-up side question. A reply that merely starts
+        // with "/" (an absolute path) is not a command.
+        if view.side_pane.is_some() {
+            let registry = SlashCommandRegistry::builtin();
+            let is_command = pa_types::slash_commands::parse_slash_command(text)
+                .is_some_and(|(name, _)| registry.is_builtin(&name));
+            if is_command {
+                self.add_side_notice(
+                    text,
+                    "Slash commands are not available in side conversations. Press esc to return to the main thread.",
+                    view,
+                );
+                return Ok(());
+            }
+            if self.active_side_question_id.is_some() {
+                // TS keeps the draft and shows the wait warning through
+                // `handleSideQuestion`'s active-run guard.
+                view.editor.set_text(text);
+                self.start_side_question(text, view).await?;
+                return Ok(());
+            }
+            if !collect_marked_images(&self.pasted_images, text).is_empty() {
+                view.editor.set_text(text);
+                self.add_side_notice(
+                    text,
+                    "Images are not supported in side conversations. Press esc to return to the main thread.",
+                    view,
+                );
+                return Ok(());
+            }
+            view.editor.add_to_history(text);
+            self.start_side_question(text, view).await?;
+            return Ok(());
+        }
         if text.starts_with('/') {
             return self.handle_slash(text, view).await;
         }
@@ -1064,6 +1155,181 @@ impl SessionUi {
         // `?` quick-shortcut guide (slash commands keep it).
         view.shortcut_guide = None;
         self.send_prompt(text, SubmitBehavior::Steer, view).await
+    }
+
+    // ------------------------------------------------------------------
+    // Side questions (/btw, /side)
+    // ------------------------------------------------------------------
+
+    /// One client-local notice turn (TS `sideQuestionComponent.addTurn`
+    /// with a `side-notice-*` id): rendered like a turn, never sent to the
+    /// daemon, never seeding a follow-up.
+    fn add_side_notice(&mut self, question: &str, answer: &str, view: &mut AgentView) {
+        self.side_question_counter += 1;
+        let id = format!(
+            "side-notice-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis())
+                .unwrap_or_default(),
+            self.side_question_counter
+        );
+        let turn = crate::side_question::SideQuestionTurn {
+            id,
+            question: question.to_string(),
+            answer: answer.to_string(),
+            status: "complete".to_string(),
+            error_message: None,
+            local: true,
+        };
+        view.side_pane
+            .get_or_insert_with(crate::side_question::SideQuestionPane::default)
+            .upsert(turn);
+        self.dirty = true;
+    }
+
+    /// Start a side question (TS `handleSideQuestion`): the answered turns
+    /// seed the follow-up's context, the pane mounts the running turn, and
+    /// the daemon run streams `side_question_event` frames back.
+    async fn start_side_question(&mut self, question: &str, view: &mut AgentView) -> Result<()> {
+        if self.active_side_question_id.is_some() {
+            self.note_as(
+                "Wait for the current side question to finish or cancel it first.",
+                StatusKind::Warning,
+                view,
+            );
+            return Ok(());
+        }
+        let previous_turns: Vec<serde_json::Value> = view
+            .side_pane
+            .as_ref()
+            .map(|pane| {
+                pane.seed_turns()
+                    .into_iter()
+                    .map(|(question, answer)| {
+                        serde_json::json!({ "question": question, "answer": answer })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.side_question_counter += 1;
+        let id = format!(
+            "side-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis())
+                .unwrap_or_default(),
+            self.side_question_counter
+        );
+        let turn = crate::side_question::SideQuestionTurn {
+            id: id.clone(),
+            question: question.to_string(),
+            answer: String::new(),
+            status: "running".to_string(),
+            error_message: None,
+            local: false,
+        };
+        view.side_pane
+            .get_or_insert_with(crate::side_question::SideQuestionPane::default)
+            .upsert(turn);
+        self.active_side_question_id = Some(id.clone());
+        self.dirty = true;
+        // TS sends `previousTurns` only when the pane already answered
+        // something (`previousTurns.length > 0 ? previousTurns : undefined`).
+        let previous_turns =
+            (!previous_turns.is_empty()).then_some(serde_json::Value::Array(previous_turns));
+        let started = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::StartSideQuestion {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    side_question_id: id.clone(),
+                    question: question.to_string(),
+                    previous_turns,
+                    rest: Default::default(),
+                },
+            )
+            .await;
+        if let Err(error) = started {
+            // TS surfaces the failed start as the turn's error state.
+            self.active_side_question_id = None;
+            if let Some(pane) = view.side_pane.as_mut() {
+                pane.upsert(crate::side_question::SideQuestionTurn {
+                    id,
+                    question: question.to_string(),
+                    answer: String::new(),
+                    status: "error".to_string(),
+                    error_message: Some(format!("{error:#}")),
+                    local: false,
+                });
+            }
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Close the side-question pane (TS `clearSideQuestion`): the active
+    /// run aborts fire-and-forget (the daemon emits the cancelled event,
+    /// which finds the pane already gone).
+    async fn clear_side_question(&mut self, abort: bool, view: &mut AgentView) {
+        let active = self.active_side_question_id.take();
+        if abort {
+            if let Some(side_question_id) = active {
+                let client = self.client.clone();
+                let active_session_id = self.active_session_id.clone();
+                tokio::spawn(async move {
+                    let _ = client
+                        .request_ok(DaemonCommand::AbortSideQuestion {
+                            id: None,
+                            active_session_id,
+                            side_question_id,
+                            rest: Default::default(),
+                        })
+                        .await;
+                });
+            }
+        }
+        view.side_pane = None;
+        self.dirty = true;
+    }
+
+    /// One streamed `side_question_event` (TS `handleSideQuestionEvent`):
+    /// upsert the turn into the pane; a terminal event for the active run
+    /// releases the follow-up guard.
+    fn apply_side_question_event(&mut self, event: &Value, view: &mut AgentView) {
+        let Some(pane) = view.side_pane.as_mut() else {
+            return;
+        };
+        let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
+        let status = event
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if self.active_side_question_id.as_deref() == Some(id) && status != "running" {
+            self.active_side_question_id = None;
+        }
+        pane.upsert(crate::side_question::SideQuestionTurn {
+            id: id.to_string(),
+            question: event
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            answer: event
+                .get("answer")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            status,
+            error_message: event
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            local: false,
+        });
+        self.dirty = true;
     }
 
     /// Send a prompt to the session and start the working loader. Session
@@ -1635,6 +1901,7 @@ impl SessionUi {
                 });
                 self.dirty = true;
             }
+
             // `/session` (TS `handleSessionCommand`): the daemon's session
             // stats as the `Session Info` block after the command echo.
             "session" => {
@@ -1789,6 +2056,144 @@ impl SessionUi {
                     markdown: info_commands::changelog_markdown(&Self::changelog_path()),
                 });
                 self.dirty = true;
+            }
+            // `/settings` (TS `showSettingsSelector`): the inline settings
+            // menu; the rows read the daemon state and the settings seam.
+            "settings" => {
+                if !resolved.args.is_empty() {
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /settings", view);
+                    return Ok(());
+                }
+                self.track_command_used("settings");
+                self.open_settings_menu(view).await;
+            }
+            // `/scoped-models` (TS `showModelsSelector`): the checkbox list
+            // that picks the models Alt+M cycles through.
+            "scoped-models" => {
+                if !resolved.args.is_empty() {
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /scoped-models", view);
+                    return Ok(());
+                }
+                self.track_command_used("scoped-models");
+                self.open_scoped_models_selector(view).await?;
+            }
+            // `/btw` (TS `handleSideQuestion` via the submit ladder; `/side`
+            // resolves to it): start a side question without touching the
+            // session transcript; the pane stays open for follow-ups until
+            // esc returns to the main thread.
+            "btw" => {
+                if resolved.args.is_empty() {
+                    self.note_as("Usage: /btw <question>", StatusKind::Warning, view);
+                    return Ok(());
+                }
+                self.track_command_used("btw");
+                self.start_side_question(&resolved.args, view).await?;
+            }
+            // `/name` (TS `handleNameCommand`; `/rename` resolves to it):
+            // a missing argument reports the current name, otherwise the
+            // rename travels to the daemon (`set_session_name` persists
+            // the `session_info` entry and broadcasts the change).
+            "name" => {
+                self.track_command_used("name");
+                let name = resolved.args.trim();
+                if name.is_empty() {
+                    match &self.session_name {
+                        Some(current) => self.note(&format!("Session name: {current}"), view),
+                        None => self.note_as("Usage: /name <name>", StatusKind::Warning, view),
+                    }
+                    return Ok(());
+                }
+                match self
+                    .bounded_request(
+                        Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                        DaemonCommand::SetSessionName {
+                            id: None,
+                            active_session_id: self.active_session_id.clone(),
+                            name: name.to_string(),
+                            worker_token: None,
+                            rest: Default::default(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        self.session_name = Some(name.to_string());
+                        view.chrome.chat_name = self.session_display();
+                        self.plain_row(&format!("Session name set: {name}"), view);
+                    }
+                    Err(error) => self.error_row(&format!("{error:#}"), view),
+                }
+            }
+            // `/fast` (TS `handleFastCommand`): toggle the priority service
+            // tier on a fast-mode-eligible model; the state refresh after
+            // the switch drives the status row.
+            "fast" => {
+                self.track_command_used("fast");
+                if !resolved.args.is_empty() {
+                    self.error_row("Usage: /fast", view);
+                    return Ok(());
+                }
+                self.handle_fast_command(view).await;
+            }
+            // `/rlm-max-depth` (TS `handleRlmMaxDepthCommand`): view or set
+            // the per-chat recursive depth limit.
+            "rlm-max-depth" => {
+                self.track_command_used("rlm-max-depth");
+                self.handle_rlm_max_depth_command(view, &resolved.args)
+                    .await;
+            }
+            // `/fullscreen [on|off]` (TS `setFullscreenMode`): persist the
+            // preference and report the TS status row. This surface always
+            // renders on the alternate screen (the Rust TUI has no inline
+            // rendering mode yet), so the toggle changes the persisted
+            // preference and the reported state, not the surface.
+            "fullscreen" => {
+                self.track_command_used("fullscreen");
+                let arg = resolved.args.trim().to_lowercase();
+                if !arg.is_empty() && arg != "on" && arg != "off" {
+                    self.error_row("Usage: /fullscreen [on|off]", view);
+                    return Ok(());
+                }
+                let enable = match arg.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => !self.fullscreen_enabled,
+                };
+                self.set_fullscreen_mode(enable, view);
+            }
+            // `/reload` (TS `handleReloadCommand`): the guards first (a
+            // streaming turn or compaction defers the reload), then the
+            // bordered loader replaces the editor while the daemon and the
+            // client re-read their inputs.
+            "reload" => {
+                if !resolved.args.is_empty() {
+                    view.editor
+                        .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
+                    self.error_row("Usage: /reload", view);
+                    return Ok(());
+                }
+                self.track_command_used("reload");
+                if self.turn_active || view.working.is_some() {
+                    self.note_as(
+                        "Wait for the current response to finish before reloading.",
+                        StatusKind::Warning,
+                        view,
+                    );
+                    return Ok(());
+                }
+                if view.compaction.is_some() {
+                    self.note_as(
+                        "Wait for compaction to finish before reloading.",
+                        StatusKind::Warning,
+                        view,
+                    );
+                    return Ok(());
+                }
+                self.handle_reload_command(view).await?;
             }
             other => {
                 self.note(
@@ -2273,6 +2678,768 @@ impl SessionUi {
             Err(message) => self.error_row(&message, view),
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Settings and scoped models (/settings, /scoped-models)
+    // ------------------------------------------------------------------
+
+    /// `/settings` (TS `showSettingsSelector`): read the daemon state and
+    /// the settings seam, then mount the menu.
+    async fn open_settings_menu(&mut self, view: &mut AgentView) {
+        let Some(state) = self.connection_state(view).await else {
+            // The failure note already rendered.
+            return;
+        };
+        let settings = self.client_settings.clone();
+        let mut values = crate::settings_menu::SettingsCurrentValues {
+            autocompact: state
+                .get("autoCompactionEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            steering_mode: state
+                .get("steeringMode")
+                .and_then(Value::as_str)
+                .unwrap_or("all")
+                .to_string(),
+            follow_up_mode: state
+                .get("followUpMode")
+                .and_then(Value::as_str)
+                .unwrap_or("all")
+                .to_string(),
+            thinking_level: state
+                .get("thinkingLevel")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            available_thinking_levels: state
+                .get("availableThinkingLevels")
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        // The settings-seam reads (TS `settingsManager` getters; the theme
+        // default matches TS `getTheme() || "prime"`). A missing seam keeps
+        // the TS defaults.
+        if let Some(settings) = &settings {
+            values.show_images = settings.show_images();
+            values.auto_resize_images = settings.image_auto_resize();
+            values.block_images = settings.block_images();
+            values.skill_commands = settings.enable_skill_commands();
+            values.builtin_skills = settings.enable_builtin_skills();
+            values.hardware_cursor = settings.show_hardware_cursor();
+            values.editor_padding = settings.editor_padding_x();
+            values.autocomplete_max_visible = settings.autocomplete_max_visible();
+            values.clear_on_shrink = settings.clear_on_shrink();
+            values.terminal_progress = settings.show_terminal_progress();
+            values.fullscreen = settings.fullscreen();
+            values.idle_eviction_minutes = settings.idle_eviction_minutes();
+            values.mermaid = settings.mermaid_rendering_mode();
+            values.quiet_startup = settings.quiet_startup();
+            values.tree_filter_mode = settings.tree_filter_mode();
+            values.warnings_anthropic_extra_usage = settings.warnings_anthropic_extra_usage();
+            values.theme = settings.theme().unwrap_or_else(|| "prime".to_string());
+        } else {
+            values.show_images = true;
+            values.auto_resize_images = true;
+            values.skill_commands = true;
+            values.builtin_skills = true;
+            values.fullscreen = self.fullscreen_enabled;
+            values.idle_eviction_minutes = "90".to_string();
+            values.mermaid = "streaming".to_string();
+            values.tree_filter_mode = "user-only".to_string();
+            values.warnings_anthropic_extra_usage = true;
+            values.theme = "prime".to_string();
+        }
+        // The registered themes (TS `getAvailableThemes`; this surface
+        // ships the builtins).
+        values.available_themes = pa_types::themes::BUILTIN_THEME_NAMES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let rows = crate::settings_menu::settings_menu_rows(&values);
+        view.settings_menu = Some(crate::settings_menu::SettingsMenu::new(rows));
+        self.dirty = true;
+    }
+
+    /// One key press while the settings menu is open (TS `SettingsList`
+    /// callbacks reduced to actions the session applies).
+    async fn handle_settings_menu_key(
+        &mut self,
+        key: KeyEvent,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        let action = {
+            let Some(menu) = view.settings_menu.as_mut() else {
+                return Ok(());
+            };
+            menu.handle_key(&id, view.editor.keybindings())
+        };
+        match action {
+            crate::settings_menu::SettingsMenuAction::None => {}
+            crate::settings_menu::SettingsMenuAction::Cancel => {
+                view.settings_menu = None;
+            }
+            crate::settings_menu::SettingsMenuAction::PreviewTheme { name } => {
+                // TS `onThemePreview`: switch live without persisting.
+                view.theme = crate::app::load_theme(&name);
+            }
+            crate::settings_menu::SettingsMenuAction::RestoreTheme { name } => {
+                // TS theme submenu cancel: preview the row's theme back.
+                view.theme = crate::app::load_theme(&name);
+            }
+            crate::settings_menu::SettingsMenuAction::Change { id, value } => {
+                self.apply_settings_change(id, &value, view).await;
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// One settings row's change (the TS `SettingsSelectorComponent`
+    /// callback switch): daemon commands for session-owned switches, the
+    /// settings seam for persisted preferences.
+    async fn apply_settings_change(&mut self, id: &str, value: &str, view: &mut AgentView) {
+        match id {
+            "autocompact" => {
+                self.daemon_switch(
+                    DaemonCommand::SetAutoCompaction {
+                        id: None,
+                        active_session_id: self.active_session_id.clone(),
+                        enabled: value == "true",
+                        rest: Default::default(),
+                    },
+                    view,
+                )
+                .await;
+            }
+            "show-images" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_show_images(value == "true") {
+                        self.error_row(&format!("{error:#}"), view);
+                        return;
+                    }
+                }
+                // The live tool-card effect (TS re-flags every tool
+                // component; the flag the view renders reads).
+                self.show_images = value == "true";
+                view.show_images = value == "true";
+            }
+            "auto-resize-images" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_image_auto_resize(enabled),
+                    value,
+                    view,
+                );
+            }
+            "block-images" => {
+                self.persist_bool_setting(
+                    |settings, blocked| settings.set_block_images(blocked),
+                    value,
+                    view,
+                );
+            }
+            "skill-commands" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_enable_skill_commands(enabled),
+                    value,
+                    view,
+                );
+            }
+            "builtin-skills" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_enable_builtin_skills(enabled),
+                    value,
+                    view,
+                );
+                // TS fires `handleReloadCommand()` — the toggle takes
+                // effect after a reload.
+                let _ = self.handle_reload_command(view).await;
+            }
+            "show-hardware-cursor" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_show_hardware_cursor(enabled),
+                    value,
+                    view,
+                );
+            }
+            "editor-padding" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Ok(padding) = value.parse::<u64>() {
+                        if let Err(error) = settings.set_editor_padding_x(padding) {
+                            self.error_row(&format!("{error:#}"), view);
+                        }
+                    }
+                }
+            }
+            "autocomplete-max-visible" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Ok(max_visible) = value.parse::<u64>() {
+                        if let Err(error) = settings.set_autocomplete_max_visible(max_visible) {
+                            self.error_row(&format!("{error:#}"), view);
+                        }
+                    }
+                }
+            }
+            "clear-on-shrink" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_clear_on_shrink(enabled),
+                    value,
+                    view,
+                );
+            }
+            "terminal-progress" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_show_terminal_progress(enabled),
+                    value,
+                    view,
+                );
+            }
+            "fullscreen" => {
+                self.set_fullscreen_mode(value == "true", view);
+            }
+            "idle-eviction-minutes" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_idle_eviction_minutes(value) {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
+            "steering-mode" => {
+                self.daemon_switch(
+                    DaemonCommand::SetSteeringMode {
+                        id: None,
+                        active_session_id: self.active_session_id.clone(),
+                        mode: serde_json::Value::String(value.to_string()),
+                        rest: Default::default(),
+                    },
+                    view,
+                )
+                .await;
+            }
+            "follow-up-mode" => {
+                self.daemon_switch(
+                    DaemonCommand::SetFollowUpMode {
+                        id: None,
+                        active_session_id: self.active_session_id.clone(),
+                        mode: serde_json::Value::String(value.to_string()),
+                        rest: Default::default(),
+                    },
+                    view,
+                )
+                .await;
+            }
+            "transport" => {
+                let Ok(transport) = serde_json::from_value::<pa_types::ai::Transport>(
+                    serde_json::Value::String(value.to_string()),
+                ) else {
+                    return;
+                };
+                self.daemon_switch(
+                    DaemonCommand::SetTransport {
+                        id: None,
+                        active_session_id: self.active_session_id.clone(),
+                        transport,
+                        rest: Default::default(),
+                    },
+                    view,
+                )
+                .await;
+            }
+            "mermaid-rendering" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_mermaid_rendering_mode(value) {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
+            "quiet-startup" => {
+                self.persist_bool_setting(
+                    |settings, quiet| settings.set_quiet_startup(quiet),
+                    value,
+                    view,
+                );
+            }
+            "tree-filter-mode" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_tree_filter_mode(value) {
+                        self.error_row(&format!("{error:#}"), view);
+                        return;
+                    }
+                }
+                // The `/tree` selector reads the live field.
+                self.tree_filter_mode = crate::tree_list::filter_mode_from_str(value);
+            }
+            "warnings-anthropic-extra-usage" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_warnings_anthropic_extra_usage(enabled),
+                    value,
+                    view,
+                );
+            }
+            "thinking" => {
+                self.apply_thinking_level(value, view).await;
+            }
+            "theme" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_theme(value) {
+                        self.error_row(&format!("{error:#}"), view);
+                        return;
+                    }
+                }
+                view.theme = crate::app::load_theme(value);
+            }
+            other => {
+                self.error_row(&format!("Unknown setting: {other}"), view);
+            }
+        }
+    }
+
+    /// Persist one boolean row through the settings seam, surfacing errors.
+    fn persist_bool_setting(
+        &mut self,
+        set: impl FnOnce(&dyn crate::client_settings::ClientSettings, bool) -> anyhow::Result<()>,
+        value: &str,
+        view: &mut AgentView,
+    ) {
+        if let Some(settings) = &self.client_settings {
+            if let Err(error) = set(settings.as_ref(), value == "true") {
+                self.error_row(&format!("{error:#}"), view);
+            }
+        }
+    }
+
+    /// A session-switch daemon command (TS fire-and-forget with a
+    /// `showError` catch): the result never blocks the menu.
+    async fn daemon_switch(&mut self, command: DaemonCommand, view: &mut AgentView) {
+        if let Err(error) = self
+            .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), command)
+            .await
+        {
+            self.error_row(&format!("{error:#}"), view);
+        }
+    }
+
+    /// `/scoped-models` (TS `showModelsSelector`): resolve the enabled
+    /// model ids from the session scope (the daemon state) or the settings
+    /// patterns, then mount the selector.
+    async fn open_scoped_models_selector(&mut self, view: &mut AgentView) -> Result<()> {
+        if self.model_catalog.is_empty() {
+            self.note("No models available", view);
+            return Ok(());
+        }
+        let state = self.connection_state(view).await;
+        let session_scope: Vec<String> = state
+            .as_ref()
+            .and_then(|state| state.get("scopedModels"))
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let model = entry.get("model")?;
+                        Some(format!(
+                            "{}/{}",
+                            model.get("provider").and_then(Value::as_str)?,
+                            model.get("id").and_then(Value::as_str)?
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let enabled_ids = if !session_scope.is_empty() {
+            Some(session_scope)
+        } else {
+            // TS falls back to the settings patterns resolved against the
+            // catalog.
+            self.client_settings
+                .as_ref()
+                .and_then(|settings| settings.enabled_models())
+                .map(|patterns| {
+                    crate::scoped_models::resolve_pattern_scope(&patterns, &self.model_catalog)
+                })
+        };
+        view.scoped_models = Some(crate::scoped_models::ScopedModelsSelector::new(
+            &self.model_catalog,
+            enabled_ids,
+        ));
+        self.dirty = true;
+        // TS refreshes the catalog when the selector opens past its TTL.
+        if self.model_refresh_due(false) {
+            self.spawn_model_catalog_refresh();
+        }
+        Ok(())
+    }
+
+    /// One key press while the scoped-models selector is open.
+    async fn handle_scoped_models_key(
+        &mut self,
+        key: KeyEvent,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        let action = {
+            let Some(selector) = view.scoped_models.as_mut() else {
+                return Ok(());
+            };
+            selector.handle_key(&id, view.editor.keybindings())
+        };
+        match action {
+            crate::scoped_models::ScopedModelsAction::None => {}
+            crate::scoped_models::ScopedModelsAction::Cancel => {
+                view.scoped_models = None;
+            }
+            crate::scoped_models::ScopedModelsAction::Change { enabled_ids } => {
+                // TS `updateSessionModels`: a strict subset scopes the
+                // session; all enabled (or none) clears the filter.
+                if let Some(enabled) = enabled_ids {
+                    if !enabled.is_empty() && enabled.len() < self.model_catalog.len() {
+                        let scoped_models: Vec<Value> = enabled
+                            .iter()
+                            .filter_map(|full_id| {
+                                let (provider, model_id) = full_id.split_once('/')?;
+                                let model = self.model_catalog.iter().find(|model| {
+                                    model.provider == provider && model.id == model_id
+                                })?;
+                                serde_json::to_value(model).ok()
+                            })
+                            .map(|model| serde_json::json!({ "model": model }))
+                            .collect();
+                        self.daemon_switch(
+                            DaemonCommand::SetScopedModels {
+                                id: None,
+                                active_session_id: self.active_session_id.clone(),
+                                scoped_models: Value::Array(scoped_models),
+                                rest: Default::default(),
+                            },
+                            view,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                }
+                self.daemon_switch(
+                    DaemonCommand::SetScopedModels {
+                        id: None,
+                        active_session_id: self.active_session_id.clone(),
+                        scoped_models: Value::Array(Vec::new()),
+                        rest: Default::default(),
+                    },
+                    view,
+                )
+                .await;
+            }
+            crate::scoped_models::ScopedModelsAction::Persist { enabled_ids } => {
+                // TS `onPersist`: all enabled clears the settings filter.
+                let patterns = match &enabled_ids {
+                    Some(enabled) if enabled.len() < self.model_catalog.len() => {
+                        Some(enabled.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_enabled_models(patterns) {
+                        self.error_row(&format!("{error:#}"), view);
+                    } else {
+                        self.note("Model selection saved to settings", view);
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Fast mode, depth, fullscreen, and reload (/fast, /rlm-max-depth,
+    // /fullscreen, /reload)
+    // ------------------------------------------------------------------
+
+    /// The catalog entry for the current model (the `/fast` eligibility
+    /// check needs the provider and api, not just the id).
+    fn current_model_entry(&self, view: &AgentView) -> Option<&pa_types::ai::Model> {
+        let model_id = view.chrome.model_id.as_deref()?;
+        self.model_catalog.iter().find(|model| model.id == model_id)
+    }
+
+    /// Recompute the `/fast` autocomplete filter (TS
+    /// `getAvailableCommands` drops `/fast` when the current model is not
+    /// fast-mode-eligible): call after every point the model id can move.
+    fn update_fast_filter(&self, view: &mut AgentView) {
+        let eligible = self
+            .current_model_entry(view)
+            .is_some_and(pa_types::ai::supports_fast_mode);
+        let mut hidden = std::collections::HashSet::new();
+        if !eligible {
+            hidden.insert("fast".to_string());
+        }
+        view.editor.set_autocomplete_hidden_commands(hidden);
+    }
+
+    /// `/fast` (TS `handleFastCommand`): toggle the priority service tier.
+    /// The TS queue (`fastModeToggleQueue`) serializes toggles; here the
+    /// dispatch is the only submission path and awaits to completion, so
+    /// toggles cannot interleave.
+    async fn handle_fast_command(&mut self, view: &mut AgentView) {
+        const UNAVAILABLE: &str = "Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication";
+        let eligible = self
+            .current_model_entry(view)
+            .is_some_and(pa_types::ai::supports_fast_mode);
+        if !eligible {
+            self.note(UNAVAILABLE, view);
+            return;
+        }
+        // TS reads `connectionState.serviceTier` (priority = on) and flips
+        // it; the refresh after the switch confirms the daemon's tier.
+        let enabled = self.service_tier.as_deref() == Some("priority");
+        let target = if enabled { "default" } else { "priority" };
+        let tier = match serde_json::from_value::<pa_types::ai::ServiceTier>(
+            serde_json::Value::String(target.to_string()),
+        ) {
+            Ok(tier) => tier,
+            Err(error) => {
+                self.error_row(&format!("{error:#}"), view);
+                return;
+            }
+        };
+        let switched = self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::SetServiceTier {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    service_tier: Some(tier),
+                    rest: Default::default(),
+                },
+            )
+            .await;
+        if let Err(error) = switched {
+            self.error_row(&format!("{error:#}"), view);
+            return;
+        }
+        // TS re-reads the state after the switch (`connection.getState()`)
+        // and patches the local tier from the response.
+        let state = self.connection_state(view).await;
+        if let Some(state) = state {
+            if let Some(tier) = state.get("serviceTier").and_then(Value::as_str) {
+                self.service_tier = Some(tier.to_string());
+            }
+        }
+        let on = self.service_tier.as_deref() == Some("priority");
+        self.note(
+            &format!("Fast mode: {}", if on { "on" } else { "off" }),
+            view,
+        );
+    }
+
+    /// `/rlm-max-depth` (TS `handleRlmMaxDepthCommand`): a missing
+    /// argument reports the depth and its source; `<int> [--global]` sets
+    /// the per-chat depth immediately and optionally the global default.
+    async fn handle_rlm_max_depth_command(&mut self, view: &mut AgentView, args: &str) {
+        let tokens: Vec<&str> = if args.is_empty() {
+            Vec::new()
+        } else {
+            args.split_whitespace().collect()
+        };
+        if tokens.is_empty() {
+            match self
+                .bounded_request(
+                    Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                    DaemonCommand::GetRlmMaxDepthStatus {
+                        id: None,
+                        active_session_id: self.active_session_id.clone(),
+                        rest: Default::default(),
+                    },
+                )
+                .await
+            {
+                Ok(data) => {
+                    let depth = data.get("maxDepth").and_then(Value::as_u64).unwrap_or(0);
+                    let source = data
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.plain_row(&format!("RLM max depth: {depth} ({source})"), view);
+                }
+                Err(error) => self.error_row(&format!("{error:#}"), view),
+            }
+            return;
+        }
+        let global = tokens.get(1) == Some(&"--global");
+        let valid = tokens.len() <= if global { 2 } else { 1 }
+            && tokens[0].chars().all(|c| c.is_ascii_digit());
+        if !valid {
+            self.note_as(
+                "Usage: /rlm-max-depth [<non-negative integer> [--global]]",
+                StatusKind::Warning,
+                view,
+            );
+            return;
+        }
+        let Ok(max_depth) = tokens[0].parse::<u64>() else {
+            self.note_as(
+                "RLM max depth must be a non-negative integer.",
+                StatusKind::Warning,
+                view,
+            );
+            return;
+        };
+        match self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::SetRlmMaxDepth {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    max_depth,
+                    global: Some(global),
+                    rest: Default::default(),
+                },
+            )
+            .await
+        {
+            Ok(data) => {
+                let saved = data
+                    .get("globalSaved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.plain_row(
+                    &format!(
+                        "RLM max depth set: {max_depth}{}",
+                        if saved {
+                            " and saved as global default"
+                        } else {
+                            ""
+                        }
+                    ),
+                    view,
+                );
+                if let Some(error) = data.get("globalError").and_then(Value::as_str) {
+                    self.error_row(
+                        &format!("RLM max depth set for this chat, but the global default was not saved: {error}"),
+                        view,
+                    );
+                }
+            }
+            Err(error) => self.error_row(&format!("{error:#}"), view),
+        }
+    }
+
+    /// `/fullscreen` (TS `setFullscreenMode`): persist the preference and
+    /// report the TS status row. This surface always renders on the
+    /// alternate screen — the Rust TUI has no inline rendering mode yet
+    /// (the main-screen rendering path is flagged for the TUI-polish
+    /// lane) — so the toggle moves the persisted preference and the
+    /// reported state; TS's non-TTY branch cannot trigger here because
+    /// the surface draws its frames headless as well.
+    fn set_fullscreen_mode(&mut self, enabled: bool, view: &mut AgentView) {
+        if let Some(settings) = &self.client_settings {
+            if let Err(error) = settings.set_fullscreen(enabled) {
+                self.error_row(&format!("{error:#}"), view);
+                return;
+            }
+        }
+        self.fullscreen_enabled = enabled;
+        view.fullscreen = enabled;
+        let status = if enabled {
+            let follow = view
+                .editor
+                .keybindings()
+                .first_key("tui.viewport.follow")
+                .map(|key| crate::keybindings::format_key_text(&key))
+                .unwrap_or_else(|| "ctrl+shift+down".to_string());
+            format!("Fullscreen rendering on — wheel/pageUp scroll, {follow} follows output")
+        } else {
+            "Fullscreen rendering off".to_string()
+        };
+        self.note(&status, view);
+    }
+
+    /// `/reload` (TS `handleReloadCommand`): the reload box replaces the
+    /// editor (TS swaps the editor container) while the daemon reload
+    /// runs; the run loop folds the outcome in when it lands.
+    async fn handle_reload_command(&mut self, view: &mut AgentView) -> Result<()> {
+        view.reload_box =
+            Some("Reloading keybindings, extensions, skills, prompts, themes...".to_string());
+        self.dirty = true;
+        let client = self.client.clone();
+        let active_session_id = self.active_session_id.clone();
+        let notes = self.reload_notes.clone();
+        let task = tokio::spawn(async move {
+            let outcome = client
+                .request_ok(DaemonCommand::Reload {
+                    id: None,
+                    active_session_id,
+                    rest: Default::default(),
+                })
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"));
+            let _ = notes.send(outcome);
+        });
+        self.reload = Some(task);
+        Ok(())
+    }
+
+    /// The `/reload` request settled (TS's post-reload client work): drop
+    /// the box, re-read the user keybindings and theme, refresh the model
+    /// catalog, and surface the TS status row.
+    pub(crate) async fn apply_reload_outcome(&mut self, outcome: ReloadNote, view: &mut AgentView) {
+        self.reload = None;
+        view.reload_box = None;
+        match outcome {
+            Ok(()) => {
+                // TS's reload re-mounts the editor container: client-side
+                // transcript state resets and the view rebuilds from the
+                // durable session store, so client status rows drop
+                // exactly like the TS re-mount.
+                self.rebuild_transcript(view).await;
+                // TS `keybindings.reload()` + the startup editor/theme
+                // re-reads; the Rust editor consumes the keybinding set,
+                // so the reloaded manager replaces it.
+                let mut keybindings = view.editor.keybindings().clone();
+                keybindings.reload();
+                view.editor.set_keybindings(keybindings);
+                // TS re-applies the settings theme (`getTheme` -> `setTheme`);
+                // an unknown name keeps the current theme (the startup
+                // loader's fallback).
+                if let Some(settings) = &self.client_settings {
+                    if let Some(name) = settings.theme() {
+                        view.theme = crate::app::load_theme(&name);
+                    }
+                }
+                // TS `refreshConnectionCatalog`: the daemon's model catalog
+                // re-fetch lands through the run loop's channel.
+                self.spawn_model_catalog_refresh();
+                // TS `showStatus`: tracked, so a back-to-back status
+                // (e.g. the `/thinking` unavailable row) rewrites it in
+                // place.
+                self.note(
+                    "Reloaded keybindings, extensions, skills, prompts, themes",
+                    view,
+                );
+            }
+            Err(error) => {
+                self.error_row(&format!("Reload failed: {error}"), view);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Whether a `/reload` is in flight (the run loop must not end before
+    /// its outcome row lands).
+    pub(crate) fn reload_pending(&self) -> bool {
+        self.reload.is_some()
     }
 
     // ------------------------------------------------------------------
@@ -2931,6 +4098,7 @@ impl SessionUi {
             // `/new` starts a fresh root session: no depth label.
             session_rlm_depth: None,
             session_has_children: false,
+            client_settings: self.client_settings.clone(),
         }
     }
 
@@ -3080,6 +4248,7 @@ impl SessionUi {
             }
             None => {}
         }
+        self.update_fast_filter(view);
         Ok(())
     }
 
@@ -3387,6 +4556,7 @@ impl SessionUi {
                 self.model_configured_providers.clone(),
             );
         }
+        self.update_fast_filter(view);
         self.dirty = true;
     }
 
@@ -3601,6 +4771,8 @@ impl SessionUi {
     /// fetch keeps the pushed outcome row instead of an empty transcript.
     pub(crate) async fn rebuild_transcript(&mut self, view: &mut AgentView) {
         self.transcript_stale = false;
+        // The rebuilt transcript invalidates the tracked status row.
+        self.last_status_index = None;
         let Ok(data) = self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -3738,6 +4910,14 @@ impl SessionUi {
         if view.provider_auth.is_some() {
             return self.handle_provider_auth_key(key, view).await;
         }
+        // The `/settings` menu and `/scoped-models` selector own the frame
+        // the same way (TS `showSelector`).
+        if view.settings_menu.is_some() {
+            return self.handle_settings_menu_key(key, view).await;
+        }
+        if view.scoped_models.is_some() {
+            return self.handle_scoped_models_key(key, view).await;
+        }
         // The `/share` loader owns the frame while an upload runs (TS the
         // loader takes focus): the cancel binding aborts, other keys are
         // the loader's.
@@ -3837,6 +5017,12 @@ impl SessionUi {
         if view.editor.keybindings().matches(&id, "app.input.clear") {
             view.editor.cancel_autocomplete();
             self.clear_ctrl_c_hint();
+            // TS `handleEscape`: an open side-question pane owns the key —
+            // the running turn aborts and the pane closes.
+            if view.side_pane.is_some() {
+                self.clear_side_question(true, view).await;
+                return Ok(());
+            }
             // Leaving browse mode restores the stashed draft instead of
             // arming an accidental empty-submit delete of the selected
             // queued message (TS `clearInputBar`).
@@ -3937,6 +5123,12 @@ impl SessionUi {
             // TS `app.tools.expand` (default ctrl+o) cycles conversation
             // detail: overview -> details -> all -> overview.
             view.detail = view.detail.next();
+            // TS `applyChatExpansion` also re-flags the side-question pane
+            // (the pane has no bash rows here, so the flag is the only
+            // carried state).
+            if let Some(pane) = view.side_pane.as_mut() {
+                pane.expanded = view.detail == crate::chat::Detail::All;
+            }
             self.dirty = true;
             return Ok(());
         }
@@ -4247,6 +5439,14 @@ impl SessionUi {
                     self.apply_update(update, view);
                 }
             }
+            DaemonClientEvent::SideQuestionEvent {
+                active_session_id,
+                event,
+            } => {
+                if active_session_id == self.active_session_id {
+                    self.apply_side_question_event(&event, view);
+                }
+            }
             DaemonClientEvent::SessionClosed {
                 active_session_id,
                 reason,
@@ -4332,6 +5532,19 @@ impl SessionUi {
             }
             TurnUpdate::UserMessage(text) => {
                 view.push_entry(ChatEntry::User { text });
+            }
+            // `session_info_changed`: the display name moved (the `/name`
+            // path also sets it locally; this is the other-client arm).
+            TurnUpdate::SessionInfoChanged { name } => {
+                self.session_name = name;
+                view.chrome.chat_name = self.session_display();
+                self.dirty = true;
+            }
+            // `service_tier_changed`: keep the local tier state current (TS
+            // patches the connection state; `/fast` reads it).
+            TurnUpdate::ServiceTierChanged { tier } => {
+                self.service_tier = Some(tier);
+                self.dirty = true;
             }
             TurnUpdate::CustomRow(entry) => {
                 view.push_entry(entry);

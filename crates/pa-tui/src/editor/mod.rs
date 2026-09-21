@@ -186,6 +186,15 @@ impl Editor {
         self.autocomplete.as_ref()
     }
 
+    /// Replace the autocomplete provider's hidden-command set (the
+    /// `/fast` model-eligibility filter; TS recomputes the command list
+    /// per render).
+    pub fn set_autocomplete_hidden_commands(&mut self, hidden: std::collections::HashSet<String>) {
+        if let Some(provider) = self.autocomplete_provider.as_mut() {
+            provider.set_hidden_commands(hidden);
+        }
+    }
+
     pub fn is_showing_autocomplete(&self) -> bool {
         self.autocomplete.is_some()
     }

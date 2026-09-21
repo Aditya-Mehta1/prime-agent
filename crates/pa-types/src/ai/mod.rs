@@ -981,6 +981,20 @@ pub struct Model {
     pub compat: Option<ModelCompat>,
 }
 
+/// TS `supportsFastMode`: the fast-mode (priority) service tier exists on
+/// gpt-5.4/5.5/5.6 models served over the OpenAI Responses APIs. Shared by
+/// the surfaces that gate the `/fast` command on model eligibility (the TS
+/// product keeps the same function in the shared AI package).
+pub fn supports_fast_mode(model: &Model) -> bool {
+    let eligible_id = model.id == "gpt-5.4"
+        || model.id == "gpt-5.5"
+        || model.id == "gpt-5.6"
+        || model.id.starts_with("gpt-5.6-");
+    eligible_id
+        && ((model.provider == "openai-codex" && model.api == "openai-codex-responses")
+            || (model.provider == "openai" && model.api == "openai-responses"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

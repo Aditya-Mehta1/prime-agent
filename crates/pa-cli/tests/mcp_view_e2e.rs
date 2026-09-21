@@ -222,6 +222,7 @@ fn headless_options(socket: &Path, dir: &Path) -> pa_tui::interactive::Interacti
         no_session: false,
         session: pa_tui::interactive::SessionSelection::New,
         show_images: true,
+        client_settings: None,
         fullscreen_mouse: true,
         initial_message: None,
         theme: "prime".to_string(),
