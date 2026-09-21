@@ -29,6 +29,11 @@ pub enum TranscriptItem {
         /// The full wire content blocks (text and image), so replayed tool
         /// results render their image rows like live ones.
         content: Vec<serde_json::Value>,
+        /// The wire `details` record (stdout/stderr/result/sent receipts),
+        /// folded onto the pending tool card so replayed cells render their
+        /// structured output exactly like live ones.
+        details: serde_json::Value,
+        is_error: bool,
     },
     BashExecution {
         command: String,
@@ -201,6 +206,8 @@ fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
                     Err(_) => serde_json::Value::Null,
                 })
                 .collect(),
+            details: t.details.clone().unwrap_or(serde_json::Value::Null),
+            is_error: t.is_error,
         }],
         AgentMessage::BashExecution(b) => vec![TranscriptItem::BashExecution {
             command: b.command.clone(),

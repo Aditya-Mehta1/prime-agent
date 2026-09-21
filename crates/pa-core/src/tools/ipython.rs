@@ -61,6 +61,50 @@ pub struct ExecuteResult {
     pub background_output: Option<String>,
     pub error: Option<KernelErrorInfo>,
     pub attachments: Vec<KernelAttachment>,
+    /// Agent messages sent from this cell, in order (TS
+    /// `sentAgentMessages` on the tool-result details).
+    pub sent_agent_messages: Vec<crate::kernel::shared::KernelSentAgentMessage>,
+}
+
+/// The wire form of one sent agent message (TS `KernelSentAgentMessage`):
+/// `id`, `message`, `deliveryStatus`, `receiverRole` when present, and the
+/// `target` endpoint (`sessionName` only when present).
+pub fn sent_agent_message_json(
+    sent: &crate::kernel::shared::KernelSentAgentMessage,
+) -> serde_json::Value {
+    use crate::kernel::shared::{SentAgentMessageTarget, SentDeliveryStatus};
+    let crate::kernel::shared::KernelSentAgentMessage {
+        id,
+        message,
+        delivery_status,
+        receiver_role,
+        target:
+            SentAgentMessageTarget {
+                active_session_id,
+                session_id,
+                session_name,
+            },
+    } = sent;
+    let delivery = match delivery_status {
+        SentDeliveryStatus::Delivered => "delivered",
+        SentDeliveryStatus::Queued => "queued",
+    };
+    let mut value = json!({
+        "id": id,
+        "message": message,
+        "deliveryStatus": delivery,
+        "target": {
+            "activeSessionId": active_session_id,
+            "sessionId": session_id,
+        },
+    });
+    if let Some(role) = receiver_role {
+        value["receiverRole"] = json!(role.as_str());
+    }
+    if let Some(name) = session_name {
+        value["target"]["sessionName"] = json!(name);
+    }
+    value
 }
 
 /// The kernel is still running a previously interrupted cell.
@@ -423,6 +467,13 @@ pub async fn execute_ipython(
         });
         details["errorEname"] = json!(error.ename);
     }
+    if !r.sent_agent_messages.is_empty() {
+        details["sentAgentMessages"] = json!(r
+            .sent_agent_messages
+            .iter()
+            .map(sent_agent_message_json)
+            .collect::<Vec<_>>());
+    }
 
     Ok(ToolExecutionResult {
         content,
@@ -459,5 +510,63 @@ pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -
         parameters: ipython_tool_schema(),
         prepare_arguments: None,
         execute,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sent_agent_message_json_matches_ts_wire_shape() {
+        // TS `KernelSentAgentMessage`: id, message, deliveryStatus, the
+        // optional receiverRole, and the target endpoint with the optional
+        // sessionName.
+        let sent = crate::kernel::shared::KernelSentAgentMessage {
+            id: "agentmsg_1".to_string(),
+            message: "Ping.\nThen report back.".to_string(),
+            delivery_status: crate::kernel::shared::SentDeliveryStatus::Delivered,
+            receiver_role: Some(crate::kernel::shared::ReceiverRole::Parent),
+            target: crate::kernel::shared::SentAgentMessageTarget {
+                active_session_id: "worker-active".to_string(),
+                session_id: "worker-session".to_string(),
+                session_name: Some("Worker".to_string()),
+            },
+        };
+        assert_eq!(
+            sent_agent_message_json(&sent),
+            json!({
+                "id": "agentmsg_1",
+                "message": "Ping.\nThen report back.",
+                "deliveryStatus": "delivered",
+                "receiverRole": "parent",
+                "target": {
+                    "activeSessionId": "worker-active",
+                    "sessionId": "worker-session",
+                    "sessionName": "Worker",
+                },
+            })
+        );
+        // The queued receipt without a role or session name omits both.
+        let queued = crate::kernel::shared::KernelSentAgentMessage {
+            id: "agentmsg_2".to_string(),
+            message: "Ping.".to_string(),
+            delivery_status: crate::kernel::shared::SentDeliveryStatus::Queued,
+            receiver_role: None,
+            target: crate::kernel::shared::SentAgentMessageTarget {
+                active_session_id: "a1".to_string(),
+                session_id: "s1".to_string(),
+                session_name: None,
+            },
+        };
+        assert_eq!(
+            sent_agent_message_json(&queued),
+            json!({
+                "id": "agentmsg_2",
+                "message": "Ping.",
+                "deliveryStatus": "queued",
+                "target": { "activeSessionId": "a1", "sessionId": "s1" },
+            })
+        );
     }
 }

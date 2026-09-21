@@ -7,14 +7,15 @@
 use serde_json::Value;
 
 use super::ipython_details::{
-    format_duration, is_agent_message_receipt, is_edit_confirmation, read_background_shell,
-    BackgroundShell, IpythonDetails, IpythonError,
+    format_duration, is_agent_message_receipt, is_edit_confirmation, parse_sent_agent_message,
+    read_background_shell, BackgroundShell, IpythonDetails, IpythonError,
 };
 use super::{highlight, ToolCallCard};
 use crate::chat::Detail;
 use crate::code_preview::{
     parse_ipython_bash_cell, preview_ipython_code, python_statement_lines, CodePreviewLanguage,
 };
+use crate::custom_message::AgentMessageDirection;
 use crate::error_summary::{normalize_error_details, summarize_error_details};
 use crate::theme::{Theme, ThemeColor};
 use crate::width::{str_width, truncate_line, wrap_line};
@@ -113,10 +114,15 @@ pub fn render(
         width,
         code,
     )];
+    // TS renders the sent-message receipt rows below the code (and below
+    // the diff rows, which this card does not render) even when the cell
+    // is collapsed; the body opens up only when expanded.
     if !detail.tool_output_expanded() {
+        render_sent_agent_messages(&mut lines, &details, false, theme, width);
         return lines;
     }
     let has_code = render_code(&mut lines, code, theme, width);
+    render_sent_agent_messages(&mut lines, &details, true, theme, width);
     render_output(
         card,
         &details,
@@ -361,6 +367,54 @@ fn render_code(lines: &mut Vec<Line>, code: &str, theme: &Theme, width: usize) -
         add_wrapped(lines, prefix, body, width);
     }
     true
+}
+
+/// TS `renderSentAgentMessages`: one summary row per sent receipt below
+/// the code (blank-separated when expanded), the `╰─`-guttered body only
+/// in the expanded view. The summary carries no body preview (the TS
+/// sent rows are the receipt summary alone).
+fn render_sent_agent_messages(
+    lines: &mut Vec<Line>,
+    details: &IpythonDetails,
+    expanded: bool,
+    theme: &Theme,
+    width: usize,
+) {
+    for sent in &details.sent_agent_messages {
+        let Some(sent) = parse_sent_agent_message(sent) else {
+            continue;
+        };
+        if expanded {
+            lines.push(Vec::new());
+        }
+        let direction = if sent.delivered {
+            AgentMessageDirection::Sent
+        } else {
+            AgentMessageDirection::Queued
+        };
+        // TS: truncateToWidth(summary, max(1, width - 1), "…") then the
+        // one-space `addPlain` margin.
+        let summary = crate::custom_message::render::agent_message_summary_line(
+            direction,
+            &sent.participant,
+            None,
+            theme,
+        );
+        let mut row: Line = vec![Span::raw(" ")];
+        row.extend(truncate_line(
+            &summary,
+            width.saturating_sub(1).max(1),
+            "\u{2026}",
+        ));
+        lines.push(row);
+        if expanded {
+            lines.extend(crate::custom_message::render::agent_message_body(
+                &sent.message,
+                theme,
+                width,
+            ));
+        }
+    }
 }
 
 /// `splitTraceback`: the lines before the traceback opener are ordinary
@@ -853,6 +907,114 @@ mod tests {
             flat.iter().any(|row| row.contains("ValueError: boom")),
             "got: {flat:?}"
         );
+    }
+
+    #[test]
+    fn sent_agent_messages_render_below_the_code() {
+        // TS `renderSentAgentMessages`: the receipt summary renders below
+        // the code with a blank separator, the body opens up in the
+        // expanded view.
+        let details = json!({
+            "status": "ok",
+            "durationMs": 3,
+            "sentAgentMessages": [{
+                "id": "agentmsg_1",
+                "message": "Ping.\nThen report back.",
+                "deliveryStatus": "delivered",
+                "receiverRole": "parent",
+                "target": {
+                    "activeSessionId": "worker-active",
+                    "sessionId": "worker-session",
+                    "sessionName": "Worker",
+                },
+            }],
+        });
+        let card = cell_card(
+            "await agent_message.send(\"Ping.\", receiver_role=\"parent\")",
+            details,
+            false,
+            false,
+        );
+        let collapsed = render(&card, 0, Detail::Overview, &theme(), 100, true);
+        let flat: Vec<String> = collapsed.iter().map(text_of).collect();
+        assert_eq!(flat.len(), 2, "top line + receipt summary: {flat:?}");
+        assert!(
+            flat[1]
+                .trim_end()
+                .starts_with(" \u{25c6} Agent message sent \u{b7} to parent Worker"),
+            "got: {flat:?}"
+        );
+        assert!(!flat[1].contains("Ping."), "no body when collapsed");
+
+        let expanded = render(&card, 0, Detail::All, &theme(), 100, true);
+        let flat: Vec<String> = expanded.iter().map(text_of).collect();
+        let summary = flat
+            .iter()
+            .position(|row| row.contains("Agent message sent"))
+            .expect("summary row");
+        assert_eq!(flat[summary - 1], "", "blank between code and receipt");
+        assert_eq!(
+            flat[summary].trim_end(),
+            " \u{25c6} Agent message sent \u{b7} to parent Worker"
+        );
+        assert_eq!(flat[summary + 1], " \u{2570}\u{2500} Ping.");
+        assert_eq!(flat[summary + 2], "    Then report back.");
+        // The summary carries no body preview and no receipt metadata.
+        assert!(!flat.iter().any(|row| row.contains("agentmsg_1")));
+        assert!(!flat.iter().any(|row| row.contains("deliveryStatus")));
+    }
+
+    #[test]
+    fn sent_agent_message_labels_and_participant_fallbacks() {
+        // TS: queued receipts label `Agent message queued`; the participant
+        // falls back name -> active session id -> session id -> unknown and
+        // renders bare without a receiver role.
+        for (delivery, label) in [
+            ("delivered", "Agent message sent"),
+            ("queued", "Agent message queued"),
+        ] {
+            let details = json!({
+                "status": "ok",
+                "sentAgentMessages": [{
+                    "id": "agentmsg_2",
+                    "message": "Ping.",
+                    "deliveryStatus": delivery,
+                    "receiverRole": "child",
+                    "target": { "activeSessionId": "worker-active", "sessionId": "worker-session" },
+                }],
+            });
+            let card = cell_card("send()", details, false, false);
+            let lines = render(&card, 0, Detail::Overview, &theme(), 100, true);
+            let text = text_of(&lines[1]);
+            assert!(
+                text.contains(&format!("\u{25c6} {label} \u{b7} to child worker-active")),
+                "got: {text}"
+            );
+        }
+        let details = json!({
+            "status": "ok",
+            "sentAgentMessages": [{
+                "id": "agentmsg_3",
+                "message": "Ping.",
+                "deliveryStatus": "queued",
+                "target": { "sessionId": "peer-session" },
+            }],
+        });
+        let card = cell_card("send()", details, false, false);
+        let lines = render(&card, 0, Detail::Overview, &theme(), 100, true);
+        assert!(
+            text_of(&lines[1]).contains("Agent message queued \u{b7} to peer-session"),
+            "got: {}",
+            text_of(&lines[1])
+        );
+        // Malformed entries render nothing.
+        let details = json!({
+            "status": "ok",
+            "sentAgentMessages": [{ "id": "agentmsg_4" }, { "message": 1 }],
+        });
+        let card = cell_card("send()", details, false, false);
+        let lines = render(&card, 0, Detail::Overview, &theme(), 100, true);
+        assert_eq!(lines.len(), 1, "malformed receipts skipped: {lines:?}");
     }
 
     #[test]

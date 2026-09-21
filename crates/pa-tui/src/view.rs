@@ -271,7 +271,68 @@ impl AgentView {
     }
 
     /// Append a replay transcript item (mapped onto chat components).
+    ///
+    /// A tool result completes the pending tool card with the same id
+    /// (TS `buildConversationComponents` folds results onto their call
+    /// components, never a new row); a result without a pending card keeps
+    /// its standalone card so the row never disappears.
     pub fn push(&mut self, item: TranscriptItem) {
+        if let TranscriptItem::ToolResult {
+            tool_call_id,
+            tool_name,
+            text,
+            content,
+            details,
+            is_error,
+        } = &item
+        {
+            let pending = self.chat.iter().rposition(|entry| {
+                matches!(entry, ChatEntry::Tool(card) if card.id == *tool_call_id && card.result.is_none())
+            });
+            if let Some(index) = pending {
+                if let Some(ChatEntry::Tool(card)) = self.chat.get_mut(index) {
+                    card.started = true;
+                    // Replayed cards never saw the live execution: the
+                    // timing collapses to the rebuild instant, matching
+                    // the snapshot path.
+                    let now = std::time::Instant::now();
+                    card.started_at = Some(now);
+                    card.ended_at = Some(now);
+                    card.result = Some(crate::chat::ToolResultView {
+                        content: if content.is_empty() {
+                            vec![serde_json::json!({ "type": "text", "text": text })]
+                        } else {
+                            content.clone()
+                        },
+                        details: details.clone(),
+                        is_error: *is_error,
+                    });
+                    card.result_partial = false;
+                }
+                self.mark_entry_stale(index);
+                return;
+            }
+            let view = crate::chat::ToolResultView {
+                content: if content.is_empty() {
+                    vec![serde_json::json!({ "type": "text", "text": text })]
+                } else {
+                    content.clone()
+                },
+                details: details.clone(),
+                is_error: *is_error,
+            };
+            self.chat
+                .push(ChatEntry::Tool(Box::new(crate::chat::ToolCallCard {
+                    id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    args: serde_json::Value::Null,
+                    started: true,
+                    result: Some(view),
+                    ..Default::default()
+                })));
+            self.entry_layout.push(None);
+            return;
+        }
         self.chat.push(item_to_entry(item));
         self.entry_layout.push(None);
     }
@@ -1290,11 +1351,16 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
             started: false,
             ..Default::default()
         })),
+        // A replayed tool result reaches the view through
+        // [`AgentView::push`], which folds it onto its pending tool card;
+        // this arm keeps a standalone card for any unmatched result.
         TranscriptItem::ToolResult {
             tool_call_id,
             tool_name,
             text,
             content,
+            details,
+            is_error,
         } => ChatEntry::Tool(Box::new(crate::chat::ToolCallCard {
             id: tool_call_id,
             name: tool_name,
@@ -1306,7 +1372,8 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
                 } else {
                     content
                 },
-                ..Default::default()
+                details,
+                is_error,
             }),
             ..Default::default()
         })),
@@ -1809,6 +1876,7 @@ mod tests {
 
     fn agent_message_row() -> ChatEntry {
         ChatEntry::AgentMessage(Box::new(crate::custom_message::AgentMessageRow {
+            direction: crate::custom_message::AgentMessageDirection::Received,
             participant: "from child lane".to_string(),
             message: "hi".to_string(),
         }))

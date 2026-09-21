@@ -248,6 +248,7 @@ fn convert_execute_result(
                 data: attachment.data,
             })
             .collect(),
+        sent_agent_messages: result.sent_agent_messages.unwrap_or_default(),
     }
 }
 

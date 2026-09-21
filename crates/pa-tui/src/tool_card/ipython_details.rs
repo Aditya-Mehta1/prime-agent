@@ -148,6 +148,44 @@ pub(crate) fn is_edit_confirmation(text: Option<&str>, diffs: &[Value]) -> bool 
     })
 }
 
+/// One parsed sent agent message (TS `SentAgentMessageDisplay`): the body
+/// text, whether the receipt is `delivered` (vs `queued`), and the
+/// `to <role> <name>` participant (TS `formatAgentMessageParticipant`
+/// with the `"sent"` direction: name, then active session id, session id,
+/// then `unknown`).
+pub(crate) struct SentAgentMessage {
+    pub(crate) message: String,
+    pub(crate) delivered: bool,
+    pub(crate) participant: String,
+}
+
+/// Parse one `sentAgentMessages` entry; `None` on a malformed record
+/// (a missing message or target leaves nothing renderable).
+pub(crate) fn parse_sent_agent_message(value: &Value) -> Option<SentAgentMessage> {
+    let message = value.get("message")?.as_str()?.to_string();
+    let delivered = value.get("deliveryStatus").and_then(Value::as_str) == Some("delivered");
+    let target = value.get("target").unwrap_or(&Value::Null);
+    let name = ["sessionName", "activeSessionId", "sessionId"]
+        .iter()
+        .find_map(|key| {
+            target
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|name| !name.trim().is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let participant = match value.get("receiverRole").and_then(Value::as_str) {
+        Some(role) => format!("to {role} {name}"),
+        None => format!("to {name}"),
+    };
+    Some(SentAgentMessage {
+        message,
+        delivered,
+        participant,
+    })
+}
+
 /// True when `text` is the `agent_message.send` receipt dict for one of the
 /// sent messages already summarized above the output (TS
 /// `isAgentMessageReceipt`).
@@ -257,4 +295,58 @@ pub(crate) fn read_background_shell(code: &str, details: &Value) -> Option<Backg
         return None;
     }
     Some(BackgroundShell { exit_code })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sent_agent_message_shapes() {
+        // The delivered receipt with a full target and role.
+        let delivered = parse_sent_agent_message(&serde_json::json!({
+            "id": "agentmsg_1",
+            "message": "Ping.",
+            "deliveryStatus": "delivered",
+            "receiverRole": "parent",
+            "target": { "activeSessionId": "a1", "sessionId": "s1", "sessionName": "Worker" },
+        }))
+        .expect("delivered receipt");
+        assert!(delivered.delivered);
+        assert_eq!(delivered.message, "Ping.");
+        assert_eq!(delivered.participant, "to parent Worker");
+        // Name -> active session id -> session id -> unknown (TS
+        // `formatAgentMessageParticipant` fallback order).
+        let by_active = parse_sent_agent_message(&serde_json::json!({
+            "id": "agentmsg_2",
+            "message": "Ping.",
+            "deliveryStatus": "queued",
+            "receiverRole": "sibling",
+            "target": { "activeSessionId": "a1", "sessionId": "s1" },
+        }))
+        .expect("queued receipt");
+        assert!(!by_active.delivered);
+        assert_eq!(by_active.participant, "to sibling a1");
+        let by_session = parse_sent_agent_message(&serde_json::json!({
+            "id": "agentmsg_3",
+            "message": "Ping.",
+            "deliveryStatus": "queued",
+            "target": { "sessionId": "s1" },
+        }))
+        .expect("bare target");
+        assert_eq!(by_session.participant, "to s1");
+        let unknown = parse_sent_agent_message(&serde_json::json!({
+            "id": "agentmsg_4",
+            "message": "Ping.",
+            "deliveryStatus": "queued",
+        }))
+        .expect("missing target falls back to unknown");
+        assert_eq!(unknown.participant, "to unknown");
+        // A missing message renders nothing.
+        assert!(parse_sent_agent_message(&serde_json::json!({
+            "id": "agentmsg_5",
+            "deliveryStatus": "delivered",
+        }))
+        .is_none());
+    }
 }

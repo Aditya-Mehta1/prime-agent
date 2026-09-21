@@ -520,6 +520,14 @@ fn mock_execution(entry: &serde_json::Value) -> MockOutcome {
         });
     }
     result.attachments = Vec::<KernelAttachment>::new();
+    result.sent_agent_messages = entry["sentAgentMessages"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(crate::kernel::shared::parse_sent_agent_message)
+                .collect()
+        })
+        .unwrap_or_default();
     MockOutcome::Ok(Box::new(result))
 }
 

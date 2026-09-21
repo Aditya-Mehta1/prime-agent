@@ -6,7 +6,8 @@
 //! through the chat status rows).
 
 use super::{
-    AgentMessageRow, CustomPanelRow, InjectedPromptKind, InjectedPromptRow, ShellCompletionRow,
+    AgentMessageDirection, AgentMessageRow, CustomPanelRow, InjectedPromptKind, InjectedPromptRow,
+    ShellCompletionRow,
 };
 use crate::chat::Detail;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
@@ -54,9 +55,58 @@ fn markdown_rows(text: &str, body_color: ThemeColor, theme: &Theme, width: usize
         .collect()
 }
 
+/// TS `agentMessageSummaryLine` (`◆ <label> · <participant>[ · <preview>]`):
+/// the accent diamond, the muted label, then the participant (and the
+/// preview when present) joined by the dim `·` separators.
+pub(crate) fn agent_message_summary_line(
+    direction: AgentMessageDirection,
+    participant: &str,
+    preview: Option<&str>,
+    theme: &Theme,
+) -> Line {
+    let mut line: Line = vec![
+        Span::styled("\u{25c6}".to_string(), theme.fg_style(ThemeColor::Accent)),
+        Span::raw(" "),
+        Span::styled(
+            direction.label().to_string(),
+            theme.fg_style(ThemeColor::Muted),
+        ),
+        Span::styled(" \u{b7} ".to_string(), theme.fg_style(ThemeColor::Dim)),
+        Span::styled(participant.to_string(), theme.fg_style(ThemeColor::Dim)),
+    ];
+    if let Some(preview) = preview {
+        line.push(Span::styled(
+            " \u{b7} ".to_string(),
+            theme.fg_style(ThemeColor::Dim),
+        ));
+        line.push(Span::styled(
+            preview.to_string(),
+            theme.fg_style(ThemeColor::Dim),
+        ));
+    }
+    line
+}
+
+/// The collapsed one-line preview of the message body: every source line
+/// flattened onto one line (trimmed, empty lines dropped), `None` when the
+/// body carries no text.
+pub(crate) fn agent_message_preview(message: &str) -> Option<String> {
+    let flat = message
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.is_empty() {
+        None
+    } else {
+        Some(flat)
+    }
+}
+
 /// The received agent-message rows (TS `AgentMessageComponent`): a leading
-/// blank (spacing-driven), the summary header, and the `╰─`-guttered body
-/// when expanded.
+/// blank (spacing-driven), the summary header with the collapsed preview of
+/// the body, and the `╰─`-guttered body when expanded.
 pub(crate) fn render_agent_message(
     row: &AgentMessageRow,
     detail: Detail,
@@ -68,16 +118,7 @@ pub(crate) fn render_agent_message(
     if leading {
         out.push(spacer());
     }
-    let accent = theme.fg_style(ThemeColor::Accent);
-    let muted = theme.fg_style(ThemeColor::Muted);
-    let dim = theme.fg_style(ThemeColor::Dim);
-    let header: Line = vec![
-        Span::styled("\u{25c6}".to_string(), accent),
-        Span::raw(" "),
-        Span::styled(super::AGENT_MESSAGE_LABEL.to_string(), muted),
-        Span::styled(" \u{b7} ".to_string(), dim),
-        Span::styled(row.participant.clone(), dim),
-    ];
+    let header = agent_message_header(row, theme, width);
     out.extend(text_rows(header, width));
     if detail.tool_output_expanded() {
         out.extend(agent_message_body(&row.message, theme, width));
@@ -85,10 +126,40 @@ pub(crate) fn render_agent_message(
     out
 }
 
+/// The summary header with the preview truncated to fit the line: the
+/// label and participant keep TS geometry, the preview gets the remaining
+/// width with the `…` ellipsis so the header stays one row.
+fn agent_message_header(row: &AgentMessageRow, theme: &Theme, width: usize) -> Line {
+    let content_width = width.saturating_sub(2).max(1);
+    let base = agent_message_summary_line(row.direction, &row.participant, None, theme);
+    let Some(preview) = agent_message_preview(&row.message) else {
+        return base;
+    };
+    let base_width: usize = str_width(&base.iter().map(|s| s.content.as_str()).collect::<String>());
+    let separator = " \u{b7} ";
+    // `text_rows` renders the header with a one-column margin, so the
+    // preview gets the content width minus the margin, the label, and
+    // the participant with its separator.
+    let available = content_width
+        .saturating_sub(1 + base_width + str_width(separator))
+        .max(1);
+    let preview = truncate_text(&preview, available, "\u{2026}");
+    if preview.is_empty() {
+        return base;
+    }
+    let mut header = base;
+    header.push(Span::styled(
+        separator.to_string(),
+        theme.fg_style(ThemeColor::Dim),
+    ));
+    header.push(Span::styled(preview, theme.fg_style(ThemeColor::Dim)));
+    header
+}
+
 /// TS `agentMessageBodyLines`: each source line wraps at `width - 4`, the
 /// first rendered line carries the `╰─ ` gutter, the rest three spaces, all
 /// in `customMessageText`, truncated to the width.
-fn agent_message_body(message: &str, theme: &Theme, width: usize) -> Vec<Line> {
+pub(crate) fn agent_message_body(message: &str, theme: &Theme, width: usize) -> Vec<Line> {
     let safe_width = width.max(1);
     let text_width = safe_width.saturating_sub(4).max(1);
     let body = theme.fg_style(ThemeColor::CustomMessageText);
@@ -137,19 +208,9 @@ pub(crate) fn render_injected_prompt(
     let accent = theme.fg_style(ThemeColor::Accent);
     let mut out = vec![spacer()];
     let expanded = detail.tool_output_expanded();
-    if expanded && !matches!(row.kind, InjectedPromptKind::KernelRestored { .. }) {
-        // TS `InjectedPromptMessageComponent.updateDisplay`: the expanded
-        // form shows the markdown body INSTEAD of the header.
-        if let Some(body) = &row.body {
-            out.extend(markdown_rows(
-                body,
-                ThemeColor::CustomMessageText,
-                theme,
-                width,
-            ));
-        }
-        return out;
-    }
+    // TS `InjectedPromptMessageComponent.updateDisplay`: the header always
+    // renders; the expanded form adds the markdown body below it (the
+    // kernel-state row stays header-only).
     let mut header: Line = match &row.kind {
         InjectedPromptKind::Heartbeat { schedule } => vec![
             Span::styled("\u{2665}".to_string(), theme.fg_style(ThemeColor::Error)),
@@ -189,6 +250,16 @@ pub(crate) fn render_injected_prompt(
         header.push(Span::styled(" ".to_string(), dim));
     }
     out.extend(text_rows(header, width));
+    if expanded && !matches!(row.kind, InjectedPromptKind::KernelRestored { .. }) {
+        if let Some(body) = &row.body {
+            out.extend(markdown_rows(
+                body,
+                ThemeColor::CustomMessageText,
+                theme,
+                width,
+            ));
+        }
+    }
     out
 }
 
@@ -231,14 +302,14 @@ fn goal_label(kind: Option<&str>) -> String {
 /// `...` ellipsis.
 fn goal_meta(objective: &str) -> String {
     let collapsed: String = objective.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!(" \u{b7} {}", truncate_text(&collapsed, 70))
+    format!(" \u{b7} {}", truncate_text(&collapsed, 70, "..."))
 }
 
-/// Plain-text truncate with the TS default `...` ellipsis
-/// (`truncateToWidth` over unstyled text).
-fn truncate_text(text: &str, width: usize) -> String {
+/// Plain-text truncate (`truncateToWidth` over unstyled text) with an
+/// explicit ellipsis.
+fn truncate_text(text: &str, width: usize, ellipsis: &str) -> String {
     let line: Line = vec![Span::raw(text.to_string())];
-    let truncated = truncate_line(&line, width, "...");
+    let truncated = truncate_line(&line, width, ellipsis);
     truncated
         .iter()
         .map(|s| s.content.as_str())
@@ -357,19 +428,21 @@ mod tests {
     #[test]
     fn agent_message_header_shape() {
         let row = AgentMessageRow {
+            direction: AgentMessageDirection::Received,
             participant: "from child model-probe".to_string(),
             message: "ready".to_string(),
         };
         let rows = render_agent_message(&row, Detail::Overview, &theme(), 60, true);
-        // Leading blank + the diamond summary line.
+        // Leading blank + the diamond summary line with the preview.
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].is_empty());
         let header = flat(&rows[1]);
         assert_eq!(
             header.trim_end(),
-            " \u{25c6} Agent message received \u{b7} from child model-probe"
+            " \u{25c6} Agent message received \u{b7} from child model-probe \u{b7} ready"
         );
-        // Colors: accent diamond, muted label, dim participant and dot.
+        // Colors: accent diamond, muted label, dim participant, preview,
+        // and the separators.
         let accent = theme().fg_style(ThemeColor::Accent);
         let muted = theme().fg_style(ThemeColor::Muted);
         let dim = theme().fg_style(ThemeColor::Dim);
@@ -384,11 +457,86 @@ mod tests {
             rows[1][5],
             Span::styled("from child model-probe".to_string(), dim)
         );
+        assert_eq!(rows[1][6], Span::styled(" \u{b7} ".to_string(), dim));
+        assert_eq!(rows[1][7], Span::styled("ready".to_string(), dim));
+    }
+
+    #[test]
+    fn agent_message_header_without_preview() {
+        // No text in the body: the header keeps the TS two-part shape
+        // without the trailing separator.
+        let row = AgentMessageRow {
+            direction: AgentMessageDirection::Received,
+            participant: "from parent root".to_string(),
+            message: "  \n  ".to_string(),
+        };
+        let rows = render_agent_message(&row, Detail::Overview, &theme(), 60, false);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            flat(&rows[0]).trim_end(),
+            " \u{25c6} Agent message received \u{b7} from parent root"
+        );
+    }
+
+    #[test]
+    fn agent_message_preview_flattens_and_truncates() {
+        // The preview flattens every body line onto one row.
+        assert_eq!(
+            agent_message_preview("first\nsecond\n\nthird"),
+            Some("first second third".to_string())
+        );
+        assert_eq!(agent_message_preview("  \n\n "), None);
+        // Truncation: a long body keeps the label and participant intact
+        // and clips the preview to the line with the \u{2026} ellipsis.
+        let row = AgentMessageRow {
+            direction: AgentMessageDirection::Received,
+            participant: "from child lane".to_string(),
+            message: format!("{} end", "word ".repeat(20)),
+        };
+        let rows = render_agent_message(&row, Detail::Overview, &theme(), 60, false);
+        assert_eq!(rows.len(), 1, "one header row: {rows:?}");
+        let header = flat(&rows[0]).trim_end().to_string();
+        assert!(header.contains("word"), "preview kept: {header:?}");
+        assert!(header.ends_with("\u{2026}"), "ellipsis: {header:?}");
+        assert!(str_width(&header) <= 58, "fits the line: {header:?}");
+    }
+
+    #[test]
+    fn agent_message_direction_labels() {
+        // TS labels: received (transcript rows), sent and queued (the
+        // ipython cell receipts).
+        assert_eq!(
+            AgentMessageDirection::Received.label(),
+            "Agent message received"
+        );
+        assert_eq!(AgentMessageDirection::Sent.label(), "Agent message sent");
+        assert_eq!(
+            AgentMessageDirection::Queued.label(),
+            "Agent message queued"
+        );
+        for direction in [
+            AgentMessageDirection::Received,
+            AgentMessageDirection::Sent,
+            AgentMessageDirection::Queued,
+        ] {
+            let row = AgentMessageRow {
+                direction,
+                participant: "to parent worker".to_string(),
+                message: "ping".to_string(),
+            };
+            let rows = render_agent_message(&row, Detail::Overview, &theme(), 80, false);
+            assert!(
+                flat(&rows[0]).contains(&format!("\u{25c6} {}", direction.label())),
+                "{direction:?} header: {}",
+                flat(&rows[0])
+            );
+        }
     }
 
     #[test]
     fn agent_message_body_gutter_when_expanded() {
         let row = AgentMessageRow {
+            direction: AgentMessageDirection::Received,
             participant: "from parent root".to_string(),
             message: "line one\nline two".to_string(),
         };
@@ -536,8 +684,48 @@ mod tests {
         assert_eq!(flat(&rows[1]).trim_end(), " RLM child status");
         // No diamond on this row.
         assert!(!flat(&rows[1]).contains('\u{25c6}'));
+        // TS `updateDisplay`: the header stays when expanded and the
+        // markdown body renders below it.
         let expanded = render_injected_prompt(&row, Detail::All, &theme(), 60);
         assert!(expanded.len() > 2, "body renders expanded: {expanded:?}");
+        assert_eq!(
+            flat(&expanded[1]).trim_end(),
+            " RLM child status",
+            "header kept expanded: {expanded:?}"
+        );
+        assert!(
+            expanded
+                .iter()
+                .any(|row| flat(row).contains("[child-failed child:lane]")),
+            "body renders below the header: {expanded:?}"
+        );
+        // The heartbeat and goal rows keep their headers expanded too (the
+        // expanded hint suffix disappears).
+        for (row, header) in [
+            (
+                InjectedPromptRow {
+                    kind: InjectedPromptKind::Heartbeat {
+                        schedule: Some("every 10m".to_string()),
+                    },
+                    body: Some("nudge".to_string()),
+                },
+                " \u{2665} Heartbeat prompt \u{b7} every 10m",
+            ),
+            (
+                InjectedPromptRow {
+                    kind: InjectedPromptKind::Goal {
+                        kind: Some("continuation".to_string()),
+                        objective: Some("ship it".to_string()),
+                    },
+                    body: Some("continue".to_string()),
+                },
+                " Goal continuation \u{b7} ship it",
+            ),
+        ] {
+            let expanded = render_injected_prompt(&row, Detail::All, &theme(), 60);
+            assert_eq!(flat(&expanded[1]).trim_end(), header, "kept: {expanded:?}");
+            assert!(expanded.len() > 2, "body below: {expanded:?}");
+        }
     }
 
     #[test]

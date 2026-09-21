@@ -88,7 +88,8 @@ pub enum ChatEntry {
     /// One tool call and its execution state (rendered by
     /// [`crate::tool_card`]).
     Tool(Box<ToolCallCard>),
-    /// One received agent message (TS `AgentMessageComponent`).
+    /// One agent-message summary row (TS `AgentMessageComponent`: the
+    /// received transcript rows).
     AgentMessage(Box<crate::custom_message::AgentMessageRow>),
     /// One injected prompt row (TS `InjectedPromptMessageComponent`).
     InjectedPrompt(Box<crate::custom_message::InjectedPromptRow>),

@@ -37,20 +37,49 @@ pub const ASYNC_BASH_COMPLETION_CUSTOM_TYPE: &str = "async_bash_completion";
 pub const COMPACTION_OUTCOME_CUSTOM_TYPE: &str = "compaction_outcome";
 pub const REFINEMENT_OUTCOME_CUSTOM_TYPE: &str = "refinement_outcome";
 
-/// The received agent-message label (TS `AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL`).
-pub(crate) const AGENT_MESSAGE_LABEL: &str = "Agent message received";
-
 // ---------------------------------------------------------------------------
 // Row payloads (carried by ChatEntry variants)
 // ---------------------------------------------------------------------------
 
-/// One received agent message: `◆ Agent message received · from <participant>`
-/// plus the guttered body (TS `AgentMessageComponent`).
+/// Which agent-message side a row renders: the received label of the
+/// transcript custom-message rows (TS `AgentMessageComponent`), or the
+/// sent/queued receipt labels of the ipython cell output (TS
+/// `renderSentAgentMessages`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMessageDirection {
+    /// `Agent message received` (the transcript custom-message rows).
+    Received,
+    /// `Agent message sent` (a delivered receipt in ipython cell output).
+    Sent,
+    /// `Agent message queued` (an undelivered receipt in ipython cell output).
+    Queued,
+}
+
+impl AgentMessageDirection {
+    /// The summary-line label (TS labels in `agent-message.ts` and
+    /// `ipython-cell.ts`).
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentMessageDirection::Received => "Agent message received",
+            AgentMessageDirection::Sent => "Agent message sent",
+            AgentMessageDirection::Queued => "Agent message queued",
+        }
+    }
+}
+
+/// One agent-message summary row: `◆ <label> · <participant>[ · <preview>]`
+/// plus the guttered body when expanded (TS `AgentMessageComponent` for
+/// received rows; the sent/queued directions feed the ipython cell
+/// receipt rows).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentMessageRow {
-    /// `from <role> <name>` (TS `formatAgentMessageParticipant`).
+    /// Which side renders: the label text follows it.
+    pub direction: AgentMessageDirection,
+    /// `from <role> <name>` / `to <role> <name>` (TS
+    /// `formatAgentMessageParticipant`).
     pub participant: String,
-    /// `details.message` (the body shown expanded).
+    /// `details.message` (the collapsed preview source and the body shown
+    /// expanded).
     pub message: String,
 }
 
@@ -302,6 +331,7 @@ fn agent_message_entry(details: &Value) -> Option<ChatEntry> {
         None => format!("from {name}"),
     };
     Some(ChatEntry::AgentMessage(Box::new(AgentMessageRow {
+        direction: AgentMessageDirection::Received,
         participant,
         message: message.to_string(),
     })))

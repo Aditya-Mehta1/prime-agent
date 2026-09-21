@@ -3,7 +3,9 @@
 against the installed TS prime-agent binary rendering the SAME session
 transcript containing every decorated custom-message row:
 
-  - a received agent message (diamond + participant + body),
+  - a received agent message (diamond + participant + preview + body),
+  - an ipython cell that sent an agent message (the sent receipt rows
+    render below the code, body in the expanded view),
   - a heartbeat prompt (pulse + schedule),
   - a goal-context continuation row,
   - a restored-python-kernel row,
@@ -15,11 +17,20 @@ transcript containing every decorated custom-message row:
 
 The session JSONL is assembled from real captured rows and resumed in the
 TS binary (`prime-agent -r <path>`) and replayed in the Rust TUI
-(`pa-tui-replay <path>`), both live in tmux at 120x36. States: the idle
+(`pa-tui-replay <path>`), both live in tmux at 120x90 (tall enough that
+the expanded transcript stays in the viewport for the reach checks). States: the idle
 transcript (collapsed) and the expanded view (Ctrl+O twice, where the
 agent-message bodies and shell-completion output open up). Frames are
 normalized for volatile content and diffed; the exit code is non-zero when
 any state differs.
+
+One documented divergence (Kevin directive 2026-09-21, live dogfood): the
+Rust received agent-message header renders the collapsed one-line body
+preview (`... \u00b7 <preview>`) that the TS `agentMessageSummaryLine`
+signature supports but no current TS caller passes. The diff normalizes
+that preview segment out of the Rust frames and the run separately asserts
+the preview IS present; the TS side is expected to adopt the same preview
+so the normalization can be dropped.
 
 tmux rules: default socket only (`env -u TMUX`), cmparity-* session names,
 no kill-server; sessions are killed individually at the end.
@@ -41,7 +52,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "bat
 import batterylib  # noqa: E402  (the shared daemon-reap sweep)
 import ts_identity  # noqa: E402  (the shared PATH-binary identity guard)
 
-SIZES = [("120", "36")]
+SIZES = [("120", "90")]
 
 # The transcript skeleton (entries copied from real captured sessions so
 # both binaries parse byte-identical payloads). Timestamps are re-stamped
@@ -174,6 +185,50 @@ def build_session(path, source_header, assistant_template, cwd):
             assistant_template, "Rows below cover every decorated custom message.", base_ms
         ),
     }, base_ms))
+    # One ipython turn that sent an agent message: the sent receipt rows
+    # (summary always, body expanded) render inside the tool card on both
+    # sides (TS `renderSentAgentMessages`).
+    base_ms += 1
+    sender = assistant_with(assistant_template, "", base_ms)
+    sender["content"] = [
+        {"type": "text", "text": "Sending one receipt now."},
+        {
+            "type": "toolCall",
+            "name": "ipython",
+            "id": "toolu_sent01",
+            "arguments": {"code": "await agent_message.send(\"Ping.\", receiver_role=\"parent\")"},
+        },
+    ]
+    sender["stopReason"] = "toolUse"
+    entries.append(entry("message", {"message": sender}, base_ms))
+    base_ms += 1
+    entries.append(entry("message", {
+        "message": {
+            "role": "toolResult",
+            "toolCallId": "toolu_sent01",
+            "toolName": "ipython",
+            "content": [{"type": "text", "text": ""}],
+            "details": {
+                "status": "ok",
+                "durationMs": 3,
+                "sentAgentMessages": [
+                    {
+                        "id": "agentmsg_sent01",
+                        "message": "Ping.\nThen report back.",
+                        "deliveryStatus": "delivered",
+                        "receiverRole": "parent",
+                        "target": {
+                            "activeSessionId": "worker-active",
+                            "sessionId": "worker-session",
+                            "sessionName": "Worker",
+                        },
+                    }
+                ],
+            },
+            "isError": False,
+            "timestamp": base_ms,
+        },
+    }, base_ms))
     for custom_type, extra in CUSTOM_ROWS:
         base_ms += 1
         content = {
@@ -232,6 +287,25 @@ def capture_plain(session):
 
 def normalize(frame, root):
     frame = frame.replace(root, "<SANDBOX>")
+    # Pre-existing replay-binary chrome gap (reproduced on origin/main with
+    # the box debug binary): the TS resume splash prints its version, the
+    # restored model, and the session cwd on the art rows; the Rust replay
+    # splash prints `prime agent v` (build-provided version, empty in
+    # sandbox builds) and no model/cwd echo, so the splash cannot match
+    # row-for-row. The whole splash block (art + label rows) drops from
+    # BOTH frames; the diff covers the transcript, which is what this
+    # harness owns.
+    def chrome_row(line):
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        # The splash ASCII art rows carry the labels, so the whole splash
+        # block (any block-element glyph row, plus the label rows) drops
+        # from both frames.
+        return (
+            "prime agent" in plain
+            or "cwd" in plain
+            or plain.strip().startswith("model ")
+            or re.search("[\u2580-\u259f]", plain) is not None
+        )
     frame = re.sub(r"v\d+\.\d+\.\d+", "vX.X.X", frame)
     frame = re.sub(r"\b[0-9a-f]{12}\b", "<SID>", frame)
     frame = re.sub(r"\b\d+(\.\d+)?(ms|s)\b", "<T>", frame)
@@ -263,12 +337,58 @@ def normalize(frame, root):
         # codes in the capture, so match them independently.
         if "←" in line and "manage" in line:
             continue
+        if chrome_row(line):
+            continue
         kept.append(line)
     while kept and not kept[0].strip():
         kept.pop(0)
     while kept and not kept[-1].strip():
         kept.pop()
     return "\n".join(kept)
+
+
+def capture_plain_text(frame):
+    """Strip ANSI codes so content assertions match the visible text."""
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", frame)
+
+
+# The fixture agent-message body (the Rust-only preview source, see the
+# module docstring for the divergence).
+AGENT_MESSAGE_BODY = (
+    "Decorations parity: the received row renders with the diamond, "
+    "label, and participant."
+)
+
+
+def strip_rust_agent_message_preview(frame):
+    """Remove the Rust-only collapsed body preview segment
+    (`\u00b7 <preview>`) from the received agent-message header so the
+    frame diff covers the shapes the TS binary renders today. The harness
+    separately asserts the preview IS present on the Rust side."""
+    return re.sub(
+        r" \u00b7 " + re.escape(AGENT_MESSAGE_BODY[:40]) + r"[^\n]*", "", frame
+    )
+
+
+def assert_sent_reach(side, collapsed, expanded):
+    """The Ctrl+O contract for this fixture: collapsed frames show the
+    agent-message and sent-receipt summaries only; the expanded frames show
+    the \u2570\u2500-guttered bodies. Any miss means the expand toggle
+    does not reach the agent-message rows."""
+    assert "Agent message received" in collapsed, f"{side}: summary missing collapsed"
+    assert "Agent message sent \u00b7 to parent Worker" in collapsed, (
+        f"{side}: sent receipt summary missing collapsed"
+    )
+    assert "\u2570\u2500 Decorations parity" not in collapsed, (
+        f"{side}: received body visible while collapsed"
+    )
+    assert "\u2570\u2500 Ping." not in collapsed, f"{side}: sent body visible while collapsed"
+    assert "\u2570\u2500 Decorations parity" in expanded, (
+        f"{side}: Ctrl+O did not expand the received body"
+    )
+    assert "\u2570\u2500 Ping." in expanded, (
+        f"{side}: Ctrl+O did not expand the sent body"
+    )
 
 
 def diff_lines(left, right):
@@ -411,9 +531,25 @@ def main():
         for size in sizes:
             ts_frames = run_ts(session_path, sandboxes["ts"], size, out_dir)
             rust_frames = run_rust(session_path, sandboxes["rust"], size, out_dir)
+            # The Ctrl+O reach check: the agent-message bodies (the
+            # \u2570\u2500 gutter) must be absent collapsed and present
+            # expanded on BOTH sides.
+            for side, frames in (("ts", ts_frames), ("rust", rust_frames)):
+                collapsed = capture_plain_text(frames["a_collapsed"])
+                expanded = capture_plain_text(frames["b_expanded"])
+                assert_sent_reach(side, collapsed, expanded)
             for state in ("a_collapsed", "b_expanded"):
                 ts_norm = normalize(ts_frames[state], base)
-                rust_norm = normalize(rust_frames[state], base)
+                rust_norm = normalize(strip_rust_agent_message_preview(rust_frames[state]), base)
+                # The carried divergence: the Rust header shows the
+                # collapsed preview; the TS binary does not (yet).
+                rust_plain = capture_plain_text(rust_frames[state])
+                assert " \u00b7 " + AGENT_MESSAGE_BODY[:40] in rust_plain, (
+                    f"rust preview missing in {state}"
+                )
+                assert " \u00b7 " + AGENT_MESSAGE_BODY[:40] not in capture_plain_text(
+                    ts_frames[state]
+                ), f"ts unexpectedly renders the preview in {state}"
                 name = f"{state}-{size[0]}x{size[1]}"
                 if ts_norm == rust_norm:
                     print(f"PASS {name}")
