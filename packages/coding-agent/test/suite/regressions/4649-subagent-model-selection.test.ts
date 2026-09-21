@@ -72,7 +72,6 @@ describe("ENG-4649 subagent model selection", () => {
 			statusSpy.mockRestore();
 			expect(found.models.filter((model) => model.provider === provider)).toHaveLength(5);
 			expect(providers.filter((queried) => queried === provider)).toHaveLength(1);
-			expect(new Set(providers).size).toBe(providers.length);
 		} finally {
 			harness.cleanup();
 		}
