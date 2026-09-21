@@ -70,70 +70,108 @@ function textOf(message: AssistantMessage): string {
 		.trim();
 }
 
-function extractFirstJsonObject(raw: string): Record<string, unknown> | null {
+/**
+ * Extract every JSON object in the reply, in reply order: the fenced block
+ * first, then the raw text. parseDecision accepts the first candidate that
+ * is a valid choice, so prose (or a discarded draft object) before the
+ * decision object cannot turn a well-formed reply into a parse refusal.
+ */
+function extractJsonObjectCandidates(raw: string): Record<string, unknown>[] {
 	const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-	const candidates = [fenced?.[1], raw].flatMap((candidate) => (candidate ? [candidate] : []));
-	for (const candidate of candidates) {
-		const trimmed = candidate.trim();
-		const parsed = parseJsonCandidates(trimmed);
-		if (parsed) return parsed;
+	const candidates: Record<string, unknown>[] = [];
+	for (const source of [fenced?.[1], raw]) {
+		if (!source) continue;
+		candidates.push(...objectCandidatesFromText(source.trim()));
 	}
-	return null;
+	return candidates;
 }
 
 /** Greedy first-brace-to-last-brace slice first, then nearest balanced-brace slices. */
-function parseJsonCandidates(trimmed: string): Record<string, unknown> | null {
+function objectCandidatesFromText(trimmed: string): Record<string, unknown>[] {
+	const candidates: Record<string, unknown>[] = [];
 	const start = trimmed.indexOf("{");
-	if (start === -1) return null;
+	if (start === -1) return candidates;
 	const end = trimmed.lastIndexOf("}");
 	if (end > start) {
 		try {
 			const parsed: unknown = JSON.parse(trimmed.slice(start, end + 1));
-			if (isJsonObject(parsed)) return parsed;
+			if (isJsonObject(parsed)) candidates.push(parsed);
 		} catch {
 			// Fall through to the balanced scan.
 		}
 	}
-	let depth = 0;
-	let inString = false;
-	let escaped = false;
-	for (let index = start; index < trimmed.length; index += 1) {
-		const char = trimmed[index];
-		if (inString) {
-			if (escaped) escaped = false;
-			else if (char === "\\") escaped = true;
-			else if (char === '"') inString = false;
-			continue;
-		}
-		if (char === '"') inString = true;
-		// Braces inside quoted strings (e.g. a parameter choice value) are
-		// content, not structure; counting them misreads the object boundary.
-		else if (char === "{") depth += 1;
-		else if (char === "}") {
-			depth -= 1;
-			if (depth === 0) {
-				try {
-					const parsed: unknown = JSON.parse(trimmed.slice(start, index + 1));
-					if (isJsonObject(parsed)) return parsed;
-				} catch {
-					// Keep scanning for a later balanced slice.
+	// The balanced scan advances past each slice to the next open brace: a
+	// brace pair in prose before the decision object must not pin every slice
+	// to the first brace and hide a later well-formed choice.
+	let scanFrom = start;
+	while (scanFrom !== -1) {
+		let depth = 0;
+		let inString = false;
+		let escaped = false;
+		let close = -1;
+		for (let index = scanFrom; index < trimmed.length; index += 1) {
+			const char = trimmed[index];
+			if (inString) {
+				if (escaped) escaped = false;
+				else if (char === "\\") escaped = true;
+				else if (char === '"') inString = false;
+				continue;
+			}
+			if (char === '"') inString = true;
+			// Braces inside quoted strings (e.g. a parameter choice value) are
+			// content, not structure; counting them misreads the object boundary.
+			else if (char === "{") depth += 1;
+			else if (char === "}") {
+				depth -= 1;
+				if (depth === 0) {
+					close = index;
+					break;
 				}
 			}
 		}
+		if (close === -1) return candidates;
+		try {
+			const parsed: unknown = JSON.parse(trimmed.slice(scanFrom, close + 1));
+			if (isJsonObject(parsed)) candidates.push(parsed);
+		} catch {
+			// Keep scanning for a later balanced slice.
+		}
+		scanFrom = trimmed.indexOf("{", close + 1);
 	}
-	return null;
+	return candidates;
 }
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Validate one decision against the compiled action space. Free text never passes. */
+/**
+ * Parse a decision against the compiled action space. Free text never passes.
+ * The first JSON object that is a valid single choice wins, so prose (or a
+ * discarded draft object) before the decision object must not turn a
+ * well-formed choice into a refusal that counts toward the stuck streak.
+ */
 export function parseDecision(raw: string, actions: Map<string, CompiledAction>): RouterDecisionOutcome {
-	const object = extractFirstJsonObject(raw);
-	if (!object) {
+	const candidates = extractJsonObjectCandidates(raw);
+	let firstRefusal: RouterDecisionOutcome | undefined;
+	for (const object of candidates) {
+		const outcome = validateDecisionObject(object, actions, raw);
+		if (outcome.action !== null) return outcome;
+		// The first candidate keeps the diagnostic about the earliest object.
+		firstRefusal ??= outcome;
+	}
+	if (!firstRefusal) {
 		return { action: null, params: {}, confidence: null, rawText: raw, parseError: "reply was not a JSON object" };
 	}
+	return firstRefusal;
+}
+
+/** Validate one extracted decision object against the compiled action space. */
+function validateDecisionObject(
+	object: Record<string, unknown>,
+	actions: Map<string, CompiledAction>,
+	raw: string,
+): RouterDecisionOutcome {
 	const actionName = object.action;
 	if (typeof actionName !== "string" || !actions.has(actionName)) {
 		return {

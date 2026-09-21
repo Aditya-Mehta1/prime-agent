@@ -304,6 +304,9 @@ describe("parseDecision", () => {
 			'Sure! {"action":"set_power","params":{"power":"low}"},"confidence":0.7} (or {"action":"finish"} later)',
 			{ action: "set_power", params: { power: "low}" }, confidence: 0.7 },
 		],
+		["prose braces then choice", 'a {x} b {"action":"press_a","confidence":1}', { action: "press_a", confidence: 1 }],
+		["draft then choice", 'a {"t":1} b {"action":"press_a","confidence":1}', { action: "press_a", confidence: 1 }],
+		["refusal from the first object", 'x {"t":1} then {"action":"press_a"}', { parseError: "unknown action null" }],
 		[
 			"missing confidence",
 			'{"action":"press_a"}',
@@ -1052,6 +1055,21 @@ describe("StdioRouterEnvironment (real subprocess)", () => {
 		await env.close();
 		expect(Date.now() - started).toBeLessThan(500);
 		await env.close();
+	});
+
+	it("close() is idempotent: a second close after a SIGKILL does not repeat the shutdown", async () => {
+		const env = new StdioRouterEnvironment({ command: echoAdapter("setInterval(()=>{},99)"), requestTimeoutMs: 50 });
+		await expect(env.init()).rejects.toThrow(/timed out/);
+		const child = (env as unknown as { child: ChildProcess }).child;
+		const closeRequests: string[] = [];
+		const originalEnd = (child.stdin!.end as unknown as (chunk?: unknown) => unknown).bind(child.stdin);
+		(child.stdin as unknown as { end: (chunk?: unknown) => unknown }).end = (chunk?: unknown) => {
+			if (typeof chunk === "string" && chunk.includes('"type":"close"')) closeRequests.push(chunk);
+			return originalEnd(chunk);
+		};
+		await env.close({ budgetMs: 0 });
+		await env.close({ budgetMs: 60_000 });
+		expect(closeRequests).toHaveLength(1);
 	});
 
 	it("tolerates a reply split across two stdout chunks and noise lines", async () => {

@@ -217,8 +217,13 @@ export class StdioRouterEnvironment implements RouterEnvironment {
 	 * Stop the adapter. `budgetMs` bounds the graceful waits (SIGTERM, then
 	 * SIGKILL, always dispatched) so cleanup cannot extend a timed-out
 	 * segment past its wall-clock budget; the default waits up to 2.5s.
+	 * Idempotent: the segment runner closes on every path after the loop has
+	 * already closed, and a second close must not repeat the shutdown (an
+	 * extra close request, another SIGTERM budget, re-ending stdin) after a
+	 * timeout already dispatched SIGKILL without waiting for the reap.
 	 */
 	async close(options: RouterCloseOptions = {}): Promise<void> {
+		if (this.closed) return;
 		this.closed = true;
 		const child = this.child;
 		if (!child) return;
