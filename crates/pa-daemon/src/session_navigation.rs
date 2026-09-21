@@ -88,7 +88,16 @@ impl SessionNavigation {
             core.store = Some(file);
         }
         self.engine.set_session_file(new_path);
-        rebuild_engine_context(&self.engine, branch_entries).await
+        // The replacement retired the runtime, so the rebuild parks on the
+        // fresh, unbuilt session: its first build seeds the goal state
+        // from the moved branch's own rows (the TS constructor's
+        // `_loadPersistedGoalState`), faithful semantics.
+        rebuild_engine_context(
+            &self.engine,
+            branch_entries,
+            pa_core::session_engine::goal_driver::GoalBranchReload::FaithfulBranch,
+        )
+        .await
     }
 
     /// `new_session`'s prepare phase (TS `SessionManager.create` +
@@ -275,13 +284,16 @@ impl SessionNavigation {
 }
 
 /// Rebuild the engine's live context onto the moved session (the same
-/// helper `branch_navigation` runs for forks).
+/// helper `branch_navigation` runs for forks), with the goal reload rule
+/// riding the rebuild (the replacement flow's fresh build seeds
+/// faithfully, the TS constructor load).
 async fn rebuild_engine_context(
     engine: &Arc<dyn SessionEngine>,
     branch_entries: Vec<pa_types::session::FileEntry>,
+    goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
 ) -> Result<(), String> {
     let engine = Arc::clone(engine);
-    tokio::task::spawn_blocking(move || engine.rebuild_session_context(branch_entries))
+    tokio::task::spawn_blocking(move || engine.rebuild_session_context(branch_entries, goal_reload))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| format!("{error:#}"))

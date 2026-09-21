@@ -316,12 +316,27 @@ pub trait SessionEngine: Send + Sync {
     /// Rebuild the engine's live context from a durable branch (the
     /// post-navigation/fork state): the worker moves its store first, then
     /// hands the new branch's entries over so the next turn runs against
-    /// the moved branch. Engines without a persistent model context accept
-    /// and ignore the branch.
+    /// the moved branch — and the goal state reloads from the moved
+    /// branch under `goal_reload` (TS `_reloadGoalStateFromBranch` at the
+    /// `_navigateTree` tail: a summary context rebuild continues the same
+    /// timeline, a plain branch move keeps faithful branch semantics).
+    /// Engines without a persistent model context accept and ignore the
+    /// branch.
     fn rebuild_session_context(
         &self,
         branch_entries: Vec<pa_types::session::FileEntry>,
+        goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
     ) -> Result<()>;
+
+    /// The `goal_update` payload for a goal state change the engine
+    /// published outside a turn (TS `_emitGoalUpdate` at
+    /// `_reloadGoalStateFromBranch`): `Some(goal)` when the state changed
+    /// since the last announcement, `None` when it did not (the
+    /// on-change dedupe the turn-boundary emissions share). Engines
+    /// without thread goals never publish.
+    fn goal_update_after_rebuild(&self) -> Option<Value> {
+        None
+    }
 
     /// The TS replacement flows' teardown pass
     /// (`AgentSessionRuntime.teardownForReplacement` ->
@@ -1336,6 +1351,7 @@ impl SessionEngine for ScriptedEngine {
     fn rebuild_session_context(
         &self,
         _branch_entries: Vec<pa_types::session::FileEntry>,
+        _goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
     ) -> Result<()> {
         // The scripted harness engine carries no durable model context.
         Ok(())

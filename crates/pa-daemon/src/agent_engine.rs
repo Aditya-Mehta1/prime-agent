@@ -155,6 +155,12 @@ pub struct AgentSessionEngine {
     /// turn built the session: consumed at build so the session starts on
     /// the moved branch (TS rebuilds context from the durable branch).
     pending_branch: std::sync::Mutex<Option<Vec<pa_types::session::FileEntry>>>,
+    /// The `goal_update` payload a live branch rebuild's goal reload
+    /// stashed (TS `_emitGoalUpdate` at `_reloadGoalStateFromBranch`):
+    /// published against the dedupe baseline while the driver lock is
+    /// held, taken by the worker that announces it. `None` when the
+    /// reload changed nothing.
+    reloaded_goal_update: std::sync::Mutex<Option<Value>>,
     /// The provider target the built session's stream reads per call
     /// (api key + model), set when the session builds: `set_model` swaps
     /// the slot so the live session follows the new model without a
@@ -350,6 +356,7 @@ impl AgentSessionEngine {
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
             pending_max_depth: std::sync::Mutex::new(None),
+            reloaded_goal_update: std::sync::Mutex::new(None),
             faux_model: std::sync::OnceLock::new(),
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
             auto_compaction_abort: std::sync::Mutex::new(None),
@@ -1567,6 +1574,7 @@ impl SessionEngine for AgentSessionEngine {
     fn rebuild_session_context(
         &self,
         branch_entries: Vec<pa_types::session::FileEntry>,
+        goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
     ) -> anyhow::Result<()> {
         // The caller parks this synchronous engine call on a blocking
         // thread (see `branch_navigation`), so `blocking_lock` is legal
@@ -1575,7 +1583,10 @@ impl SessionEngine for AgentSessionEngine {
         let built = self.session.blocking_lock().is_some();
         if !built {
             // The session builds lazily on the first turn; park the branch
-            // so the build consumes it (see `session_agent`).
+            // so the build consumes it (see `session_agent`). The goal
+            // state seed rides the build (`adopt_built_session`: the TS
+            // constructor's `_loadPersistedGoalState`), so the reload
+            // rule has nothing to run here.
             *self
                 .pending_branch
                 .lock()
@@ -1591,8 +1602,42 @@ impl SessionEngine for AgentSessionEngine {
             // branch invalidates the conversation an armed compact-trigger
             // review would read, so the trigger drops.
             engine.session.discard_compact_auto_refine();
-            engine.session.rebuild_branch_context(branch_entries).await
+            engine
+                .session
+                .rebuild_branch_context(branch_entries)
+                .await?;
+            // TS `_reloadGoalStateFromBranch({ monotonicTokens })` at the
+            // `_navigateTree` tail: the rebuilt context reads the moved
+            // branch's own latest persisted goal entry (the session manager
+            // adopted the entries above, so the same scan the TS
+            // `sessionManager.getBranch()` read applies), with the
+            // same-timeline rule clamping the same goal's accounting. The
+            // reload's announcement publishes here — while the driver lock
+            // is held, so a racing goal mutation can neither interleave
+            // nor make the payload read fail — and the caller takes it.
+            let mut driver = engine.goal_driver.lock().await;
+            let session = engine.session.shared_persistence();
+            let manager = session.lock().await;
+            driver.reload_from_branch(&manager, goal_reload);
+            let announcement = self.publish_goal_state(driver.state());
+            *self
+                .reloaded_goal_update
+                .lock()
+                .expect("reloaded goal update lock") = announcement;
+            Ok(())
         })
+    }
+
+    fn goal_update_after_rebuild(&self) -> Option<Value> {
+        // The on-change announcement the TS `_emitGoalUpdate` at the
+        // reload emits: the reload already published it through the
+        // shared dedupe (an unchanged state stashes nothing, and a later
+        // turn-boundary check never re-announces it); the announcing
+        // caller takes it exactly once.
+        self.reloaded_goal_update
+            .lock()
+            .expect("reloaded goal update lock")
+            .take()
     }
 
     /// Rebind the engine's session cwd (see [`SessionEngine::set_cwd`]):
@@ -6083,7 +6128,10 @@ async fn replacement_teardown_retires_the_session_and_the_funnel_adopts_the_bran
         let engine = std::sync::Arc::clone(&engine);
         tokio::task::spawn_blocking(move || {
             use crate::engine::SessionEngine as _;
-            engine.rebuild_session_context(branch)
+            engine.rebuild_session_context(
+                branch,
+                pa_core::session_engine::goal_driver::GoalBranchReload::FaithfulBranch,
+            )
         })
         .await
         .expect("park join")
@@ -6133,6 +6181,126 @@ async fn replacement_teardown_retires_the_session_and_the_funnel_adopts_the_bran
     drop(texts);
     drop(state);
     drop(session);
+    // The engine owns a private runtime; dropping it from an async
+    // context panics, so the teardown rides a blocking thread.
+    tokio::task::spawn_blocking(move || drop(engine))
+        .await
+        .expect("engine drop join");
+}
+
+/// A live branch rebuild reloads the goal state from the moved branch (TS
+/// `_reloadGoalStateFromBranch` at the `_navigateTree` tail): a branch
+/// that predates the goal rows leaves the driver on the branch's own
+/// (empty) state, moving back onto the branch that owns the rows
+/// restores them, and each reload's change publishes as the
+/// `goal_update` payload exactly once (the on-change dedupe the turn
+/// emissions share).
+#[tokio::test]
+async fn live_branch_rebuild_reloads_the_goal_state_from_the_moved_branch() {
+    let engine = {
+        let (engine, _events) = tokio::task::spawn_blocking(|| {
+            run_prompts(
+                json!({
+                    "engine": "faux",
+                    "responses": (0..4).map(|index| json!({ "text": format!("reply {index}") })).collect::<Vec<_>>(),
+                }),
+                &["hello", "/goal ship it", "/goal pause"],
+            )
+        })
+        .await
+        .expect("prompt join");
+        std::sync::Arc::new(engine)
+    };
+    // The prompt built the session and the goal commands left the paused
+    // goal's `thread_goal_state` rows on the live branch.
+    assert!(engine.session.lock().await.is_some());
+    let goal_before = engine.goal_state_value();
+    assert_eq!(goal_before["status"], "paused", "state: {goal_before:?}");
+    assert_eq!(goal_before["objective"], "ship it");
+    let goal_id = goal_before["goalId"].as_str().expect("goal id").to_string();
+
+    // The live branch (the entries the driver's rows live on), captured
+    // for the move back. The engine owns a private runtime, so every
+    // engine call (the block_on the capture needs) rides a blocking
+    // thread.
+    let goal_branch = {
+        let engine = std::sync::Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || {
+            let handles = engine
+                .goal_runtime
+                .lock()
+                .expect("goal runtime lock")
+                .clone()
+                .expect("goal handles");
+            let entries = engine
+                .runtime
+                .block_on(async { handles.session.lock().await })
+                .get_all_entries()
+                .to_vec();
+            // The moved branch is the post-header path (the store form the
+            // worker hands the engine carries no header row).
+            entries
+                .iter()
+                .filter(|entry| !matches!(entry, pa_types::session::FileEntry::Header { .. }))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .await
+        .expect("branch capture join")
+    };
+
+    // A pre-goal branch: no `thread_goal_state` entry anywhere.
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.append_message(json!({
+        "role": "user",
+        "content": "moved branch marker",
+        "timestamp": 1u64,
+    }));
+    let branch = store.branch_file_entries();
+    {
+        let engine = std::sync::Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || {
+            use crate::engine::SessionEngine as _;
+            engine.rebuild_session_context(
+                branch,
+                pa_core::session_engine::goal_driver::GoalBranchReload::FaithfulBranch,
+            )
+        })
+        .await
+        .expect("rebuild join")
+        .expect("live branch rebuild");
+    }
+    let reloaded = engine.goal_state_value();
+    assert_eq!(reloaded["status"], "idle", "state: {reloaded:?}");
+    // The reload publishes its change once, then stays silent (TS
+    // `_emitGoalUpdate` at the reload; the dedupe keeps an unchanged
+    // state quiet).
+    let update = engine
+        .goal_update_after_rebuild()
+        .expect("the reload announced the change");
+    assert_eq!(update["status"], "idle");
+    assert!(engine.goal_update_after_rebuild().is_none());
+
+    // Moving back onto the branch that owns the goal rows restores them
+    // (the same-goal id and objective, the durable counters).
+    {
+        let engine = std::sync::Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || {
+            use crate::engine::SessionEngine as _;
+            engine.rebuild_session_context(
+                goal_branch,
+                pa_core::session_engine::goal_driver::GoalBranchReload::FaithfulBranch,
+            )
+        })
+        .await
+        .expect("rebuild join")
+        .expect("live branch rebuild");
+    }
+    let restored = engine.goal_state_value();
+    assert_eq!(restored["status"], "paused", "state: {restored:?}");
+    assert_eq!(restored["objective"], "ship it");
+    assert_eq!(restored["goalId"].as_str(), Some(goal_id.as_str()));
+
     // The engine owns a private runtime; dropping it from an async
     // context panics, so the teardown rides a blocking thread.
     tokio::task::spawn_blocking(move || drop(engine))

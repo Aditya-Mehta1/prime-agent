@@ -12,6 +12,26 @@ use crate::goals::{
 };
 use crate::session::manager::SessionManager;
 
+/// The goal-state reload rule at a branch rebuild (TS
+/// `_reloadGoalStateFromBranch`'s `monotonicTokens` option): a context
+/// rebuild with a summary continues the same timeline, a plain branch
+/// move is time travel and keeps faithful branch semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalBranchReload {
+    /// A summary context rebuild (compaction-style cut): the rebuilt
+    /// branch's last persisted goal entry can lag the in-memory state
+    /// (queue/flush races; child-usage attribution landing late), so the
+    /// same goal's accounting counters clamp to the max and its status or
+    /// an already-fired gate (budget limit, pause, completion) never
+    /// regresses across the cold boundary. A different goal adopts
+    /// faithfully.
+    SameTimeline,
+    /// A plain branch move (tree navigation without a summary): the moved
+    /// branch's own latest persisted goal state adopts as-is, even when
+    /// it is older — the goal state follows the branch cut.
+    FaithfulBranch,
+}
+
 /// Wall-clock accounting anchor for time-used attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AccountingStartedAt(pub u64);
@@ -56,22 +76,60 @@ impl GoalDriver {
 
     /// Rehydrate the driver from the session branch (latest persisted entry).
     pub fn load_persisted(session: &SessionManager) -> Self {
-        let mut state = empty_goal_state();
+        Self::restore_persisted(Self::latest_persisted_state(session))
+    }
+
+    /// The branch's latest valid persisted goal state (TS
+    /// `_loadPersistedGoalState`: newest-first scan over the branch's
+    /// custom entries; `emptyGoalState()` when no valid entry exists).
+    pub fn latest_persisted_state(session: &SessionManager) -> GoalState {
         for entry in session.get_all_entries().iter().rev() {
             if let FileEntry::Custom { payload, .. } = entry {
                 if payload.custom_type == GOAL_STATE_CUSTOM_TYPE {
                     if let Some(data) = &payload.data {
                         if is_persisted_goal_state(data) {
                             if let Ok(parsed) = serde_json::from_value::<GoalState>(data.clone()) {
-                                state = normalize_goal_state(parsed);
-                                break;
+                                return normalize_goal_state(parsed);
                             }
                         }
                     }
                 }
             }
         }
-        Self::restore_persisted(state)
+        empty_goal_state()
+    }
+
+    /// Reload the goal state from the session's current branch (TS
+    /// `_reloadGoalStateFromBranch` at the `_navigateTree` tail): the
+    /// branch's latest persisted entry adopts under [`rule`], and the
+    /// wall-clock anchor restarts like the TS `_goalAccountingStartedAt`
+    /// reset (active goals re-anchor at the reload; everything else drops
+    /// the anchor).
+    pub fn reload_from_branch(&mut self, session: &SessionManager, rule: GoalBranchReload) {
+        let previous = self.state.clone();
+        let reloaded = Self::latest_persisted_state(session);
+        self.state = match rule {
+            GoalBranchReload::SameTimeline
+                if reloaded.goal_id.is_some() && reloaded.goal_id == previous.goal_id =>
+            {
+                // The counters clamp to the max; every other field (status,
+                // objective, budget, an already-fired gate) keeps the
+                // in-memory state, mirroring the TS `{ ...previous, max }`
+                // spread (both sides are normalized, so `active` stays
+                // consistent with the kept status).
+                GoalState {
+                    tokens_used: previous.tokens_used.max(reloaded.tokens_used),
+                    continuations_used: previous
+                        .continuations_used
+                        .max(reloaded.continuations_used),
+                    time_used_seconds: previous.time_used_seconds.max(reloaded.time_used_seconds),
+                    ..previous
+                }
+            }
+            _ => reloaded,
+        };
+        self.accounting_started_at =
+            (self.state.status == GoalStatus::Active).then_some(AccountingStartedAt(now_millis()));
     }
 
     /// Adopt an already-persisted goal state without re-persisting it: a
@@ -752,5 +810,189 @@ mod tests {
             },
         ));
         assert!(!GoalDriver::is_branch_seedable(&other));
+    }
+
+    /// Append one raw `thread_goal_state` row (the TS test seam
+    /// `sessionManager.appendCustomEntry(GOAL_STATE_CUSTOM_TYPE, ...)`)
+    /// so a reload can observe a branch entry the driver did not write
+    /// through its own state machine.
+    fn append_goal_row(session: &mut SessionManager, state: &GoalState) {
+        let value = serde_json::to_value(state).unwrap();
+        session.append_custom_entry(GOAL_STATE_CUSTOM_TYPE, Some(value));
+    }
+
+    /// TS `agent-session-goal.test.ts` "reloads the goal state from the
+    /// branch after a summary context rebuild" (the monotonic arm): a
+    /// stale same-goal snapshot never regresses the accounting, while a
+    /// plain branch move stays faithful to the branch even when lower.
+    #[test]
+    fn same_timeline_reload_never_regresses_the_same_goal() {
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut session, "do work", None).unwrap();
+        let goal_id = driver.state().goal_id.clone();
+        assert_eq!(driver.state().status, GoalStatus::Active);
+
+        // Bill usage through the same path a real assistant message uses.
+        assert_eq!(
+            driver.record_assistant_usage(&mut session, "a1", &usage(40, 10)),
+            UsageOutcome::Accounted
+        );
+        assert!(driver.state().tokens_used >= 50);
+
+        // Simulate a stale persisted snapshot for the SAME goal: an older
+        // accounting entry re-persisted after the newer usage (queue/flush
+        // race, or child-usage attribution landing after the branch write).
+        append_goal_row(
+            &mut session,
+            &GoalState {
+                tokens_used: 1,
+                continuations_used: 0,
+                time_used_seconds: 0,
+                ..driver.state().clone()
+            },
+        );
+
+        // A summary navigation (compaction) continues the same timeline:
+        // the same goal's accounting must not regress to the stale row.
+        driver.reload_from_branch(&session, GoalBranchReload::SameTimeline);
+        assert_eq!(driver.state().status, GoalStatus::Active);
+        assert_eq!(driver.state().goal_id, goal_id);
+        assert!(driver.state().tokens_used >= 50);
+
+        // Plain branch moves are time travel and stay faithful to the
+        // branch's last persisted entry, even when it is lower.
+        driver.reload_from_branch(&session, GoalBranchReload::FaithfulBranch);
+        assert_eq!(driver.state().goal_id, goal_id);
+        assert_eq!(driver.state().tokens_used, 1);
+    }
+
+    /// TS `agent-session-goal.test.ts` "keeps a fired budget gate
+    /// monotonic across summary context rebuilds": the gate that already
+    /// fired survives the same-timeline reload and the counter never
+    /// regresses.
+    #[test]
+    fn same_timeline_reload_keeps_a_fired_budget_gate() {
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut session, "do work", Some(100)).unwrap();
+        let goal_id = driver.state().goal_id.clone();
+
+        // Bill usage until the budget gate fires.
+        assert_eq!(
+            driver.record_assistant_usage(&mut session, "a1", &usage(60, 50)),
+            UsageOutcome::BudgetReached
+        );
+        assert_eq!(driver.state().status, GoalStatus::BudgetLimited);
+
+        // A stale branch snapshot for the same goal predates the gate.
+        append_goal_row(
+            &mut session,
+            &GoalState {
+                active: true,
+                status: GoalStatus::Active,
+                tokens_used: 10,
+                ..driver.state().clone()
+            },
+        );
+
+        // A summary rebuild continues the same timeline: the gate that
+        // already fired must survive, and the counter must not regress.
+        driver.reload_from_branch(&session, GoalBranchReload::SameTimeline);
+        assert_eq!(driver.state().status, GoalStatus::BudgetLimited);
+        assert_eq!(driver.state().goal_id, goal_id);
+        assert!(driver.state().tokens_used >= 110);
+    }
+
+    /// A different goal on the moved branch adopts faithfully even under
+    /// the same-timeline rule (TS clamps only
+    /// `reloaded.goalId === previous.goalId`).
+    #[test]
+    fn same_timeline_reload_adopts_a_different_goal_faithfully() {
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut session, "first goal", None).unwrap();
+        assert_eq!(
+            driver.record_assistant_usage(&mut session, "a1", &usage(40, 10)),
+            UsageOutcome::Accounted
+        );
+
+        // The moved branch carries another goal with lower counters.
+        append_goal_row(
+            &mut session,
+            &GoalState {
+                active: true,
+                status: GoalStatus::Active,
+                goal_id: Some("other-goal".to_string()),
+                objective: Some("second goal".to_string()),
+                tokens_used: 3,
+                continuations_used: 0,
+                time_used_seconds: 0,
+                ..empty_goal_state()
+            },
+        );
+        driver.reload_from_branch(&session, GoalBranchReload::SameTimeline);
+        assert_eq!(driver.state().goal_id.as_deref(), Some("other-goal"));
+        assert_eq!(driver.state().objective.as_deref(), Some("second goal"));
+        assert_eq!(driver.state().tokens_used, 3);
+
+        // A newer persisted state adopts faithfully as well: the branch's
+        // own row wins on both arms when the ids differ.
+        append_goal_row(
+            &mut session,
+            &GoalState {
+                active: true,
+                status: GoalStatus::Active,
+                goal_id: Some("other-goal".to_string()),
+                objective: Some("second goal".to_string()),
+                tokens_used: 500,
+                continuations_used: 4,
+                time_used_seconds: 9,
+                ..empty_goal_state()
+            },
+        );
+        driver.reload_from_branch(&session, GoalBranchReload::FaithfulBranch);
+        assert_eq!(driver.state().tokens_used, 500);
+        assert_eq!(driver.state().continuations_used, 4);
+        assert_eq!(driver.state().time_used_seconds, 9);
+    }
+
+    /// The reload's newest-first scan skips invalid rows (TS
+    /// `isPersistedGoalState` guard) and the empty state is the
+    /// no-entry fallthrough; the wall-clock anchor follows the reloaded
+    /// status like the TS `_goalAccountingStartedAt` reset.
+    #[test]
+    fn reload_skips_invalid_rows_and_restarts_the_anchor() {
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut session, "do work", None).unwrap();
+
+        // An invalid row (missing the counters) lands after the valid one:
+        // the scan skips it and keeps the branch's last VALID entry.
+        session.append_custom_entry(
+            GOAL_STATE_CUSTOM_TYPE,
+            Some(serde_json::json!({
+                "active": true,
+                "status": "active",
+            })),
+        );
+        driver.reload_from_branch(&session, GoalBranchReload::FaithfulBranch);
+        assert_eq!(driver.state().status, GoalStatus::Active);
+        assert!(driver.state().goal_id.is_some());
+        assert!(driver.accounting_started_at.is_some());
+
+        // A branch without any goal entry reloads to the empty state and
+        // drops the anchor.
+        let mut fresh = persisted_session();
+        fresh.append_message(pa_types::session::AgentMessage::User(
+            pa_types::ai::UserMessage {
+                content: UserContent::Text("no goal here".to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            },
+        ));
+        driver.reload_from_branch(&fresh, GoalBranchReload::FaithfulBranch);
+        assert_eq!(driver.state(), &empty_goal_state());
+        assert!(driver.accounting_started_at.is_none());
     }
 }

@@ -1427,7 +1427,7 @@ impl Worker {
             "get_session_tree" => self.tree_navigation.get_session_tree(),
             "get_user_messages_for_forking" => self.tree_navigation.get_user_messages_for_forking(),
             "set_session_entry_label" => self.tree_navigation.set_session_entry_label(payload),
-            "navigate_tree" => self.tree_navigation.navigate_tree(payload).await,
+            "navigate_tree" => self.handle_navigate_tree(payload).await,
             "fork" => self.handle_fork(payload).await,
             "abort_branch_summary" => {
                 self.tree_navigation.abort();
@@ -1488,6 +1488,26 @@ impl Worker {
             ));
         }
         Ok(())
+    }
+
+    /// `navigate_tree` with the reload's announcement (TS
+    /// `_reloadGoalStateFromBranch` -> `_emitGoalUpdate`): a tree move
+    /// that reloaded the goal state announces the change at the moment it
+    /// happened — before the navigation's response reaches the client —
+    /// so attached surfaces never show the pre-navigation goal. The
+    /// engine owns the on-change dedupe, so an unchanged reload (or a
+    /// no-op leaf move, which never rebuilds) stays silent.
+    async fn handle_navigate_tree(&self, payload: &Value) -> DaemonResponse {
+        let response = self.tree_navigation.navigate_tree(payload).await;
+        if response.success {
+            if let Some(goal) = self.engine.goal_update_after_rebuild() {
+                self.emit_worker_event(json!({
+                    "type": "goal_update",
+                    "goal": goal,
+                }));
+            }
+        }
+        response
     }
 
     /// `replace_acp_mcp_servers` (TS daemon-mode.ts case): the session's
@@ -6282,6 +6302,7 @@ mod turn_stream_tests {
         fn rebuild_session_context(
             &self,
             _branch_entries: Vec<pa_types::session::FileEntry>,
+            _goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
         ) -> anyhow::Result<()> {
             Ok(())
         }

@@ -256,7 +256,10 @@ impl TreeNavigation {
         }
 
         // Move the leaf and persist the summary entry, then rebuild the
-        // engine context onto the moved branch.
+        // engine context onto the moved branch. A created summary entry
+        // means the navigation rebuilds the context across a
+        // compaction-style cut (TS `Boolean(summaryText)`).
+        let summarized = summary.is_some();
         let (branch_entries, summary_entry) = {
             let mut core = self.core.lock().unwrap();
             let Some(store) = core.store.as_mut() else {
@@ -320,7 +323,17 @@ impl TreeNavigation {
             }
             (store.branch_file_entries(), summary_entry)
         };
-        if let Err(error) = rebuild_engine_context(&self.engine, branch_entries).await {
+        // TS `Boolean(summaryText)`: a created summary entry means the
+        // navigation rebuilt the context across a compaction-style cut
+        // (the same timeline — the goal's accounting is monotonic); a
+        // plain move is time travel and reloads faithfully.
+        let goal_reload = if summarized {
+            pa_core::session_engine::goal_driver::GoalBranchReload::SameTimeline
+        } else {
+            pa_core::session_engine::goal_driver::GoalBranchReload::FaithfulBranch
+        };
+        if let Err(error) = rebuild_engine_context(&self.engine, branch_entries, goal_reload).await
+        {
             return response_failure(None, "navigate_tree", &error, None);
         }
         let mut data = json!({ "cancelled": false });
@@ -450,7 +463,16 @@ impl TreeNavigation {
             core.store = Some(forked);
         }
         self.engine.set_session_file(new_path);
-        rebuild_engine_context(&self.engine, branch_entries).await
+        // A replacement flow retires the runtime first, so the rebuild
+        // parks on the fresh, unbuilt session: its first build seeds the
+        // goal state from the moved branch's own rows (the TS
+        // constructor's `_loadPersistedGoalState`), faithful semantics.
+        rebuild_engine_context(
+            &self.engine,
+            branch_entries,
+            pa_core::session_engine::goal_driver::GoalBranchReload::FaithfulBranch,
+        )
+        .await
     }
 
     /// Wait until the running turn (if any) has settled (the compaction
@@ -493,13 +515,17 @@ impl TreeNavigation {
 /// Rebuild the engine's live context onto the moved branch. The engine
 /// method is synchronous and may ride its own runtime (the
 /// `run_compaction` pattern), so it runs on a blocking thread — never on
-/// the worker's async dispatcher (a `block_on` there panics).
+/// the worker's async dispatcher (a `block_on` there panics). The goal
+/// reload rule rides the rebuild (TS `_reloadGoalStateFromBranch`'s
+/// `monotonicTokens`: a summary context rebuild continues the same
+/// timeline, a plain branch move keeps faithful branch semantics).
 async fn rebuild_engine_context(
     engine: &std::sync::Arc<dyn crate::engine::SessionEngine>,
     branch_entries: Vec<pa_types::session::FileEntry>,
+    goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
 ) -> Result<(), String> {
     let engine = std::sync::Arc::clone(engine);
-    tokio::task::spawn_blocking(move || engine.rebuild_session_context(branch_entries))
+    tokio::task::spawn_blocking(move || engine.rebuild_session_context(branch_entries, goal_reload))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| format!("{error:#}"))
