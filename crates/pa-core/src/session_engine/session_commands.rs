@@ -71,9 +71,13 @@ pub struct SessionCommandExecution {
     /// (the durable transcript itself records nothing, matching the TS
     /// queued-command catch arm that returns silently).
     pub compaction_skipped: Option<&'static str>,
-    /// A follow-up prompt to admit as a turn (goal start/resume). The
-    /// durable goal-context row for that turn is already in `messages`.
-    pub continuation_prompt: Option<String>,
+    /// An injected custom row the follow-up turn runs on (goal
+    /// start/resume): the loop admission carries the row itself, so the
+    /// transcript holds ONE representation of the turn (the custom row),
+    /// like TS's prepared-turn primary record. It is NOT part of
+    /// `messages` — the loop's `message_end` persists it once the turn
+    /// is admitted.
+    pub continuation_message: Option<CustomMessage>,
     /// The command failed: the TS error message. The failure result row
     /// (`Command failed: ...`) is already appended to `messages`.
     pub error: Option<String>,
@@ -336,10 +340,10 @@ async fn execute_goal(
             true,
         ));
     }
-    if let Some(context) = context_message {
-        execution.continuation_prompt = Some(context.content.text());
-        execution.push_message(context);
-    }
+    // TS `_runOrQueueGoalContext`: the goal-context row becomes the
+    // turn's primary record (an injected custom row), never an early
+    // durable row — the loop admission appends it once.
+    execution.continuation_message = context_message;
     Ok(())
 }
 

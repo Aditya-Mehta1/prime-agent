@@ -712,6 +712,179 @@ mod tests {
         registration.unregister();
     }
 
+    /// The injected-turn representation drives the compaction walk (the
+    /// f7 goal-continue differential's shape): a session whose last turn
+    /// is an injected custom row — ONE representation, the goal-context
+    /// row, with no duplicate user message — compacts with a whole-turn
+    /// cut (a single history call, the whole goal turn kept). The
+    /// double-represented shape the fix removes (the custom row PLUS a
+    /// user message with the same text, the pre-fix engine branch) shifts
+    /// the keep-recent crossing and lands the cut mid-turn: a split-turn
+    /// compaction with an extra turn-prefix summarizer call — the
+    /// short-session compact TS never makes.
+    #[tokio::test]
+    async fn injected_custom_turn_cuts_whole_turns_the_double_row_splits() {
+        let registration = faux_registration();
+        let model = registration.get_model();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::in_memory(tmp.path());
+        let user = |text: &str| {
+            AgentMessage::User(pa_types::ai::UserMessage {
+                content: UserContent::Text(text.to_string()),
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        let reply = |text: &str| {
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![pa_types::ai::AssistantContentBlock::Text(
+                    pa_types::ai::TextContent {
+                        text: text.to_string(),
+                        text_signature: None,
+                        rest: Default::default(),
+                    },
+                )],
+                api: "faux".to_string(),
+                provider: "faux".to_string(),
+                model: "compact-m".to_string(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: pa_types::ai::Usage::default(),
+                stop_reason: pa_types::ai::StopReason::Stop,
+                stop_reason_raw: None,
+                error_message: None,
+                timestamp: 0,
+                rest: Default::default(),
+            })
+        };
+        let goal_row = |session: &mut SessionManager| {
+            session.append_custom_message(
+                "goal_context",
+                UserContent::Text("[goal: continuation] keep going".to_string()),
+                true,
+                Some(serde_json::json!({ "kind": "continuation" })),
+            )
+        };
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let record_summary = |recorder: std::sync::Arc<std::sync::Mutex<Vec<String>>>| {
+            pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
+                move |context: &pa_types::ai::Context,
+                      _options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let text = match &context.messages[0] {
+                        pa_types::ai::Message::User(user) => user.content.text(),
+                        _ => panic!("expected a user request"),
+                    };
+                    recorder.lock().unwrap().push(text);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        "## Summary\nthe session story",
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ))
+        };
+        registration.set_responses(vec![record_summary(seen.clone())]);
+        let settings = |keep_recent_tokens: u64| super::super::compaction::CompactionSettings {
+            keep_recent_tokens,
+            ..Default::default()
+        };
+
+        // ONE representation (the fixed engine branch): the goal turn is
+        // the custom row plus its reply.
+        session.append_message(user("seed turn"));
+        session.append_message(reply("seed reply"));
+        let kept_goal_row_id = goal_row(&mut session);
+        session.append_message(reply("goal reply"));
+        let outcome = execute_compaction(
+            &mut session,
+            CompactOptions {
+                model: model.clone(),
+                api_key: None,
+                custom_instructions: None,
+                settings: settings(2),
+                abort: None,
+                harness_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(run) = outcome else {
+            panic!("expected the compaction to run");
+        };
+        // Whole-turn cut: one history call, no turn-prefix call, the
+        // entire goal turn (custom row plus reply) kept.
+        assert_eq!(
+            registration.call_count(),
+            1,
+            "the whole-turn cut makes one call"
+        );
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("checkpoint summary"));
+        assert!(!requests[0].contains("PREFIX of a turn"));
+        assert_eq!(run.result.first_kept_entry_id, kept_goal_row_id);
+        assert!(
+            !run.result.summary.contains("Turn Context (split turn)"),
+            "a whole-turn cut never merges a turn context: {summary}",
+            summary = run.result.summary
+        );
+
+        // The double-represented shape the fix removes (the pre-fix
+        // engine branch): the custom row PLUS a user message with the
+        // same text. The extra user row shifts the keep-recent crossing
+        // and the pull-back lands the cut mid-turn — the extra
+        // turn-prefix call TS never makes (the f7 goal-continue split).
+        let calls_before = registration.call_count();
+        seen.lock().unwrap().clear();
+        // Two calls in the doubled shape (history plus the extra
+        // turn-prefix summarizer the double row forces).
+        registration.set_responses(vec![
+            record_summary(seen.clone()),
+            record_summary(seen.clone()),
+        ]);
+        let mut doubled = SessionManager::in_memory(tmp.path());
+        doubled.append_message(user("seed turn"));
+        doubled.append_message(reply("seed reply"));
+        goal_row(&mut doubled);
+        doubled.append_message(user("[goal: continuation] keep going"));
+        doubled.append_message(reply("goal reply"));
+        let outcome = execute_compaction(
+            &mut doubled,
+            CompactOptions {
+                model,
+                api_key: None,
+                custom_instructions: None,
+                settings: settings(2),
+                abort: None,
+                harness_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CompactOutcome::Ran(run) = outcome else {
+            panic!("expected the compaction to run");
+        };
+        assert_eq!(
+            registration.call_count() - calls_before,
+            2,
+            "the double row splits the turn and makes the extra prefix call"
+        );
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        let prefix_request = requests
+            .iter()
+            .find(|text| text.contains("PREFIX of a turn"))
+            .expect("the double row's turn-prefix call");
+        assert!(
+            prefix_request.contains("[User]: [goal: continuation] keep going"),
+            "the split prefix is the duplicate user row: {prefix_request}"
+        );
+        assert!(run.result.summary.contains("Turn Context (split turn)"));
+        registration.unregister();
+    }
+
     /// A split turn with no history to summarize makes only the
     /// turn-prefix wire call and stands the literal "No prior history."
     /// in for the history half (TS

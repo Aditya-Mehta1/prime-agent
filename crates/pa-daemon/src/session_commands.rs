@@ -62,7 +62,7 @@ pub(crate) fn run_session_command(
                 messages: vec![session_command_failure_row(&command, &error)],
                 compaction: None,
                 compaction_skipped: None,
-                continuation_prompt: None,
+                continuation_message: None,
                 error: Some(error),
                 refinement: None,
                 refinement_failed: None,

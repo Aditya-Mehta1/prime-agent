@@ -1978,24 +1978,55 @@ impl SessionEngine for AgentSessionEngine {
                 return;
             }
             // A goal start/resume schedules its continuation context as
-            // the turn; the durable goal-context row is already emitted.
+            // the turn (an injected custom row): the durable row's
+            // message pair precedes the turn it drives (TS's prepared-turn
+            // primary record emits at admission), and the loop admission
+            // carries the row itself — one representation of the turn.
             // An unchanged `/goal` state stays silent (TS emits
             // goal_update only on state change; the interactive surface
             // dedupes announcements).
-            if let Some(continuation) = execution.continuation_prompt {
-                self.run_turns(&continuation, &[], aborted, &mut emit);
+            if let Some(message) = execution.continuation_message {
+                if !emit(EngineEvent::CustomMessage(
+                    crate::session_commands::custom_message_value(&message),
+                )) {
+                    return;
+                }
+                self.run_turns(TurnPrompt::Injected(message), aborted, &mut emit);
             } else {
                 emit(EngineEvent::Done(Ok(())));
             }
             return;
         }
-        // The accepted turn row: an injected custom row (wire
-        // `role: "custom"`) replaces the user message — the row persists
-        // and renders as itself while the model turn still runs on the
-        // message text (TS injected-prompt turns: RLM child terminal
-        // notices). The plain turn records the accepted user message;
-        // images ride as multimodal content blocks after the text (TS
-        // prompt admission: the text part first, then the image parts).
+        // The injected custom row (wire `role: "custom"`) parses to its
+        // session shape first: an unparseable row fails the turn instead
+        // of double-representing it (the loop would admit a user row with
+        // the same text while the row already persists and renders).
+        let injected = match &request.custom_message {
+            Some(custom) => {
+                match serde_json::from_value::<pa_types::session::AgentMessage>(custom.clone()) {
+                    Ok(pa_types::session::AgentMessage::Custom(parsed)) => Some(parsed),
+                    Ok(_) => {
+                        emit(EngineEvent::Done(Err(
+                            "injected custom message must carry role \"custom\"".to_string(),
+                        )));
+                        return;
+                    }
+                    Err(error) => {
+                        emit(EngineEvent::Done(Err(format!(
+                            "injected custom message parse failed: {error}"
+                        ))));
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
+        // The accepted turn row: an injected custom row replaces the user
+        // message — the row persists and renders as itself while the model
+        // turn runs on the row itself (TS injected-prompt turns: RLM child
+        // terminal notices). The plain turn records the accepted user
+        // message; images ride as multimodal content blocks after the text
+        // (TS prompt admission: the text part first, then the image parts).
         let accepted = match &request.custom_message {
             Some(custom) => EngineEvent::CustomMessage(custom.clone()),
             None => {
@@ -2020,7 +2051,14 @@ impl SessionEngine for AgentSessionEngine {
         if !emit(accepted) {
             return;
         }
-        self.run_turns(&request.message, &request.images, aborted, &mut emit);
+        let turn_prompt = match injected {
+            Some(custom) => TurnPrompt::Injected(custom),
+            None => TurnPrompt::User {
+                text: request.message.clone(),
+                images: request.images.clone(),
+            },
+        };
+        self.run_turns(turn_prompt, aborted, &mut emit);
     }
 }
 
@@ -2033,12 +2071,10 @@ impl AgentSessionEngine {
     fn run_model_turn(
         &self,
         admission: TurnAdmission,
-        prompt: &str,
-        images: &[pa_agent::types::ImageContent],
+        prompt: &TurnPrompt,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> TurnResult {
-        let prompt = prompt.to_string();
         // Model resolution and session construction are hard failures: they
         // never reach the provider, so the retry loop does not apply (the
         // TS loop only classifies provider stream failures).
@@ -2109,7 +2145,6 @@ impl AgentSessionEngine {
                     first_attempt.set(false);
                     let agent = agent.clone();
                     let prompt = prompt.clone();
-                    let images = images.to_vec();
                     let model = model.clone();
                     async move {
                         // A retry re-issues the failed turn: the failed
@@ -2120,7 +2155,7 @@ impl AgentSessionEngine {
                             drop_trailing_assistant(&agent).await;
                         }
                         match self
-                            .run_turn_once(&agent, &prompt, &images, first, &mut **emit)
+                            .run_turn_once(&agent, &prompt, first, &mut **emit)
                             .await
                         {
                             Ok(TurnOnce::Message { assistant }) => {
@@ -2524,23 +2559,20 @@ impl AgentSessionEngine {
     /// trailing `Done` ends the run.
     fn run_turns(
         &self,
-        first_prompt: &str,
-        first_images: &[pa_agent::types::ImageContent],
+        first: TurnPrompt,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
-        // The first turn admits the prompt with its images; every
-        // autonomous follow-up turn runs text-only (the TS driver
-        // regenerates from the loop state, never re-sending attachments).
-        let mut prompt = first_prompt.to_string();
-        let mut first = true;
+        // The first turn admits the prompt (a user prompt with its
+        // images, or an injected custom row); every autonomous follow-up
+        // turn runs text-only (the TS driver regenerates from the loop
+        // state, never re-sending attachments).
+        let mut prompt = first;
         let mut overflow_retry = false;
         // TS resets `_overflowRecovery` when a message that starts an agent
         // run enters the loop: the admitted prompt here.
         self.reset_overflow_recovery();
         loop {
-            let images: &[pa_agent::types::ImageContent] = if first { first_images } else { &[] };
-            first = false;
             // TS `_runPreTurnCompaction` (`beforeModelSelection` for queued
             // prompts): a stale overflow error from the previous run gets
             // its compact-and-retry attempt on the newly admitted prompt
@@ -2562,7 +2594,7 @@ impl AgentSessionEngine {
             } else {
                 TurnAdmission::FreshPrompt
             };
-            let turn = self.run_model_turn(admission, &prompt, images, aborted, emit);
+            let turn = self.run_model_turn(admission, &prompt, aborted, emit);
             let assistant = match turn {
                 TurnResult::Message(assistant) => {
                     // A settled non-error turn resets the overflow
@@ -2657,7 +2689,10 @@ impl AgentSessionEngine {
                         emit(EngineEvent::Done(Err("No response produced.".to_string())));
                         return;
                     }
-                    prompt = text;
+                    prompt = TurnPrompt::User {
+                        text,
+                        images: Vec::new(),
+                    };
                 }
                 AutonomousFollowUp::Stop { reason, status } => {
                     let row = pa_core::autonomous::autonomous_stop_row(&reason, &status);
@@ -2754,8 +2789,7 @@ impl AgentSessionEngine {
     async fn run_turn_once(
         &self,
         agent: &std::sync::Arc<pa_agent::agent::Agent>,
-        prompt: &str,
-        images: &[pa_agent::types::ImageContent],
+        prompt: &TurnPrompt,
         first_attempt: bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<TurnOnce> {
@@ -2943,17 +2977,29 @@ impl AgentSessionEngine {
         // the loop hands each streamed event to `emit` the moment it
         // arrives. Buffering events until the future resolves is what made
         // clients render a turn as one final batch.
-        let prompt_text = prompt.to_string();
-        let prompt_images = images.to_vec();
+        let prompt = prompt.clone();
         let mut admitted = std::pin::pin!(async {
             if first_attempt {
                 let guard = self.session.lock().await;
                 let engine = guard.as_ref().expect("session built");
-                engine
-                    .session
-                    .prompt_with_images(&prompt_text, prompt_images, Default::default())
-                    .await
-                    .map(|_| ())
+                match &prompt {
+                    // A plain turn admits a user prompt (text plus
+                    // images); an injected turn admits the custom row
+                    // itself (TS `_promptInjectedMessage`: the loop
+                    // context holds ONE representation of the turn —
+                    // the custom row — and the provider request carries
+                    // its user-role view at the loop boundary).
+                    TurnPrompt::User { text, images } => engine
+                        .session
+                        .prompt_with_images(text, images.clone(), Default::default())
+                        .await
+                        .map(|_| ()),
+                    TurnPrompt::Injected(message) => engine
+                        .session
+                        .prompt_injected_message(message)
+                        .await
+                        .map(|_| ()),
+                }
             } else {
                 agent.continue_run().await.map(|_| ())
             }
@@ -3056,6 +3102,22 @@ enum TurnAdmission {
     /// the overflow compact-and-retry path after the failed turn's error
     /// message left the loop context.
     Continue,
+}
+
+/// The first turn's admitted prompt (TS `preparedMessages`): a plain
+/// user prompt, or an injected custom row the turn runs on.
+#[derive(Debug, Clone)]
+enum TurnPrompt {
+    /// A user prompt: text plus its image parts.
+    User {
+        text: String,
+        images: Vec<pa_agent::types::ImageContent>,
+    },
+    /// An injected custom row (TS `_promptInjectedMessage` — goal
+    /// continuations, RLM child terminal notices): the loop admission
+    /// carries the row itself, so the transcript and the compaction walk
+    /// hold one representation of the turn.
+    Injected(pa_types::session::CustomMessage),
 }
 
 /// What the turn-boundary consumption did to the run.
@@ -3377,6 +3439,193 @@ pub(crate) mod tests {
         assert!(
             engine.mint_post_compaction_goal_continuation().is_none(),
             "a paused goal minted a continuation"
+        );
+    }
+
+    /// The engine session's entries as their persisted wire shapes.
+    fn engine_session_entries(engine: &AgentSessionEngine) -> Vec<pa_types::session::FileEntry> {
+        let guard = engine.session.blocking_lock();
+        let core = guard.as_ref().expect("session built");
+        let persistence = core.session.shared_persistence();
+        engine
+            .runtime
+            .block_on(async { persistence.lock().await.get_all_entries().to_vec() })
+    }
+
+    /// An injected custom turn (wire `customMessage`, the RLM child
+    /// terminal-notice path) holds ONE representation in the engine
+    /// branch: the accepted custom row persists and renders as itself
+    /// (the wire pair, exactly once), the engine session's transcript
+    /// gains the custom row and NO user row with the same text, and the
+    /// model turn still runs on the notice text (TS
+    /// `_promptInjectedMessage` -> `agent.prompt([customMessage])`).
+    #[test]
+    fn injected_custom_turn_holds_one_representation() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, _dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "notice acknowledged"}] }),
+            1,
+        );
+        let notice_text = "[child-exited: no-reply child:lane]";
+        let notice = serde_json::json!({
+            "role": "custom",
+            "customType": "rlm_child_terminal_notice",
+            "content": notice_text,
+            "display": true,
+            "details": {
+                "kind": "completed_without_reply",
+                "childId": "sub-1",
+                "sessionName": "lane",
+            },
+            "timestamp": crate::util::now_ms(),
+        });
+        let mut events: Vec<EngineEvent> = Vec::new();
+        engine.run_prompt(
+            0,
+            PromptRequest {
+                images: Vec::new(),
+                message: notice_text.to_string(),
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: Some(notice),
+            },
+            &|| false,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        );
+        // The wire: the accepted custom row's pair, no user row, the
+        // model turn settled on the notice text.
+        let custom_rows: Vec<&Value> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::CustomMessage(row)
+                    if row["customType"] == "rlm_child_terminal_notice" =>
+                {
+                    Some(row)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(custom_rows.len(), 1, "events: {events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::UserMessage(_))),
+            "the injected turn must not emit a user row: {events:?}"
+        );
+        assert_eq!(
+            assistant_texts(&events),
+            vec!["notice acknowledged".to_string()],
+            "the model turn ran on the notice text: {events:?}"
+        );
+        // The engine session's transcript: one custom row, no duplicate
+        // user row with the notice text, the assistant settled.
+        let entries = engine_session_entries(&engine);
+        let notice_rows = entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, pa_types::session::FileEntry::CustomMessage { payload, .. }
+                    if payload.custom_type == "rlm_child_terminal_notice")
+            })
+            .count();
+        assert_eq!(notice_rows, 1, "entries: {entries:?}");
+        let user_rows = entries
+            .iter()
+            .filter(|entry| match entry {
+                pa_types::session::FileEntry::Message {
+                    message: pa_types::session::AgentMessage::User(user),
+                    ..
+                } => user.content.text().contains(notice_text),
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            user_rows, 0,
+            "the injected turn must not persist a user row: {entries:?}"
+        );
+        let assistant_rows = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    pa_types::session::FileEntry::Message {
+                        message: pa_types::session::AgentMessage::Assistant(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(assistant_rows, 1, "entries: {entries:?}");
+    }
+
+    /// A `/goal` start schedules its continuation as an injected custom
+    /// row (TS `_runOrQueueGoalContext` -> the prepared-turn primary
+    /// record): the engine session's transcript holds the goal-context
+    /// row once and NO user row carrying the goal-context prompt — the
+    /// pre-fix double representation that shifted the compaction walk.
+    #[test]
+    fn goal_start_continuation_holds_one_representation() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, _dir) = faux_engine_with_settings(
+            serde_json::json!({ "responses": [{"text": "goal turn reply"}] }),
+            1,
+        );
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(
+            &engine,
+            "/goal land the post-compact continue".to_string(),
+            &mut events,
+        );
+        assert_eq!(engine.goal_state_value()["status"], "active");
+        let entries = engine_session_entries(&engine);
+        let goal_rows: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                pa_types::session::FileEntry::CustomMessage { payload, .. } => {
+                    (payload.custom_type == "goal_context").then(|| payload.content.text())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(goal_rows.len(), 1, "entries: {entries:?}");
+        let goal_prompt = goal_rows[0].clone();
+        let user_rows = entries
+            .iter()
+            .filter(|entry| match entry {
+                pa_types::session::FileEntry::Message {
+                    message: pa_types::session::AgentMessage::User(user),
+                    ..
+                } => user.content.text().contains(&goal_prompt),
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            user_rows, 0,
+            "the goal continuation must not persist a duplicate user row: {entries:?}"
+        );
+        // The wire: the goal-context row's message pair goes out with
+        // the command rows, before the turn's assistant.
+        let goal_pair_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, EngineEvent::CustomMessage(row) if row["customType"] == "goal_context")
+            })
+            .expect("the goal-context row rides the wire");
+        let assistant_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, EngineEvent::AssistantMessage(message) if message["content"][0]["text"] == "goal turn reply")
+            })
+            .expect("the continuation turn settled");
+        assert!(
+            goal_pair_index < assistant_index,
+            "the row precedes the turn it drives: {events:?}"
         );
     }
 

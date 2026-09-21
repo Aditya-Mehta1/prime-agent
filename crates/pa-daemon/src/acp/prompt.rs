@@ -450,20 +450,12 @@ async fn run_session_command_segment(
     // settled turn participates in the autonomous follow-up like any model
     // turn. The pre-turn compaction arms run before it, like any admitted
     // prompt (TS `_runPreTurnCompaction`).
-    if let Some(continuation) = execution.continuation_prompt {
+    if let Some(message) = execution.continuation_message {
         session.run_pre_turn_compaction(mode).await;
-        let result = mode
-            .engine
-            .session
-            .prompt(
-                &continuation,
-                PromptOptions {
-                    streaming_behavior: Some(StreamingBehavior::FollowUp),
-                    queue_if_busy: true,
-                    ..Default::default()
-                },
-            )
-            .await;
+        // The goal continuation is an injected custom row (TS's
+        // prepared-turn primary record): the loop carries the row itself,
+        // so the transcript holds one representation of the turn.
+        let result = mode.engine.session.prompt_injected_message(&message).await;
         if let Err(error) = result {
             *turn_failure = Some(format!("{error:#}"));
             return Ok(false);

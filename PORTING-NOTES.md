@@ -2293,25 +2293,28 @@ mock's model requests byte-compared TS vs Rust).
 Adjacent gaps surfaced by the f7 goal-continue differential (pre-existing,
 NOT this lane's surface — reported for their owning lanes):
 
-- Injected-custom turns double-represent in the engine branch: the daemon
-  engine runs an injected custom row's turn on the raw text as a plain
-  user prompt (`run_turns(text)` -> `prompt_with_images` -> the loop's
-  user message), so the ENGINE session branch carries BOTH the custom
-  entry (persisted via the session-command/injected emit) AND a user
+- Injected-custom turns double-represented in the engine branch — FIXED
+  (the injected-turn representation lane): the daemon engine used to run
+  an injected custom row's turn on the raw text as a plain user prompt
+  (`run_turns(text)` -> `prompt_with_images` -> the loop's user message),
+  so the ENGINE session branch carried BOTH the custom entry AND a user
   message with the same text; TS's followUp runs the turn ON the custom
-  message and appends only the custom entry. The wire rows and the model
-  requests match (the worker persists the custom row, and the custom text
-  rides the request as the user role), but the compaction walk sees the
-  extra user row: its ~256-token estimate shifts the keep-recent crossing
-  and the TS-verbatim pull-back then lands the cut mid-turn — a
-  short-session compact splits on Rust where TS cuts whole (observed in
-  the f7 goal-continue fixture: Rust made the split-turn prefix
-  summarizer call, TS one history call). The harness accommodates it
-  (a content-matched queue serves the split-prefix call so the scripted
-  cursor stays aligned; the goal session's durable row is excluded from
-  the pre-existing durable sweep, whose own comparison the goal window
-  owns). Fix: pass the custom message to the loop for injected turns
-  (the injected-turn representation lane).
+  message and appends only the custom entry. The fix ports the TS seam:
+  `AgentSession::prompt_injected_message` admits the custom row itself
+  into the loop (TS `_promptInjectedMessage` ->
+  `agent.prompt([customMessage])`), so the loop context and the
+  compaction walk see the same turn structure as TS; the provider
+  request carries the row's user-role view at the loop boundary
+  (TS `convertToLlm`). `/goal` start/resume continuations moved onto the
+  same seam (`continuation_message` instead of the early durable row +
+  text prompt), the ACP surface follows, and the f7 goal-continue
+  fixture is honest again (the split-prefix content-matched queue and
+  the request exclusion are removed; the compact response compares the
+  summary too). The pre-fix effect: the extra user row's ~256-token
+  estimate shifted the keep-recent crossing and the TS-verbatim
+  pull-back landed the cut mid-turn — a short-session compact split on
+  Rust where TS cut whole (the f7 goal-continue fixture observed Rust
+  making the split-turn prefix summarizer call, TS one history call).
 - The daemon worker never mirrors the engine's `thread_goal_state`
   entries into its own session file (the engine session is in-memory;
   `set_session_file` only feeds the system prompt): a started goal — and

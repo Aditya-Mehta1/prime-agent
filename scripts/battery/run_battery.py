@@ -2047,24 +2047,15 @@ class Battery:
                 # the session's mock-1 turns and the compact's summarizer
                 # draw their scripted replies in order; the dashboard
                 # status-line model falls through to the default filler.
-                # The split-turn prefix call rides its own content-matched
-                # queue: the Rust engine branch carries the injected
-                # custom turn as a user row TS does not (the pre-existing
-                # injected-turn representation gap, documented in
-                # PORTING-NOTES), so a short-session cut splits on Rust
-                # where TS cuts whole — the matched queue keeps the
-                # session-model cursor aligned across the extra call (the
-                # queue is unused on the TS side).
+                # The injected goal turn holds ONE representation on both
+                # sides (the custom row — TS `agent.prompt([customMessage])`,
+                # the Rust loop admission), so the short-session compact
+                # cuts whole turns identically and no extra split-turn
+                # prefix summarizer call exists on either side: the
+                # single ordered queue serves every mock-1 request.
                 side.mock.set_responses(
                     [{"text": "statusline filler"}],
                     queues=[
-                        {
-                            "name": "goal-split-prefix",
-                            "match": ["PREFIX of a turn that was too large to keep"],
-                            "responses": [
-                                {"text": "the split turn prefix filler summary"}
-                            ],
-                        },
                         {
                             "name": "goal-continue",
                             "matchModels": ["mock-1"],
@@ -2144,15 +2135,16 @@ class Battery:
                     timeout=240,
                 )
                 side.evidence_json(flow, "goal-compact-response.json", compact)
-                # The summary stays out of the projection: the Rust
-                # split-turn merged summary carries the injected-turn
-                # representation gap's prefix filler (PORTING-NOTES); the
-                # goal-continue window comparison below owns the compacted
-                # surface's parity.
+                # The compact response compares honestly: both sides
+                # cut whole turns (the injected turn holds one
+                # representation), so both summarizers draw the same
+                # scripted summary. `tokensBefore` stays a presence check
+                # (each side's own pre-compaction estimate).
                 goal_compact[side.name] = {
                     "success": compact.get("success"),
                     "error": compact.get("error"),
                     "hasTokensBefore": "tokensBefore" in (compact.get("data") or {}),
+                    "summary": (compact.get("data") or {}).get("summary"),
                 }
                 # The post-compaction continue drives the continuation
                 # turn; settle it (the goal-complete tool call and the
@@ -2170,11 +2162,6 @@ class Battery:
                 # The session-model requests only: the daemon's
                 # status-line model (its own id) fires at turn
                 # boundaries outside this differential's surface.
-                # The split-turn prefix call (the injected-turn
-                # representation gap's extra summarizer call, served by
-                # the matched queue) is excluded: it exists only on the
-                # Rust side and its comparison belongs to the
-                # injected-turn lane.
                 goal_requests[side.name] = [
                     {
                         "model": request.get("body", {}).get("model"),
@@ -2184,8 +2171,6 @@ class Battery:
                     }
                     for request in self.new_mock_requests(side, mark)
                     if request.get("body", {}).get("model") == "mock-1"
-                    and "PREFIX of a turn that was too large to keep"
-                    not in self.last_user_text(request)
                 ]
                 side.evidence_json(flow, "goal-mock-requests.json", goal_requests[side.name])
                 wire.close()
@@ -2272,10 +2257,9 @@ class Battery:
             sessions_dir = side.root / flow / "sessions"
             for path in sorted(sessions_dir.glob("*.jsonl")) if sessions_dir.exists() else []:
                 # The goal-continue session is excluded: its compaction
-                # row carries the pre-existing split-turn divergence of the
-                # injected-turn representation gap (PORTING-NOTES); the
-                # goal-continue window comparison owns that session's
-                # compacted surface.
+                # runs mid-goal-turn on session-specific seed text (the
+                # wire window and compact-response comparisons above own
+                # that session's compacted surface).
                 if "battery-goal-continue" in path.read_text():
                     continue
                 for line in path.read_text().splitlines():

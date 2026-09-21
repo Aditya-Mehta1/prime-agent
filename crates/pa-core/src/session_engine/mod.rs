@@ -527,6 +527,39 @@ impl AgentSession {
         self.prompt_with_images(text, Vec::new(), options).await
     }
 
+    /// Admit an injected custom message as the turn's prompt (TS
+    /// `_promptInjectedMessage` -> `_createPreparedTurnAction(..., {
+    /// message })` -> `agent.prompt([customMessage])`): the loop context
+    /// and the transcript hold ONE representation of the turn — the
+    /// custom row itself, appended by the loop's `message_end` — while
+    /// the provider request carries its user-role view (the loop-boundary
+    /// `convert_to_llm` conversion, TS `convertToLlm`). The injected
+    /// content is never template-expanded or command-parsed (TS injected
+    /// turns skip `_normalizeSubmission`).
+    pub async fn prompt_injected_message(
+        &self,
+        message: &pa_types::session::CustomMessage,
+    ) -> anyhow::Result<PromptOutcome> {
+        let state = self.agent.state().await;
+        let busy = state.is_streaming;
+        if busy {
+            anyhow::bail!(
+                "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+            );
+        }
+        let mut prompt_messages = Vec::new();
+        if let Some(digest_row) = self.pending_digest_prompt_row().await? {
+            prompt_messages.push(digest_row);
+        }
+        let custom_row = session_message_to_loop(&SessionAgentMessage::Custom(message.clone()))
+            .ok_or_else(|| anyhow::anyhow!("injected custom message conversion failed"))?;
+        prompt_messages.push(custom_row);
+        self.agent
+            .prompt(pa_agent::agent::AgentPromptInput::Messages(prompt_messages))
+            .await?;
+        Ok(PromptOutcome::Prompt)
+    }
+
     /// Classify a prompt as a session command without admitting it: the
     /// same expansion-plus-grammar parse `prompt` applies. Host turn loops
     /// use this to keep their pre-turn compaction arms off the
@@ -958,6 +991,86 @@ mod tests {
             })
             .count();
         assert_eq!(digest_rows, 1);
+    }
+
+    /// An injected custom message admits as the turn's prompt (TS
+    /// `_promptInjectedMessage` -> `agent.prompt([customMessage])`): the
+    /// transcript and the loop context hold ONE representation of the
+    /// turn — the custom row, appended once by the loop's `message_end`
+    /// — and the provider request carries the row's user-role view (the
+    /// loop-boundary conversion), never a duplicate user message.
+    #[tokio::test]
+    async fn prompt_injected_message_persists_one_custom_row() {
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_text_turn("notice acknowledged");
+        let (session, _tmp) = digest_session(Arc::clone(&provider)).await;
+        let notice_text = "[child-exited: no-reply child:lane]";
+        let notice = pa_types::session::CustomMessage {
+            custom_type: "rlm_child_terminal_notice".to_string(),
+            content: pa_types::ai::UserContent::Text(notice_text.to_string()),
+            display: true,
+            details: Some(serde_json::json!({
+                "kind": "completed_without_reply",
+                "childId": "sub-1",
+                "sessionName": "lane",
+            })),
+            timestamp: 0,
+            rest: Default::default(),
+        };
+        session.prompt_injected_message(&notice).await.unwrap();
+        session.agent().wait_for_idle().await;
+
+        // The provider request carries the notice text as its user-role
+        // view — once, with no duplicate user message (TS `convertToLlm`
+        // at the loop boundary). The first-turn harness digest rides
+        // ahead of it (TS commit-time injection), exactly like a plain
+        // prompt's request.
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1);
+        let user_texts: Vec<String> = calls[0]
+            .messages
+            .iter()
+            .filter(|message| matches!(message, pa_agent::types::Message::User(_)))
+            .map(user_text)
+            .collect();
+        assert_eq!(user_texts.len(), 2, "digest plus notice: {calls:?}");
+        assert_eq!(user_texts[1], notice_text);
+        assert_eq!(
+            user_texts
+                .iter()
+                .filter(|text| *text == notice_text)
+                .count(),
+            1,
+            "no duplicate user message: {calls:?}"
+        );
+
+        // One representation in the transcript: the custom row, exactly
+        // once, and no user row with the same text.
+        let entries = session.entries().await;
+        let notice_rows = entries
+            .iter()
+            .filter(|entry| match entry {
+                FileEntry::CustomMessage { payload, .. } => {
+                    payload.custom_type == "rlm_child_terminal_notice"
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(notice_rows, 1);
+        let user_rows = entries
+            .iter()
+            .filter(|entry| match entry {
+                FileEntry::Message {
+                    message: SessionAgentMessage::User(user),
+                    ..
+                } => user.content.text().contains(notice_text),
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            user_rows, 0,
+            "the injected turn must not persist a user row"
+        );
     }
 
     #[tokio::test]
