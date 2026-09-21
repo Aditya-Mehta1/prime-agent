@@ -2449,8 +2449,42 @@ impl Worker {
             core.abort_requested = true;
         }
         self.work_notify.notify_one();
+        // TS `shutdown` closes every session through `closeSession` ->
+        // `session.abort()` (which awaits the in-flight turn and compaction)
+        // before the runtime dispose. The settle + kernel teardown must
+        // happen before the process exit this reply unlocks: `std::process`
+        // exit runs no destructors, so an undisposed kernel would be
+        // orphaned here (the #235 daemon-worker leak class).
+        self.compaction.abort();
+        self.tree_navigation.abort();
+        self.await_session_work_settled().await;
+        if let Some(agent_engine) = &self.agent_engine {
+            agent_engine.dispose_kernel().await;
+        }
         self.engine.end_telemetry().await;
         response_success(None, "shutdown", None)
+    }
+
+    /// Wait until no turn or compaction run is in flight (the awaited
+    /// `session.abort()` half of the TS close path). The caller requests
+    /// the aborts first — `abort_requested` stops an in-flight turn's event
+    /// consumption, `CompactionManager::abort` settles the run — then this
+    /// parks on the idle notify until the runner parks; the kernel dispose
+    /// must never race a live run that holds kernel execution state.
+    async fn await_session_work_settled(&self) {
+        loop {
+            // Register the permit before the flag check: a run that settles
+            // between the check and the await still wakes this waiter
+            // (`notify_waiters` only reaches already-registered futures).
+            let notified = self.idle_notify.notified();
+            {
+                let core = self.core.lock().unwrap();
+                if !core.busy && !core.compacting {
+                    return;
+                }
+            }
+            notified.await;
+        }
     }
 
     /// Clear the queued-input suspension (TS `_resumeSessionInputAdmission`,
@@ -2818,14 +2852,47 @@ impl Worker {
         // `session archived` (schema v1) + the session-ended finalization:
         // kill disposes the session like the TS dispose callback does.
         self.engine.archive_session_telemetry().await;
-        let mut core = self.core.lock().unwrap();
-        if let Some(store) = core.store.as_mut() {
-            let _ = store.append_session_state("archived");
-            let _ = store.rewrite();
+        // The persist (TS archive-before-abort). The guard rides a block, not
+        // an explicit drop: a `drop(core)` does not end the guard's slot in
+        // an async generator, so the later awaits would make the future
+        // non-Send.
+        {
+            let mut core = self.core.lock().unwrap();
+            if let Some(store) = core.store.as_mut() {
+                let _ = store.append_session_state("archived");
+                let _ = store.rewrite();
+            }
+            core.created = false;
         }
-        core.created = false;
-        let active_session_id = core.active_session_id.clone();
-        drop(core);
+        // TS `closeSessionOnce("killed")`: the persist precedes the abort,
+        // the awaited `session.abort()` settles the in-flight turn and
+        // compaction, and only then does the runtime dispose run — the
+        // kernel teardown must not race a live run.
+        {
+            let mut core = self.core.lock().unwrap();
+            core.abort_requested = true;
+            // TS dispose cancels the queued session actions and clears the
+            // agent queues (`requestAbort` parks the input pump, `dispose`
+            // rejects every queued action): nothing may feed another turn
+            // after the close below (and the turn runner clears the abort
+            // flag when it pops an item, so the cancel must land first).
+            core.steering.clear();
+            core.follow_up.clear();
+        }
+        self.work_notify.notify_one();
+        self.compaction.abort();
+        self.tree_navigation.abort();
+        self.await_session_work_settled().await;
+        // The runtime dispose of the TS close path
+        // (`closeSessionOnce` -> `runtime.dispose()` ->
+        // `session.disposeAsync` -> `IpythonKernelProvisioner.dispose`,
+        // default snapshot policy): the session's kernel dies with the
+        // session. The worker keeps the engine object, so the engine-drop
+        // teardown from #235 cannot run yet — dispose it explicitly.
+        if let Some(agent_engine) = &self.agent_engine {
+            agent_engine.dispose_kernel().await;
+        }
+        let active_session_id = self.core.lock().unwrap().active_session_id.clone();
         let _ = self.emit_session_closed(&active_session_id, DaemonSessionClosedReason::Killed);
         let _ = self.record_recovery(false, "killed");
         response_success(None, "kill", None)
@@ -3262,6 +3329,14 @@ impl TurnRunner {
             let item: Option<QueuedItem> = {
                 let mut core = self.core.lock().unwrap();
                 if core.shutdown_requested {
+                    drop(core);
+                    // The shutdown handler waits on the idle notify for
+                    // the in-flight run to settle before it disposes the
+                    // kernel; this is the runner's last chance to fire it
+                    // (the parking arm below never runs once shutdown is
+                    // requested, and the runner always reaches this point
+                    // with the previous run already settled).
+                    self.idle_notify.notify_waiters();
                     return;
                 }
                 // The input-admission gate (TS

@@ -105,20 +105,27 @@ async fn monitor(worker: Arc<Worker>) {
             // reconsider.
             continue;
         }
-        exit_orphaned(&worker, since);
+        exit_orphaned(&worker, since).await;
     }
 }
 
-/// The TS give-up exit: persist the recovery journal, remove the worker's
-/// own socket file, and end the process (the same sequence the routed
-/// `shutdown` command runs; the monitor only reaches this with no session
-/// work in flight, so nothing else needs to settle first).
-fn exit_orphaned(worker: &Worker, absent_since: tokio::time::Instant) {
+/// The TS give-up exit: dispose the session's kernel, persist the recovery
+/// journal, remove the worker's own socket file, and end the process (the
+/// same sequence the routed `shutdown` command runs; the monitor only
+/// reaches this with no session work in flight, so nothing else needs to
+/// settle first). The kernel dispose is the TS `shutdown(0)` close pass
+/// (`closeSession` -> runtime dispose -> `IpythonKernelProvisioner.dispose`):
+/// the process exit runs no destructors, so an undisposed kernel would be
+/// orphaned here.
+async fn exit_orphaned(worker: &Worker, absent_since: tokio::time::Instant) {
     eprintln!(
         "pa-daemon worker: supervisor {} unreachable for {}s; exiting orphaned worker",
         worker.config.supervisor_socket_path.display(),
         absent_since.elapsed().as_secs()
     );
+    if let Some(agent_engine) = &worker.agent_engine {
+        agent_engine.dispose_kernel().await;
+    }
     let _ = worker.record_recovery(false, "shutdown");
     crate::socket::cleanup_socket_path(
         &worker.config.socket_path,

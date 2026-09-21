@@ -338,6 +338,23 @@ impl AgentSessionEngine {
         Ok(())
     }
 
+    /// Tear the built session's kernel down (TS `closeSession` ->
+    /// `AgentSessionRuntime.dispose` -> `AgentSession.disposeAsync` ->
+    /// `IpythonKernelProvisioner.dispose`: one final namespace snapshot,
+    /// drained host requests, then the `python -m rlm.repl` process exits).
+    ///
+    /// The engine object survives the call: the worker process outlives its
+    /// session, so the engine-drop teardown (the strong owner of the
+    /// provisioner going away) cannot run yet. This is the explicit seam the
+    /// worker invokes at every session end — kill, shutdown, the orphan
+    /// exit — so the kernel process never outlives the session that owns it.
+    pub async fn dispose_kernel(&self) {
+        let guard = self.session.lock().await;
+        if let Some(engine) = guard.as_ref() {
+            engine.dispose_kernel().await;
+        }
+    }
+
     /// Build the core session once (same once-only rule as `session_agent`),
     /// through the same guarded funnel.
     pub(crate) fn ensure_core_session(&self, model: &Model) -> anyhow::Result<()> {

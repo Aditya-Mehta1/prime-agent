@@ -2094,3 +2094,63 @@ plain-admitted -> abort -> plain-rejected -> resume_queue ("No queued work
 to resume") -> plain-admitted), pa-daemon unit tests for the same surface,
 and the existing f7 iterative rows (whose steer-after-compact step is the
 TUI's real submission path and doubles as the no-regression check).
+
+
+## Worker session-end kernel disposal (daemon-kernel-dispose lane, the #235 follow-up)
+
+RULING (read from the shipped TS product): TS disposes a session's kernel
+at every session end — the kernel is NOT a TS-designed long-lived per-worker
+resource. The chain, end to end:
+
+- `daemon-mode.ts` `closeSessionOnce` (every close reason — killed,
+  shutdown, replaced, update, completed) awaits the session's abort
+  (`waitForAbort` defaults true; `session.abort()` settles the in-flight
+  turn, compaction, and branch-summary runs), then calls
+  `state.runtime.dispose(disposal)`.
+- `agent-session-runtime.ts` `disposeOnce`/`teardownCurrent` await
+  `session.disposeAsync({ kernelSnapshot: options.kernelSnapshot ?? true })`
+  (the replacement paths — resume/new/fork/switch — run the same dispose
+  through `teardownForReplacement`).
+- `agent-session.ts` `_disposeAsyncOnce` awaits
+  `this._ipythonKernelProvisioner?.dispose({ snapshot: kernelSnapshot })`.
+- `ipython.ts` `IpythonKernelProvisioner.dispose` resolves the pending
+  boot, aborts in-flight startups, and `m.shutdown({ snapshot,
+  drainHostRequests: true })` — the `python -m rlm.repl` process exits.
+- The worker's supervisor-lost exit calls `this.shutdown(0)`, which closes
+  every session first; a host hard-killed before its close pass leaves the
+  kernel to the orphan journal (`core/orphan-process-journal.ts`, ported).
+
+The `kernelSnapshot: false` policy appears only where the child's artifact
+dir is deleted right after disposal (RLM subagent delete/close with
+tombstone); the top-level kill/shutdown flushes a final snapshot.
+
+Rust port (pa-daemon): the worker keeps the engine object past the session
+end (the #235 engine-drop teardown cannot run there), so every end path
+calls the explicit seam — `AgentSessionEngine::dispose_kernel()` ->
+`SessionEngine::dispose_kernel()` -> `provisioner.dispose(None)` (default
+snapshot policy, host-request drain, the TS `shutdown` semantics):
+
+- `kill`: archive first (TS persist-before-abort), then the awaited abort
+  (`abort_requested` + compaction/branch-summary aborts + idle wait for the
+  in-flight run to settle), then the kernel dispose, then the
+  `session_closed` broadcast.
+- `shutdown`: the settle + dispose run in the handler, before the reply
+  unlocks `std::process::exit(0)` — the exit runs no destructors, so an
+  undisposed kernel would be orphaned with its worker gone.
+- the supervisor-lost `exit_orphaned`: the monitor only reaches the exit
+  with no session work in flight, so the dispose runs before the exit.
+
+Documented divergence (left as-is, out of this lane's scope): the TS
+replacement flows (new_session/switch_session/fork/tree navigation) dispose
+the whole runtime — the new session boots a fresh kernel with a fresh
+namespace. The Rust port rebuilds the live session's context in place on
+the same engine and keeps the kernel (namespace and all) across the swap;
+the fresh-namespace-per-replacement TS behavior is a separate parity
+question for the tree/fork lanes.
+
+Verifiers: `pa-daemon/tests/kernel_dispose_e2e.rs` — kill, daemon shutdown,
+and the supervisor-SIGKILL orphan exit each must leave no live kernel
+process (process-table diff against the pre-test baseline; every path ends
+the worker process too, so a missing dispose leaves an orphaned kernel that
+the diff catches). The seam itself is pinned by the pa-core
+`kernel_teardown.rs` dispose tests from #235.
