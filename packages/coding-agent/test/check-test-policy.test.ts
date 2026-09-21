@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { debtFailures, parseBudgetException, scan } from "../../../scripts/check-test-policy.mjs";
+import { debtFailures, scan } from "../../../scripts/check-test-policy.mjs";
 
 // The fixture is built from plain strings rather than a template literal, so
 // the scan of this file cannot see it: the pin must measure the fixture.
@@ -16,14 +16,6 @@ describe("check-test-policy", () => {
 		expect(scan(generatedWorker, "store.test.ts")).toEqual([
 			expect.objectContaining({ category: "wall-clock-timer", line: 3, detail: "setTimeout/setInterval" }),
 		]);
-	});
-
-	it("takes a test-line-budget exception only from a commit trailer with a substantial reason", () => {
-		expect(parseBudgetException("fix\n\nTest-Budget-Exception: the revert-mutant pin costs 40 lines\n")).toBe(
-			"the revert-mutant pin costs 40 lines",
-		);
-		expect(parseBudgetException("fix\n\nTest-Budget-Exception: why\n")).toBeUndefined();
-		expect(parseBudgetException("fix\n\nmentions Test-Budget-Exception: mid sentence\n")).toBeUndefined();
 	});
 
 	it("lets frozen debt shrink but never grow", () => {

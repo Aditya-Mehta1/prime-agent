@@ -4,7 +4,6 @@
 	"packages/agent/vitest.config.ts": {"explicit-test-timeout":1},
 	"packages/ai/test/cache-retention.test.ts": {"conditional-or-disabled-test":4},
 	"packages/ai/test/mcp-oauth.test.ts": {"environment-gated-path":7,"fixed-resource":1},
-	"packages/ai/test/openai-codex-stream.test.ts": {"wall-clock-timer":2},
 	"packages/ai/test/stream.test.ts": {"conditional-or-disabled-test":81,"wall-clock-timer":3},
 	"packages/ai/vitest.config.ts": {"explicit-test-timeout":1},
 	"packages/coding-agent/test/acp-cold-cli.test.ts": {"explicit-test-timeout":1,"wall-clock-timer":3},

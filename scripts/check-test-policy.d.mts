@@ -18,6 +18,4 @@ export type TestPolicyDebt = Record<string, Record<string, number>>;
 
 export function scan(content: string, path?: string, embedded?: boolean): TestPolicyViolation[];
 
-export function parseBudgetException(commitMessages: string): string | undefined;
-
 export function debtFailures(frozen: TestPolicyDebt, current: TestPolicyDebt): TestPolicyFailure[];

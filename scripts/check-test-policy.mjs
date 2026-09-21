@@ -5,7 +5,6 @@ import { relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const root = resolve(import.meta.dirname, "..");
-const MIN_REASON_LENGTH = 12;
 const baselinePath = resolve(import.meta.dirname, "test-policy-baseline.json");
 const testFilePattern =
 	/(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)vitest\.config\.[cm]?[jt]s$|^prime-agent-runtime\/test\/.*\.py$/;
@@ -341,7 +340,7 @@ export function scan(content, path = "", embedded = false) {
 	const add = (category, line, detail, explicitTitle = title) => {
 		const previous = lines[line - 2]?.trim() ?? "";
 		const suppression = previous.match(/^(?:\/\/|#) test-policy: allow ([a-z-]+) -- (.+)$/);
-		if (suppression?.[1] === category && suppression[2].trim().length >= MIN_REASON_LENGTH) return;
+		if (suppression?.[1] === category && suppression[2].trim().length >= 12) return;
 		violations.push({ category, detail, identity: `${category}\0${explicitTitle}\0${detail}`, line, title: explicitTitle });
 	};
 
@@ -708,18 +707,6 @@ function changedLineStats(base) {
 	return stats;
 }
 
-/**
- * A recorded, reviewable escape from the test-line budget. The budget blocks
- * silent test bloat, but it also blocks fix PRs whose only honest pin costs
- * more lines than the one-line production fix, so authors dropped load-bearing
- * pins to fit. A `Test-Budget-Exception: <reason>` line in any commit of the
- * change turns the overrun into a warning that CI prints.
- */
-export function parseBudgetException(commitMessages) {
-	const reason = commitMessages.match(/^Test-Budget-Exception:[ \t]*(\S.*)$/m)?.[1]?.trim();
-	return reason && reason.length >= MIN_REASON_LENGTH ? reason : undefined;
-}
-
 function main() {
 	const debt = currentDebt();
 	if (process.argv.includes("--update-baseline")) {
@@ -730,13 +717,15 @@ function main() {
 	}
 	const base = resolveBase();
 	const failures = debtFailures(JSON.parse(readFileSync(baselinePath, "utf8")), debt);
-	const warnings = [];
 	const lineStats = changedLineStats(base);
 	if (lineStats && lineStats.testAdded - lineStats.testDeleted > lineStats.sourceAdded) {
-		const detail = `net test additions ${lineStats.testAdded - lineStats.testDeleted} exceed source additions ${lineStats.sourceAdded}`;
-		const exception = parseBudgetException(base ? git(["log", "--format=%B", `${base}..HEAD`], true) : "");
-		if (exception) warnings.push(`<test-line-budget> [excess-test-lines] ${detail}; allowed by Test-Budget-Exception: ${exception}`);
-		else failures.push({ path: "<test-line-budget>", line: 0, category: "excess-test-lines", title: "changed test LOC", detail });
+		failures.push({
+			path: "<test-line-budget>",
+			line: 0,
+			category: "excess-test-lines",
+			title: "changed test LOC",
+			detail: `net test additions ${lineStats.testAdded - lineStats.testDeleted} exceed source additions ${lineStats.sourceAdded}`,
+		});
 	}
 	for (const path of changedTestFiles(base)) {
 		const current = scan(readFileSync(resolve(root, path), "utf8"), path);
@@ -750,13 +739,12 @@ function main() {
 		}
 	}
 
-	for (const warning of warnings) console.warn(`Test-policy warning: ${warning}`);
 	if (failures.length > 0) {
 		console.error("New test-policy violations:\n");
 		for (const failure of failures) console.error(`${failure.path}:${failure.line} [${failure.category}] ${failure.title}: ${failure.detail}`);
 		if (failures.some((failure) => failure.category === "excess-test-lines")) {
 			console.error(
-				'\nCut redundant test lines, or record why the pin is worth its size with a "Test-Budget-Exception: <reason>" line in a commit message.',
+				"\nCut or consolidate the added tests until net test lines fit within the source lines added; there is no exception to this budget.",
 			);
 		}
 		console.error("\nUse a deterministic signal, deferred promise, fake timer, or unconditional local fixture instead.");
