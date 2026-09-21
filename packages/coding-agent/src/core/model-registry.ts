@@ -875,6 +875,13 @@ export class ModelRegistry {
 			this.refresh();
 			const cachePath = this.primeInferenceCatalogCachePath();
 			if (cachePath) {
+				const primeInferenceApiKey = await this.authStorage.getApiKey(PRIME_INFERENCE_PROVIDER_ID);
+				const primeInferenceHeaders = primeInferenceApiKey
+					? {
+							...this.authStorage.getProviderHeaders(PRIME_INFERENCE_PROVIDER_ID),
+							Authorization: `Bearer ${primeInferenceApiKey}`,
+						}
+					: undefined;
 				// Track the in-flight catalog refresh so waitForPendingModelRefreshes()
 				// can await it: session-model restore must observe the post-refresh
 				// catalog, not the pre-refresh fallback (bundled/disk snapshot).
@@ -882,6 +889,7 @@ export class ModelRegistry {
 					cachePath,
 					this.bundledPrimeInferenceModels(),
 					{
+						headers: primeInferenceHeaders,
 						offline: isOfflineModeEnabled(),
 					},
 				)

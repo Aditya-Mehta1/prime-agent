@@ -154,7 +154,7 @@ export async function fetchPrimeInferenceModelCatalog(
 export async function refreshPrimeInferenceModels(
 	cachePath: string,
 	bundledModels: readonly Model<"openai-completions">[],
-	options: { fetchFn?: typeof fetch; offline?: boolean } = {},
+	options: { fetchFn?: typeof fetch; headers?: Record<string, string>; offline?: boolean } = {},
 ): Promise<Model<"openai-completions">[] | undefined> {
 	const cached = readCachedPrimeInferenceModels(cachePath, bundledModels);
 	if (options.offline) return cached;
@@ -162,7 +162,10 @@ export async function refreshPrimeInferenceModels(
 	if (existing) return existing;
 	const promise = (async () => {
 		try {
-			const { payload, entries } = await fetchPrimeInferenceModelCatalog({ fetchFn: options.fetchFn });
+			const { payload, entries } = await fetchPrimeInferenceModelCatalog({
+				fetchFn: options.fetchFn,
+				headers: options.headers,
+			});
 			const models = buildPrimeInferenceModels(bundledModels, entries);
 			if (!models) return cached;
 			writeCache(cachePath, payload);
