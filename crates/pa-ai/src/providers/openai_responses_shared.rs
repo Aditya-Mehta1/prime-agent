@@ -168,7 +168,7 @@ pub fn convert_responses_messages(
         }
     }
 
-    for msg in &transformed {
+    for (msg_index, msg) in transformed.iter().enumerate() {
         match msg {
             Message::User(user) => match &user.content {
                 UserMessageContent::Text(text) => messages.push(json!({
@@ -228,9 +228,15 @@ pub fn convert_responses_messages(
                         AssistantContent::Text(text) => {
                             let parsed_signature =
                                 parse_text_signature(text.text_signature.as_deref());
-                            // OpenAI requires id to be max 64 characters.
-                            let msg_id = match parsed_signature.as_ref() {
-                                None => String::new(),
+                            // OpenAI requires id to be max 64 characters and
+                            // rejects empty ids ([ApiParam][invalid_id]); a
+                            // message without a usable signature id falls
+                            // back to its index in the converted history.
+                            let msg_id = match parsed_signature
+                                .as_ref()
+                                .filter(|signature| !signature.id.is_empty())
+                            {
+                                None => format!("msg_{msg_index}"),
                                 Some(signature) => {
                                     if signature.id.len() > 64 {
                                         format!("msg_{}", short_hash(&signature.id))
@@ -260,21 +266,28 @@ pub fn convert_responses_messages(
                             output.push(Value::Object(entry));
                         }
                         AssistantContent::ToolCall(tool_call) => {
-                            let (call_id, item_id_raw) = tool_call
-                                .id
-                                .split_once('|')
-                                .unwrap_or((tool_call.id.as_str(), ""));
+                            // The item id is the `fc_` segment after the `|`.
+                            // Without a `|` there is no item id: the `id` key
+                            // is omitted (an empty id is rejected by the API
+                            // with [ApiParam][invalid_id]) and the whole id
+                            // serves as the call id.
+                            let (call_id, item_id) = match tool_call.id.split_once('|') {
+                                Some((call_id, item_id)) => {
+                                    (call_id, (!item_id.is_empty()).then_some(item_id))
+                                }
+                                None => (tool_call.id.as_str(), None),
+                            };
                             let mut entry = Map::new();
                             entry.insert("type".into(), json!("function_call"));
-                            // For different-model messages, set id to null to
+                            // For different-model messages, omit the id to
                             // avoid pairing validation against rs_ reasoning
                             // items tracked by the provider.
-                            let item_id = if is_different_model && item_id_raw.starts_with("fc_") {
-                                Value::Null
-                            } else {
-                                json!(item_id_raw)
-                            };
-                            entry.insert("id".into(), item_id);
+                            let omit_id = item_id.is_none()
+                                || (is_different_model
+                                    && item_id.is_some_and(|id| id.starts_with("fc_")));
+                            if !omit_id {
+                                entry.insert("id".into(), json!(item_id.unwrap_or_default()));
+                            }
                             entry.insert("call_id".into(), json!(call_id));
                             entry.insert("name".into(), json!(tool_call.name));
                             entry.insert(
@@ -374,4 +387,288 @@ pub fn convert_responses_tools(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        Message, StopReason, TextContent, ToolCall, ToolResultMessage, Usage, UserMessage,
+        UserMessageContent, UserOrToolContent,
+    };
+
+    fn codex_model() -> Model {
+        Model {
+            id: "gpt-5.1-codex".into(),
+            name: "gpt-5.1-codex".into(),
+            api: "openai-codex-responses".into(),
+            provider: "openai-codex".into(),
+            base_url: "https://chatgpt.com/backend-api".into(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![crate::types::ModelInput::Text],
+            cost: crate::types::zero_model_cost(),
+            context_window: 400_000,
+            max_tokens: 128_000,
+            featured: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    fn user(text: &str) -> Message {
+        Message::User(UserMessage {
+            content: UserMessageContent::Text(text.into()),
+            timestamp: 0,
+            rest: Default::default(),
+        })
+    }
+
+    fn assistant(content: Vec<AssistantContent>, model_id: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            content,
+            api: "openai-codex-responses".into(),
+            provider: "openai-codex".into(),
+            model: model_id.into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: 0,
+            rest: Default::default(),
+        })
+    }
+
+    fn tool_call(id: &str) -> AssistantContent {
+        AssistantContent::ToolCall(ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: [("cmd".to_string(), json!("ls"))].into_iter().collect(),
+            thought_signature: None,
+            rest: Default::default(),
+        })
+    }
+
+    fn text_block(text: &str, signature: Option<&str>) -> AssistantContent {
+        AssistantContent::Text(TextContent {
+            text: text.into(),
+            text_signature: signature.map(str::to_string),
+            rest: Default::default(),
+        })
+    }
+
+    fn tool_result(tool_call_id: &str) -> Message {
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: tool_call_id.into(),
+            tool_name: "bash".into(),
+            content: vec![UserOrToolContent::Text(TextContent {
+                text: "ok".into(),
+                text_signature: None,
+                rest: Default::default(),
+            })],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+            rest: Default::default(),
+        })
+    }
+
+    fn convert(model: &Model, messages: Vec<Message>) -> Vec<Value> {
+        convert_responses_messages(
+            model,
+            &Context {
+                system_prompt: None,
+                messages,
+                tools: None,
+            },
+            &OPENAI_TOOL_CALL_PROVIDERS,
+            ConvertResponsesMessagesOptions {
+                include_system_prompt: false,
+            },
+        )
+    }
+
+    /// Every input item that carries an `id` or `call_id` must be non-empty:
+    /// the Responses API rejects empty ids with `[ApiParam][invalid_id]`.
+    fn assert_no_empty_ids(items: &[Value]) {
+        for item in items {
+            for key in ["id", "call_id"] {
+                if let Some(Value::String(id)) = item.get(key) {
+                    assert!(!id.is_empty(), "empty {key} in item: {item}");
+                }
+            }
+        }
+    }
+
+    /// A tool call without the `call_id|item_id` encoding omits the item
+    /// `id` entirely and keeps the whole id as `call_id` (TS evidence:
+    /// `convertResponsesMessages` with a pipe-less toolCall.id; the dogfood
+    /// bug emitted `id: ""` here and the API rejected the turn).
+    #[test]
+    fn pipe_less_tool_call_id_omits_item_id() {
+        let items = convert(
+            &codex_model(),
+            vec![
+                user("hi"),
+                assistant(vec![tool_call("call_x")], "gpt-5.1-codex"),
+                tool_result("call_x"),
+            ],
+        );
+        assert_no_empty_ids(&items);
+        assert_eq!(
+            items,
+            vec![
+                json!({
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "hi" }],
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_x",
+                    "name": "bash",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_x",
+                    "output": "ok",
+                }),
+            ]
+        );
+    }
+
+    /// A tool call id with an empty `fc_` segment (stream items without an
+    /// id) omits the item `id` instead of emitting `id: ""`.
+    #[test]
+    fn empty_item_id_segment_omits_item_id() {
+        let items = convert(
+            &codex_model(),
+            vec![
+                user("hi"),
+                assistant(vec![tool_call("call_x|")], "gpt-5.1-codex"),
+                tool_result("call_x|"),
+            ],
+        );
+        assert_no_empty_ids(&items);
+        let function_call = items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+        let Some(function_call) = function_call else {
+            panic!("missing function_call item in {items:?}");
+        };
+        assert!(function_call.get("id").is_none());
+        assert_eq!(function_call.get("call_id"), Some(&json!("call_x")));
+    }
+
+    /// A fully-empty tool call id omits the item `id`; the `call_id` fields
+    /// stay empty on both items, matching the TS reference exactly (the
+    /// reachable dogfood shape never produces an empty tool call id because
+    /// tool results inherit the tool call id verbatim).
+    #[test]
+    fn empty_tool_call_id_omits_item_id() {
+        let items = convert(
+            &codex_model(),
+            vec![
+                user("hi"),
+                assistant(vec![tool_call("")], "gpt-5.1-codex"),
+                tool_result(""),
+            ],
+        );
+        let function_call = items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+        let Some(function_call) = function_call else {
+            panic!("missing function_call item in {items:?}");
+        };
+        assert!(function_call.get("id").is_none());
+        assert_eq!(function_call.get("call_id"), Some(&json!("")));
+    }
+
+    /// Same-provider messages from a different model omit the `fc_` item id
+    /// so the API does not pair it against `rs_` reasoning items tracked for
+    /// this model (TS: `itemId = undefined`).
+    #[test]
+    fn different_model_fc_item_id_is_omitted() {
+        let items = convert(
+            &codex_model(),
+            vec![
+                user("a"),
+                assistant(vec![tool_call("call_x|fc_y")], "gpt-5"),
+                tool_result("call_x|fc_y"),
+            ],
+        );
+        let function_call = items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+        let Some(function_call) = function_call else {
+            panic!("missing function_call item in {items:?}");
+        };
+        assert!(function_call.get("id").is_none());
+        assert_eq!(function_call.get("call_id"), Some(&json!("call_x")));
+    }
+
+    /// A piped same-model tool call keeps its `fc_` item id.
+    #[test]
+    fn piped_tool_call_id_keeps_item_id() {
+        let items = convert(
+            &codex_model(),
+            vec![
+                user("hi"),
+                assistant(vec![tool_call("call_x|fc_y")], "gpt-5.1-codex"),
+                tool_result("call_x|fc_y"),
+            ],
+        );
+        assert_no_empty_ids(&items);
+        let function_call = items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+        let Some(function_call) = function_call else {
+            panic!("missing function_call item in {items:?}");
+        };
+        assert_eq!(function_call.get("id"), Some(&json!("fc_y")));
+        assert_eq!(function_call.get("call_id"), Some(&json!("call_x")));
+    }
+
+    /// Assistant text without a signature id falls back to its converted
+    /// history index instead of an empty message id (TS: `msg_${msgIndex}`).
+    #[test]
+    fn message_without_signature_uses_index_fallback_id() {
+        let items = convert(
+            &codex_model(),
+            vec![
+                user("a"),
+                assistant(vec![text_block("one", None)], "gpt-5.1-codex"),
+            ],
+        );
+        let message = items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("message"));
+        let Some(message) = message else {
+            panic!("missing message item in {items:?}");
+        };
+        assert_eq!(message.get("id"), Some(&json!("msg_1")));
+    }
+
+    /// A signature with an empty id is treated as missing (TS `!msgId`).
+    #[test]
+    fn message_with_empty_signature_id_uses_index_fallback() {
+        let signature = "{\"v\":1,\"id\":\"\"}";
+        let items = convert(
+            &codex_model(),
+            vec![
+                user("a"),
+                assistant(vec![text_block("hello", Some(signature))], "gpt-5.1-codex"),
+            ],
+        );
+        let message = items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("message"));
+        let Some(message) = message else {
+            panic!("missing message item in {items:?}");
+        };
+        assert_eq!(message.get("id"), Some(&json!("msg_1")));
+    }
 }

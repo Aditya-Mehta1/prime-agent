@@ -2831,3 +2831,44 @@ of lane): the retried boundary sequence diverges on `auto_retry_*`
 placement (TS resets the retry counter at the successful `message_end`
 hook; the Rust retry driver closes `auto_retry_end` after the attempt
 boundary).
+
+
+## pa-ai: Responses input-item ids never empty (dogfood P0, TS ruling)
+
+TS ground truth (`packages/ai/src/providers/openai-responses-shared.ts`,
+`convertResponsesMessages`, verified by driving the TS package directly with
+`npx tsx` on degenerate ids; goldens mirrored in
+`openai_responses_shared.rs::tests`):
+
+- `function_call` item: `toolCall.id.split("|")` with no `|` leaves the
+  item id `undefined`, so the `id` key is OMITTED from the wire JSON (never
+  `""`); `call_id` is the whole id. A different-model message with an `fc_`
+  item id also omits `id` (the Rust port previously sent `null` there, and
+  `""` for the absent case - the live dogfood failure: follow-up turns
+  carried `input[N].id: ""` and the API rejected the turn with
+  `[ApiParam][invalid_id]`).
+- `message` item: without a usable text-signature id the TS synthesizes
+  `msg_${msgIndex}` where `msgIndex` counts every converted message
+  (user/assistant/toolResult). The Rust port previously sent `""`.
+- `function_call_output.call_id`: the TS sends `split("|")[0]` verbatim,
+  including `""` for an empty tool result id; no fallback exists upstream.
+  The Rust port matches that exactly - an empty `call_id` is only reachable
+  when the tool call id itself was empty, which the agent layer never
+  produces (tool results inherit the tool call id verbatim).
+
+Deliberate narrowing (documented, not invention): a `|`-terminated id with
+an EMPTY item segment (`"call_x|"`) folds into the omitted-`id` path. The
+TS emits `id: ""` there, but that shape is unreachable in TS (its stream
+template interpolates `undefined` for missing ids); it IS reachable in Rust
+(the stream uses `unwrap_or("")`), and the API rejects `id: ""`, so the
+guard treats an empty segment like an absent one.
+
+Ambiguity found (out of lane, reported): `response.output_item.done` in
+`openai_responses_stream.rs` removes the slot BEFORE the
+`current_slot(output_index)` lookup, so the `done` finalize paths are dead
+(reasoning signatures are never recorded from `done` items; arguments are
+already set by the `function_call_arguments.delta/done` events, which is
+why tool calls still work). Effect: reasoning items are not replayed on
+follow-up turns (token waste, no API error). The TS uses `currentBlock`
+(set at `added`, not slot-lookup) and does record the signature. Needs its
+own verified lane; not changed here.

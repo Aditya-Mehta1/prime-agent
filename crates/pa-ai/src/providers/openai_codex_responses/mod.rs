@@ -843,4 +843,235 @@ mod tests {
             .unwrap();
         assert_eq!(value, "b");
     }
+
+    use crate::types::{
+        Message, ModelInput, TextContent, ToolResultMessage, UserMessage, UserMessageContent,
+        UserOrToolContent,
+    };
+
+    fn codex_wire_model() -> Model {
+        Model {
+            id: "gpt-5.1-codex".into(),
+            name: "gpt-5.1-codex".into(),
+            api: "openai-codex-responses".into(),
+            provider: "openai-codex".into(),
+            base_url: "https://chatgpt.com/backend-api".into(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: crate::types::zero_model_cost(),
+            context_window: 400_000,
+            max_tokens: 128_000,
+            featured: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    /// Replay a codex wire turn that issues one function call (the event
+    /// shapes the #222 codex suite replays) and return the recorded
+    /// assistant message. `item_id` omits the `fc_` item id from the wire
+    /// items, the degenerate shape that produced the dogfood
+    /// `[ApiParam][invalid_id]` rejection on the follow-up turn.
+    fn replay_codex_tool_call_turn(model: &Model, item_id: Option<&str>) -> AssistantMessage {
+        let function_call_item = |arguments: &str| {
+            let mut item = Map::new();
+            item.insert("type".into(), json!("function_call"));
+            item.insert("call_id".into(), json!("call_abc"));
+            if let Some(item_id) = item_id {
+                item.insert("id".into(), json!(item_id));
+            }
+            item.insert("name".into(), json!("bash"));
+            item.insert("arguments".into(), json!(arguments));
+            Value::Object(item)
+        };
+        let events = vec![
+            json!({"type": "response.created", "response": {"id": "resp_1"}}),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1", "summary": []},
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [],
+                    "encrypted_content": "enc",
+                },
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": function_call_item(""),
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": "{\"cmd\":",
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": " \"ls\"}",
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 1,
+                "arguments": "{\"cmd\":\"ls\"}",
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": function_call_item("{\"cmd\":\"ls\"}"),
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                    },
+                },
+            }),
+        ];
+        let mut output = AssistantMessage {
+            content: Vec::new(),
+            api: "openai-codex-responses".into(),
+            provider: "openai-codex".into(),
+            model: model.id.clone(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: 0,
+            rest: Default::default(),
+        };
+        let (writer, _stream) = AssistantMessageEventStream::new();
+        let mut processor = ResponsesStreamProcessor::new(
+            model,
+            &mut output,
+            &writer,
+            ResponsesStreamHooks::default(),
+        );
+        for event in events {
+            let mapped = map_codex_event(event).expect("codex event mapping");
+            processor.handle_event(&mapped.event).expect("stream event");
+        }
+        processor.finish().expect("stream finish");
+        output
+    }
+
+    fn followup_request_input(
+        model: &Model,
+        output: AssistantMessage,
+        tool_call_id: &str,
+    ) -> Vec<Value> {
+        let context = Context {
+            system_prompt: Some("You are a helpful assistant.".into()),
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserMessageContent::Text("run ls".into()),
+                    timestamp: 0,
+                    rest: Default::default(),
+                }),
+                Message::Assistant(output),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: tool_call_id.into(),
+                    tool_name: "bash".into(),
+                    content: vec![UserOrToolContent::Text(TextContent {
+                        text: "ok".into(),
+                        text_signature: None,
+                        rest: Default::default(),
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 0,
+                    rest: Default::default(),
+                }),
+            ],
+            tools: None,
+        };
+        let body = build_request_body(model, &context, &OpenAICodexResponsesOptions::default());
+        body.get("input")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("request input items")
+    }
+
+    fn assert_no_empty_ids(items: &[Value]) {
+        for item in items {
+            for key in ["id", "call_id"] {
+                if let Some(Value::String(id)) = item.get(key) {
+                    assert!(!id.is_empty(), "empty {key} in item: {item}");
+                }
+            }
+        }
+    }
+
+    fn function_call_item(items: &[Value]) -> &Value {
+        items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .unwrap_or_else(|| panic!("missing function_call item in {items:?}"))
+    }
+
+    /// Wire-level verifier: after a codex tool-call turn, the follow-up
+    /// request replays the recorded rows and every input item carries valid
+    /// ids (the dogfood bug sent `input[2].id: ""` and the API rejected the
+    /// turn with `[ApiParam][invalid_id]`).
+    #[test]
+    fn codex_tool_call_followup_request_carries_valid_ids() {
+        let model = codex_wire_model();
+        let output = replay_codex_tool_call_turn(&model, Some("fc_123"));
+        // The recorded rows carry the `call_id|item_id` encoding and the
+        // streamed arguments.
+        let tool_call = match output.content.last() {
+            Some(crate::types::AssistantContent::ToolCall(tool_call)) => tool_call,
+            other => panic!("expected a recorded tool call, got {other:?}"),
+        };
+        assert_eq!(tool_call.id, "call_abc|fc_123");
+        assert_eq!(tool_call.arguments["cmd"], json!("ls"));
+        let items = followup_request_input(&model, output, "call_abc|fc_123");
+        assert_no_empty_ids(&items);
+        assert_eq!(
+            items[0].get("role"),
+            Some(&json!("user")),
+            "expected the user row first: {items:?}"
+        );
+        let function_call = function_call_item(&items);
+        assert_eq!(function_call.get("id"), Some(&json!("fc_123")));
+        assert_eq!(function_call.get("call_id"), Some(&json!("call_abc")));
+    }
+
+    /// Degenerate wire shape: function_call items without an `fc_` item id.
+    /// The recorded tool call id carries an empty item segment; the
+    /// follow-up request must omit the `id` key (never `id: ""`).
+    #[test]
+    fn codex_followup_omits_missing_item_id_instead_of_sending_empty() {
+        let model = codex_wire_model();
+        let output = replay_codex_tool_call_turn(&model, None);
+        let recorded_id = match output.content.last() {
+            Some(crate::types::AssistantContent::ToolCall(tool_call)) => tool_call.id.clone(),
+            other => panic!("expected a recorded tool call, got {other:?}"),
+        };
+        assert_eq!(recorded_id, "call_abc|");
+        let items = followup_request_input(&model, output, &recorded_id);
+        assert_no_empty_ids(&items);
+        let function_call = function_call_item(&items);
+        assert!(
+            function_call.get("id").is_none(),
+            "expected no item id on the degenerate replay: {function_call:?}"
+        );
+        assert_eq!(function_call.get("call_id"), Some(&json!("call_abc")));
+    }
 }
