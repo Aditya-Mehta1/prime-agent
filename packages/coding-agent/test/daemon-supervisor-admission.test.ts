@@ -9,6 +9,11 @@ import {
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import {
+	DAEMON_TCP_AUTH_TIMEOUT_MS,
+	DAEMON_TCP_IDLE_TIMEOUT_MS,
+	DAEMON_TCP_MAX_LINE_CHARS,
+} from "../src/modes/daemon/daemon-tcp.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 import { type Deferred, createDeferred as deferred } from "./suite/scheduling.js";
 
@@ -681,5 +686,43 @@ describe("daemon supervisor prompt admission ownership", () => {
 			{ closingReason: "update", force: false },
 			{ closingReason: "shutdown", force: true },
 		]);
+	});
+});
+
+function fakeTcpSocket(): Socket & { timeouts: number[] } {
+	const socket = new PassThrough() as unknown as Socket & { timeouts: number[] };
+	Object.assign(socket, { timeouts: [] as number[], setTimeout: (ms: number) => socket.timeouts.push(ms) });
+	return socket;
+}
+
+describe("daemon supervisor tcp admission", () => {
+	const token = "mesh-token-value-0123456789";
+
+	it("bounds lines and deadlines untrusted TCP connections", async () => {
+		const supervisor = createHarness() as any;
+		supervisor.handleLine = vi.fn(async () => undefined);
+
+		const oversized = fakeTcpSocket();
+		supervisor.handleConnection(oversized, { tcpAuthToken: token });
+		expect(oversized.timeouts).toEqual([DAEMON_TCP_AUTH_TIMEOUT_MS]);
+		oversized.write(`${"x".repeat(DAEMON_TCP_MAX_LINE_CHARS + 1)}\n`);
+		await waitFor(() => oversized.destroyed);
+		expect(supervisor.handleLine).not.toHaveBeenCalled();
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("longer than"));
+
+		const unauthenticated = fakeTcpSocket();
+		supervisor.handleConnection(unauthenticated, { tcpAuthToken: token });
+		unauthenticated.emit("timeout");
+		await waitFor(() => unauthenticated.destroyed);
+		expect(supervisor.log).toHaveBeenCalledWith("Closed unauthenticated TCP client connection");
+
+		const authenticated = fakeTcpSocket();
+		supervisor.handleConnection(authenticated, { tcpAuthToken: token });
+		authenticated.write(`${JSON.stringify({ id: "t1", type: "list", auth: { token } })}\n`);
+		await waitFor(() => supervisor.handleLine.mock.calls.length > 0);
+		expect(authenticated.timeouts).toEqual([DAEMON_TCP_AUTH_TIMEOUT_MS, DAEMON_TCP_IDLE_TIMEOUT_MS]);
+		authenticated.emit("timeout");
+		await waitFor(() => authenticated.destroyed);
+		expect(supervisor.log).toHaveBeenCalledWith("Closed idle TCP client connection");
 	});
 });

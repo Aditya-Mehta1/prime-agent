@@ -3,7 +3,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Environment variable checked for the daemon TCP port (after the CLI flag, before settings). */
-export const DAEMON_TCP_PORT_ENV = "PRIME_AGENT_DAEMON_PORT";
+const DAEMON_TCP_PORT_ENV = "PRIME_AGENT_DAEMON_PORT";
+
+/** Upper bound for one TCP command line; an oversized line closes the connection. */
+export const DAEMON_TCP_MAX_LINE_CHARS = 1024 * 1024;
+/** Refuses TCP connections once this many concurrent sockets are admitted. */
+export const DAEMON_TCP_MAX_CONNECTIONS = 256;
+/** Closes a TCP socket that sends no authenticated line within this window. */
+export const DAEMON_TCP_AUTH_TIMEOUT_MS = 30_000;
+/** Idle window for an authenticated TCP socket; any traffic resets it. */
+export const DAEMON_TCP_IDLE_TIMEOUT_MS = 10 * 60_000;
 
 /** Auth verdict for one TCP command line. */
 export interface DaemonTcpAuthVerdict {
@@ -23,7 +32,7 @@ export interface DaemonTcpTokenRecord {
 }
 
 /** Token file path inside the agent dir. */
-export function daemonTcpTokenPath(agentDir: string): string {
+function daemonTcpTokenPath(agentDir: string): string {
 	return join(agentDir, "daemon-tcp-token");
 }
 
@@ -31,7 +40,7 @@ export function daemonTcpTokenPath(agentDir: string): string {
  * Parse the port from an environment map. Throws a named error when the
  * variable is present but not a valid port (never silently ignored).
  */
-export function daemonTcpPortFromEnv(env: Record<string, string | undefined>): number | undefined {
+function daemonTcpPortFromEnv(env: Record<string, string | undefined>): number | undefined {
 	const raw = env[DAEMON_TCP_PORT_ENV];
 	if (raw === undefined || raw === "") {
 		return undefined;
@@ -59,7 +68,7 @@ export function resolveDaemonTcpPort(
 }
 
 /** Timing-safe token comparison that does not leak length differences. */
-export function daemonTcpTokensMatch(actual: string, expected: string): boolean {
+function daemonTcpTokensMatch(actual: string, expected: string): boolean {
 	if (actual.length !== expected.length) {
 		return false;
 	}
@@ -71,7 +80,7 @@ export function daemonTcpTokensMatch(actual: string, expected: string): boolean 
 }
 
 /** Read the existing token without creating one. Returns undefined when unset. */
-export function readDaemonTcpToken(agentDir: string): string | undefined {
+function readDaemonTcpToken(agentDir: string): string | undefined {
 	const tokenPath = daemonTcpTokenPath(agentDir);
 	if (!existsSync(tokenPath)) {
 		return undefined;
@@ -111,8 +120,25 @@ export function loadOrCreateDaemonTcpToken(agentDir: string): DaemonTcpTokenReco
 	}
 	mkdirSync(agentDir, { recursive: true });
 	const token = randomBytes(32).toString("base64url");
-	writeFileSync(tokenPath, JSON.stringify({ token }) + "\n", { mode: 0o600 });
-	return { token, tokenPath, created: true };
+	try {
+		// Exclusive create: a concurrent daemon must not overwrite a token its peer
+		// may already be authenticating with; the race loser reuses the winner's.
+		writeFileSync(tokenPath, `${JSON.stringify({ token })}\n`, { mode: 0o600, flag: "wx" });
+		return { token, tokenPath, created: true };
+	} catch (error) {
+		if (!isExclusiveCreateConflict(error)) {
+			throw error;
+		}
+		const existingToken = readDaemonTcpToken(agentDir);
+		if (existingToken === undefined) {
+			throw error;
+		}
+		return { token: existingToken, tokenPath, created: false };
+	}
+}
+
+function isExclusiveCreateConflict(error: unknown): boolean {
+	return error instanceof Error && (error as NodeJS.ErrnoException).code === "EEXIST";
 }
 
 /**
@@ -130,6 +156,11 @@ export function checkDaemonTcpLineAuth(line: string, expectedToken: string): Dae
 	try {
 		parsed = JSON.parse(line) as typeof parsed;
 	} catch {
+		return { ok: false, id: "unknown", command: undefined, reason: "invalid_json" };
+	}
+	// A JSON primitive such as `null` would otherwise throw on the field reads
+	// below and take the socket's data handler down with it.
+	if (parsed === null || typeof parsed !== "object") {
 		return { ok: false, id: "unknown", command: undefined, reason: "invalid_json" };
 	}
 	const id = typeof parsed.id === "string" ? parsed.id : "unknown";

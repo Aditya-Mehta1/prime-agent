@@ -1,22 +1,35 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import {
-	checkDaemonTcpLineAuth,
-	DAEMON_TCP_PORT_ENV,
-	daemonTcpPortFromEnv,
-	daemonTcpTokenPath,
-	daemonTcpTokensMatch,
-	loadOrCreateDaemonTcpToken,
-	readDaemonTcpToken,
-	resolveDaemonTcpPort,
-} from "../src/modes/daemon/daemon-tcp.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const tokenRace = vi.hoisted(() => ({ armed: false, winnerToken: "" }));
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		writeFileSync: (path: unknown, data: unknown, options: unknown) => {
+			if (tokenRace.armed && typeof path === "string" && path.endsWith("daemon-tcp-token")) {
+				tokenRace.armed = false;
+				const winnerLine = `${JSON.stringify({ token: tokenRace.winnerToken })}\n`;
+				actual.writeFileSync(path, winnerLine, { mode: 0o600 });
+				throw Object.assign(new Error("concurrent creator already wrote the token"), { code: "EEXIST" });
+			}
+			return actual.writeFileSync(path as never, data as never, options as never);
+		},
+	};
+});
+
+const { checkDaemonTcpLineAuth, loadOrCreateDaemonTcpToken, resolveDaemonTcpPort } = await import(
+	"../src/modes/daemon/daemon-tcp.js"
+);
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
+	tokenRace.armed = false;
 });
 
 function tempAgentDir(): string {
@@ -34,7 +47,7 @@ describe("daemon tcp token store", () => {
 		const second = loadOrCreateDaemonTcpToken(agentDir);
 		expect(second.created).toBe(false);
 		expect(second.token).toBe(first.token);
-		expect(readFileSync(daemonTcpTokenPath(agentDir), "utf8")).toContain(first.token);
+		expect(readFileSync(join(agentDir, "daemon-tcp-token"), "utf8")).toContain(first.token);
 	});
 
 	it("creates the token file with owner-only permissions", () => {
@@ -43,29 +56,39 @@ describe("daemon tcp token store", () => {
 		expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
 	});
 
-	it("reads without creating when unset and refuses corrupt files", () => {
+	it("refuses corrupt token files instead of overwriting them", () => {
 		const agentDir = tempAgentDir();
-		expect(readDaemonTcpToken(agentDir)).toBeUndefined();
-		expect(existsSync(daemonTcpTokenPath(agentDir))).toBe(false);
-		loadOrCreateDaemonTcpToken(agentDir);
-		expect(readDaemonTcpToken(agentDir)).toBe(loadOrCreateDaemonTcpToken(agentDir).token);
-		writeFileSync(daemonTcpTokenPath(agentDir), "{ not json", { mode: 0o600 });
-		expect(() => readDaemonTcpToken(agentDir)).toThrow(/not valid JSON/);
-		writeFileSync(daemonTcpTokenPath(agentDir), JSON.stringify({ version: 1 }), { mode: 0o600 });
+		writeFileSync(join(agentDir, "daemon-tcp-token"), "{ not json", { mode: 0o600 });
+		expect(() => loadOrCreateDaemonTcpToken(agentDir)).toThrow(/not valid JSON/);
+		writeFileSync(join(agentDir, "daemon-tcp-token"), JSON.stringify({ version: 1 }), { mode: 0o600 });
 		expect(() => loadOrCreateDaemonTcpToken(agentDir)).toThrow(/missing its token/);
+		expect(readFileSync(join(agentDir, "daemon-tcp-token"), "utf8")).toContain(JSON.stringify({ version: 1 }));
+	});
+
+	it("reuses the concurrent winner's token when the exclusive create loses", () => {
+		const agentDir = tempAgentDir();
+		tokenRace.winnerToken = "winner-token-value-0123456789abcdef";
+		tokenRace.armed = true;
+
+		const record = loadOrCreateDaemonTcpToken(agentDir);
+
+		expect(record.token).toBe("winner-token-value-0123456789abcdef");
+		expect(record.created).toBe(false);
+		expect(readFileSync(join(agentDir, "daemon-tcp-token"), "utf8")).toContain("winner-token-value-0123456789abcdef");
 	});
 });
 
 describe("daemon tcp port resolution", () => {
 	it("prefers the CLI flag > env > settings, rejecting invalid sources", () => {
-		expect(resolveDaemonTcpPort(4100, 4200, { [DAEMON_TCP_PORT_ENV]: "4300" })).toBe(4100);
-		expect(resolveDaemonTcpPort(undefined, 4200, { [DAEMON_TCP_PORT_ENV]: "4300" })).toBe(4300);
+		expect(resolveDaemonTcpPort(4100, 4200, { PRIME_AGENT_DAEMON_PORT: "4300" })).toBe(4100);
+		expect(resolveDaemonTcpPort(undefined, 4200, { PRIME_AGENT_DAEMON_PORT: "4300" })).toBe(4300);
 		expect(resolveDaemonTcpPort(undefined, 4200, {})).toBe(4200);
 		expect(resolveDaemonTcpPort(undefined, undefined, {})).toBeUndefined();
 		expect(resolveDaemonTcpPort(70000, undefined, {})).toBeUndefined();
 		expect(resolveDaemonTcpPort(0, 8123, {})).toBe(8123);
-		expect(() => daemonTcpPortFromEnv({ [DAEMON_TCP_PORT_ENV]: "not-a-port" })).toThrow(new RegExp(DAEMON_TCP_PORT_ENV));
-		expect(daemonTcpPortFromEnv({})).toBeUndefined();
+		expect(() => resolveDaemonTcpPort(undefined, undefined, { PRIME_AGENT_DAEMON_PORT: "not-a-port" })).toThrow(
+			/PRIME_AGENT_DAEMON_PORT/,
+		);
 	});
 });
 
@@ -90,8 +113,12 @@ describe("daemon tcp line auth", () => {
 		const empty = checkDaemonTcpLineAuth(`{"id":"t5","type":"list","auth":{"token":""}}`, token);
 		expect(empty).toMatchObject({ ok: false, reason: "missing_token" });
 		expect(checkDaemonTcpLineAuth("not json at all", token)).toMatchObject({ ok: false, reason: "invalid_json" });
-		expect(daemonTcpTokensMatch(token, token)).toBe(true);
-		expect(daemonTcpTokensMatch(token, `${token}x`)).toBe(false);
-		expect(daemonTcpTokensMatch(token, "test-token-value-0123456788")).toBe(false);
+	});
+
+	it("refuses JSON primitive lines instead of dereferencing them", () => {
+		// `null` in particular used to throw from the socket data handler.
+		for (const line of ["null", "5", '"str"', "true"]) {
+			expect(checkDaemonTcpLineAuth(line, token)).toMatchObject({ ok: false, reason: "invalid_json" });
+		}
 	});
 });
