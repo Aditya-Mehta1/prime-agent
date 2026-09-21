@@ -239,6 +239,12 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 			outputTokens += decision.usage?.outputTokens ?? 0;
 
 			if (decision.modelError) {
+				// A disposal abort mid-decision surfaces as stopReason "aborted"
+				// -> modelError; the abort result takes precedence over the
+				// model-failure report.
+				if (options.signal?.aborted) {
+					return finish("failed", "aborted", "Router aborted during the current step.");
+				}
 				const stepTrace: RouterStepTrace = {
 					step,
 					timestampMs: decisionStarted,

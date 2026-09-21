@@ -670,14 +670,17 @@ describe("runSystemRouterLoop", () => {
 		expect(aborted.reason).toBe("aborted");
 	});
 
-	it("reports aborted instead of done when the signal fires during the decision", async () => {
+	it.each([
+		["done", decision({ action: FINISH_ACTION, confidence: 1 })],
+		["a model error", decision({ modelError: "decision model stopped early (aborted)" })],
+	])("reports aborted instead of %s when the signal fires during the decision", async (_label, outcome) => {
 		const controller = new AbortController();
 		const result = await runLoop(new FakeEnvironment(["x"]), {
 			decide: async (request) => {
 				controller.abort();
 				// The in-flight decision's retries stop with the external signal.
 				expect((request as { signal?: AbortSignal }).signal?.aborted).toBe(true);
-				return decision({ action: FINISH_ACTION, confidence: 1 });
+				return { ...outcome };
 			},
 			signal: controller.signal,
 		});
