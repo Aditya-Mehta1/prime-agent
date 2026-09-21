@@ -254,7 +254,8 @@ export function runTailscaleStatus(json = false): number {
 			console.log(`${chalk.bold("Served locally")}: nothing (see docs/tailscale.md)`);
 		}
 	} catch {
-		console.log(`${chalk.bold("Served locally")}: (unparseable status)`);
+		console.log(chalk.yellow(`tailscale serve status output was unparseable; served-local status is unavailable`));
+		return 1;
 	}
 	return 0;
 }
