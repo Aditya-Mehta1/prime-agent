@@ -352,6 +352,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         session_id,
         handlers,
         python_skills,
+        cwd.clone(),
         &config.agent_dir,
         on_bootstrap_result,
     );

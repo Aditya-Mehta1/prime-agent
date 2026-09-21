@@ -154,6 +154,16 @@ pub struct AgentSessionEngine {
     /// session cwd; deterministic harnesses replace it through
     /// [`AgentSessionEngine::set_autonomous_driver`].
     autonomous_driver: std::sync::RwLock<std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>>,
+    /// Whether `autonomous_driver` still holds the product default (no
+    /// harness replaced it): a cwd rebind swaps the default shell driver
+    /// (it runs in the session cwd) but must keep an injected one.
+    autonomous_driver_default: std::sync::atomic::AtomicBool,
+    /// The session's live working directory (TS the runtime's `cwd`, rebuilt
+    /// per replacement): seeds the core session build (the kernel-resident
+    /// tools run there), the settings reads, and the MCP settings
+    /// discovery. Shared with the MCP user-servers closure so a
+    /// [`SessionEngine::set_cwd`] rebind is visible to it.
+    cwd: std::sync::Arc<std::sync::RwLock<std::path::PathBuf>>,
     /// This session's RLM recursion depth (0 for top-level sessions),
     /// stamped by `configure_rlm_identity`. Gates the kernel `refine.*`
     /// host requests (TS `_autoRefineAllowedForSession` depth check).
@@ -227,6 +237,7 @@ impl AgentSessionEngine {
             pa_core::autonomous::ShellAutonomousDriver::new(config.cwd.clone()),
         )
             as std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>);
+        let cwd = std::sync::Arc::new(std::sync::RwLock::new(config.cwd.clone()));
         // The ACP MCP store (auth storage construction is blocking; the
         // engine construction paths are already off the hot async paths).
         let agent_dir = config.agent_dir.clone();
@@ -236,7 +247,7 @@ impl AgentSessionEngine {
         // so `mcp.refresh` - which re-resolves integrations - sees
         // settings changes, mirroring the in-process engine's
         // `mcp_gating` extraction (agentDir + project settings.json).
-        let mcp_cwd = config.cwd.clone();
+        let mcp_cwd = std::sync::Arc::clone(&cwd);
         let mcp_agent_dir = agent_dir.clone();
         let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: pa_core::auth::AuthStorage::create_with_oauth(
@@ -244,6 +255,11 @@ impl AgentSessionEngine {
                 std::sync::Arc::new(pa_core::mcp::McpOAuth::new()),
             ),
             get_user_servers: Box::new(move || {
+                // The live cwd slot, not the construction-time cwd: the
+                // rebind (a switched-to session in another directory) must
+                // reach the MCP settings discovery (TS rebuilds the runtime's
+                // MCP manager per replacement).
+                let mcp_cwd = mcp_cwd.read().expect("engine cwd lock").clone();
                 let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
                 Some(
                     settings
@@ -296,6 +312,8 @@ impl AgentSessionEngine {
             link,
             children,
             autonomous_driver,
+            autonomous_driver_default: std::sync::atomic::AtomicBool::new(true),
+            cwd,
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
             pending_max_depth: std::sync::Mutex::new(None),
@@ -313,10 +331,17 @@ impl AgentSessionEngine {
         &self,
         driver: std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>,
     ) {
+        self.autonomous_driver_default
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         *self
             .autonomous_driver
             .write()
             .expect("autonomous driver lock") = driver;
+    }
+
+    /// The session's live working directory (the engine's cwd slot).
+    fn cwd(&self) -> std::path::PathBuf {
+        self.cwd.read().expect("engine cwd lock").clone()
     }
 
     /// The async build of the core session (the same funnel as
@@ -473,10 +498,8 @@ impl AgentSessionEngine {
             // the saved settings default, then the featured default, then
             // the first available model.
             let all: Vec<Model> = registry.get_all().to_vec();
-            let settings = pa_core::settings::SettingsManager::create(
-                &self.config.cwd,
-                &self.config.agent_dir,
-            );
+            let settings =
+                pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
             let startup =
                 pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
                     cli_provider: None,
@@ -545,10 +568,8 @@ impl AgentSessionEngine {
             .current_selection()
             .thinking
             .or_else(|| {
-                let settings = pa_core::settings::SettingsManager::create(
-                    &self.config.cwd,
-                    &self.config.agent_dir,
-                );
+                let settings =
+                    pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
                 settings
                     .get_default_thinking_level()
                     .map(pa_core::settings::ThinkingLevelSetting::model_level)
@@ -619,8 +640,8 @@ impl AgentSessionEngine {
         if let Some(session_dir) = &self.config.session_dir {
             std::fs::create_dir_all(session_dir)?;
         }
-        let session_manager =
-            pa_core::session::manager::SessionManager::in_memory(&self.config.cwd);
+        let cwd = self.cwd();
+        let session_manager = pa_core::session::manager::SessionManager::in_memory(&cwd);
         let session_file = self
             .session_file
             .lock()
@@ -637,10 +658,8 @@ impl AgentSessionEngine {
         // `telemetryDisabled` on the runtime config). Sinks resolve from
         // settings + env inside `build_client`.
         let telemetry = (self.config.telemetry_disabled != Some(true)).then(|| {
-            let settings = pa_core::settings::SettingsManager::create(
-                &self.config.cwd,
-                &self.config.agent_dir,
-            );
+            let settings =
+                pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
             pa_core::session_engine::telemetry::TelemetryWiring {
                 client: pa_core::session_engine::telemetry::build_client(
                     &settings,
@@ -652,7 +671,7 @@ impl AgentSessionEngine {
         });
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
             telemetry,
-            cwd: self.config.cwd.clone(),
+            cwd,
             agent_dir: self.config.agent_dir.clone(),
             mcp_manager: Some(std::sync::Arc::clone(&self.mcp)),
             model: Some(agent_model),
@@ -823,7 +842,7 @@ impl AgentSessionEngine {
     /// `globalError` field.
     fn write_global_rlm_max_depth(&self, max_depth: u64) -> Option<String> {
         let mut settings =
-            pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir);
+            pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
         match settings.set_rlm_max_depth(max_depth) {
             Ok(()) => None,
             Err(error) => Some(error.to_string()),
@@ -1377,7 +1396,7 @@ impl SessionEngine for AgentSessionEngine {
         };
         let api_key = self.resolve_request_api_key(&model);
         let settings =
-            pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir);
+            pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
         let reserve_tokens = settings
             .settings()
             .branch_summary
@@ -1464,6 +1483,34 @@ impl SessionEngine for AgentSessionEngine {
         })
     }
 
+    /// Rebind the engine's session cwd (see [`SessionEngine::set_cwd`]):
+    /// the core session rebuild (a replacement flow just retired the old
+    /// session) reads the slot, so the rebuilt session's kernel-resident
+    /// tools run in the moved-to session's cwd — the TS
+    /// `createRuntime({ cwd: sessionManager.getCwd() })` rebind. The
+    /// product-default shell-gate driver follows the cwd (it runs shell
+    /// gates there); a harness-injected driver stays.
+    fn set_cwd(&self, cwd: std::path::PathBuf) {
+        {
+            let mut slot = self.cwd.write().expect("engine cwd lock");
+            if *slot == cwd {
+                return;
+            }
+            *slot = cwd.clone();
+        }
+        if self
+            .autonomous_driver_default
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            *self
+                .autonomous_driver
+                .write()
+                .expect("autonomous driver lock") =
+                std::sync::Arc::new(pa_core::autonomous::ShellAutonomousDriver::new(cwd))
+                    as std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>;
+        }
+    }
+
     fn configure_rlm_identity(
         &self,
         identity: crate::engine::RlmSessionIdentity,
@@ -1495,10 +1542,8 @@ impl SessionEngine for AgentSessionEngine {
                     .map(|depth| (u64::from(depth), "inherited"))
             })
             .or_else(|| {
-                let settings = pa_core::settings::SettingsManager::create(
-                    &self.config.cwd,
-                    &self.config.agent_dir,
-                );
+                let settings =
+                    pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
                 settings.get_rlm_max_depth().map(|depth| (depth, "global"))
             })
             .or_else(|| {
@@ -1699,7 +1744,7 @@ impl SessionEngine for AgentSessionEngine {
             let Some(engine) = guard.as_ref() else {
                 return crate::engine::empty_resource_snapshot();
             };
-            let cwd = self.config.cwd.display().to_string();
+            let cwd = self.cwd().display().to_string();
             let mut skills = Vec::new();
             for skill in &engine.skills {
                 let mut entry = json!({
@@ -2671,7 +2716,7 @@ impl AgentSessionEngine {
 
     /// The provider retry policy from settings (TS `providerRetryPolicy`).
     fn retry_policy(&self) -> pa_core::session_engine::provider_retry::ProviderRetryPolicy {
-        pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir)
+        pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir)
             .get_provider_retry_policy()
     }
 
@@ -2679,7 +2724,7 @@ impl AgentSessionEngine {
     fn failover_policy(
         &self,
     ) -> pa_core::session_engine::provider_failover::ProviderFailoverPolicy {
-        pa_core::settings::SettingsManager::create(&self.config.cwd, &self.config.agent_dir)
+        pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir)
             .get_provider_failover_policy()
     }
 

@@ -9,8 +9,9 @@
 //! Store: one `AgentCronJobStore::for_session_artifacts()` per worker
 //! process, like TS daemon-mode (`options.worker ?
 //! AgentCronJobStore.forSessionArtifacts() : ...`); sessions register
-//! their artifact partition when they bind (create and the navigation
-//! replacement flow) and jobs rebind with them.
+//! their artifact partition when they bind (create and every
+//! replacement flow - new_session / switch_session / import_jsonl /
+//! fork) and jobs rebind with them.
 //!
 //! Delivery: a due job is claimed by the store and fired through the
 //! session's queue lanes — heartbeats on their delivery-mode lane (steer

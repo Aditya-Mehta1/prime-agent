@@ -606,7 +606,8 @@ pub struct Worker {
     pub(crate) prompt_admissions: crate::prompt_admission::WorkerAdmissions,
     /// The scheduling surface (wave b10): the session's cron/heartbeat
     /// artifact store plus the scheduler firing due jobs into the queue;
-    /// shared with the navigation swap flow, which rebinds on replacement.
+    /// the worker rebinds the live session's jobs onto it after create
+    /// and every replacement swap (TS `rebindCronJobsToState`).
     pub(crate) scheduled: std::sync::Arc<crate::scheduled_jobs::ScheduledJobs>,
 }
 
@@ -817,7 +818,6 @@ impl Worker {
         let navigation = crate::session_navigation::SessionNavigation::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
-            std::sync::Arc::clone(&scheduled),
         );
         Worker {
             config,
@@ -1827,16 +1827,7 @@ impl Worker {
         self.status_runner.seed_from_session();
         // Bind the schedule catalog onto the session (artifact partition,
         // job rebind, scheduler start) — TS `rebindCronJobsToState`.
-        let scheduled_binding = {
-            let core = self
-                .core
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::scheduled_jobs::live_binding(&core)
-        };
-        if let Some((binding, artifact_dir)) = scheduled_binding {
-            self.scheduled.bind_session(binding, artifact_dir).await;
-        }
+        self.bind_scheduled_jobs().await;
         // Recovery journal writes must not happen while holding the core
         // lock: record_recovery locks the core to read the store.
         let _ = self.record_recovery(true, "create");
@@ -2556,6 +2547,96 @@ impl Worker {
                 };
                 let _ = engine.ensure_core_session_async(&model).await;
             });
+        }
+    }
+
+    /// Rebind the worker onto the replacement session's cwd (TS
+    /// `createRuntime({ cwd: sessionManager.getCwd() })` in
+    /// `switchSession` / `importFromJsonl`): the core's cwd (the wire
+    /// summary, the settings reads, the user-bash guard, the schedule
+    /// catalog's binding) and the engine's cwd slot (the rebuilt session's
+    /// kernel-resident tools, its settings and MCP discovery) move onto
+    /// the target session's recorded working directory. The teardown has
+    /// already retired the live session, so nothing old observes the move;
+    /// the rebuild that follows builds cold in the new cwd.
+    pub(crate) fn rebind_worker_cwd(&self, cwd: &str) {
+        {
+            let mut core = self
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            core.cwd = cwd.to_string();
+        }
+        self.engine.set_cwd(std::path::PathBuf::from(cwd));
+    }
+
+    /// Refresh the replacement session's derived state (TS
+    /// `refreshReplacedSessionState` on the `sessionReplaced` event): the
+    /// moved-to session's depth re-seeds the worker core and the engine's
+    /// RLM identity (a resumed subagent keeps its persisted depth), and
+    /// the wire summary re-seeds from the new session. The schedule
+    /// catalog rebind runs separately (`bind_scheduled_jobs`), like the
+    /// TS dispatch handlers that call `rebindCronJobsToState` after the
+    /// runtime call.
+    pub(crate) fn refresh_replaced_session_state(&self) {
+        // The status line re-seeds from the moved-to session's persisted
+        // verdict (TS `summarizer.forget` + `seed` on the replacement).
+        self.status_runner.seed_from_session();
+        let (rlm_depth, summary) = {
+            let mut core = self
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The moved-to file's persisted depth wins (TS
+            // `config.rlmDepth ?? header.rlmDepth`; the replacement carries
+            // no create-config depth).
+            let rlm_depth = core
+                .store
+                .as_ref()
+                .and_then(SessionFile::rlm_depth)
+                .unwrap_or(0);
+            core.rlm_depth = rlm_depth;
+            (rlm_depth, self.summary_locked(&core))
+        };
+        // No thinking flag rides the rebind (the create command's level is
+        // already resolved on the engine), and the TS replacement runtime
+        // carries no inherited max-depth: the moved-to session's persisted
+        // chat override, the global setting, the env, or the default
+        // resolve it (`_resolveRlmMaxDepth` precedence).
+        if let Err(error) = self
+            .engine
+            .configure_rlm_identity(crate::engine::RlmSessionIdentity {
+                rlm_depth,
+                rlm_max_depth: None,
+                cwd: Some(summary.cwd.clone()),
+                session_id: Some(summary.session_id.clone()),
+                session_file: summary.session_file.clone(),
+                thinking: None,
+            })
+        {
+            eprintln!("pa-daemon: replacement identity rebind failed: {error:#}");
+        }
+        if let Ok(summary_value) = serde_json::to_value(&summary) {
+            self.engine.set_session_summary(summary_value);
+        }
+    }
+
+    /// Bind the live session's schedule catalog (TS `rebindCronJobsToState`):
+    /// register the session's artifact partition, rebind the stored jobs onto
+    /// the live ids, and start (or wake) the scheduler. Runs at create and
+    /// after every replacement swap (new_session / switch_session /
+    /// import_jsonl / fork) - the jobs follow the live session onto the
+    /// moved-to file, exactly like the TS rebind on the runtime swap.
+    pub(crate) async fn bind_scheduled_jobs(&self) {
+        let binding = {
+            let core = self
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::scheduled_jobs::live_binding(&core)
+        };
+        if let Some((binding, artifact_dir)) = binding {
+            self.scheduled.bind_session(binding, artifact_dir).await;
         }
     }
 

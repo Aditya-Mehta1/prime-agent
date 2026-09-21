@@ -2336,3 +2336,53 @@ NOT this lane's surface — reported for their owning lanes):
   stays compared); the abort-propagation fix belongs to the
   compaction-abort/turn-abort lane.
 
+- lane `replacement-rebinds`: the two #237 pre-existing replacement-surface
+  residues — the switch cwd rebind and the fork schedule rebind (TS
+  ground truth for both).
+  Cwd: TS `AgentSessionRuntime.switchSession` / `importFromJsonl` rebuild
+  the runtime with `createRuntime({ cwd: sessionManager.getCwd() })` — the
+  TARGET session's recorded working directory (TS `SessionManager.open`:
+  `cwdOverride ?? header.cwd ?? process.cwd()`), and
+  `assertSessionCwdExists` gates a gone cwd at the prepare (before any
+  teardown). `newSession` keeps the runtime's own cwd
+  (`createRuntime({ cwd: this.cwd })`). The kernel itself is constructed
+  with the session cwd (`new IpythonKernelProvisioner(this._cwd, ...)`),
+  not the process cwd — the daemon worker happened to coincide (the
+  supervisor spawns the worker process in the session cwd), which is why
+  the residue was invisible until a switch crossed directories. Port:
+  `PreparedReplacement` carries the target cwd out of the prepare;
+  the worker rebinds `core.cwd` + the engine's live cwd slot between the
+  teardown and the rebuild (the rebuilt session's kernel-resident tools,
+  settings/MCP discovery, and shell-gate driver follow); pa-core threads
+  the session cwd into `kernel_provisioner` explicitly. The `cwdOverride`
+  stays runtime-resident (TS never persists it into the target header).
+  Schedule rebind: TS daemon-mode calls `rebindCronJobsToState(state)`
+  after `runtime.fork` (and `refreshReplacedSessionState` after EVERY
+  runtime replacement, which registers the artifact partition and rebinds
+  again). `AgentCronJobStore.rebindSessionJobs` rebinds EVERY job whose
+  `activeSessionId` matches the live session OR whose `sessionFile`
+  resolves to the target file — no source filter (plain cron, heartbeat,
+  and rlm_heartbeat all rebind), preserving status and source; the new
+  binding is the (forked/switched-to) session's
+  `{ activeSessionId, sessionId, sessionFile, cwd }`. On fork the jobs
+  move to the forked session file so a future restore targets the fork,
+  not the source branch; the cwd and the daemon-local active session id
+  stay (TS `forkFrom(_, this.cwd)` keeps the runtime cwd). Port:
+  `Worker::bind_scheduled_jobs` runs at create, after every navigation
+  replacement swap, and after the fork swap;
+  `Worker::refresh_replaced_session_state` ports the rest of
+  `refreshReplacedSessionState` (depth re-seed from the moved-to file, RLM
+  identity re-derive without a create-inherited max-depth — the TS
+  replacement runtime carries no `runtimeMetadata`, so the persisted chat
+  override -> global -> env -> default precedence applies — plus the wire
+  summary and status-line re-seed).
+  Verifiers: unit
+  `session_navigation::tests::switch_session_rebinds_the_worker_cwd_and_new_session_keeps_it`
+  (the get_state summary cwd follows the switch target; a gone stored cwd
+  fails at the prepare with the TS `MissingSessionCwdError` text;
+  `new_session` keeps the cwd) and
+  `session_navigation::tests::fork_rebinds_the_scheduled_jobs_onto_the_forked_session`
+  (the cron job's sessionFile/sessionId follow the fork); live-kernel e2e
+  `replacement_kernel_e2e::switch_session_rebinds_the_kernel_cwd_onto_the_target_session`
+  (a session created in `alpha/` switches onto a file recording `beta/`;
+  the post-switch kernel's `os.getcwd()` receipt is `beta`).

@@ -447,6 +447,14 @@ pub trait SessionEngine: Send + Sync {
         Ok(())
     }
 
+    /// Rebind the engine's session cwd (TS rebuilds the replacement runtime
+    /// with `createRuntime({ cwd: sessionManager.getCwd() })`): a
+    /// `switch_session` / `import_jsonl` onto a session file with another
+    /// recorded cwd moves the rebuilt session's cwd — its kernel-resident
+    /// tools, settings reads, and MCP settings discovery follow. Engines
+    /// without a session cwd (the scripted harness) keep the no-op default.
+    fn set_cwd(&self, _cwd: std::path::PathBuf) {}
+
     /// An agent message from `child_active_session_id` (one of this
     /// session's RLM children) reached this session. The engine's child
     /// registry records it so a child's terminal notice can be withheld:

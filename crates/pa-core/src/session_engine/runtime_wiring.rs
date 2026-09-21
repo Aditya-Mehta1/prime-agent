@@ -112,10 +112,17 @@ pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
 /// product paths, but an embedding host whose ambient env differs from the
 /// session's agent dir must not leak its own paths into the kernel. Same
 /// discipline as the daemon worker env (#109).
+///
+/// `cwd` is the SESSION's working directory (TS
+/// `new IpythonKernelProvisioner(this._cwd, ...)`), not the host process's:
+/// the kernel-resident tools (bash/edit) run there, and a runtime whose
+/// session cwd differs from the process cwd (a daemon worker switched onto
+/// another session file) must spawn the kernel in the session's cwd.
 pub fn kernel_provisioner(
     session_id: String,
     handlers: HostRequestHandlers,
     python_skills: Vec<KernelPythonSkill>,
+    cwd: std::path::PathBuf,
     agent_dir: &std::path::Path,
     on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
 ) -> Arc<KernelProvisioner> {
@@ -125,7 +132,7 @@ pub fn kernel_provisioner(
         agent_dir.to_string_lossy().to_string(),
     );
     Arc::new(KernelProvisioner::new(
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        cwd,
         IpythonKernelProvisionerOptions {
             python: None,
             env,

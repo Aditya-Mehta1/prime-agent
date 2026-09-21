@@ -540,6 +540,15 @@ impl Worker {
         self.teardown_for_replacement().await;
         match self.tree_navigation.replace_with_fork(forked).await {
             Ok(()) => {
+                // The fork is a whole-runtime replacement (TS
+                // `refreshReplacedSessionState` +
+                // `rebindCronJobsToState` after `runtime.fork`): the
+                // forked session's derived state re-seeds, and the live
+                // session's scheduled jobs rebind onto the forked
+                // session file — future restores target the fork, not the
+                // source branch.
+                self.refresh_replaced_session_state();
+                self.bind_scheduled_jobs().await;
                 self.prewarm_replacement_session();
                 let mut data = json!({ "cancelled": false });
                 if let Some(selected_text) = selected_text {

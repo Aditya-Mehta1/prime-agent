@@ -25,6 +25,11 @@
 //! 4. `navigate_tree`: the SAME kernel process stays alive and its
 //!    namespace is WARM (the variable set before the move is still
 //!    there) - the kernel must not be torn down on a tree move.
+//! 5. `switch_session` onto a session file with another recorded cwd:
+//!    the rebuilt runtime's kernel-resident tools run in the TARGET
+//!    session's cwd (TS `createRuntime({ cwd:
+//!    sessionManager.getCwd() })`) - the post-switch kernel's
+//!    `os.getcwd()` is the switched-to session's directory.
 //!
 //! The kernel Python is ambient product state (the auto-bootstrapped kernel
 //! venv); like the other live-kernel verifiers, these tests skip (with a
@@ -380,10 +385,15 @@ fn run_turn(client: &mut Client, session_id: &str, message: &str, id: &str) {
 /// A cell's receipt proves the kernel executed it; the content is the
 /// cell's verdict (`seeded` for the seed, `warm`/`cold` for the probe).
 fn await_receipt(dir: &Path, name: &str) -> String {
-    let receipt = receipt_path(dir, name);
+    await_receipt_text(&receipt_path(dir, name))
+}
+
+/// Poll for a kernel cell's receipt content (the cwd rebind verifier
+/// reads the full path the cell wrote).
+fn await_receipt_text(receipt: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if let Ok(content) = std::fs::read_to_string(&receipt) {
+        if let Ok(content) = std::fs::read_to_string(receipt) {
             return content;
         }
         assert!(
@@ -592,6 +602,113 @@ fn fork_disposes_the_kernel_and_starts_cold() {
         await_receipt(dir.path(), "probe"),
         "cold",
         "the forked session's kernel kept the source session's namespace"
+    );
+}
+
+/// The switch cwd rebind (TS `switchSession` -> `createRuntime({ cwd:
+/// sessionManager.getCwd() })`): the rebuilt runtime's kernel-resident
+/// tools run in the TARGET session's recorded cwd - the post-switch
+/// kernel's `os.getcwd()` is the switched-to session's working directory,
+/// not the worker's original one.
+#[test]
+fn switch_session_rebinds_the_kernel_cwd_onto_the_target_session() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let _guard = test_lock();
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let socket = dir.path().join("supervisor.sock");
+    let alpha = dir.path().join("alpha");
+    let beta = dir.path().join("beta");
+    std::fs::create_dir_all(&alpha).expect("alpha dir");
+    std::fs::create_dir_all(&beta).expect("beta dir");
+    // One scripted turn: an ipython cell writes the kernel's cwd receipt.
+    let receipt = dir.path().join("receipts").join("cwd.txt");
+    std::fs::create_dir_all(receipt.parent().expect("receipts dir")).expect("receipts dir");
+    let script = dir.path().join("faux.json");
+    std::fs::write(
+        &script,
+        json!({
+            "engine": "faux",
+            "responses": [
+                { "content": [
+                    { "type": "toolCall", "name": "ipython", "arguments": {
+                        "code": format!(
+                            "import os\nopen({receipt:?}, \"w\").write(os.getcwd())\nprint(\"cwd\")",
+                            receipt = receipt.to_string_lossy(),
+                        ),
+                    } },
+                ] },
+                { "text": "done" },
+            ],
+        })
+        .to_string(),
+    )
+    .expect("write faux script");
+
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+    let sessions_dir = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    client.send_command(
+        "c1",
+        json!({
+            "type": "create",
+            "config": {
+                "cwd": alpha.to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": script.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("c1");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let session_id = created["data"]["activeSessionId"]
+        .as_str()
+        .or_else(|| created["data"]["id"].as_str())
+        .expect("active session id")
+        .to_string();
+
+    // A target session file recording the OTHER directory as its cwd.
+    let target = sessions_dir.join("switch-target.jsonl");
+    std::fs::write(
+        &target,
+        format!(
+            "{}\n",
+            json!({
+                "type": "session",
+                "id": "switch-target",
+                "timestamp": "2026-09-21T00:00:00.000Z",
+                "cwd": beta.to_string_lossy(),
+            })
+        ),
+    )
+    .expect("write switch target");
+    client.send_command(
+        "s1",
+        json!({
+            "type": "switch_session",
+            "activeSessionId": session_id,
+            "sessionPath": target.to_string_lossy(),
+        }),
+    );
+    let switched = client.read_response("s1");
+    assert_eq!(
+        switched["success"], true,
+        "switch_session failed: {switched}"
+    );
+
+    // The post-switch turn runs the cell on the rebuilt session's kernel:
+    // the cwd the tools see is the target session's recorded cwd.
+    run_turn(&mut client, &session_id, "print the cwd", "t1");
+    let observed = await_receipt_text(&receipt);
+    assert_eq!(
+        observed,
+        beta.to_string_lossy(),
+        "the switched-to session's kernel kept the worker's original cwd"
     );
 }
 
