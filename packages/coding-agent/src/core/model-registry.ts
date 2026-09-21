@@ -623,9 +623,11 @@ export class ModelRegistry {
 				// The file was absent across the whole read: the empty custom-model
 				// result is deterministic, so absence is a stable identity.
 				this.modelsJsonIdentity = undefined;
-			} else if (modelsJsonIdentity && after && isSameCatalogFileIdentity(modelsJsonIdentity, after)) {
+			} else if (!error && modelsJsonIdentity && after && isSameCatalogFileIdentity(modelsJsonIdentity, after)) {
 				this.modelsJsonIdentity = after;
 			} else {
+				// A failed read or parse is not a catalog build: the next refresh
+				// re-reads the file instead of pinning the empty result.
 				this.modelsJsonIdentity = "unstable";
 			}
 		}
