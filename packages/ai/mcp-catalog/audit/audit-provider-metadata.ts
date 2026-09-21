@@ -664,7 +664,7 @@ interface CatalogEntryShape {
 
 async function main(): Promise<void> {
 	const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-	const catalogPath = path.resolve(scriptDir, "../../src/mcp/catalog.json");
+	const catalogPath = path.resolve(scriptDir, "../../../coding-agent/catalog/mcp-services.bundled.json");
 	const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8")) as { entries: CatalogEntryShape[] };
 	const targets = catalog.entries
 		.filter((entry) => entry.transport.type === "http" || entry.transport.type === "sse")

@@ -1,7 +1,10 @@
 # MCP service catalog sources
 
-This directory holds the inputs for the MCP service catalog shipped at
-`packages/ai/src/mcp/catalog.json`:
+This directory holds historical MCP service-catalog import inputs. The old
+compiled `packages/ai/src/mcp/catalog.json` is no longer shipped; the runtime
+uses the tiny inline fallback in `packages/ai/src/mcp/catalog.ts`, the bundled
+asset at `packages/coding-agent/catalog/mcp-services.bundled.json`, and remote
+refreshes from `PrimeIntellect-ai/prime-agent-catalog`.
 
 - `sources/openai-plugins.json` — pinned snapshot of the 25 remote
   account/SaaS/cloud service MCP configs in OpenAI's public plugins catalog
@@ -18,8 +21,9 @@ This directory holds the inputs for the MCP service catalog shipped at
 
 ## Import rules
 
-`npx tsx packages/ai/scripts/import-mcp-catalog.ts` (run from the repo root)
-rebuilds the catalog offline and deterministically:
+The deleted one-time importer used these rules to rebuild the old compiled
+catalog offline and deterministically. Catalog generation now lives in
+`PrimeIntellect-ai/prime-agent-catalog`:
 
 - Each upstream server config becomes a record. Remote streamable HTTP servers
   are grouped by a reviewed endpoint key (lowercased host, trailing slash and
@@ -98,9 +102,9 @@ rebuilds the catalog offline and deterministically:
 - Everything except the pre-existing `linear`/`notion` integrations ships
   `verification: "unverified"`. Import success is never a readiness claim.
 
-The committed `catalog.json` must always equal the importer output; the
-regression test in `packages/ai/test/mcp-catalog.test.ts` rebuilds it from
-these fixtures and fails on drift.
+The committed runtime fallback must stay tiny: `packages/ai/test/mcp-catalog.test.ts`
+asserts that `packages/ai/src/mcp/catalog.ts` only reserves the legacy Linear and
+Notion built-ins.
 
 ## Read-only public metadata audit
 
