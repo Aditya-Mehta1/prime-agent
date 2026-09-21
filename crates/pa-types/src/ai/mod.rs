@@ -461,6 +461,11 @@ pub struct Usage {
 pub enum StopReason {
     Stop,
     Length,
+    /// Terminal reason of a turn that ended in tool calls. Deserialization
+    /// also accepts the raw OpenAI wire value `tool_calls` (TS's loader
+    /// keeps any `stopReason` string, so a session file written by the TS
+    /// product or a foreign tool never loses its assistant rows).
+    #[serde(alias = "tool_calls")]
     ToolUse,
     Error,
     Aborted,
@@ -574,6 +579,12 @@ pub struct AssistantMessage {
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultMessage {
     pub tool_call_id: String,
+    /// The tool's name. The product always writes it, but a session file
+    /// from a foreign tool or an older build may omit it — the TS loader
+    /// keeps such rows (an undefined name renders empty), so the field
+    /// defaults instead of degrading the whole entry. An empty name is not
+    /// re-serialized, keeping the round trip lossless against the source.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tool_name: String,
     pub content: Vec<UserContentBlock>,
     /// Structured details for logs or UI rendering.

@@ -673,14 +673,18 @@ class PerfWave:
 
     # -- dimension: compaction on a large session ---------------------------------
     #
-    # PARITY NOTE (found by this wave, 2026-09-21): growing the session by
-    # `import_jsonl` makes the TS daemon compact it, while the Rust daemon
-    # answers "Session is too short to compact" — the imported rows reach
-    # the provider context (the next request carries them) but not the
-    # engine's compaction view. That gap is reported to the owning lane;
-    # the benchmark grows both sides identically through `prompt_and_wait`
-    # turns (the f7 battery pattern, compactable on both products), so the
-    # measured pipeline is comparable.
+    # PARITY NOTE (found by this wave, 2026-09-21; fixed by the
+    # import-compaction lane, see crates/pa-daemon/tests/
+    # import_compaction_e2e.rs): growing the session by `import_jsonl`
+    # used to make the TS daemon compact it while the Rust daemon answered
+    # "Session is too short to compact". Root cause: the Rust session-file
+    # parse degraded whole message rows to Unknown on fields the TS loader
+    # tolerates (the raw provider stopReason "tool_calls", a missing
+    # toolName), so the compaction walk under-counted and found no cut with
+    # history. The wire parse now keeps those rows (pa-types), and the e2e
+    # locks the whole flow. The benchmark still grows both sides
+    # identically through `prompt_and_wait` turns (the f7 battery pattern),
+    # so the measured pipeline is comparable.
 
     COMPACT_GROW_TURNS = 40
     # ~3k tokens of deterministic text per turn -> ~120k tokens of history,

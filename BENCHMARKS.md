@@ -93,15 +93,20 @@ is `scripts/battery/run_perf_wave.sh`).
 
 ### Findings the wave surfaced
 
-1. **Compaction parity gap (Rust)**: growing a daemon session through
-   `import_jsonl` makes the TS daemon compact it, while the Rust daemon
-   answers `Session is too short to compact` — the imported rows reach
-   the provider context (the next request carries all 4.5k messages) but
-   not the engine's compaction view. Reproduced twice on `main` in the
-   perf sandbox (2026-09-21); the benchmark grows sessions through live
-   `prompt_and_wait` turns instead (identical on both sides), and the gap
-   is reported for the compaction-owning lane to verify against the TS
-   binary.
+1. **Compaction parity gap (Rust, FIXED)**: growing a daemon session
+   through `import_jsonl` made the TS daemon compact it while the Rust
+   daemon answered `Session is too short to compact`. Root-caused by the
+   import-compaction lane against the TS binary: the Rust session-file
+   parse degraded whole message rows to `Unknown` on fields the TS loader
+   tolerates (the raw provider `stopReason: "tool_calls"`, a tool result
+   without `toolName`), so the compaction walk under-counted, found no cut
+   with history inside the default 20k-token keep window, and refused
+   while the provider request still carried the surviving rows. Fixed in
+   the pa-types wire parse (tolerant deserialization) and locked by
+   `crates/pa-daemon/tests/import_compaction_e2e.rs` (red before the fix,
+   green after; the TS binary compacts the same import). The benchmark
+   keeps growing sessions through live `prompt_and_wait` turns (identical
+   on both sides), so the measured pipeline stays comparable.
 2. **First-touch kernel provisioning costs ~7 s on both sides** (the first
    session in a fresh agent dir installs the kernel runtime into a fresh
    venv). Both products pay it on the first ipython cell of a fresh
