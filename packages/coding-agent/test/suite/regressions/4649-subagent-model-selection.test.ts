@@ -61,7 +61,10 @@ describe("ENG-4649 subagent model selection", () => {
 	});
 
 	it("checks provider auth once per provider when resolving the authenticated catalog", async () => {
-		const harness = await createHarness({ provider, models: Array.from({ length: 5 }, (_, index) => ({ id: `model-${index}` })) });
+		const harness = await createHarness({
+			provider,
+			models: Array.from({ length: 5 }, (_, index) => ({ id: `model-${index}` })),
+		});
 		try {
 			const statusSpy = vi.spyOn(harness.session.modelRegistry, "getProviderAuthStatus");
 			const found = await harness.session.findRlmModels("model", 20);

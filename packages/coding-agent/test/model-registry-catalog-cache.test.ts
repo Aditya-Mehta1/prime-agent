@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
@@ -34,7 +34,9 @@ vi.mock("node:crypto", async (importOriginal) => {
 		}) as typeof actual.createHash,
 	};
 });
-const cacheFingerprint = createHmac("sha256", "k").update("prime-agent:private-prime-authorization:v1\0t").digest("hex");
+const cacheFingerprint = createHmac("sha256", "k")
+	.update("prime-agent:private-prime-authorization:v1\0t")
+	.digest("hex");
 const counted = (map: Map<string, number>, path: string) => map.get(path) ?? 0;
 const touch = (path: string, iso: string) => utimesSync(path, new Date(iso), new Date(iso));
 
@@ -48,7 +50,9 @@ describe("model registry catalog and auth-source caching", () => {
 		tempDir = mkdtempSync(join(tmpdir(), "pi-test-catalog-cache-"));
 		modelsJsonPath = join(tempDir, "models.json");
 		privateCachePath = join(tempDir, "prime-inference-private-models.json");
-		authStorage = AuthStorage.inMemory({ "prime-inference": { type: "api_key", key: "k", primeTeam: { teamId: "t", name: "n" } } });
+		authStorage = AuthStorage.inMemory({
+			"prime-inference": { type: "api_key", key: "k", primeTeam: { teamId: "t", name: "n" } },
+		});
 		vi.stubEnv("PRIME_API_KEY", undefined);
 		vi.stubEnv("PRIME_TEAM_ID", undefined);
 		vi.stubEnv("PI_OFFLINE", "1");
@@ -61,8 +65,15 @@ describe("model registry catalog and auth-source caching", () => {
 	});
 
 	function writePrivateCache(displayName: string, mtimeIso: string): void {
-		const entry = { id: "internal/glm-5.2-fast", display_name: displayName, pricing: { input_usd_per_mtok: 1, output_usd_per_mtok: 2 } };
-		writeFileSync(privateCachePath, JSON.stringify({ fingerprint: cacheFingerprint, data: [entry], refreshedAt: Date.now() }));
+		const entry = {
+			id: "internal/glm-5.2-fast",
+			display_name: displayName,
+			pricing: { input_usd_per_mtok: 1, output_usd_per_mtok: 2 },
+		};
+		writeFileSync(
+			privateCachePath,
+			JSON.stringify({ fingerprint: cacheFingerprint, data: [entry], refreshedAt: Date.now() }),
+		);
 		touch(privateCachePath, mtimeIso);
 	}
 
