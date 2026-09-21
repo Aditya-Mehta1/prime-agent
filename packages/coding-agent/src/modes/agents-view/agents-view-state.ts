@@ -430,7 +430,7 @@ export interface UnifiedSessionIndex {
 }
 
 export interface AgentsViewRecursiveRollup {
-	/** Own cost plus every descendant's cost. */
+	/** Own cost plus every descendant's cost, deleted subagents included. */
 	cost: number;
 	/** Total descendant sessions (resident + passive) under this record. */
 	descendantCount: number;
@@ -454,7 +454,12 @@ export function computeRecursiveRollups(
 	const rollups = new Map<UnifiedSessionRecord, AgentsViewRecursiveRollup>();
 	for (let position = order.length - 1; position >= 0; position--) {
 		const record = order[position]!;
-		let cost = record.daemon?.usage?.cost ?? record.saved?.usage?.cost ?? 0;
+		// Deleted subagents keep no row, and their spend is already subtracted
+		// from the parent's own usage by the attribution entries: without this
+		// term a deletion erases the money from the subtree total.
+		let cost =
+			(record.daemon?.usage?.cost ?? record.saved?.usage?.cost ?? 0) +
+			(record.saved?.deletedDescendantUsage?.cost ?? 0);
 		let descendantCount = 0;
 		for (const child of index.childrenByParent.get(record) ?? []) {
 			if (!isSubagentDescendantRecord(child, record)) continue;

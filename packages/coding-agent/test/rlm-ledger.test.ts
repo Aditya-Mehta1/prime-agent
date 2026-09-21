@@ -48,7 +48,9 @@ import {
 	RlmSpawnLedger,
 	readLegacyRlmSubagentRegistry,
 	rlmLedgerPath,
+	withPassiveRlmDescendantInfos,
 } from "../src/modes/daemon/rlm-ledger.js";
+import { deserializeSavedSessionInfo, serializeSavedSessionInfo } from "../src/modes/daemon/saved-session-info.js";
 
 const { SessionManager } = sessionManagerModule;
 
@@ -1189,6 +1191,160 @@ describe("passive descendants in the saved catalog", () => {
 			expect(await list(otherDir)).toEqual([otherParent.getSessionId()]);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("deleted descendant usage", () => {
+	function appendSpend(manager: ReturnType<typeof makeChildSession>["manager"], cost: number, tokens: number): void {
+		manager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "spend" }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "test",
+			usage: {
+				input: tokens,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: tokens + 1,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		manager.flushNow();
+	}
+
+	it("folds nested tombstone spend and never bills live or vanished rows", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-deleted-usage-"));
+		try {
+			const { sessionsDir, parent, parentFile } = makeRoots(root);
+			const parentArtifactDir = parent.getSessionArtifactDir();
+			if (!parentArtifactDir) throw new Error("Missing parent artifact directory");
+			const deletedChild = makeChildSession(root, join(parentArtifactDir, "sub-11111111"), parentFile, 1, "gone");
+			appendSpend(deletedChild.manager, 0.4, 50);
+			const deletedGrandchild = makeChildSession(
+				root,
+				join(parentArtifactDir, "sub-11111111", "sub-22222222"),
+				deletedChild.file,
+				2,
+				"also-gone",
+			);
+			appendSpend(deletedGrandchild.manager, 0.1, 10);
+			const liveChild = makeChildSession(root, join(parentArtifactDir, "sub-33333333"), parentFile, 1, "kept");
+			appendSpend(liveChild.manager, 0.2, 20);
+			const liveGrandchildOfDeletedChild = makeChildSession(
+				root,
+				join(parentArtifactDir, "sub-11111111", "sub-44444444"),
+				deletedChild.file,
+				2,
+				"survivor",
+			);
+			appendSpend(liveGrandchildOfDeletedChild.manager, 0.3, 30);
+			const vanishedChild = makeChildSession(
+				root,
+				join(parentArtifactDir, "sub-55555555"),
+				parentFile,
+				1,
+				"vanished",
+			);
+			const ledger = new RlmSpawnLedger(root, sessionsDir);
+			await ledger.appendSpawn({
+				childId: "sub-11111111",
+				parent: parentFile,
+				child: deletedChild.file,
+				depth: 1,
+				name: "gone",
+			});
+			await ledger.appendSpawn({
+				childId: "sub-22222222",
+				parent: deletedChild.file,
+				child: deletedGrandchild.file,
+				depth: 2,
+				name: "also-gone",
+			});
+			await ledger.appendSpawn({
+				childId: "sub-33333333",
+				parent: parentFile,
+				child: liveChild.file,
+				depth: 1,
+				name: "kept",
+			});
+			await ledger.appendSpawn({
+				childId: "sub-44444444",
+				parent: deletedChild.file,
+				child: liveGrandchildOfDeletedChild.file,
+				depth: 2,
+				name: "survivor",
+			});
+			await ledger.appendSpawn({
+				childId: "sub-55555555",
+				parent: parentFile,
+				child: vanishedChild.file,
+				depth: 1,
+				name: "vanished",
+			});
+			await ledger.appendDelete({ childId: "sub-11111111", child: deletedChild.file, reason: "user" });
+			await ledger.appendDelete({ childId: "sub-22222222", child: deletedGrandchild.file, reason: "user" });
+			await ledger.appendDelete({ childId: "sub-55555555", child: vanishedChild.file, reason: "user" });
+			rmSync(vanishedChild.file);
+
+			const byParent = await ledger.deletedDescendantUsageByParent();
+			expect(byParent.get(canonicalSessionPath(parentFile))).toEqual({
+				inputTokens: 60,
+				outputTokens: 2,
+				cost: 0.5,
+			});
+			expect(byParent.get(canonicalSessionPath(deletedChild.file))).toEqual({
+				inputTokens: 10,
+				outputTokens: 1,
+				cost: 0.1,
+			});
+			expect(byParent.has(canonicalSessionPath(liveChild.file))).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("attaches tombstone spend to catalog rows and the saved-session wire shape", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-deleted-wire-"));
+		try {
+			const { sessionsDir, parent, parentFile } = makeRoots(root);
+			const parentArtifactDir = parent.getSessionArtifactDir();
+			if (!parentArtifactDir) throw new Error("Missing parent artifact directory");
+			const deletedChild = makeChildSession(root, join(parentArtifactDir, "sub-11111111"), parentFile, 1, "gone");
+			appendSpend(deletedChild.manager, 0.4, 50);
+			const liveChild = makeChildSession(root, join(parentArtifactDir, "sub-22222222"), parentFile, 1, "kept");
+			const ledger = new RlmSpawnLedger(root, sessionsDir);
+			await ledger.appendSpawn({
+				childId: "sub-11111111",
+				parent: parentFile,
+				child: deletedChild.file,
+				depth: 1,
+				name: "gone",
+			});
+			await ledger.appendSpawn({
+				childId: "sub-22222222",
+				parent: parentFile,
+				child: liveChild.file,
+				depth: 1,
+				name: "kept",
+			});
+			await ledger.appendDelete({ childId: "sub-11111111", child: deletedChild.file, reason: "user" });
+
+			const parentInfo = await sessionManagerModule.readSessionInfo(parentFile);
+			if (!parentInfo) throw new Error("Missing parent session info");
+			const merged = await withPassiveRlmDescendantInfos([parentInfo], ledger);
+			expect(merged).toHaveLength(2);
+			expect(merged[0]?.deletedDescendantUsage).toEqual({ inputTokens: 50, outputTokens: 1, cost: 0.4 });
+			expect(merged[1]).toMatchObject({ parentSessionPath: canonicalSessionPath(parentFile), rlmDepth: 1 });
+			expect(merged[1]?.deletedDescendantUsage).toBeUndefined();
+			const roundTrip = deserializeSavedSessionInfo(serializeSavedSessionInfo(merged[0]!));
+			expect(roundTrip.deletedDescendantUsage).toEqual({ inputTokens: 50, outputTokens: 1, cost: 0.4 });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 });

@@ -258,6 +258,9 @@ export interface SessionInfo {
 	allMessagesText: string;
 	agentStatus?: AgentStatus;
 	usage?: SessionUsageSummary;
+
+	/** Recursive spend of ledger-tombstoned descendants; folded into agents-view subtree costs. */
+	deletedDescendantUsage?: SessionUsageSummary;
 }
 
 export type ReadonlySessionManager = Pick<

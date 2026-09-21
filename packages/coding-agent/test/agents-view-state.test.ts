@@ -644,6 +644,48 @@ describe("agents view state", () => {
 		expect(afterRollup?.descendantCount).toBe(1);
 	});
 
+	test("bills deleted subagents' spend to the parent that spent them", () => {
+		const parent = makeSummary({
+			id: "parent-active",
+			activeSessionId: "parent-active",
+			sessionId: "parent-session",
+			sessionFile: "/tmp/project/parent.jsonl",
+			usage: { inputTokens: 100, outputTokens: 10, cost: 0.42 },
+		});
+		const child = makeSummary({
+			id: "child-active",
+			activeSessionId: "child-active",
+			sessionId: "child-session",
+			sessionFile: "/tmp/project/child.jsonl",
+			runtimeKind: "subagent",
+			parentActiveSessionId: "parent-active",
+			usage: { inputTokens: 50, outputTokens: 5, cost: 0.68 },
+		});
+		// The deleted subagent keeps no row; its spend rides the parent's saved record.
+		const records = reconcileUnifiedSessions(
+			[parent, child],
+			[
+				makeSessionInfo({
+					path: "/tmp/project/parent.jsonl",
+					id: "parent-session",
+					usage: { inputTokens: 100, outputTokens: 10, cost: 0.42 },
+					deletedDescendantUsage: { inputTokens: 30, outputTokens: 3, cost: 0.3 },
+				}),
+				makeSessionInfo({
+					path: "/tmp/project/child.jsonl",
+					id: "child-session",
+					parentSessionPath: "/tmp/project/parent.jsonl",
+					rlmDepth: 1,
+					usage: { inputTokens: 50, outputTokens: 5, cost: 0.68 },
+				}),
+			],
+		);
+
+		const rollup = computeRecursiveRollups(records).get(records[0]!);
+		expect(rollup?.cost).toBeCloseTo(1.4);
+		expect(rollup?.descendantCount).toBe(1);
+	});
+
 	test("rolls up spawned subagents but never a branched session's copied lineage", () => {
 		const source = makeSummary({
 			id: "src",
@@ -2021,6 +2063,7 @@ function makeSessionInfo(overrides: Partial<SessionInfo> & { path: string; id: s
 		allMessagesText: overrides.allMessagesText ?? "hello",
 		agentStatus: overrides.agentStatus,
 		usage: overrides.usage,
+		deletedDescendantUsage: overrides.deletedDescendantUsage,
 	};
 }
 

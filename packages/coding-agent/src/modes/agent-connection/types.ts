@@ -136,6 +136,8 @@ export interface AgentConnectionSavedSessionInfo {
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
 	usage?: SessionUsageSummary;
+	/** Recursive spend of ledger-tombstoned descendants; folded into agents-view subtree costs. */
+	deletedDescendantUsage?: SessionUsageSummary;
 }
 
 export type AgentConnectionSessionListProgress = (loaded: number, total: number) => void;

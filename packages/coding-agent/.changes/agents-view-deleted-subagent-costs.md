@@ -1,0 +1,1 @@
+- Fixed agents-view session costs dropping the spend of deleted subagents; their cost now folds back into the parent row's total, matching in-session /context.

@@ -15,6 +15,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { EventLog } from "../../core/event-log.js";
 import { canonicalSessionPath } from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
+import type { SessionUsageSummary } from "../../core/usage.js";
 import { readFirstLineSync } from "../../utils/file-lines.js";
 
 /**
@@ -488,6 +489,99 @@ export class RlmSpawnLedger {
 		return this.enqueue(() => this.liveEdgesUnlocked());
 	}
 
+	/**
+	 * Recursive spend of tombstoned descendants, keyed by parent session path.
+	 * A deleted subagent keeps no row anywhere, and its spend is subtracted
+	 * from the parent's own usage by the attribution entries, so nothing
+	 * re-adds it once its edge dies. This folds it back per family so cost
+	 * rollups can bill it to the parent that spent it.
+	 */
+	deletedDescendantUsageByParent(): Promise<Map<string, SessionUsageSummary>> {
+		return this.enqueue(() => this.deletedDescendantUsageByParentUnlocked());
+	}
+
+	private async deletedDescendantUsageByParentUnlocked(): Promise<Map<string, SessionUsageSummary>> {
+		const edges = [...this.replaySync().values()];
+		const liveChildPaths = new Set<string>();
+		for (const edge of edges) {
+			if (!edge.deleted) liveChildPaths.add(canonicalSessionPath(edge.child));
+		}
+		// First-writer-wins per path: a corrupt raced ledger must not bill one
+		// tombstone to two parents.
+		const tombstonedChildrenByParent = new Map<string, string[]>();
+		const claimedByParent = new Map<string, string>();
+		for (const edge of edges) {
+			if (!edge.deleted) continue;
+			const childPath = canonicalSessionPath(edge.child);
+			if (liveChildPaths.has(childPath) || claimedByParent.has(childPath)) continue;
+			const parentPath = canonicalSessionPath(edge.parent);
+			claimedByParent.set(childPath, parentPath);
+			const children = tombstonedChildrenByParent.get(parentPath) ?? [];
+			children.push(childPath);
+			tombstonedChildrenByParent.set(parentPath, children);
+		}
+		// Iterative post-order fold (a pathological ledger chain must not
+		// overflow the stack): own spend plus tombstoned descendants' folds,
+		// memoized per path.
+		const contributionByChild = new Map<string, SessionUsageSummary>();
+		const onStack = new Set<string>();
+		for (const children of tombstonedChildrenByParent.values()) {
+			for (const rootChild of children) {
+				if (contributionByChild.has(rootChild)) continue;
+				const stack = [rootChild];
+				onStack.add(rootChild);
+				while (stack.length > 0) {
+					const current = stack.at(-1)!;
+					if (contributionByChild.has(current)) {
+						stack.pop();
+						onStack.delete(current);
+						continue;
+					}
+					const pending = (tombstonedChildrenByParent.get(current) ?? []).filter(
+						(path) => !contributionByChild.has(path) && !onStack.has(path),
+					);
+					if (pending.length > 0) {
+						stack.push(...pending);
+						for (const path of pending) onStack.add(path);
+						continue;
+					}
+					stack.pop();
+					onStack.delete(current);
+					const total = { inputTokens: 0, outputTokens: 0, cost: 0 };
+					const info = await readSessionInfo(current).catch(() => null);
+					if (info?.usage) {
+						total.inputTokens += info.usage.inputTokens;
+						total.outputTokens += info.usage.outputTokens;
+						total.cost += info.usage.cost;
+					}
+					for (const descendant of tombstonedChildrenByParent.get(current) ?? []) {
+						const folded = contributionByChild.get(descendant);
+						if (!folded) continue;
+						total.inputTokens += folded.inputTokens;
+						total.outputTokens += folded.outputTokens;
+						total.cost += folded.cost;
+					}
+					contributionByChild.set(current, total);
+				}
+			}
+		}
+		const usageByParent = new Map<string, SessionUsageSummary>();
+		for (const [parentPath, children] of tombstonedChildrenByParent) {
+			const total = { inputTokens: 0, outputTokens: 0, cost: 0 };
+			for (const child of children) {
+				const folded = contributionByChild.get(child);
+				if (!folded) continue;
+				total.inputTokens += folded.inputTokens;
+				total.outputTokens += folded.outputTokens;
+				total.cost += folded.cost;
+			}
+			if (total.inputTokens > 0 || total.outputTokens > 0 || total.cost > 0) {
+				usageByParent.set(parentPath, total);
+			}
+		}
+		return usageByParent;
+	}
+
 	private async liveEdgesUnlocked(
 		edges = [...this.replaySync().values()].filter((edge) => !edge.deleted),
 	): Promise<RlmLedgerEdge[]> {
@@ -769,12 +863,23 @@ export async function withPassiveRlmDescendantInfos(
 	const sessions = [...savedSessions];
 	const seen = new Set(savedSessions.map((info) => canonicalSessionPath(info.path)));
 	let edges: RlmLedgerEdge[];
+	let deletedUsageByParent: Map<string, SessionUsageSummary>;
 	try {
 		edges = await ledger.liveEdges();
+		deletedUsageByParent = await ledger.deletedDescendantUsageByParent();
 	} catch (error) {
 		// A broken ledger must not take the whole catalog down with it.
 		options.log?.(`Could not merge passive RLM descendants: ${String(error)}`);
 		return sessions;
+	}
+	// Every row - scanned or merged below - carries its tombstoned descendants'
+	// spend so recursive cost rollups bill deleted subagents to the parent
+	// that spent them.
+	const deletedUsageFor = (path: string): SessionUsageSummary | undefined =>
+		deletedUsageByParent.get(canonicalSessionPath(path));
+	for (const [index, session] of sessions.entries()) {
+		const deletedUsage = deletedUsageFor(session.path);
+		if (deletedUsage) sessions[index] = { ...session, deletedDescendantUsage: deletedUsage };
 	}
 	for (const edge of edges) {
 		const childPath = canonicalSessionPath(edge.child);
@@ -785,10 +890,12 @@ export async function withPassiveRlmDescendantInfos(
 		if (options.cwd !== undefined && (!info.cwd || resolve(info.cwd) !== resolve(options.cwd))) continue;
 		// The ledger edge is the authoritative topology (family() semantics); a fork
 		// can leave the transcript header pointing at a dead ancestor path.
+		const deletedUsage = deletedUsageFor(childPath);
 		const merged: SessionInfo = {
 			...info,
 			parentSessionPath: edge.parent,
 			rlmDepth: edge.depth,
+			...(deletedUsage ? { deletedDescendantUsage: deletedUsage } : {}),
 		};
 		sessions.push(merged);
 		options.onSession?.(merged);
