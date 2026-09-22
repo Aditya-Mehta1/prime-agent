@@ -1,8 +1,13 @@
 //! Session entry parsing, migration, context reconstruction, and tree.
+mod reverse_scanner;
+mod window_loader;
 pub mod discovery;
 pub mod manager;
 pub mod manager_ext;
 pub mod tree;
+
+pub use reverse_scanner::{ReverseJsonlScanner, ScanOutcome};
+pub use window_loader::{load_session_window, SessionWindow, WindowSource};
 
 use std::collections::HashMap;
 
@@ -275,7 +280,36 @@ pub fn get_latest_compaction_entry(entries: &[FileEntry]) -> Option<&CompactionE
     })
 }
 
+/// The pipeline's transcript push rule, shared by `build_session_context`
+/// and the window loader: message rows push their message, custom-message
+/// rows rejoin as wire messages, non-empty branch summaries push. Returns
+/// whether the entry pushed a message.
+fn append_context_message(entry: &FileEntry, target: &mut Vec<AgentMessage>) -> bool {
+    match entry {
+        FileEntry::Message { message, .. } => {
+            target.push(message.clone());
+            true
+        }
+        FileEntry::CustomMessage { payload, .. } => {
+            target.push(AgentMessage::Custom(create_custom_message(payload, entry)));
+            true
+        }
+        FileEntry::BranchSummary { payload, .. } if !payload.summary.is_empty() => {
+            target.push(AgentMessage::BranchSummary(
+                pa_types::session::BranchSummaryMessage {
+                    summary: payload.summary.clone(),
+                    from_id: payload.from_id.clone(),
+                    timestamp: timestamp_to_millis(entry.timestamp()),
+                },
+            ));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Reconstructed conversation state at a leaf.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionContext {
     pub messages: Vec<AgentMessage>,
     pub thinking_level: String,
@@ -338,22 +372,6 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
     }
 
     let mut messages: Vec<AgentMessage> = Vec::new();
-    let append_message = |entry: &FileEntry, target: &mut Vec<AgentMessage>| match entry {
-        FileEntry::Message { message, .. } => target.push(message.clone()),
-        FileEntry::CustomMessage { payload, .. } => {
-            target.push(AgentMessage::Custom(create_custom_message(payload, entry)));
-        }
-        FileEntry::BranchSummary { payload, .. } if !payload.summary.is_empty() => {
-            target.push(AgentMessage::BranchSummary(
-                pa_types::session::BranchSummaryMessage {
-                    summary: payload.summary.clone(),
-                    from_id: payload.from_id.clone(),
-                    timestamp: timestamp_to_millis(entry.timestamp()),
-                },
-            ));
-        }
-        _ => {}
-    };
 
     if let Some(compaction_index) = compaction {
         let payload = match &entries[compaction_index] {
@@ -370,7 +388,7 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
                 found_first_kept = true;
             }
             if found_first_kept {
-                append_message(&entries[index], &mut retained);
+                append_context_message(&entries[index], &mut retained);
             }
         }
         messages.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
@@ -383,11 +401,11 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
         }));
         messages.extend(retained);
         for &index in &path[path.partition_point(|&i| i <= compaction_index)..] {
-            append_message(&entries[index], &mut messages);
+            append_context_message(&entries[index], &mut messages);
         }
     } else {
         for &index in &path {
-            append_message(&entries[index], &mut messages);
+            append_context_message(&entries[index], &mut messages);
         }
     }
 
