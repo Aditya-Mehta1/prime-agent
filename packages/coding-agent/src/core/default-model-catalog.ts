@@ -14,14 +14,7 @@ function getDefaultModelCache(): CatalogCache<string> {
 	defaultModelCache ??= new CatalogCache(
 		DEFAULT_MODEL_CATALOG_URL,
 		join(getAgentDir(), "default-model.v1.json"),
-		(payload) => {
-			const parsed = payload as { schemaVersion?: unknown; defaultModel?: unknown };
-			if (parsed.schemaVersion !== 1) throw new Error("Unsupported default-model catalog version");
-			if (typeof parsed.defaultModel !== "string" || !DEFAULT_MODEL_ID_PATTERN.test(parsed.defaultModel)) {
-				throw new Error("Invalid default-model catalog entry");
-			}
-			return parsed.defaultModel;
-		},
+		(payload) => parseDefaultModelCatalog(payload),
 	);
 	return defaultModelCache;
 }

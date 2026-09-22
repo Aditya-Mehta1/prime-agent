@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -23,8 +23,7 @@ describe("catalog-defined default model", () => {
 		const root = mkdtempSync(join(tmpdir(), "default-model-catalog-"));
 		cacheRoots.push(root);
 		const agentDir = join(root, "agent");
-		writeFileSync(join(agentDir, "..", "auth.json"), "{}");
-		vi.stubEnv("PRIME_AGENT_DIR", agentDir);
+		vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", agentDir);
 
 		vi.stubGlobal(
 			"fetch",
