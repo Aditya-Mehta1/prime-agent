@@ -429,7 +429,10 @@ interface PrivatePrimeAuthorizationCache {
 	refreshedAt: number;
 }
 
-/** Stat identity of a catalog file; equality means a cached parse is still current (sessionScanStates/cron catalog precedent). */
+/**
+ * Stat identity of a catalog file; equality means a cached parse is still current
+ * (sessionScanStates/cron catalog precedent).
+ */
 interface CatalogFileIdentity {
 	dev: number;
 	ino: number;
@@ -489,7 +492,10 @@ export class ModelRegistry {
 	private privatePrimeAuthorizationCacheSnapshot:
 		| { identity: CatalogFileIdentity; cache: PrivatePrimeAuthorizationCache | undefined }
 		| undefined;
-	/** models.json identity the current catalog was built from: undefined = absent at both bracket stats (or no path), "unstable" = raced write or failed read/parse. */
+	/**
+	 * models.json identity the current catalog was built from: undefined = absent at both bracket stats
+	 * (or no path), "unstable" = raced write or failed read/parse.
+	 */
 	private modelsJsonIdentity: CatalogFileIdentity | "unstable" | undefined = "unstable";
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
@@ -1016,7 +1022,8 @@ export class ModelRegistry {
 		if (cached?.fingerprint === fingerprint) {
 			// Serve the credential-scoped cache so startup and model lists don't
 			// block on the network. Stale entries refresh in the background.
-			// cached.models is reference-stable while its file is unchanged, so an equal reference, same team, and unchanged models.json means nothing changed.
+			// cached.models is reference-stable while its file is unchanged, so an equal reference, same team,
+			// and unchanged models.json means nothing changed.
 			const authorizationUnchanged =
 				this.authorizedPrivatePrimeInferenceModels === cached.models &&
 				this.authorizedPrivatePrimeInferenceTeamId === teamId &&

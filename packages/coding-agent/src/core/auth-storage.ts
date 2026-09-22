@@ -113,7 +113,10 @@ type AuthSourceCandidateMemo = {
 	candidate: AuthSourceCandidate;
 };
 
-/** Memo key marker for values that must never be hashed: command-backed keys (the memo must never force the exec) and static MCP tokens. */
+/**
+ * Memo key marker for values that must never be hashed: command-backed keys (the memo must never force
+ * the exec) and static MCP tokens.
+ */
 const AUTH_SOURCE_LAZY_VALUE_KEY = "value-lazy";
 
 type AuthApiKeyResult = {
