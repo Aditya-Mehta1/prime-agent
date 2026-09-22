@@ -158,10 +158,11 @@ describe("ENG-4649 subagent model selection", () => {
 			.mockRejectedValueOnce(new Error("offline"));
 		const fetchModels = vi.fn((input: string | URL | Request) => {
 			const url = String(input);
-			// The provider catalog refresh runs in the background; reject it so the
-			// codex discovery under test is the only source of codex models.
-			if (url.includes("prime-agent-catalog/main/models/catalog.v1.json")) {
-				return Promise.reject(new Error("provider catalog offline"));
+			// Catalog refreshes (provider catalog, default-model pointer) run in the
+			// background; reject them so the codex discovery under test is the only
+			// source of codex models.
+			if (url.includes("prime-agent-catalog/main/")) {
+				return Promise.reject(new Error("catalog refresh offline"));
 			}
 			return codexCatalogCalls();
 		});
