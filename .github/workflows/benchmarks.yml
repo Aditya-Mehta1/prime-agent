@@ -19,7 +19,7 @@ permissions: {}
 
 jobs:
   request:
-    if: github.event_name == 'pull_request_target' || github.ref == 'refs/heads/main'
+    if: (github.event_name == 'pull_request_target' || github.ref == 'refs/heads/main') && github.event.pull_request.base.ref != 'rust'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     concurrency:
