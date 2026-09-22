@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { SESSION_CWD_CHANGED_CUSTOM_TYPE } from "../../src/core/messages.js";
 import { createHarness, getMessageText } from "./harness.js";
@@ -36,6 +37,23 @@ describe("AgentSession.setCwd", () => {
 		} finally {
 			resumed.cleanup();
 			first.cleanup();
+		}
+	});
+
+	it("returns to the branch's directory when navigating before the /cwd entry", async () => {
+		const harness = await createHarness({ persistSession: true });
+		try {
+			harness.setResponses([fauxAssistantMessage("ok")]);
+			await harness.session.prompt("hi");
+			const before = harness.sessionManager.getEntries().at(-1)!;
+			const child = join(harness.tempDir, "child");
+			mkdirSync(child);
+			await harness.session.setCwd("child");
+			await harness.session.navigateTree(before.id, { summarize: false });
+			expect(harness.sessionManager.getCwd()).toBe(harness.tempDir);
+			expect(harness.eventsOfType("cwd_changed").map((event) => event.cwd)).toEqual([child, harness.tempDir]);
+		} finally {
+			harness.cleanup();
 		}
 	});
 

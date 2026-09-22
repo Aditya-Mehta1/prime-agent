@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -318,6 +318,7 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
+import { isExistingDirectory } from "./session-cwd.js";
 import type {
 	BranchSummaryEntry,
 	ChildUsageAttributionEntry,
@@ -1592,6 +1593,7 @@ export class AgentSession {
 	private _acpMcpTools: ToolDefinition[] = [];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private readonly _launchCwd: string;
 	private _agentDir?: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -1712,10 +1714,11 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
-		const persistedCwd = this._loadPersistedCwd();
-		if (persistedCwd && config.cwd === this.sessionManager.getHeader()?.cwd) {
-			this._cwd = persistedCwd;
-			this.sessionManager.setCwd(persistedCwd);
+		this._launchCwd = config.cwd;
+		const branchCwd = this._branchCwd();
+		if (branchCwd !== this._cwd) {
+			this._cwd = branchCwd;
+			this.sessionManager.setCwd(branchCwd);
 		}
 		this._agentDir = config.agentDir;
 		this._modelRegistry = config.modelRegistry;
@@ -2093,16 +2096,22 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/** Latest /cwd on the active branch, if that directory still exists. */
-	private _loadPersistedCwd(): string | undefined {
+	/** The cwd the active branch prescribes: its latest still-existing /cwd entry, else the launch cwd. */
+	private _branchCwd(): string {
+		if (this._launchCwd !== this.sessionManager.getHeader()?.cwd) return this._launchCwd;
 		const branch = this.sessionManager.getBranch();
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const entry = branch[i];
 			if (entry.type !== "custom" || entry.customType !== SESSION_CWD_STATE_CUSTOM_TYPE) continue;
 			const cwd = (entry.data as { cwd?: unknown } | undefined)?.cwd;
-			return typeof cwd === "string" && statSync(cwd, { throwIfNoEntry: false })?.isDirectory() ? cwd : undefined;
+			return typeof cwd === "string" && isExistingDirectory(cwd) ? cwd : this._launchCwd;
 		}
-		return undefined;
+		return this._launchCwd;
+	}
+
+	private async _reloadCwdFromBranch(): Promise<void> {
+		const cwd = this._branchCwd();
+		if (cwd !== this._cwd && isExistingDirectory(cwd)) await this._applyCwd(cwd);
 	}
 
 	private _resolveRlmMaxDepth(): {
@@ -14087,20 +14096,26 @@ export class AgentSession {
 		});
 	}
 
+	/** Point the kernel, the session state, and attached clients at `cwd`. */
+	private async _applyCwd(cwd: string): Promise<void> {
+		await this._ipythonKernelProvisioner?.setCwd(cwd);
+		this._cwd = cwd;
+		this.sessionManager.setCwd(cwd);
+		this._emit({ type: "cwd_changed", cwd });
+	}
+
 	/** Retarget this session's working directory; persisted on the branch so a resume restarts there. */
 	async setCwd(input: string): Promise<string> {
 		const cwd = resolve(this._cwd, expandTildePath(input.trim()));
-		if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Not a directory: ${cwd}`);
+		if (!isExistingDirectory(cwd)) throw new Error(`Not a directory: ${cwd}`);
 		// Holding the admission fence keeps a concurrent prompt from starting a turn under the kernel chdir.
 		const admissionFence = await this._acquireDirectTurnAdmissionFence();
 		try {
 			if (this.isStreaming) throw new Error("Cannot change the working directory while the agent is running.");
 			if (cwd === this._cwd) return cwd;
-			await this._ipythonKernelProvisioner?.setCwd(cwd);
-			this.sessionManager.appendCustomEntryWithRollback(SESSION_CWD_STATE_CUSTOM_TYPE, { cwd });
 			const previousCwd = this._cwd;
-			this._cwd = cwd;
-			this.sessionManager.setCwd(cwd);
+			await this._applyCwd(cwd);
+			this.sessionManager.appendCustomEntryWithRollback(SESSION_CWD_STATE_CUSTOM_TYPE, { cwd });
 			await this.sendCustomMessage(
 				{
 					customType: SESSION_CWD_CHANGED_CUSTOM_TYPE,
@@ -14110,7 +14125,6 @@ export class AgentSession {
 				},
 				{ deliverAs: "nextTurn" },
 			);
-			this._emit({ type: "cwd_changed", cwd });
 			return cwd;
 		} finally {
 			admissionFence.release();
@@ -14379,6 +14393,8 @@ export class AgentSession {
 				summaryEntry,
 				fromExtension: summaryText ? fromExtension : undefined,
 			});
+
+			await this._reloadCwdFromBranch();
 
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
