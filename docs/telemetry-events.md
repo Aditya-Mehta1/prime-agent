@@ -230,6 +230,16 @@ client run (adoption; later copies in the same run are not reported).
 |---|---|---|
 | `lines` | number | the copied text's line count |
 
+### `tui enhanced keys`
+
+The terminal enhanced-key modes settled for an interactive run (adoption:
+emitted once per client run when the kitty keyboard protocol answer lands).
+
+| property | type | notes |
+|---|---|---|
+| `kitty` | boolean | the kitty keyboard protocol is active (flags `1\|2\|4`) |
+| `modify_other_keys` | boolean | always `false` in this port: the xterm modifyOtherKeys mode-2 fallback is never armed (crossterm cannot parse the resulting `CSI 27;mods;key~` sequences — the whole input buffer drops on the parse error, the shift-modified-printable bug class); every surface start instead resets the mode. The property keeps the TS event shape. |
+
 ### `tui image pasted`
 
 An image was pasted into the input editor from the clipboard and attached

@@ -852,8 +852,42 @@ impl Default for KeybindingsManager {
     }
 }
 
-/// Format a key id for display in hints ("ctrl+o" -> "Ctrl+O", arrows to glyphs).
+/// The platform flavor used to label modifier keys in hints (TS
+/// `formatKeyPart`'s `platform` parameter, `process.platform` at the call
+/// sites): macOS terminals send the literal Control key, so `alt` is
+/// labeled `Option` and control is never relabeled as Cmd.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LabelPlatform {
+    /// `process.platform === "darwin"`: `alt` renders as `Option`.
+    Macos,
+    /// Every other platform: `alt` renders as `Alt`.
+    Other,
+}
+
+impl LabelPlatform {
+    /// The platform the binary is running on.
+    fn host() -> Self {
+        if std::env::consts::OS == "macos" {
+            Self::Macos
+        } else {
+            Self::Other
+        }
+    }
+
+    fn is_macos(self) -> bool {
+        matches!(self, Self::Macos)
+    }
+}
+
+/// Format a key id for display in hints ("ctrl+o" -> "Ctrl+O", arrows to
+/// glyphs; `alt` renders as `Option` on macOS, `Alt` elsewhere).
 pub fn format_key_text(key: &str) -> String {
+    format_key_text_on(key, LabelPlatform::host())
+}
+
+/// The platform-explicit form of [`format_key_text`] (TS `formatKeyText(key,
+/// platform)`), so the label choice is testable on every host.
+fn format_key_text_on(key: &str, platform: LabelPlatform) -> String {
     key.split('/')
         .map(|binding| {
             binding
@@ -866,6 +900,9 @@ pub fn format_key_text(key: &str) -> String {
                     "right" => "\u{2192}".to_string(),
                     "pageUp" => "PageUp".to_string(),
                     "pageDown" => "PageDown".to_string(),
+                    // macOS labels the modifier after the keyboard row
+                    // (Option), like TS formatKeyPart's darwin branch.
+                    "alt" if platform.is_macos() => "Option".to_string(),
                     other => {
                         let mut c = other.chars();
                         match c.next() {
@@ -1274,5 +1311,26 @@ mod tests {
         assert_eq!(format_key_text("shift+alt+up"), "Shift+Alt+\u{2191}");
         assert_eq!(format_key_text("escape"), "Esc");
         assert_eq!(format_key_text("ctrl+o/alt+o"), "Ctrl+O/Alt+O");
+    }
+
+    #[test]
+    fn formats_alt_label_per_platform() {
+        // TS formatKeyPart: darwin renders `alt` as `Option` (the macOS
+        // keyboard row), every other platform keeps `Alt`.
+        assert_eq!(
+            format_key_text_on("alt+b", LabelPlatform::Macos),
+            "Option+B"
+        );
+        assert_eq!(format_key_text_on("alt+b", LabelPlatform::Other), "Alt+B");
+        assert_eq!(
+            format_key_text_on("shift+alt+left", LabelPlatform::Macos),
+            "Shift+Option+\u{2190}"
+        );
+        // Multiple bindings split by `/` keep their platform label per part,
+        // and control is never relabeled as Cmd.
+        assert_eq!(
+            format_key_text_on("alt+o/ctrl+o", LabelPlatform::Macos),
+            "Option+O/Ctrl+O"
+        );
     }
 }

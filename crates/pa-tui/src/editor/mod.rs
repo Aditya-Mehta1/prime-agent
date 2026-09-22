@@ -498,7 +498,10 @@ impl Editor {
         self.last_action = None;
         self.push_undo_snapshot();
 
-        let clean = normalize_text(pasted_text);
+        // A tmux popup can re-encode control bytes inside the paste as
+        // CSI-u Ctrl+letter sequences; decode them before the per-char
+        // filter so newlines survive (TS handlePaste).
+        let clean = normalize_text(&text_utils::decode_paste_ctrl_sequences(pasted_text));
         let filtered_raw: String = clean
             .chars()
             .filter(|&c| c == '\n' || (c as u32) >= 32)
@@ -572,6 +575,17 @@ mod tests {
             .expect("submit event");
         assert_eq!(submitted, "a\nb");
         assert_eq!(e.get_text(), "");
+    }
+
+    #[test]
+    fn paste_decodes_reencoded_ctrl_bytes() {
+        // A tmux csi-u paste re-encodes newlines as CSI-u Ctrl+J; the
+        // decode happens before the per-char filter, so the newline
+        // survives instead of leaking "[106;5u" into the editor.
+        let mut e = ed();
+        e.handle_paste("alpha\x1b[106;5ubeta");
+        assert_eq!(e.get_text(), "alpha\nbeta");
+        assert_eq!(e.get_lines(), vec!["alpha", "beta"]);
     }
 
     #[test]
@@ -653,6 +667,31 @@ mod tests {
         let mut e = ed();
         e.handle_paste("one\ntwo");
         assert_eq!(e.get_text(), "one\ntwo");
+    }
+
+    /// One paste is one undo unit (TS `handlePaste` pushes a single undo
+    /// snapshot before inserting): one undo removes the whole paste — the
+    /// collapsed marker AND the stored content — never a fragment.
+    #[test]
+    fn undo_removes_a_whole_paste_in_one_step() {
+        let mut e = ed();
+        e.handle_input("x");
+        let big = (0..15)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(
+            e.handle_paste(&big),
+            PasteDisposition::Marker { .. }
+        ));
+        assert_eq!(e.get_text(), "x[paste #1 +15 lines]");
+        e.handle_input("ctrl+-");
+        assert_eq!(e.get_text(), "x", "one undo removed the whole paste");
+        // The same holds for a small inline paste: one undo, whole text.
+        e.handle_paste("one\ntwo");
+        assert_eq!(e.get_text(), "xone\ntwo");
+        e.handle_input("ctrl+-");
+        assert_eq!(e.get_text(), "x");
     }
 
     #[test]

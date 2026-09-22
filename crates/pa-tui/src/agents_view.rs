@@ -1210,6 +1210,11 @@ impl Renderer {
                 // surface of the process enters it, so a view switch never
                 // flashes the primary screen.
                 crate::altscreen::enter()?;
+                // The enhanced-key modes come up with the raw-mode
+                // bracket (TS `ProcessTerminal.start`): pastes arrive as
+                // one chunk, the kitty probe runs before the reader
+                // thread starts polling.
+                crate::enhanced_keys::enable(&mut std::io::stdout())?;
                 // One reader thread feeds the view; the reader registry
                 // joins the previous surface's reader (the chat it opened)
                 // before this one starts polling. The reader also observes
@@ -1321,6 +1326,10 @@ impl Renderer {
     fn finish(self, preserve_alt_screen: bool) -> Vec<String> {
         match self {
             Renderer::Terminal(_) => {
+                // The enhanced-key modes release with the raw-mode bracket
+                // (TS `stop` on every exit, handoffs included).
+                let mut out = std::io::stdout();
+                let _ = crate::enhanced_keys::disable(&mut out);
                 if preserve_alt_screen {
                     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
                 } else {

@@ -78,7 +78,11 @@ Notable systemic findings:
   `scoped-models`, `fullscreen`, `btw`, `debug`; `/debug` is missing from the Rust
   registry entirely and surfaces as "Unknown command").
 - Bracketed paste (`ESC[?2004`) is never enabled anywhere in the Rust workspace,
-  so real pastes arrive as keystroke events.
+  so real pastes arrive as keystroke events. (Fixed in `term-enhanced-keys`:
+  `pa-tui/src/enhanced_keys.rs` enables `?2004h/l` around every raw-mode
+  bracket plus the kitty mode (the modifyOtherKeys fallback is never armed —
+  see its row below), and `pa-tui/src/input.rs` coalesces marker-less
+  multi-line bursts; see `scripts/bracketed_paste_parity.py`.)
 - Interrupt paths only send `Abort`/`AbortCompaction`; `AbortBash`/`AbortRetry`/
   `AbortBranchSummary` wire commands exist but are never sent from the UI.
 - The `/btw` side-question engine and wire protocol exist (`pa-daemon/src/side_question.rs`,
@@ -337,8 +341,8 @@ Method: every TS file in `packages/tui/src` read in full; each behavior located 
 | fullscreen.ts:649 | `hyperlinkAt` (link lookup in last painted frame) | crates/pa-tui/src/hyperlinks.rs:125 (`frame_link_ranges`; not exposed to mouse dispatch) | PARTIAL | mouse-select |
 | keys.ts:788 | `matchesKey`/`parseKey`: kitty CSI-u, legacy tables, modifyOtherKeys | crates/pa-tui/src/keys.rs:12 (`key_event_to_id` over crossterm events) | PARTIAL | term-enhanced-keys (new) |
 | keys.ts:505 | `isKeyRelease`/`isKeyRepeat` (kitty event types) | crates/pa-tui/src/keys.rs:12 (crossterm kinds; release filtered) | PARTIAL | term-enhanced-keys (new) |
-| keys.ts:1379 | `decodePrintableKey` (CSI-u / modifyOtherKeys printable decode) | crates/pa-tui/src/editor/text_utils.rs:68 (`decode_printable`; no CSI-u decode) | PARTIAL | term-enhanced-keys (new) |
-| keys.ts:44 | Kitty protocol global flag (`setKittyProtocolActive`) | MISSING | MISSING | term-enhanced-keys (new) |
+| keys.ts:1379 | `decodePrintableKey` (CSI-u / modifyOtherKeys printable decode) | crates/pa-tui/src/keys.rs tests + editor text_utils: crossterm resolves the kitty CSI-u alternate (`shift+=` -> `+`) before the id layer; a trailing `+` key id is the literal plus (split_key_id); modifyOtherKeys sequences never arrive (the fallback is never armed) | MATCHES | — |
+| keys.ts:44 | Kitty protocol global flag (`setKittyProtocolActive`) | crates/pa-tui/src/enhanced_keys.rs (module state; crossterm parses CSI-u) | MATCHES | — |
 | keybindings.ts:56 | `TUI_KEYBINDINGS` definition table | crates/pa-tui/src/keybindings.rs:40 (defaults verbatim) | MATCHES | — |
 | keybindings.ts:191 | `KeybindingsManager`: user overlay, conflicts, same-scope freeing, `getKeys`/`matches` | crates/pa-tui/src/keybindings.rs:738 (`rebuild`) | MATCHES | — |
 | keybindings.ts:211 | Config file load, legacy-name migration, JSON rewrite | crates/pa-tui/src/keybindings.rs:499 (`migrate_keybindings_config`) | MATCHES | — |
@@ -350,13 +354,13 @@ Method: every TS file in `packages/tui/src` read in full; each behavior located 
 | slash-command-context.ts:5 | `getSlashCommandContext` (name/argument, prompt-start, mid-line) | crates/pa-tui/src/autocomplete.rs:92 | MATCHES | — |
 | render-cache.ts:1 | `VersionedRenderCache` (width+version keyed) | MISSING (per-entry layout cache exists: crates/pa-tui/src/view.rs:357, not the generic cache; only TS consumer is ipython-cell) | MISSING | render-cache (new) |
 | stdin-buffer.ts:232 | `StdinBuffer`: complete-sequence splitting (CSI/OSC/APC/DCS), timeout flush | crates/pa-tui/src/input.rs:30 (crossterm parses sequences; no buffer-timeout semantics) | PARTIAL | term-enhanced-keys (new) |
-| stdin-buffer.ts:171 | Raw multiline-paste heuristic (`[^\r\n][\r\n]+[^\r\n]`) | MISSING | MISSING | term-enhanced-keys (new) |
+| stdin-buffer.ts:171 | Raw multiline-paste heuristic (`[^\r\n][\r\n]+[^\r\n]`) | crates/pa-tui/src/input.rs (`is_raw_multiline_paste` + burst coalescing over the chunk boundary) | MATCHES | — |
 | stdin-buffer.ts:307 | Kitty-printable dedup (`pendingKittyPrintableCodepoint`) | MISSING | MISSING | term-enhanced-keys (new) |
 | terminal.ts:143 | `ProcessTerminal`: raw mode, resize, alt-screen handoff | crates/pa-tui/src/interactive.rs:1190 (`setup`) + crates/pa-tui/src/altscreen.rs:20 | MATCHES | — |
-| terminal.ts:137 | Bracketed paste enable/disable (`?2004h/l`) | MISSING (no `EnableBracketedPaste` anywhere in the workspace; `Event::Paste` never fires from a real terminal) | MISSING | term-enhanced-keys (new) |
-| terminal.ts:288 | Kitty keyboard protocol query + `\x1b[>7u` push | MISSING | MISSING | term-enhanced-keys (new) |
-| terminal.ts:314 | modifyOtherKeys fallback (`\x1b[>4;2m`) | MISSING | MISSING | term-enhanced-keys (new) |
-| terminal.ts:93 | `drainInput` (kitty release drain on exit) | MISSING | MISSING | term-enhanced-keys (new) |
+| terminal.ts:137 | Bracketed paste enable/disable (`?2004h/l`) | crates/pa-tui/src/enhanced_keys.rs (`enable`/`disable`, wired into every raw-mode bracket) | MATCHES | — |
+| terminal.ts:288 | Kitty keyboard protocol query + `\x1b[>7u` push | crates/pa-tui/src/enhanced_keys.rs (crossterm support probe — query `?u` + DA1 — then `>7u`, 150ms fallback, late-answer upgrade) | MATCHES | — |
+| terminal.ts:314 | modifyOtherKeys fallback (`\x1b[>4;2m`) | crates/pa-tui/src/enhanced_keys.rs — INTENTIONAL DIVERGENCE: never armed (crossterm drops the resulting `CSI 27;mods;key~` sequences on the parse error, losing every shift-modified printable); every start writes the `>4;0m` reset instead (clears a sticky mode another pane armed) | DIVERGES | — |
+| terminal.ts:93 | `drainInput` (kitty release drain on exit) | crates/pa-tui/src/enhanced_keys.rs (`drain`: 1000ms/50ms idle, modes off first) | MATCHES | — |
 | terminal.ts:130 | `setTitle` (OSC 0) | MISSING | MISSING | term-integration (new) |
 | terminal.ts:126 | `setProgress` (OSC 9;4 + 1s keepalive) | MISSING | MISSING | term-integration (new) |
 | terminal.ts:117 | `setMouseTracking` `?1002h ?1006h` / reverse disable | crates/pa-tui/src/mouse_tracking.rs:26 | MATCHES | — |
@@ -399,7 +403,7 @@ Method: every TS file in `packages/tui/src` read in full; each behavior located 
 | components/editor.ts:938 | `layoutText`/word-wrap layout with cursor placement per chunk | crates/pa-tui/src/editor/layout.rs:8 | MATCHES | — |
 | components/editor.ts:119 | `wordWrapLine` (wrap opportunities, backtrack, atomic re-wrap) | crates/pa-tui/src/editor/wrap.rs:154 — **panics on non-ASCII wrap** (char-ordinal `Segment.index` sliced as byte offset; reproduced: `end byte index 16 is not a char boundary` in wrap.rs:193) | PARTIAL | editor-wrap-unicode (new) |
 | components/editor.ts:44 | `segmentWithMarkers` (atomic paste/image markers by valid id) | crates/pa-tui/src/editor/wrap.rs:88 (byte/char index mixing; see row above) | PARTIAL | editor-wrap-unicode (new) |
-| components/editor.ts:1207 | `handlePaste` (large-paste markers >10 lines/>1000 chars, ctrl CSI-u decode, path space) | crates/pa-tui/src/editor/mod.rs:475 (marker logic matches; no CSI-u ctrl decode — paste markers never arrive, see ?2004 row) | PARTIAL | term-enhanced-keys (new) |
+| components/editor.ts:1207 | `handlePaste` (large-paste markers >10 lines/>1000 chars, ctrl CSI-u decode, path space) | crates/pa-tui/src/editor/mod.rs:475 (marker logic + `decode_paste_ctrl_sequences` in text_utils.rs) | MATCHES | — |
 | components/editor.ts:1320 | Backspace (grapheme delete, line merge) | crates/pa-tui/src/editor/text_ops.rs:7 | MATCHES | — |
 | components/editor.ts:1380 | `moveToVisualLine` + snap-to-marker + `computeVerticalMoveColumn` sticky table | crates/pa-tui/src/editor/motion.rs:240 + crates/pa-tui/src/editor/motion.rs:215 | MATCHES | — |
 | components/editor.ts:1854 | Word motion (whitespace/punctuation runs, atomic markers) | crates/pa-tui/src/editor/motion.rs:67 | MATCHES | — |
@@ -459,7 +463,7 @@ Method: every TS file in `packages/tui/src` read in full; each behavior located 
 - **utils.ts:1189 sliceByColumn** — no `strict` boundary exclusion, so a wide char crossing the boundary is kept instead of clipped.
 - **components/editor.ts:119 wordWrapLine** — **reproduced panic**: `word_wrap_line` mixes grapheme-ordinal indices with byte slicing (`wrap.rs:193` panics on non-ASCII text with `end byte index … is not a char boundary`); TS uses Intl.Segmenter offsets throughout.
 - **components/editor.ts:44 segmentWithMarkers** — marker ranges are byte offsets compared against char-ordinal grapheme indices (same root cause as the wrap panic).
-- **components/editor.ts:1207 handlePaste** — the large-paste marker logic matches, but the CSI-u ctrl decode inside pasted text (tmux popup re-encoding) is missing.
+- **components/editor.ts:1207 handlePaste** — the large-paste marker logic matches, but the CSI-u ctrl decode inside pasted text (tmux popup re-encoding) is missing. (Fixed in `term-enhanced-keys`: `decode_paste_ctrl_sequences`.)
 - **components/editor.ts:2389 autocomplete triggers** — Rust lacks the TS "regular state + no completion context → cancel" rule; only empty-text cancels.
 - **components/editor.ts:2205 async request** — parked-until-idle replaces the TS abort/20ms-symbol-debounce machinery; symbol-typing debounce timing differs.
 - **components/select-list.ts:189 metadata** — `sourceTag` column and its theme hook are not rendered.

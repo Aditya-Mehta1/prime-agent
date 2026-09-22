@@ -1539,6 +1539,35 @@ mod tests {
         line.iter().map(|s| s.content.as_str()).collect::<String>()
     }
 
+    /// A rendered hint row carries the platform's alt label: the queue
+    /// browse header quotes `app.message.navigateOlder` and friends through
+    /// the shared `format_key_text`, so the row shows `Alt+\u{2191}` on
+    /// Linux/Windows hosts and `Option+\u{2191}` on macOS (TS
+    /// `formatKeyPart`'s darwin branch).
+    #[test]
+    fn hint_rows_carry_the_platform_alt_label() {
+        let mut v = view();
+        v.queue_selected = Some(crate::queued::QueueSelectionItem {
+            lane: crate::queued::QueueLane::Steering,
+            index: 0,
+            text: "turn right".to_string(),
+        });
+        let frame = v.render_frame(80, 24);
+        let joined = frame.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("browse"),
+            "the queue browse header renders: {joined}"
+        );
+        if std::env::consts::OS == "macos" {
+            assert!(
+                joined.contains("Option+\u{2191}"),
+                "macOS hint row: {joined}"
+            );
+        } else {
+            assert!(joined.contains("Alt+\u{2191}"), "hint row: {joined}");
+        }
+    }
+
     #[test]
     fn frame_is_exactly_height_rows() {
         let mut v = view();

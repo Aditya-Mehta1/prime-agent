@@ -299,6 +299,26 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         })
     }
 
+    fn enhanced_keys(
+        &self,
+        kitty: bool,
+        modify_other_keys: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("kitty", serde_json::Value::from(kitty));
+            properties.set(
+                "modify_other_keys",
+                serde_json::Value::from(modify_other_keys),
+            );
+            client.track("tui enhanced keys", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
     fn suspend_used(&self, outcome: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let Some(client) = self.client() else {

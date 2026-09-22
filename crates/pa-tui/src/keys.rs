@@ -145,3 +145,70 @@ pub fn split_repeated(data: &[KeyId], keybinding_id: &str) -> Option<Vec<KeyId>>
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Shift-modified printables must reach the editor as their produced
+    /// character. The kitty protocol's `report alternate keys` flag makes
+    /// the terminal carry the shifted character (`shift+=` arrives as
+    /// `CSI 61:43;2u`), and crossterm's CSI-u parser resolves it to
+    /// `Char('+')` with SHIFT cleared before this layer sees the event.
+    #[test]
+    fn shifted_printables_map_to_the_produced_character() {
+        // (produced char, the CSI-u alternate form a kitty terminal sends):
+        // shift+1 `CSI 49:33;2u`, shift+/ `CSI 47:63;2u`,
+        // shift+' `CSI 39:34;2u`, shift+= `CSI 61:43;2u`,
+        // shift+; `CSI 59:58;2u` — the full dogfooded range.
+        let range = [
+            ('!', "49:33"),
+            ('?', "47:63"),
+            ('"', "39:34"),
+            ('+', "61:43"),
+            (':', "59:58"),
+        ];
+        for (produced, sequence) in range {
+            let event = KeyEvent::new(KeyCode::Char(produced), KeyModifiers::NONE);
+            let id = key_event_to_id(&event);
+            assert_eq!(
+                id.as_deref(),
+                Some(produced.to_string().as_str()),
+                "shifted range item `{sequence}`"
+            );
+        }
+    }
+
+    /// A kitty CSI-u event WITHOUT the shifted alternate (`CSI 61;2u` —
+    /// no `report alternate keys`) arrives as the base key plus SHIFT;
+    /// the id keeps the base character (TS `decodeKittyPrintable` falls
+    /// back to the reported codepoint the same way).
+    #[test]
+    fn shift_modified_base_key_keeps_the_base_character() {
+        let event = KeyEvent::new(KeyCode::Char('='), KeyModifiers::SHIFT);
+        assert_eq!(key_event_to_id(&event).as_deref(), Some("="));
+    }
+
+    /// The shifted range inserts through the editor: each event decodes to
+    /// the produced character and lands in the buffer (the dogfood class —
+    /// a shifted key that produced NOTHING — regresses here).
+    #[test]
+    fn editor_inserts_the_full_shifted_range() {
+        let mut editor = crate::editor::Editor::new();
+        for (produced, _) in [
+            ('+', "61:43"),
+            ('!', "49:33"),
+            ('?', "47:63"),
+            ('"', "39:34"),
+            (':', "59:58"),
+        ] {
+            let event = KeyEvent::new(KeyCode::Char(produced), KeyModifiers::NONE);
+            let Some(id) = key_event_to_id(&event) else {
+                panic!("shifted key {produced:?} dropped at the id layer");
+            };
+            editor.handle_input(&id);
+        }
+        assert_eq!(editor.get_text(), "+!?\":");
+    }
+}

@@ -28,6 +28,7 @@ pub mod daemon_client;
 pub mod direct_transport;
 pub mod editor;
 pub mod effort_picker;
+mod enhanced_keys;
 pub mod error_summary;
 mod exit_guard;
 pub mod export_share;

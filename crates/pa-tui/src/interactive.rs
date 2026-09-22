@@ -110,6 +110,13 @@ pub trait InteractionTelemetry: Send + Sync {
     /// is `resumed` (the SIGCONT continuation restored the terminal) /
     /// `failed` (the cycle errored).
     fn suspend_used(&self, outcome: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// The terminal enhanced-key modes settled (`tui enhanced keys`):
+    /// `kitty` / `modify_other_keys` report the established combination.
+    fn enhanced_keys(
+        &self,
+        kitty: bool,
+        modify_other_keys: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// The `!`/`!!` bash shortcut ran a command from the chat view (event
     /// `tui bash shortcut used`): `excluded` is the `!!` variant, and
     /// `side_conversation` marks a run inside a side-question pane.
@@ -700,6 +707,9 @@ pub async fn run_interactive(
     }
 
     let mut pending: VecDeque<UiInput> = VecDeque::new();
+    // The enhanced-key modes settle once (kitty answer or fallback) and
+    // report one adoption event; headless runs hold pipes and never probe.
+    let mut enhanced_keys_pending = renderer.is_terminal();
     let mut running = true;
     let mut headless_done = false;
     let mut wait_idle_deadline: Option<Instant> = None;
@@ -719,6 +729,18 @@ pub async fn run_interactive(
         // The tray override row (the Ctrl+C exit hint) follows the session's
         // hint state on every frame.
         view.chrome.tray_override = session.tray_override();
+
+        // The enhanced-key modes settle once per run: the kitty probe
+        // answered, or the modifyOtherKeys fallback fired. One adoption
+        // event reports the established combination.
+        if enhanced_keys_pending {
+            if let Some((kitty, modify_other_keys)) = crate::enhanced_keys::settle_state() {
+                if let Some(telemetry) = &session.telemetry {
+                    telemetry.enhanced_keys(kitty, modify_other_keys).await;
+                }
+                enhanced_keys_pending = false;
+            }
+        }
 
         // Process one queued UI input. A WaitIdle step is a barrier: it stays
         // at the head of the queue until the turn finishes (or its deadline).
@@ -1381,38 +1403,53 @@ impl Renderer {
                 if mouse {
                     crate::mouse_tracking::enable(&mut std::io::stdout())?;
                 }
+                // Bracketed paste and the kitty keyboard protocol come up
+                // with the raw-mode bracket (TS `ProcessTerminal.start`):
+                // pastes arrive as one chunk instead of per-line Enter
+                // submissions, and the kitty probe runs before the reader
+                // thread starts polling.
+                crate::enhanced_keys::enable(&mut std::io::stdout())?;
                 // One reader thread feeds the loop; crossterm events are
                 // process-global, so the reader registry joins the previous
                 // surface's reader before this one starts polling. The
                 // reader also observes Ctrl+C pairs for the exit guard:
                 // this thread stays alive when the UI loop is wedged, so
                 // the force-quit contract holds regardless of loop state.
-                crate::input::spawn_terminal_reader(move |event| match event {
-                    crossterm::event::Event::Key(key) => {
-                        exit_guard.observe_key(&key);
-                        ui_tx.send(UiInput::Key(key)).is_ok()
-                    }
-                    crossterm::event::Event::Paste(text) => {
+                // The paste-aware variant coalesces a marker-less
+                // multi-line keystroke burst (tmux 3.2 and older forward
+                // pastes without bracketed markers) into one editor paste
+                // — TS StdinBuffer's `isRawMultilinePaste`.
+                crate::input::spawn_paste_aware_reader(move |input| match input {
+                    crate::input::ReaderInput::BurstPaste(text) => {
                         ui_tx.send(UiInput::Paste(text)).is_ok()
                     }
-                    // TS forces a full re-render on resize (tui.ts
-                    // widthChanged/heightChanged); the loop repaints on
-                    // the dirty flag this sets.
-                    crossterm::event::Event::Resize(..) => ui_tx.send(UiInput::Resize).is_ok(),
-                    // Mouse reports are always consumed (nothing
-                    // downstream understands them): wheel turns reach the
-                    // loop only while tracking is active (TS consumes
-                    // reports even when tracking is disabled).
-                    crossterm::event::Event::Mouse(mouse) => {
-                        if !crate::mouse_tracking::active() {
-                            true
-                        } else if let Some(event) = crate::mouse::from_crossterm(&mouse) {
-                            ui_tx.send(UiInput::Mouse(event)).is_ok()
-                        } else {
-                            true
+                    crate::input::ReaderInput::Event(event) => match event {
+                        crossterm::event::Event::Key(key) => {
+                            exit_guard.observe_key(&key);
+                            ui_tx.send(UiInput::Key(key)).is_ok()
                         }
-                    }
-                    _ => true,
+                        crossterm::event::Event::Paste(text) => {
+                            ui_tx.send(UiInput::Paste(text)).is_ok()
+                        }
+                        // TS forces a full re-render on resize (tui.ts
+                        // widthChanged/heightChanged); the loop repaints on
+                        // the dirty flag this sets.
+                        crossterm::event::Event::Resize(..) => ui_tx.send(UiInput::Resize).is_ok(),
+                        // Mouse reports are always consumed (nothing
+                        // downstream understands them): wheel turns reach the
+                        // loop only while tracking is active (TS consumes
+                        // reports even when tracking is disabled).
+                        crossterm::event::Event::Mouse(mouse) => {
+                            if !crate::mouse_tracking::active() {
+                                true
+                            } else if let Some(event) = crate::mouse::from_crossterm(&mouse) {
+                                ui_tx.send(UiInput::Mouse(event)).is_ok()
+                            } else {
+                                true
+                            }
+                        }
+                        _ => true,
+                    },
                 });
                 let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
                 // The adopted buffer still holds the previous view's frame;
@@ -1517,6 +1554,10 @@ impl Renderer {
                 // command prompts on the plain terminal (TS `exitFullscreen`
                 // on suspend).
                 let _ = crate::mouse_tracking::disable(&mut std::io::stdout());
+                // The raw-mode bracket takes the enhanced-key modes with
+                // it (TS `stop` on suspend: paste markers off, kitty
+                // flags popped); `resume` re-enables both.
+                let _ = crate::enhanced_keys::disable(&mut std::io::stdout());
                 self.flush_to_main_screen(view)?;
                 crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
                 terminal::disable_raw_mode()?;
@@ -1534,6 +1575,10 @@ impl Renderer {
                 // The suspension released the alternate screen (the client
                 // command prompted on the primary one); re-enter it.
                 crate::altscreen::enter()?;
+                // The raw-mode bracket re-arms the enhanced-key modes (TS
+                // `start` on SIGCONT re-runs the paste enable and the kitty
+                // query).
+                crate::enhanced_keys::enable(&mut std::io::stdout())?;
                 // The fullscreen surface re-enables mouse tracking with the
                 // terminal (TS `applyFullscreen` on resume).
                 if *mouse {
@@ -1640,9 +1685,20 @@ impl Renderer {
     /// main screen, show the cursor, restore cooked mode — the resume hint
     /// the composition root prints next lands right below the flushed frame.
     fn finish(mut self, view: &mut AgentView, preserve_alt_screen: bool) -> Vec<String> {
+        // In-flight kitty key releases are consumed before the terminal is
+        // restored (TS `drainInput` before `stop`): a release that lands
+        // after raw mode is off would leak its escape sequence into the
+        // parent shell over slow SSH. Runs on every exit — the agents-view
+        // handoff drains too (TS `teardownSessionUi`); headless runs hold
+        // plain pipes and skip it inside the drain.
+        crate::enhanced_keys::drain(&mut std::io::stdout());
         // Tracking releases with the surface (TS `TUI.stop` writes the
         // disable before leaving the alt screen).
         let _ = crate::mouse_tracking::disable(&mut std::io::stdout());
+        // The enhanced-key modes release with the raw-mode bracket (TS
+        // `stop` writes the paste disable, the kitty pop, and the
+        // modifyOtherKeys reset for every exit, handoffs included).
+        let _ = crate::enhanced_keys::disable(&mut std::io::stdout());
         match self {
             Renderer::Terminal { .. } => {
                 if preserve_alt_screen {

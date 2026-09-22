@@ -253,8 +253,11 @@ fn force_quit() -> ! {
 /// flush, no daemon I/O — anything that could block is skipped by design.
 fn restore_terminal_best_effort() {
     use std::io::Write;
-    let _ = crossterm::terminal::disable_raw_mode();
     let mut out = std::io::stdout();
+    // The enhanced-key modes release with the terminal (TS `stop`):
+    // leaving paste mode on would hand the shell stray markers.
+    let _ = crate::enhanced_keys::disable(&mut out);
+    let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(out, crossterm::terminal::LeaveAlternateScreen);
     let _ = crossterm::execute!(out, crossterm::cursor::Show);
     let _ = out.flush();
