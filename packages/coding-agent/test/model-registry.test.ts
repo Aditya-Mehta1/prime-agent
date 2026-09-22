@@ -742,6 +742,7 @@ describe("ModelRegistry", () => {
 
 	describe("auth refresh across processes", () => {
 		test("refreshAvailableModels returns while provider catalog refresh is still pending", async () => {
+			vi.stubEnv("OPENAI_API_KEY", "test-openai-key");
 			const registry = ModelRegistry.inMemory(authStorage);
 			let providerCatalogRequested = false;
 			vi.stubGlobal(
