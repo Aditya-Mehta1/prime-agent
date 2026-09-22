@@ -114,6 +114,19 @@ commands (`model`, `effort`, `tree`, `fork`, `clone`, `export`, `share`,
 |---|---|---|
 | `command_name` | string | canonical builtin command name |
 
+### `skill used`
+
+A `/skill:<name>` submission expanded into its skill block (the
+skill-command execution seam, TS `_expandSkillCommand`). Emitted once per
+expanded invocation from the session's prompt admission; never carries
+prompt or skill content.
+
+| property | type | notes |
+|---|---|---|
+| `skill_name` | string | the invoked skill's name |
+| `skill_kind` | string | `markdown` / `python` |
+| `source` | string | `prompt` (admitted fresh) / `steer` / `follow_up` (queued during a run) |
+
 ### `onboarding completed`
 
 | property | type | notes |
@@ -327,12 +340,10 @@ carrying the command or its output).
 
 ## Planned events (seams not yet in the product)
 
-These stay in the catalog as planned schema v1 additions; they are NOT
-emitted yet. Each lands in the same PR as its product seam (see the
-adoption convention below):
-
-- `skill used` (`skill_name`, `skill_kind`, `source`): the product has no
-  skill-command execution seam yet.
+Planned events stay in this catalog as schema v1 placeholders until
+their product seam lands (each in the same PR as the seam, per the
+adoption convention below). None are pending right now: the former
+`skill used` placeholder shipped with its seam (the `/skill:` expansion).
 
 ## Cohorts and breakdowns
 

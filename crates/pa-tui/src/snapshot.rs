@@ -791,8 +791,14 @@ pub fn message_value_to_entries(message: &Value) -> Vec<ChatEntry> {
         .and_then(Value::as_str)
         .unwrap_or_default();
     match role {
+        // TS `addMessageToChat`'s user case: a text that IS a skill block
+        // renders the skill-invocation card (+ the trailing argument text
+        // as its own user block); every other text renders the user block.
         "user" => user_display_text(message)
-            .map(|text| vec![ChatEntry::User { text }])
+            .map(|text| {
+                crate::custom_message::skill_invocation_entries(&text)
+                    .unwrap_or_else(|| vec![ChatEntry::User { text }])
+            })
             .unwrap_or_default(),
         "assistant" => assistant_value_to_entries(message),
         "custom" => custom_message_entries(message),
@@ -1097,6 +1103,30 @@ mod tests {
             vec![ChatEntry::User {
                 text: "[image]".to_string()
             }]
+        );
+    }
+
+    #[test]
+    fn a_skill_block_user_message_decodes_to_the_card() {
+        // TS `addMessageToChat`'s user case: the persisted user message
+        // that carried a skill invocation parses into the card + the
+        // trailing argument text, never the raw block.
+        let message = json!({
+            "role": "user",
+            "content": "<skill name=\"websearch\" location=\"/s/SKILL.md\">\nRun one query.\n</skill>\n\nfind parity tuis"
+        });
+        let entries = message_value_to_entries(&message);
+        assert!(
+            matches!(
+                entries.as_slice(),
+                [
+                    ChatEntry::SkillInvocation(card),
+                    ChatEntry::User { text }
+                ] if card.name == "websearch"
+                    && card.content == "Run one query."
+                    && text == "find parity tuis"
+            ),
+            "entries: {entries:?}"
         );
     }
 

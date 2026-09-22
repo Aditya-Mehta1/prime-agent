@@ -484,6 +484,7 @@ impl AgentView {
                 .any(|entry| matches!(entry, ChatEntry::Assistant(m) if m.streaming)),
             ChatEntry::InjectedPrompt(_) | ChatEntry::RefinementOutcome(_) => true,
             ChatEntry::CustomPanel(_) => true,
+            ChatEntry::SkillInvocation(_) => true,
             ChatEntry::ClientMarkdown { .. }
             | ChatEntry::ClientText { .. }
             | ChatEntry::ChangelogPanel { .. } => true,
@@ -596,7 +597,13 @@ impl AgentView {
             }
             ChatEntry::User { text } => {
                 let mut rows = Vec::new();
-                if !first {
+                // TS `addMessageToChat` separates a user submission from
+                // the components above it with `Spacer(1)` — EXCEPT the
+                // skill invocation's own argument text, which joins the
+                // card below it without a spacer.
+                let follows_skill_card =
+                    index > 0 && matches!(self.chat[index - 1], ChatEntry::SkillInvocation(_));
+                if !first && !follows_skill_card {
                     rows.push(Vec::new());
                 }
                 rows.extend(render_user_block(
@@ -686,6 +693,19 @@ impl AgentView {
                 width,
                 self.conversation_leading(index, self.detail.tool_output_expanded()),
             ),
+            // TS `addMessageToChat`'s user case: `Spacer(1)` when the chat
+            // is non-empty, then the card (the conversation-spacing scan the
+            // agent-message rows use does not apply — the TS user case is
+            // the plain children-count check).
+            ChatEntry::SkillInvocation(row) => {
+                crate::custom_message::skill_invocation::render_skill_invocation(
+                    row,
+                    self.detail,
+                    &self.theme,
+                    width,
+                    !first,
+                )
+            }
             ChatEntry::InjectedPrompt(row) => {
                 crate::custom_message::render::render_injected_prompt(
                     row,

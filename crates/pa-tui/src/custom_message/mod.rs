@@ -2,7 +2,9 @@
 //! `role: "custom"` wire messages (TS `agent-message.ts`,
 //! `injected-prompt-message.ts`, `compaction-outcome-message.ts`,
 //! `refinement-outcome-message.ts`, `shell-completion.ts`, and the generic
-//! `custom-message.ts` box). Decode maps every custom type to the component
+//! `custom-message.ts` box) plus the user-message skill-invocation card
+//! (TS `skill-invocation-message.ts`, parsed out of a user message's
+//! `<skill>` block). Decode maps every custom type to the component
 //! the TS dispatch (`createDisplayedCustomMessageComponent` /
 //! `buildConversationComponents`) picks; rendering ports each component's
 //! row geometry and theme colors.
@@ -20,6 +22,9 @@
 
 pub(crate) mod refinement;
 pub(crate) mod render;
+pub mod skill_invocation;
+
+pub use skill_invocation::{skill_invocation_entries, SkillInvocationRow};
 
 use crate::chat::{ChatEntry, StatusKind};
 use crate::theme::ThemeColor;

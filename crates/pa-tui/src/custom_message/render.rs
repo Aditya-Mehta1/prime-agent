@@ -1,6 +1,7 @@
 //! Custom-message row rendering: each component's row geometry and theme
 //! colors, ported from the TS interactive components (`agent-message.ts`,
-//! `injected-prompt-message.ts`, `shell-completion.ts`, `custom-message.ts`;
+//! `injected-prompt-message.ts`, `shell-completion.ts`, `custom-message.ts`,
+//! `skill-invocation-message.ts`;
 //! `expandable-event-message.ts` + `refinement-outcome-message.ts` live in
 //! the sibling `refinement` module, `compaction-outcome-message.ts` renders
 //! through the chat status rows).

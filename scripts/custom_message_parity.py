@@ -13,7 +13,11 @@ transcript containing every decorated custom-message row:
   - a background-shell completion,
   - a compaction outcome,
   - a refinement outcome,
-  - an autonomous-status row (the generic custom box).
+  - an autonomous-status row (the generic custom box),
+  - a skill invocation user message (the persisted `<skill>` block a
+    user-typed `/skill:<name> [args]` expands into: the compact
+    expandable `[skill]` card collapsed, the markdown body expanded, the
+    args as their own user block, never the raw block text).
 
 The session JSONL is assembled from real captured rows and resumed in the
 TS binary (`prime-agent -r <path>`) and replayed in the Rust TUI
@@ -91,6 +95,21 @@ CUSTOM_ROWS = [
 ]
 
 MARKER_TEXT = "decorations parity transcript complete"
+
+# The persisted shape of a user-typed `/skill:web-search find rust tuis`
+# submission (TS `_expandSkillCommand` output): the card renders the name
+# collapsed and the content expanded; the args render as their own user
+# block below it.
+SKILL_BLOCK_MESSAGE = (
+    "<skill name=\"web-search\" location=\"/skills/web-search/SKILL.md\">\n"
+    "References are relative to /skills/web-search.\n\n"
+    "Run one web search and report the titles.\n"
+    "</skill>\n\n"
+    "find rust tuis"
+)
+SKILL_CARD_SUMMARY = "[skill] web-search"
+SKILL_CARD_BODY = "Run one web search and report the titles."
+SKILL_ARGS = "find rust tuis"
 
 
 def newest_assistant_message(sessions):
@@ -247,6 +266,10 @@ def build_session(path, source_header, assistant_template, cwd):
         entries.append(entry("custom_message", fields, base_ms))
     base_ms += 1
     entries.append(entry("message", {
+        "message": {"role": "user", "content": SKILL_BLOCK_MESSAGE, "timestamp": base_ms},
+    }, base_ms))
+    base_ms += 1
+    entries.append(entry("message", {
         "message": assistant_with(assistant_template, MARKER_TEXT, base_ms),
     }, base_ms))
     with open(path, "w") as f:
@@ -389,6 +412,19 @@ def assert_sent_reach(side, collapsed, expanded):
     assert "\u2570\u2500 Ping." in expanded, (
         f"{side}: Ctrl+O did not expand the sent body"
     )
+
+
+def assert_skill_reach(side, collapsed, expanded):
+    """The skill-invocation card contract: collapsed shows the one-line
+    `[skill] <name>` card and the args user block; expanded adds the
+    markdown body; the raw block text never floods either state."""
+    assert SKILL_CARD_SUMMARY in collapsed, f"{side}: skill card summary missing collapsed"
+    assert SKILL_ARGS in collapsed, f"{side}: skill args missing collapsed"
+    assert SKILL_CARD_BODY not in collapsed, f"{side}: skill body visible while collapsed"
+    assert "<skill name=" not in collapsed, f"{side}: raw skill block visible collapsed"
+    assert SKILL_CARD_BODY in expanded, f"{side}: Ctrl+O did not expand the skill body"
+    assert "<skill name=" not in expanded, f"{side}: raw skill block visible expanded"
+    assert SKILL_ARGS in expanded, f"{side}: skill args missing expanded"
 
 
 def diff_lines(left, right):
@@ -538,6 +574,7 @@ def main():
                 collapsed = capture_plain_text(frames["a_collapsed"])
                 expanded = capture_plain_text(frames["b_expanded"])
                 assert_sent_reach(side, collapsed, expanded)
+                assert_skill_reach(side, collapsed, expanded)
             for state in ("a_collapsed", "b_expanded"):
                 ts_norm = normalize(ts_frames[state], base)
                 rust_norm = normalize(strip_rust_agent_message_preview(rust_frames[state]), base)

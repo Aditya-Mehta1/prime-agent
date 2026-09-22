@@ -434,6 +434,29 @@ impl AgentSessionEngine {
         self.cwd.read().expect("engine cwd lock").clone()
     }
 
+    /// Expand a `/skill:<name>` submission for the accepted-turn user row
+    /// (TS `_normalizeSubmission` persists the expanded text as the user
+    /// message): build the core session when needed (it loads the skill
+    /// inventory), then expand against it. Non-skill inputs and build
+    /// failures pass the text through unchanged — the turn then surfaces
+    /// the failure it would have surfaced anyway.
+    pub(crate) fn expand_skill_submission(&self, text: &str) -> String {
+        let Ok(model) = self.resolve_model() else {
+            return text.to_string();
+        };
+        if let Err(error) = self.ensure_core_session(&model) {
+            eprintln!("skill submission expansion skipped: session build failed: {error:#}");
+            return text.to_string();
+        }
+        self.runtime.block_on(async {
+            let guard = self.session.lock().await;
+            match guard.as_ref() {
+                Some(engine) => engine.expand_skill_submission(text),
+                None => text.to_string(),
+            }
+        })
+    }
+
     /// The async build of the core session (the same funnel as
     /// `ensure_core_session`, awaited on the caller's runtime instead of
     /// parked on the engine's own): read seams (`get_system_prompt`)
@@ -2227,7 +2250,7 @@ impl SessionEngine for AgentSessionEngine {
     fn run_prompt(
         &self,
         _prompt_index: usize,
-        request: PromptRequest,
+        mut request: PromptRequest,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
@@ -2235,6 +2258,16 @@ impl SessionEngine for AgentSessionEngine {
         // happen (kernel host requests and session-command mutations), so
         // every emit of this prompt runs through the tracking wrapper.
         let mut emit = self.goal_tracking_emit(emit);
+        // The accepted-turn row carries the skill-expanded text (TS
+        // `_normalizeSubmission` persists the expanded submission as the
+        // user message): a `/skill:<name>` command expands against the
+        // session's skill inventory before the row persists and
+        // broadcasts, so the transcript renders the skill card instead
+        // of the raw command. Everything else skips the expansion (and
+        // its on-demand session build) entirely.
+        if request.message.starts_with("/skill:") {
+            request.message = self.expand_skill_submission(&request.message);
+        }
         // Session commands (compact/refine/goal/autonomous) never admit a
         // model turn and never record a user-message row: the durable echo
         // row replaces it. Execute before admission so the idle-wait loop

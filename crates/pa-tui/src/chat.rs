@@ -91,6 +91,11 @@ pub enum ChatEntry {
     /// One agent-message summary row (TS `AgentMessageComponent`: the
     /// received transcript rows).
     AgentMessage(Box<crate::custom_message::AgentMessageRow>),
+    /// One skill-invocation card (TS `SkillInvocationMessageComponent`):
+    /// the expandable `<skill>`-block card a user message carrying a
+    /// skill invocation parses into (the trailing arguments render as the
+    /// user block that follows it).
+    SkillInvocation(Box<crate::custom_message::SkillInvocationRow>),
     /// One injected prompt row (TS `InjectedPromptMessageComponent`).
     InjectedPrompt(Box<crate::custom_message::InjectedPromptRow>),
     /// One background-shell completion row (TS `ShellCompletionComponent`).

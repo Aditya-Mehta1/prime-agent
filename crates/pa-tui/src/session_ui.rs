@@ -6264,7 +6264,17 @@ impl SessionUi {
                 self.start_loader(view);
             }
             TurnUpdate::UserMessage(text) => {
-                view.push_entry(ChatEntry::User { text });
+                // TS `addMessageToChat`'s user case: a skill block parses
+                // into the skill-invocation card plus the trailing
+                // argument text as its own user block.
+                match crate::custom_message::skill_invocation_entries(&text) {
+                    Some(entries) => {
+                        for entry in entries {
+                            view.push_entry(entry);
+                        }
+                    }
+                    None => view.push_entry(ChatEntry::User { text }),
+                }
             }
             // `session_info_changed`: the display name moved (the `/name`
             // path also sets it locally; this is the other-client arm).
