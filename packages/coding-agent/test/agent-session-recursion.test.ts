@@ -665,7 +665,7 @@ describe("AgentSession rlm recursion", () => {
 		await waitFor(() => root.getRlmChildSession(result.rlm_child_id)?.getLastAssistantText() !== undefined);
 		const child = root.getRlmChildSession(result.rlm_child_id);
 		expect(child?.getLastAssistantText()).toBe("child answer: summarize shard 1");
-		expect(child?.systemPrompt).toContain(`Working directory: ${tempDir}`);
+		expect(child?.systemPrompt).toContain(`Working directory: ${tempDir}\n`);
 		expect(getMessageText(child?.messages[0])).toContain(
 			"The persistent memories produced across this session so far:",
 		);
@@ -1897,11 +1897,7 @@ describe("AgentSession rlm recursion", () => {
 		{ label: "unsupported kwargs", options: { temperature: 0 }, error: "Unsupported rlm.spawn kwargs: temperature" },
 		{ label: "a non-string thinking kwarg", options: { thinking: 3 }, error: "rlm.spawn thinking must be a string" },
 		{ label: "an unknown thinking level", options: { thinking: "ultra" }, error: "must be one of" },
-		{
-			label: "a cwd that is not a directory",
-			options: { cwd: "missing-dir" },
-			error: "rlm.spawn cwd is not a directory",
-		},
+		{ label: "a missing cwd", options: { cwd: "missing-dir" }, error: "rlm.spawn cwd is not a directory" },
 	])("rejects rlm.spawn for $label", async ({ options, depth, maxDepth, error }) => {
 		const root = createSession({ depth, maxDepth });
 

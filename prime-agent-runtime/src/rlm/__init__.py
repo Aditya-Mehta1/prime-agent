@@ -172,7 +172,7 @@ async def spawn(
     ``model`` selects a child with an exact ``provider/model`` selector.
     ``thinking`` sets the child reasoning level (e.g. 'off', 'low', 'medium', 'high');
     defaults to the parent level; levels invalid for the resolved model fail the spawn.
-    ``cwd`` sets the child working directory (relative to the parent cwd); it must be
+    ``cwd`` sets the child working directory (absolute, or relative to the parent cwd); it must be
     an existing directory.
     """
     if not isinstance(prompt, str):
