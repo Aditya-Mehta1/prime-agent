@@ -500,6 +500,15 @@ enum UiInput {
     HeadlessDone,
 }
 
+/// TS `TUI.MIN_RENDER_INTERVAL_MS`: the frame scheduler's minimum spacing
+/// between renders (every state change in the window coalesces into the
+/// next frame, capping the render rate at ~60fps however fast the stream
+/// delivers).
+const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+/// The spinner's wall-clock cadence (TS `Loader` `DEFAULT_INTERVAL_MS`):
+/// the animation phase advances one frame per 80ms of animating time
+/// regardless of the render rate.
+const SPINNER_INTERVAL_MS: u128 = 80;
 /// Spec §10.2: the client reconnect window after an update restart
 /// (10 minutes).
 const RECONNECT_WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -741,6 +750,18 @@ pub async fn run_interactive(
     // The enhanced-key modes settle once (kitty answer or fallback) and
     // report one adoption event; headless runs hold pipes and never probe.
     let mut enhanced_keys_pending = renderer.is_terminal();
+    // The frame scheduler (TS `requestRender` + `scheduleRender`): state
+    // changes coalesce, and the loop paints at most one frame per
+    // MIN_RENDER_INTERVAL_MS. `last_render_at` is `None` before the first
+    // frame, `render_deadline` is armed while a dirty frame waits out the
+    // interval.
+    let mut last_render_at: Option<Instant> = None;
+    let mut render_deadline: Option<Instant> = None;
+    let mut anim_started: Option<Instant> = None;
+    // The spinner phase painted by the last frame (`usize::MAX` before the
+    // first): a quiet turn only dirties when the 80ms phase advances, not
+    // on every loop tick.
+    let mut last_pulse_phase: usize = usize::MAX;
     let mut running = true;
     let mut headless_done = false;
     let mut wait_idle_deadline: Option<Instant> = None;
@@ -773,190 +794,230 @@ pub async fn run_interactive(
             }
         }
 
-        // Process one queued UI input. A WaitIdle step is a barrier: it stays
-        // at the head of the queue until the turn finishes (or its deadline).
-        if let Some(UiInput::WaitIdle { timeout_ms }) = pending.front() {
-            let timeout_ms = *timeout_ms;
-            // A parked follow-up/steering message keeps the barrier waiting
-            // until the session delivers it (the queue strip must clear
-            // before the next step observes the frames).
-            if session.turn_active || !view.queued.is_empty() {
-                if wait_idle_deadline.is_none() {
-                    wait_idle_deadline = Some(Instant::now() + Duration::from_millis(timeout_ms));
-                } else if Instant::now() > wait_idle_deadline.unwrap() {
+        // Drain the whole queued input batch in this one iteration (TS
+        // `handleInput` dispatches every event of a stdin chunk, then
+        // schedules one render): a burst of wheel turns or held keys
+        // applies as one batch instead of one full-layout render pass per
+        // event, and an exit key queued behind a burst lands in the same
+        // batch — the loop never spends its cycles behind a backlog the
+        // user cannot escape. A WaitIdle step is a barrier: it stays at the
+        // head of the queue until the turn finishes (or its deadline),
+        // holding everything queued behind it.
+        let mut inputs_pending = !pending.is_empty();
+        while inputs_pending {
+            if let Some(UiInput::WaitIdle { timeout_ms }) = pending.front() {
+                let timeout_ms = *timeout_ms;
+                // A parked follow-up/steering message keeps the barrier waiting
+                // until the session delivers it (the queue strip must clear
+                // before the next step observes the frames).
+                if session.turn_active || !view.queued.is_empty() {
+                    if wait_idle_deadline.is_none() {
+                        wait_idle_deadline =
+                            Some(Instant::now() + Duration::from_millis(timeout_ms));
+                    } else if Instant::now() > wait_idle_deadline.unwrap() {
+                        wait_idle_deadline = None;
+                        pending.pop_front();
+                        session.note("timed out waiting for the turn to finish", &mut view);
+                    }
+                    // The barrier holds the batch: the queued inputs stay
+                    // until the turn delivers them.
+                    inputs_pending = false;
+                } else {
                     wait_idle_deadline = None;
                     pending.pop_front();
-                    session.note("timed out waiting for the turn to finish", &mut view);
                 }
-            } else {
-                wait_idle_deadline = None;
-                pending.pop_front();
-            }
-        } else if let Some(input) = pending.pop_front() {
-            session.dirty = true;
-            match input {
-                UiInput::Key(key) => {
-                    // TS stops the selection auto-scroll on every
-                    // non-mouse input (`handleFullscreenInput`).
-                    session.stop_selection_auto_scroll();
-                    session.handle_key(key, &mut view, &mut running).await?;
-                    // TS `handleCtrlZ` (`app.suspend`, default ctrl+z):
-                    // hand the terminal to the shell and stop the process
-                    // group; execution continues here once the user
-                    // foregrounds the process (SIGCONT), where the cycle
-                    // re-applies raw mode, the alt screen, and SGR mouse
-                    // tracking (TS `ui.start()` + `applyFullscreen(true)`).
-                    // Headless runs keep no terminal renderer (TS never
-                    // registers the action without one), so the request is
-                    // observed and dropped.
-                    // A provider login that prompts on the plain terminal
-                    // (browser OAuth, the MCP device flow): hand the
-                    // terminal over while the flow runs, like `/mcp
-                    // login`.
-                    if session.pending_terminal_login() {
-                        renderer.suspend(&mut view)?;
-                        session.run_terminal_login(&mut view).await?;
-                        renderer.resume()?;
-                    }
-                    // A `/update` run: the child processes own the plain
-                    // terminal, and a successful self-update replaces this
-                    // process with the updated CLI (never returns).
-                    if session.pending_update() {
-                        renderer.suspend(&mut view)?;
-                        session.run_update(&mut view).await?;
-                        renderer.resume()?;
-                    }
-                    if session.take_suspend_request() && renderer.is_terminal_mut().is_some() {
-                        match crate::suspend::suspend_cycle(
-                            &mut crate::suspend::ProcessSignals,
-                            &mut TerminalHandoff {
-                                renderer: &mut renderer,
-                                view: &mut view,
-                            },
-                        ) {
-                            Ok(()) => session.track_suspend_used("resumed"),
-                            Err(error) => {
-                                session.track_suspend_used("failed");
+            } else if let Some(input) = pending.pop_front() {
+                session.dirty = true;
+                match input {
+                    UiInput::Key(key) => {
+                        // TS stops the selection auto-scroll on every
+                        // non-mouse input (`handleFullscreenInput`).
+                        session.stop_selection_auto_scroll();
+                        session.handle_key(key, &mut view, &mut running).await?;
+                        // TS `handleCtrlZ` (`app.suspend`, default ctrl+z):
+                        // hand the terminal to the shell and stop the process
+                        // group; execution continues here once the user
+                        // foregrounds the process (SIGCONT), where the cycle
+                        // re-applies raw mode, the alt screen, and SGR mouse
+                        // tracking (TS `ui.start()` + `applyFullscreen(true)`).
+                        // Headless runs keep no terminal renderer (TS never
+                        // registers the action without one), so the request is
+                        // observed and dropped.
+                        // A provider login that prompts on the plain terminal
+                        // (browser OAuth, the MCP device flow): hand the
+                        // terminal over while the flow runs, like `/mcp
+                        // login`.
+                        if session.pending_terminal_login() {
+                            renderer.suspend(&mut view)?;
+                            session.run_terminal_login(&mut view).await?;
+                            renderer.resume()?;
+                        }
+                        // A `/update` run: the child processes own the plain
+                        // terminal, and a successful self-update replaces this
+                        // process with the updated CLI (never returns).
+                        if session.pending_update() {
+                            renderer.suspend(&mut view)?;
+                            session.run_update(&mut view).await?;
+                            renderer.resume()?;
+                        }
+                        if session.take_suspend_request() && renderer.is_terminal_mut().is_some() {
+                            match crate::suspend::suspend_cycle(
+                                &mut crate::suspend::ProcessSignals,
+                                &mut TerminalHandoff {
+                                    renderer: &mut renderer,
+                                    view: &mut view,
+                                },
+                            ) {
+                                Ok(()) => session.track_suspend_used("resumed"),
+                                Err(error) => {
+                                    session.track_suspend_used("failed");
+                                    session.error_row(&format!("{error:#}"), &mut view);
+                                    // Try to take the terminal back so the run
+                                    // stays usable; if that also fails, the
+                                    // draw below surfaces the broken frame.
+                                    let _ = renderer.resume();
+                                }
+                            }
+                        }
+                        // A selector that resolved to a client command (the
+                        // `/mcp` view's Enter): dispatch it through the same
+                        // submit path as an editor submission, so the
+                        // terminal-suspending auth flows get the identical
+                        // suspend/resume bracket.
+                        if let Some(command) = session.take_pending_client_command() {
+                            let suspended = session.needs_terminal_suspension(&command);
+                            if suspended {
+                                renderer.suspend(&mut view)?;
+                            }
+                            let dispatched = session.submit_prompt(&command, &mut view).await;
+                            if suspended {
+                                renderer.resume()?;
+                            }
+                            if let Err(error) = dispatched {
                                 session.error_row(&format!("{error:#}"), &mut view);
-                                // Try to take the terminal back so the run
-                                // stays usable; if that also fails, the
-                                // draw below surfaces the broken frame.
-                                let _ = renderer.resume();
+                                view.editor.set_text(&command);
+                                session.dirty = true;
                             }
                         }
                     }
-                    // A selector that resolved to a client command (the
-                    // `/mcp` view's Enter): dispatch it through the same
-                    // submit path as an editor submission, so the
-                    // terminal-suspending auth flows get the identical
-                    // suspend/resume bracket.
-                    if let Some(command) = session.take_pending_client_command() {
-                        let suspended = session.needs_terminal_suspension(&command);
+                    UiInput::Paste(text) => {
+                        session.stop_selection_auto_scroll();
+                        session.handle_paste(&text, &mut view);
+                    }
+                    // A mouse report reaches the transcript scroll dispatch
+                    // (TS `handleFullscreenInput`'s wheel branch); non-wheel
+                    // reports are consumed inside.
+                    UiInput::Mouse(event) => {
+                        session.handle_mouse(event, &mut view);
+                    }
+                    // The headless plan's pause step: the queued keystroke
+                    // batch ahead of this barrier is fully handled, so the
+                    // parked suggestions materialize now — the same state the
+                    // terminal loop's 50 ms idle tick produces after a real
+                    // user pauses typing.
+                    UiInput::SettleIdle => {
+                        session.materialize_editor_autocomplete(&mut view);
+                    }
+                    UiInput::Submit(text) => {
+                        session.stop_selection_auto_scroll();
+                        // A terminal-suspending client command (`/mcp login`):
+                        // the auth flow prompts on the plain terminal.
+                        let suspended = session.needs_terminal_suspension(&text);
                         if suspended {
                             renderer.suspend(&mut view)?;
                         }
-                        let dispatched = session.submit_prompt(&command, &mut view).await;
+                        let dispatched = session.submit_prompt(&text, &mut view).await;
                         if suspended {
                             renderer.resume()?;
                         }
                         if let Err(error) = dispatched {
+                            // TS: a rejected submission surfaces the `⚠ Error`
+                            // row and keeps the client mounted with the draft
+                            // restored — a failed prompt never exits the UI.
                             session.error_row(&format!("{error:#}"), &mut view);
-                            view.editor.set_text(&command);
+                            view.editor.set_text(&text);
                             session.dirty = true;
                         }
+                        // A `/update` run parked by the submission: the child
+                        // processes own the plain terminal, and a successful
+                        // self-update replaces this process (never returns).
+                        if session.pending_update() {
+                            renderer.suspend(&mut view)?;
+                            session.run_update(&mut view).await?;
+                            renderer.resume()?;
+                        }
                     }
-                }
-                UiInput::Paste(text) => {
-                    session.stop_selection_auto_scroll();
-                    session.handle_paste(&text, &mut view);
-                }
-                // A mouse report reaches the transcript scroll dispatch
-                // (TS `handleFullscreenInput`'s wheel branch); non-wheel
-                // reports are consumed inside.
-                UiInput::Mouse(event) => {
-                    session.handle_mouse(event, &mut view);
-                }
-                // The headless plan's pause step: the queued keystroke
-                // batch ahead of this barrier is fully handled, so the
-                // parked suggestions materialize now — the same state the
-                // terminal loop's 50 ms idle tick produces after a real
-                // user pauses typing.
-                UiInput::SettleIdle => {
-                    session.materialize_editor_autocomplete(&mut view);
-                }
-                UiInput::Submit(text) => {
-                    session.stop_selection_auto_scroll();
-                    // A terminal-suspending client command (`/mcp login`):
-                    // the auth flow prompts on the plain terminal.
-                    let suspended = session.needs_terminal_suspension(&text);
-                    if suspended {
-                        renderer.suspend(&mut view)?;
+                    UiInput::HeadlessDone => headless_done = true,
+                    UiInput::ScrollTop => {
+                        session.stop_selection_auto_scroll();
+                        view.scroll_to_top();
                     }
-                    let dispatched = session.submit_prompt(&text, &mut view).await;
-                    if suspended {
-                        renderer.resume()?;
+                    UiInput::Resize => {
+                        session.stop_selection_auto_scroll();
+                        // The editor lays its window out against the new row
+                        // count; the branch's dirty flag repaints the frame at
+                        // the new geometry.
+                        if let Ok((_width, height)) = crossterm::terminal::size() {
+                            view.set_terminal_rows(height);
+                        }
                     }
-                    if let Err(error) = dispatched {
-                        // TS: a rejected submission surfaces the `⚠ Error`
-                        // row and keeps the client mounted with the draft
-                        // restored — a failed prompt never exits the UI.
-                        session.error_row(&format!("{error:#}"), &mut view);
-                        view.editor.set_text(&text);
-                        session.dirty = true;
+                    UiInput::WaitIdle { .. } => unreachable!("barrier handled above"),
+                }
+                // Paint the handled input in this iteration: the select below can
+                // otherwise wait out its 50ms tick before the next draw, and
+                // that wait is felt directly as keystroke-to-render lag.
+                // A handoff paints nothing: the next surface owns the pane
+                // (TS `returnToAgentsView` hands the terminal over without a
+                // final repaint — the agents view's mount clears the alt
+                // screen), so the chat's last layout is dead work that only
+                // delays the switch.
+                if let Some(renderer) = renderer.is_terminal_mut() {
+                    if !session.open_agents_view && session.pending_selection.is_none() {
+                        crate::app::draw(renderer, &mut view)?;
+                        // The frame scheduler's bookkeeping follows the
+                        // inline paint: the 16ms gate below now measures its
+                        // interval from this frame, and a paint satisfied
+                        // any armed deadline.
+                        last_render_at = Some(Instant::now());
+                        last_pulse_phase = view.pulse_frame;
+                        render_deadline = None;
                     }
-                    // A `/update` run parked by the submission: the child
-                    // processes own the plain terminal, and a successful
-                    // self-update replaces this process (never returns).
-                    if session.pending_update() {
-                        renderer.suspend(&mut view)?;
-                        session.run_update(&mut view).await?;
-                        renderer.resume()?;
-                    }
+                    session.dirty = false;
                 }
-                UiInput::HeadlessDone => headless_done = true,
-                UiInput::ScrollTop => {
-                    session.stop_selection_auto_scroll();
-                    view.scroll_to_top();
+                // An exit key must not wait out the select tick before the
+                // bounded shutdown path runs.
+                if !running {
+                    break;
                 }
-                UiInput::Resize => {
-                    session.stop_selection_auto_scroll();
-                    // The editor lays its window out against the new row
-                    // count; the branch's dirty flag repaints the frame at
-                    // the new geometry.
-                    if let Ok((_width, height)) = crossterm::terminal::size() {
-                        view.set_terminal_rows(height);
-                    }
+                // `exit_requested` is the same leave-now signal (agents-back,
+                // `/resume`, `/exit`): in terminal mode the teardown below must
+                // run this iteration, not after the select's 50ms idle tick
+                // parks the loop — that park reads directly as switch latency
+                // (TS's event loop leaves on the key). Headless runs keep the
+                // tail pass so captured frames stay identical.
+                if session.exit_requested && renderer.is_terminal() {
+                    session.exit_reason = "session_request";
+                    break;
                 }
-                UiInput::WaitIdle { .. } => unreachable!("barrier handled above"),
-            }
-            // Paint the handled input in this iteration: the select below can
-            // otherwise wait out its 50ms tick before the next draw, and
-            // that wait is felt directly as keystroke-to-render lag.
-            // A handoff paints nothing: the next surface owns the pane
-            // (TS `returnToAgentsView` hands the terminal over without a
-            // final repaint — the agents view's mount clears the alt
-            // screen), so the chat's last layout is dead work that only
-            // delays the switch.
-            if let Some(renderer) = renderer.is_terminal_mut() {
-                if !session.open_agents_view && session.pending_selection.is_none() {
-                    crate::app::draw(renderer, &mut view)?;
+                // Headless input keeps the one-step-per-iteration order the
+                // plans were written against: every step renders before the
+                // next applies (a plan step is not a terminal burst, and the
+                // captured frame sequence IS the verifier evidence — a
+                // batched drain would collapse intermediate states like the
+                // quick-shortcut guide or the expanded compaction block out
+                // of the capture). The terminal path keeps the full batch
+                // drain, the input-starvation fix.
+                if !renderer.is_terminal() {
+                    inputs_pending = false;
                 }
-                session.dirty = false;
-            }
-            // An exit key must not wait out the select tick before the
-            // bounded shutdown path runs.
-            if !running {
-                break;
-            }
-            // `exit_requested` is the same leave-now signal (agents-back,
-            // `/resume`, `/exit`): in terminal mode the teardown below must
-            // run this iteration, not after the select's 50ms idle tick
-            // parks the loop — that park reads directly as switch latency
-            // (TS's event loop leaves on the key). Headless runs keep the
-            // tail pass so captured frames stay identical.
-            if session.exit_requested && renderer.is_terminal() {
-                session.exit_reason = "session_request";
-                break;
+            } else {
+                // The batch drained: everything queued was handled in this
+                // one pass (TS dispatches a stdin chunk's events the same
+                // way). Without this arm the drain loop would spin on the
+                // empty queue — the select below would never run again,
+                // starving every render and input after the first batch
+                // (the trapped, 90%+ CPU state the dogfood hit).
+                inputs_pending = false;
             }
         }
         // A `/share` upload in flight holds the run open like an active
@@ -1245,36 +1306,90 @@ pub async fn run_interactive(
                 // cadence.
                 session.selection_auto_scroll_tick(&mut view);
             }
+            _frame = async {
+                match render_deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // The coalesced frame's deadline arrived: the render gate
+                // below paints the accumulated state now.
+            }
         }
 
         // The tray goal label follows the live goal state (TS
         // `syncGoalTray`); the label only changes when the state does.
         session.sync_goal_tray(&mut view);
 
-        // Spinner animation: the loader frame advances while a turn or a
-        // compaction runs.
-        if session.turn_active || view.compaction.is_some() || view.share_loader.is_some() {
-            view.pulse_frame = view.pulse_frame.wrapping_add(1);
-        }
-
-        // Render when the transcript changed or an animation is live; an
-        // idle session re-renders nothing (a full-transcript layout costs
-        // linear time, so redrawing an unchanged idle frame burns CPU for
-        // every attached session).
+        // Spinner animation (TS `Loader`'s `setInterval(80ms)` drives the
+        // phase, not the render rate): the frame gate below caps renders,
+        // so a per-iteration increment would spin the loader too fast —
+        // the phase follows the animating clock instead, and only a phase
+        // change dirties the frame (TS's interval callback is the only
+        // requestRender a quiet turn produces, so a turn without stream
+        // events paints at the 80ms loader cadence, not the 16ms frame
+        // cap).
         let animating = session.turn_active
             || view.retry.is_some()
             || view.compaction.is_some()
             || view.share_loader.is_some();
         if animating {
-            session.dirty = true;
-        }
-        if let Some(renderer) = renderer.is_terminal_mut() {
-            if session.dirty {
-                crate::app::draw(renderer, &mut view)?;
-                session.dirty = false;
+            let started = *anim_started.get_or_insert_with(Instant::now);
+            let phase = (started.elapsed().as_millis() / SPINNER_INTERVAL_MS) as usize;
+            view.pulse_frame = phase;
+            if phase != last_pulse_phase {
+                session.dirty = true;
             }
-        } else if session.dirty {
-            renderer.render_headless(&mut session, &mut view);
+            // Arm the next phase boundary: without a deadline the select
+            // would only wake on the 50ms tick, adding up to a full tick
+            // of spinner latency to every phase change.
+            let next_phase =
+                started + Duration::from_millis(SPINNER_INTERVAL_MS as u64 * (phase as u64 + 1));
+            if render_deadline.is_none_or(|deadline| deadline > next_phase) {
+                render_deadline = Some(next_phase);
+            }
+        } else {
+            anim_started = None;
+            last_pulse_phase = usize::MAX;
+        }
+
+        // The frame gate (TS `scheduleRender`: at most one render per
+        // MIN_RENDER_INTERVAL_MS): every state change inside the window
+        // coalesces into the next frame — a stream burst renders at most
+        // one frame per tick instead of one full-transcript layout per
+        // event, an idle session re-renders nothing, and a dirty state
+        // inside the window waits for the deadline arm above instead of
+        // burning a render now.
+        if session.dirty {
+            if let Some(renderer) = renderer.is_terminal_mut() {
+                let interval_elapsed = last_render_at
+                    .map(|at| at.elapsed() >= MIN_RENDER_INTERVAL)
+                    .unwrap_or(true);
+                if interval_elapsed {
+                    crate::app::draw(renderer, &mut view)?;
+                    session.dirty = false;
+                    last_render_at = Some(Instant::now());
+                    last_pulse_phase = view.pulse_frame;
+                    render_deadline = None;
+                } else {
+                    render_deadline = Some(last_render_at.unwrap() + MIN_RENDER_INTERVAL);
+                }
+            } else {
+                // Headless capture keeps the per-change frame sequence
+                // the verifiers assert on: no wall-clock interval applies.
+                renderer.render_headless(&mut session, &mut view);
+                session.dirty = false;
+                last_pulse_phase = view.pulse_frame;
+            }
+        } else if render_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            // A fired deadline with nothing dirty to paint must not
+            // re-fire on every iteration (the sleep is in the past, so
+            // the arm would return immediately): drop it. A future arm
+            // (the spinner's next phase boundary) stays: the select needs
+            // that wakeup even when nothing else is dirty.
+            render_deadline = None;
         }
         if session.exit_requested {
             session.exit_reason = "session_request";

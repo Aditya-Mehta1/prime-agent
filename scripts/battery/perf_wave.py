@@ -18,6 +18,9 @@ Dimensions (each writes evidence under <run>/<dim>/<side>/):
                   session
   export          `session export` (HTML) wall time on the large corpus
   daemon_overhead daemon-tree RSS delta across 10 idle sessions
+  sustained_cpu   30s idle + paced plain/code streaming + long tool turn
+                  %CPU of the interactive process, asserted (render-loop
+                  regression guard, lane cpu-spin)
 
 Runs on the mission box or in a perf sandbox; timings are only comparable
 when both sides run on the same quiet machine, so the intended execution is
@@ -63,6 +66,7 @@ ALL_DIMS = [
     "compaction",
     "export",
     "daemon_overhead",
+    "sustained_cpu",
 ]
 
 # The 1000+ row resume/export corpus: 350 turns -> 1078 rows.
@@ -623,6 +627,60 @@ class PerfWave:
         return out
 
     # -- dimension: streaming throughput -----------------------------------------
+
+    # -- dimension: sustained CPU (render-loop regression guard) ------------------
+    #
+    # The cpu-spin dogfood fix (frame-batch scheduler, per-block markdown
+    # cache, timer-driven spinner) is guarded by absolute budgets, not a
+    # TS ratio: a render loop that burns 90%+ of a core while idle or
+    # while a stream renders is a bug at any TS-relative speed.
+    # sustained_cpu.py drives the interactive TUI through the faux
+    # provider (idle window, paced plain-text stream, paced code stream,
+    # long tool-execution turn), samples %CPU per process from /proc, and
+    # asserts: idle < 5%, streaming < 30%, typing mid-stream < 50ms, and
+    # the double-Ctrl+C exit mid-scroll (bug #6's trapped-scroll repro).
+
+    def dim_sustained_cpu(self) -> dict:
+        script = Path(__file__).parent / "sustained_cpu.py"
+        out_dir = self.run_dir / "sustained_cpu"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # NOTE: no PI_PACKAGE_DIR here either — sustained_cpu.py scopes the
+        # runtime sidecar to the rust pane itself (same reason as the
+        # streaming dim).
+        env = dict(os.environ)
+        env.pop("PI_PACKAGE_DIR", None)
+        env["PA_RUST_BINARY"] = str(Path(self.rust_bin).resolve())
+        proc = subprocess.run(
+            ["python3", str(script), "--out", str(out_dir)],
+            env=env,
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            timeout=2400,
+        )
+        self.evidence("sustained_cpu", "shared", "sustained_cpu.log", proc.stdout + proc.stderr)
+        result: dict[str, dict] = {}
+        for side_name in ("ts", "rust"):
+            path = out_dir / f"{side_name}-sustained-cpu.json"
+            if not path.exists():
+                print(f"WARNING: missing {path}", file=sys.stderr)
+                continue
+            data = json.loads(path.read_text())
+
+            def tui_mean(dim):
+                return ((data.get(dim) or {}).get("tui") or {}).get("mean_pct")
+
+            result[side_name] = {
+                "tui_idle_mean_pct": tui_mean("idle"),
+                "tui_plain_mean_pct": tui_mean("plain"),
+                "tui_code_mean_pct": tui_mean("code"),
+                "tui_tool_mean_pct": tui_mean("tool"),
+                "typing_ms_median": (data.get("typing_probe") or {}).get("median_ms"),
+                "exit_s": (data.get("exit_probe") or {}).get("elapsed_s"),
+                "passed": data.get("passed"),
+            }
+        result["_exit_code"] = proc.returncode
+        return result
 
     def dim_streaming(self) -> dict:
         # stream_throughput.py runs both binaries itself (faux engine on

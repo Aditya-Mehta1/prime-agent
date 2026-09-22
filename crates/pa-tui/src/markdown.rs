@@ -75,6 +75,19 @@ impl MarkdownStyle {
 
 /// Rendered markdown document as styled lines.
 pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<Line> {
+    render_markdown_tagged(text, width, style, "", &mut MarkdownBlockCache::default())
+}
+
+/// Cached render with a style discriminator (see [`MarkdownBlockCache`]):
+/// the same raw text rendered under different styles (the dim thinking
+/// block) must not hit the other style's rows.
+pub fn render_markdown_tagged(
+    text: &str,
+    width: usize,
+    style: &MarkdownStyle,
+    style_tag: &str,
+    cache: &mut MarkdownBlockCache,
+) -> Vec<Line> {
     let content_width = width.max(1);
     if text.trim().is_empty() {
         return Vec::new();
@@ -82,6 +95,9 @@ pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<L
     let normalized = text.replace('\t', "   ");
     let mut lines: Vec<Line> = Vec::new();
     let blocks = parse_blocks(&normalized);
+    // The next render's cache: starts from the current map (a hit keeps
+    // its entry alive) and drops everything this document did not use.
+    let mut next_cache = std::mem::take(&mut cache.0);
     for (i, block) in blocks.iter().enumerate() {
         let next = blocks.get(i + 1);
         // A blank source line separates blocks: TS's lexer emits one `space`
@@ -92,9 +108,79 @@ pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<L
         if block.sep_blank {
             lines.push(Vec::new());
         }
-        render_block(block, next, content_width, style, &mut lines);
+        let is_final = i == blocks.len() - 1;
+        let key = is_final.then(|| block_cache_key(style_tag, block, next, content_width));
+        let mut block_lines: Option<Vec<Line>> = None;
+        if let Some(key) = &key {
+            if let Some(cached) = next_cache.get(key) {
+                lines.extend(cached.iter().cloned());
+                block_lines = Some(cached.clone());
+            }
+        }
+        if block_lines.is_none() {
+            let mut rendered = Vec::new();
+            render_block(block, next, content_width, style, &mut rendered);
+            lines.extend(rendered.iter().cloned());
+            if let Some(key) = &key {
+                rendered.shrink_to_fit();
+                next_cache.insert(key.clone(), rendered);
+            }
+        }
     }
+    cache.0 = next_cache;
     lines
+}
+
+/// Per-block render cache (TS `Markdown.blockCache`, markdown.ts): a
+/// streaming append re-renders only the changing final block — every
+/// earlier block replays its rendered rows by `(width, kind, next kind,
+/// raw)` key instead of re-running inline styling and wrapping. The map
+/// is rebuilt on every render (TS swaps `nextCache` in), so it stays
+/// bounded to the current document's blocks, and the final block is
+/// never cached: while streaming, appended text can reinterpret an open
+/// block (unterminated fences, growing lists); once a block is no longer
+/// last, its raw text is final.
+#[derive(Default)]
+pub struct MarkdownBlockCache(std::collections::HashMap<String, Vec<Line>>);
+
+/// The cache key (TS: `${width}|${token.type}|${nextTokenType}|${token.raw}`):
+/// the style discriminator (the dim thinking block), width, this block's
+/// kind, the following kind (a block's trailing blank row depends on it),
+/// and the raw block lines.
+fn block_cache_key(style_tag: &str, block: &Block, next: Option<&Block>, width: usize) -> String {
+    let mut key = String::with_capacity(64);
+    key.push_str(style_tag);
+    key.push('|');
+    key.push_str(&width.to_string());
+    key.push('|');
+    key.push_str(block_kind_name(&block.kind));
+    key.push('|');
+    if let Some(next) = next {
+        // The trailing-blank decision reads `next.sep_blank` (TS encodes
+        // it as the next token being a `space` token, part of its key).
+        if next.sep_blank {
+            key.push_str("space|");
+        }
+        key.push_str(block_kind_name(&next.kind));
+    }
+    key.push('|');
+    for line in &block.lines {
+        key.push_str(line);
+        key.push('\n');
+    }
+    key
+}
+
+fn block_kind_name(kind: &BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Heading => "heading",
+        BlockKind::Paragraph => "paragraph",
+        BlockKind::Code { .. } => "code",
+        BlockKind::List { .. } => "list",
+        BlockKind::Quote => "quote",
+        BlockKind::Hr => "hr",
+        BlockKind::Table { .. } => "table",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -359,6 +359,7 @@ pub fn render_assistant(
     code_block_indent: &str,
     width: usize,
     preceded_by_tool_activity: bool,
+    cache: &mut crate::markdown::MarkdownBlockCache,
 ) -> Vec<Line> {
     let show_thinking = detail.show_thinking();
     let visible_blocks: Vec<&MessageBlock> = message
@@ -379,10 +380,10 @@ pub fn render_assistant(
     for (index, block) in visible_blocks.iter().enumerate() {
         match block {
             MessageBlock::Text(text) => {
-                out.extend(render_markdown_block(text, &md, width));
+                out.extend(render_markdown_block(text, &md, width, cache));
             }
             MessageBlock::Thinking(text) => {
-                out.extend(render_thinking_block(text, theme, &md, width));
+                out.extend(render_thinking_block(text, theme, &md, width, cache));
                 // Thinking adds spacing only when another visible block follows.
                 if index + 1 < visible_blocks.len() {
                     out.push(spacer());
@@ -429,9 +430,11 @@ pub(crate) fn render_markdown_block(
     text: &str,
     md: &crate::markdown::MarkdownStyle,
     width: usize,
+    cache: &mut crate::markdown::MarkdownBlockCache,
 ) -> Vec<Line> {
     let content_width = width.saturating_sub(2).max(1);
-    let rendered = crate::markdown::render_markdown(text.trim(), content_width, md);
+    let rendered =
+        crate::markdown::render_markdown_tagged(text.trim(), content_width, md, "", cache);
     let mut out = Vec::new();
     for line in rendered.into_iter() {
         let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
@@ -452,6 +455,7 @@ fn render_thinking_block(
     theme: &Theme,
     md: &crate::markdown::MarkdownStyle,
     width: usize,
+    cache: &mut crate::markdown::MarkdownBlockCache,
 ) -> Vec<Line> {
     let mut md = md.clone();
     let dim = theme.fg_style(ThemeColor::Dim);
@@ -467,7 +471,8 @@ fn render_thinking_block(
     md.hr = dim;
     md.list_bullet = dim;
     let content_width = width.saturating_sub(2).max(1);
-    let rendered = crate::markdown::render_markdown(text.trim(), content_width, &md);
+    let rendered =
+        crate::markdown::render_markdown_tagged(text.trim(), content_width, &md, "dim", cache);
     let mut out = Vec::new();
     for line in rendered.into_iter() {
         // The markdown margin sits outside the styled content (default fg).
@@ -808,7 +813,15 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(&plain, Detail::Overview, &theme(), "  ", 60, false);
+        let rows = render_assistant(
+            &plain,
+            Detail::Overview,
+            &theme(),
+            "  ",
+            60,
+            false,
+            &mut crate::markdown::MarkdownBlockCache::default(),
+        );
         assert!(crate::osc133::row_markers(&rows[0]).start);
         assert!(crate::osc133::row_markers(rows.last().unwrap()).end);
 
@@ -819,7 +832,15 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(&with_tools, Detail::Overview, &theme(), "  ", 60, false);
+        let rows = render_assistant(
+            &with_tools,
+            Detail::Overview,
+            &theme(),
+            "  ",
+            60,
+            false,
+            &mut crate::markdown::MarkdownBlockCache::default(),
+        );
         assert_eq!(crate::osc133::row_markers(&rows[0]), Default::default());
     }
 
@@ -843,7 +864,15 @@ mod tests {
                 .trim_end()
                 .to_string()
         };
-        let rows = render_assistant(&message, Detail::Overview, &theme(), "    ", 60, false);
+        let rows = render_assistant(
+            &message,
+            Detail::Overview,
+            &theme(),
+            "    ",
+            60,
+            false,
+            &mut crate::markdown::MarkdownBlockCache::default(),
+        );
         let flat: Vec<String> = rows
             .iter()
             .map(|line| line.iter().map(|s| s.content.as_str()).collect::<String>())
@@ -854,7 +883,15 @@ mod tests {
             "non-default indent applied: {flat:?}"
         );
         // The default (no setting) stays two spaces.
-        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, false);
+        let rows = render_assistant(
+            &message,
+            Detail::Overview,
+            &theme(),
+            "  ",
+            60,
+            false,
+            &mut crate::markdown::MarkdownBlockCache::default(),
+        );
         let flat: Vec<String> = rows
             .iter()
             .map(|line| line.iter().map(|s| s.content.as_str()).collect::<String>())
@@ -901,7 +938,15 @@ mod tests {
             error: Some("Error: request failed after retries".into()),
             aborted: false,
         };
-        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, false);
+        let rows = render_assistant(
+            &message,
+            Detail::Overview,
+            &theme(),
+            "  ",
+            60,
+            false,
+            &mut crate::markdown::MarkdownBlockCache::default(),
+        );
         let flat: Vec<String> = rows
             .iter()
             .map(|line| line.iter().map(|s| s.content.as_str()).collect())
@@ -922,7 +967,15 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, true);
+        let rows = render_assistant(
+            &message,
+            Detail::Overview,
+            &theme(),
+            "  ",
+            60,
+            true,
+            &mut crate::markdown::MarkdownBlockCache::default(),
+        );
         assert_eq!(rows.last().unwrap().len(), 0, "trailing spacer");
         // A tool-only message after tool activity renders no spacers.
         let message = AssistantMessage {
@@ -932,7 +985,15 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, true);
+        let rows = render_assistant(
+            &message,
+            Detail::Overview,
+            &theme(),
+            "  ",
+            60,
+            true,
+            &mut crate::markdown::MarkdownBlockCache::default(),
+        );
         assert!(rows.is_empty(), "got: {rows:?}");
     }
 
