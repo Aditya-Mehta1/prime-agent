@@ -294,9 +294,9 @@ export async function copySourceCatalogAssets(options = {}) {
 	const outDir = resolve(options.outDir ?? join(packageDir, "dist"));
 	mkdirSync(outDir, { recursive: true });
 	const targets = bundledTargets(outDir);
-	const allTargetsPresent = bundledCatalogFiles.every((file) => existsSync(join(outDir, file)));
-	if (allTargetsPresent) return validateBundledCatalogDir(outDir, options);
-
+	// Prefer the generated source catalog over stale dist copies: incremental
+	// builds must package the freshly generated snapshot, not whatever dist
+	// happened to keep from a previous build.
 	const sourceDir = join(packageDir, "catalog");
 	const allSourcesPresent = bundledCatalogFiles.every((file) => existsSync(join(sourceDir, file)));
 	if (allSourcesPresent) {
@@ -304,6 +304,9 @@ export async function copySourceCatalogAssets(options = {}) {
 		cpSync(join(sourceDir, "mcp-services.bundled.json"), targets.mcpServices);
 		return validateBundledCatalogDir(outDir, options);
 	}
+
+	const allTargetsPresent = bundledCatalogFiles.every((file) => existsSync(join(outDir, file)));
+	if (allTargetsPresent) return validateBundledCatalogDir(outDir, options);
 
 	try {
 		const [modelBody, mcpServiceBody] = await Promise.all([
