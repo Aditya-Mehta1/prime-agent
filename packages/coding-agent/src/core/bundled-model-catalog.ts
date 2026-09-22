@@ -36,11 +36,15 @@ export function createBundledModelCatalog(
 	);
 }
 
-function loadBundledModels(source: boolean, assetPath: string): Model<Api>[] {
+function loadBundledModels(_source: boolean, assetPath: string): Model<Api>[] {
 	try {
-		const catalog = source
-			? createBundledModelCatalog(JSON.parse(readFileSync(assetPath, "utf8")))
-			: parseModelCatalog(JSON.parse(readFileSync(assetPath, "utf8")));
+		// Both source checkouts and installed binaries combine the packaged provider
+		// catalog with the compiled non-private Prime Inference entries: the catalog
+		// repo never carries Prime models (clients fetch those live with credentials),
+		// so without this merge a fresh offline install would offer no Prime models
+		// for onboarding. A damaged installation still falls back to the compiled
+		// definitions below.
+		const catalog = createBundledModelCatalog(JSON.parse(readFileSync(assetPath, "utf8")));
 		return [
 			...parseProviderModelCatalog(catalog, installedModels),
 			...catalog.models.filter(

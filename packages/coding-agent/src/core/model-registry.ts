@@ -32,6 +32,7 @@ import { getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { getBundledModels } from "./bundled-model-catalog.js";
+import { refreshDefaultModelCatalog } from "./default-model-catalog.js";
 import { CATALOG_REFRESH_INTERVAL_MS, CatalogCache, isCatalogOffline } from "./model-catalog-cache.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
@@ -920,6 +921,9 @@ export class ModelRegistry {
 
 	private async refreshProviderCatalog(force: boolean): Promise<void> {
 		await this.providerCatalog.refresh("public", { force });
+		// The catalog-defined default model rides the same cadence; failures keep the
+		// cached value and never block model discovery.
+		await refreshDefaultModelCatalog(force).catch(() => undefined);
 		this.reloadModelsAfterCatalogChange();
 	}
 
