@@ -1594,6 +1594,7 @@ export class AgentSession {
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private readonly _launchCwd: string;
+	private _launchCwdOverridesBranch: boolean;
 	private _agentDir?: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -1715,6 +1716,7 @@ export class AgentSession {
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._launchCwd = config.cwd;
+		this._launchCwdOverridesBranch = config.cwd !== this.sessionManager.getHeader()?.cwd;
 		const branchCwd = this._branchCwd();
 		if (branchCwd !== this._cwd) {
 			this._cwd = branchCwd;
@@ -2096,9 +2098,9 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/** The cwd the active branch prescribes: its latest still-existing /cwd entry, else the launch cwd. */
+	/** The cwd the active branch prescribes: its latest still-existing /cwd entry, else the launch cwd; an explicit launch override wins until the first /cwd. */
 	private _branchCwd(): string {
-		if (this._launchCwd !== this.sessionManager.getHeader()?.cwd) return this._launchCwd;
+		if (this._launchCwdOverridesBranch) return this._launchCwd;
 		const branch = this.sessionManager.getBranch();
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const entry = branch[i];
@@ -2111,7 +2113,11 @@ export class AgentSession {
 
 	private async _reloadCwdFromBranch(): Promise<void> {
 		const cwd = this._branchCwd();
-		if (cwd !== this._cwd && isExistingDirectory(cwd)) await this._applyCwd(cwd);
+		if (cwd === this._cwd || !isExistingDirectory(cwd)) return;
+		await this._applyCwd(cwd);
+		this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter(
+			(message) => message.customType !== SESSION_CWD_CHANGED_CUSTOM_TYPE,
+		);
 	}
 
 	private _resolveRlmMaxDepth(): {
@@ -14115,7 +14121,13 @@ export class AgentSession {
 			if (cwd === this._cwd) return cwd;
 			const previousCwd = this._cwd;
 			await this._applyCwd(cwd);
-			this.sessionManager.appendCustomEntryWithRollback(SESSION_CWD_STATE_CUSTOM_TYPE, { cwd });
+			try {
+				this.sessionManager.appendCustomEntryWithRollback(SESSION_CWD_STATE_CUSTOM_TYPE, { cwd });
+			} catch (error) {
+				await this._applyCwd(previousCwd);
+				throw error;
+			}
+			this._launchCwdOverridesBranch = false;
 			await this.sendCustomMessage(
 				{
 					customType: SESSION_CWD_CHANGED_CUSTOM_TYPE,
