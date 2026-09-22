@@ -131,6 +131,9 @@ SUDO_MATCHING_COMMANDS = [
     "sh <(printf 'sudo id')",
     "${SUDO_CMD:-sudo} id",
     "${X:-$(printf sudo)} id",
+    "echo $(sudo id",
+    "echo <(sudo id",
+    'bash -c "$(sudo id',
     "CMD=sudo; eval \"$CMD id\"",
     "CMD=sudo; sh -c \"$CMD id\"",
     "eval eval eval eval eval eval eval 'sudo id'",
@@ -314,6 +317,7 @@ SUDO_NON_MATCHING_COMMANDS = [
     "cat <<EOF\nsudo id\nEOF",
     "python -c \"print('sudo')\"",
     "$(date)",
+    "echo $(date",
     "timeout 30 ls",
     "env -i ls",
     "cd /tmp && make install",
@@ -436,6 +440,12 @@ class SudoDetectionTest(unittest.TestCase):
         self.assertIn("sudo", bash_module._sudo_violation("sudo ls"))
         self.assertIn("doas", bash_module._sudo_violation("doas id"))
 
+    def test_matching_paren_keeps_the_three_arg_family_contract(self):
+        # #2373/#2390/#2415 ship this helper as (text, open_index, end); a
+        # divergent arity here would break the merged module with a TypeError.
+        self.assertEqual(bash_module._matching_paren("$(sudo id)", 1, 10), 9)
+        self.assertEqual(bash_module._matching_paren("$(sudo id", 1, 9), 8)  # unterminated
+
 
 class BraceFloodTest(unittest.TestCase):
     """The brace-expansion cap: a flood fails closed and never scans quadratically."""
@@ -543,7 +553,7 @@ class SudoGuardTest(unittest.IsolatedAsyncioTestCase):
     def test_kwarg_bypass_passes_guard(self):
         instance = self._mock_handle()
         bash("sudo id", allow_sudo=True)
-        instance.assert_called_once_with("sudo id")
+        instance.assert_called_once_with("sudo id", script="sudo id")
 
     def test_kwarg_bypass_does_not_leak(self):
         self._mock_handle()
@@ -554,7 +564,7 @@ class SudoGuardTest(unittest.IsolatedAsyncioTestCase):
         instance = self._mock_handle()
         with mock.patch.object(bash_module, "_SUDO_BYPASS_AT_KERNEL_START", True):
             bash("sudo id")
-        instance.assert_called_once_with("sudo id")
+        instance.assert_called_once_with("sudo id", script="sudo id")
 
     def test_late_bypass_env_ignored_and_warned(self):
         os.environ[BASH_SUDO_BYPASS_ENV] = "1"
@@ -564,6 +574,32 @@ class SudoGuardTest(unittest.IsolatedAsyncioTestCase):
             self._refused("sudo id")
         self.assertIn("PI_BASH_ALLOW_SUDO appeared after kernel start", stderr.getvalue())
         self.assertEqual(stderr.getvalue().count("appeared after kernel start"), 1)
+
+    def test_direct_handle_construction_is_guarded(self):
+        with self.assertRaises(PrivilegeEscalationRefusalError):
+            bash_module.BashHandle("sudo id")
+
+    async def test_one_prefix_read_feeds_the_scan_and_the_spawn(self):
+        reads = []
+        real = bash_module._with_prefix
+
+        def spy(command):
+            reads.append(command)
+            return real(command)
+
+        os.environ["PRIME_AGENT_BASH_COMMAND_PREFIX"] = "cd /tmp"
+        with mock.patch.object(bash_module, "_with_prefix", spy):
+            await self._run("pwd")
+        self.assertEqual(reads, ["pwd"])  # one read for the scan and the spawn alike
+
+    def test_scanned_prefix_text_is_the_spawned_script(self):
+        instance = self._mock_handle()
+        os.environ["PRIME_AGENT_BASH_COMMAND_PREFIX"] = "sudo -n id"
+        with self.assertRaises(PrivilegeEscalationRefusalError):
+            bash("echo hi")
+        os.environ["PRIME_AGENT_BASH_COMMAND_PREFIX"] = "cd /tmp"
+        bash("echo hi")
+        instance.assert_called_once_with("echo hi", script="cd /tmp\necho hi")
 
     def test_child_env_strips_late_bypass(self):
         os.environ[BASH_SUDO_BYPASS_ENV] = "1"

@@ -751,10 +751,10 @@ def _tokenize(command: str) -> list[_Word]:
             # Process substitution (`<(cmd)`, `>(cmd)`) runs the span as a command
             # of its own. Keep it in one word so the span scan recurses into it.
             note_character()
-            end = _matching_paren(command, index + 1) + 1
+            close = _matching_paren(command, index + 1, length)
             expansion = True
-            buffer.append(command[index:end])
-            index = end
+            buffer.append(command[index : close + 1])
+            index = close + 1
             continue
         redirect = None
         if started or char.isdigit() or char in "<>":
@@ -873,52 +873,67 @@ def _is_flag_word(word: _Word) -> bool:
     return word.value.startswith("-") and word.value != "-"
 
 
-def _matching_paren(value: str, open_index: int) -> int:
-    """Index of the `)` matching the `(` at `open_index`, skipping quoted spans."""
-    depth = 0
-    single = False
-    double = False
-    index = open_index
-    while index < len(value):
-        char = value[index]
-        if char == "\\" and not single and index + 1 < len(value):
-            index += 2  # an escaped character cannot open or close a quote
+def _quote_span_end(command: str, start: int, end: int) -> int:
+    """Index just past the quoted span starting at `command[start]` (a single
+    or double quote), skipping escaped characters inside double quotes."""
+    quote = command[start]
+    i = start + 1
+    while i < end:
+        ch = command[i]
+        if quote == '"' and ch == "\\":
+            i += 2
             continue
-        if single:
-            if char == "'":
-                single = False
-        elif double:
-            if char == '"':
-                double = False
-        elif char == "'":
-            single = True
-        elif char == '"':
-            double = True
-        elif char == "(":
+        if ch == quote:
+            return i + 1
+        i += 1
+    return end
+
+
+def _matching_paren(command: str, open_index: int, end: int) -> int:
+    """Index of the `)` matching the `(` at `open_index`, or `end - 1`.
+
+    Quote-aware: a `)` inside a single- or double-quoted span or after a
+    backslash escape never closes the substitution, mirroring how the shell
+    parses it. Unterminated quotes or an unmatched `(` scan to the end, so
+    the whole region stays live-command territory rather than a miss."""
+    depth = 0
+    i = open_index
+    while i < end:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+        elif ch in "'\"":
+            i = _quote_span_end(command, i, end)
+        elif ch == "(":
             depth += 1
-        elif char == ")":
+            i += 1
+        elif ch == ")":
             depth -= 1
             if depth == 0:
-                return index
-        index += 1
-    return len(value)
+                return i
+            i += 1
+        else:
+            i += 1
+    return end - 1  # unterminated: scan to the end
 
 
 def _expansion_spans(value: str) -> list[str]:
     """`$(...)` and backtick spans of an expansion word, as command text."""
     spans: list[str] = []
     index = 0
-    while index < len(value):
+    length = len(value)
+    while index < length:
         char = value[index]
-        if char == "$" and value.startswith("$(", index):
-            end = _matching_paren(value, index + 1)
-            spans.append(value[index + 2 : end])
-            index = end + 1 if end < len(value) else end
-            continue
-        if char in "<>" and value.startswith("(", index + 1):
-            end = _matching_paren(value, index + 1)
-            spans.append(value[index + 2 : end])
-            index = end + 1 if end < len(value) else end
+        if (char == "$" and value.startswith("$(", index)) or (
+            char in "<>" and value.startswith("(", index + 1)
+        ):
+            close = _matching_paren(value, index + 1, length)
+            if value[close : close + 1] == ")":
+                spans.append(value[index + 2 : close])  # matched: the interior runs
+                index = close + 1
+            else:
+                spans.append(value[index + 2 :])  # unterminated: the remainder runs
+                index = length
             continue
         if char == "`":
             end = value.find("`", index + 1)
@@ -1557,7 +1572,10 @@ def _process_substitution_body(value: str) -> str | None:
     """Inner command text of a `<(cmd)` process substitution, else None."""
     if not value.startswith("<("):
         return None
-    return value[2 : _matching_paren(value, 1)]
+    close = _matching_paren(value, 1, len(value))
+    if value[close : close + 1] != ")":
+        close = len(value)  # unterminated: the remainder runs as the command
+    return value[2:close]
 
 
 def _is_command_flag(value: str) -> bool:
@@ -1883,11 +1901,12 @@ def _warn_once_about_late_sudo_bypass() -> None:
     )
 
 
-def _guard_sudo(command: str, allow_sudo: bool) -> None:
-    """String-only scan for sudo/doas before any spawn; refusals never start a process."""
+def _guard_sudo(script: str, allow_sudo: bool) -> None:
+    """String-only scan for sudo/doas in the text the shell will run;
+    refusals never start a process."""
     if allow_sudo or _SUDO_BYPASS_AT_KERNEL_START:
         return
-    violation = _sudo_violation(_with_prefix(command))
+    violation = _sudo_violation(script)
     if violation is None:
         return
     _warn_once_about_late_sudo_bypass()
@@ -2070,14 +2089,23 @@ class BashHandle:
     handle; later awaits only wait and cancelling them leaves it running.
     """
 
-    def __init__(self, command: str) -> None:
+    def __init__(self, command: str, script: str | None = None) -> None:
         # Every asyncio use in this module runs on a handle path (bash() is the
         # only constructor), so bind the module global here, before
         # _schedule_background_completion_notice or any await can run.
         global asyncio
         import asyncio
 
+        # `command` is the text the caller wrote and stays the display value.
+        # `script` is the text the shell runs, computed and validated by bash()
+        # from one read of the prefix. A handle built directly has no script
+        # yet, so it is guarded here on the same one read that supplies its
+        # script: the class must not be a way around the guard.
+        if script is None:
+            script = _with_prefix(command)
+            _guard_sudo(script, False)
         self.command = command
+        self._script = script
         completion_context = _current_cell_completion_context()
         self._creating_cell_finished = completion_context[0] if completion_context else None
         self._creating_cell_task = completion_context[1] if completion_context else None
@@ -2136,13 +2164,13 @@ class BashHandle:
                 _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
             )
             script = _status_script(
-                _with_prefix(command),
+                self._script,
                 completion_token[:token_midpoint],
                 completion_token[token_midpoint:],
             )
         else:
             # Windows lacks a foreground-status channel, so its exit drain stays best-effort.
-            script = _with_prefix(command)
+            script = self._script
             self._job = _winjob.create_job()
             if self._job is None:
                 # Nothing spawned yet, so nothing can leak: refuse to start.
@@ -2813,8 +2841,12 @@ def bash(command: str, *, allow_sudo: bool = False) -> BashHandle:
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
-    _guard_sudo(command, allow_sudo)
-    return BashHandle(command)
+    # One read of the prefix feeds both the scan and the spawn, so a mid-call
+    # change to the environment can no longer make the scanned text differ
+    # from the executed text.
+    script = _with_prefix(command)
+    _guard_sudo(script, allow_sudo)
+    return BashHandle(command, script=script)
 
 
 def _shell() -> str:
