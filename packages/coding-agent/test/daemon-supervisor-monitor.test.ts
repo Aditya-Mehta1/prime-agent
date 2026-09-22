@@ -518,6 +518,8 @@ describe("daemon worker supervisor monitoring", () => {
 				removedAgentIds: new Map(),
 				snapshotPending: false,
 			},
+			rosterFlushScheduled: false,
+			rosterDirtyAgentIds: new Set(),
 			shuttingDown: false,
 			clearSupervisorAvailabilityCheck: vi.fn(),
 			scheduleSupervisorFenceCheck: vi.fn(),
