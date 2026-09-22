@@ -113,6 +113,8 @@ const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
+	"gpt-6-sol",
+	"gpt-6-luna",
 ]);
 
 const MODELS_DEV_PROVIDER_IDS = [
@@ -254,7 +256,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.id.includes("gpt-5.6")) {
 		mergeThinkingLevelMap(model, { minimal: null, max: "max" });
 	}
-	// gpt-6 reasoning is mandatory with no minimal effort; xhigh/max are supported (OpenRouter capability data).
+	// gpt-6: no minimal effort; xhigh/max are supported (OpenAI model pages).
+	// Astra's reasoning is mandatory (off is rejected); Sol and Luna accept
+	// reasoning.effort "none", like the gpt-5.6 family.
 	if (model.id.includes("gpt-6")) {
 		mergeThinkingLevelMap(model, { minimal: null, xhigh: "xhigh", max: "max" });
 	}
@@ -262,7 +266,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		(model.api === "openai-responses" ||
 			model.api === "azure-openai-responses" ||
 			model.api === "openai-codex-responses") &&
-		model.id.startsWith("gpt-6")
+		model.id.includes("gpt-6-astra")
 	) {
 		mergeThinkingLevelMap(model, { off: null });
 	}
@@ -288,6 +292,11 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	if (model.id.includes("fable-5") || model.id.includes("mythos-5")) {
 		mergeThinkingLevelMap(model, { off: null, xhigh: "xhigh", max: "max" });
+	}
+	// Claude Opus 5.5 is always-on adaptive like the Fable/Mythos models: it rejects
+	// `thinking: {type: "disabled"}` and non-default sampling params with a 400.
+	if (model.id.includes("opus-5-5") || model.id.includes("opus-5.5")) {
+		mergeThinkingLevelMap(model, { off: null });
 	}
 	if (model.id.includes("mythos-preview")) {
 		mergeThinkingLevelMap(model, { off: null, max: "max" });
@@ -317,6 +326,22 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	if (model.provider === "openai-codex" && model.id === "gpt-5.1-codex-mini") {
 		mergeThinkingLevelMap(model, { minimal: "medium", low: "medium", medium: "medium", high: "high" });
+	}
+	// models.dev reasoning_options list a model's effort levels, not whether it
+	// accepts `thinking: {type: "disabled"}`, so the derived map hides "off" for
+	// every Anthropic model. Per the Anthropic thinking docs only the always-on
+	// models (Fable/Mythos, Opus 5.5) reject disabled thinking; drop the derived
+	// off override for the rest so "off" stays provider-default.
+	if (
+		model.api === "anthropic-messages" &&
+		model.thinkingLevelMap?.off === null &&
+		!model.id.includes("fable-5") &&
+		!model.id.includes("mythos-5") &&
+		!model.id.includes("mythos-preview") &&
+		!model.id.includes("opus-5-5") &&
+		!model.id.includes("opus-5.5")
+	) {
+		delete model.thinkingLevelMap.off;
 	}
 }
 
@@ -1516,6 +1541,49 @@ async function collectCatalogModelsWithStatus(): Promise<CatalogCollection> {
 				cacheWrite: 0,
 			},
 			contextWindow: 272000,
+			maxTokens: 128000,
+		});
+	}
+
+	// Add missing GPT-6 Sol / Luna until models.dev includes them. Specs verified
+	// against the OpenAI model pages: 1,050,000-token context, 128,000 max output,
+	// reasoning.effort none/low/medium (default)/high/xhigh/max, text+image input.
+	if (!allModels.some((m) => m.provider === "openai" && m.id === "gpt-6-sol")) {
+		allModels.push({
+			id: "gpt-6-sol",
+			name: "GPT-6 Sol",
+			api: "openai-responses",
+			baseUrl: "https://api.openai.com/v1",
+			provider: "openai",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 2,
+				output: 10,
+				cacheRead: 0.2,
+				cacheWrite: 2.5,
+			},
+			contextWindow: 1050000,
+			maxTokens: 128000,
+		});
+	}
+
+	if (!allModels.some((m) => m.provider === "openai" && m.id === "gpt-6-luna")) {
+		allModels.push({
+			id: "gpt-6-luna",
+			name: "GPT-6 Luna",
+			api: "openai-responses",
+			baseUrl: "https://api.openai.com/v1",
+			provider: "openai",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 0.1,
+				output: 0.5,
+				cacheRead: 0.01,
+				cacheWrite: 0.125,
+			},
+			contextWindow: 1050000,
 			maxTokens: 128000,
 		});
 	}
