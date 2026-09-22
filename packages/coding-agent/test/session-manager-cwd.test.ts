@@ -17,13 +17,13 @@ function seed() {
 }
 
 describe("SessionManager cwd resolution", () => {
-	it("resolves the newest existing /cwd entry on the branch, else the header cwd, even when the header dir is gone", () => {
+	it("resolves the newest existing /cwd entry on the branch and keeps the cwd when the header dir is gone", () => {
 		const { root, header, child, msgId, file } = seed();
 		rmSync(header, { recursive: true });
 		const sm = SessionManager.open(file);
 		expect(sm.getCwd()).toBe(child);
 		sm.branch(msgId);
-		expect(sm.getCwd()).toBe(header);
+		expect(sm.getCwd()).toBe(child);
 		rmSync(root, { recursive: true, force: true });
 	});
 

@@ -1710,15 +1710,14 @@ export class ReplKernelManager {
 		}
 	}
 
-	/** Future spawns/restarts use `cwd`; a running kernel chdirs now. */
+	/** Future spawns/restarts use `cwd`; a running kernel chdirs now and a refusal is thrown to the caller. */
 	async setCwd(cwd: string): Promise<void> {
-		if (this.isRunning) {
-			const result = await this.execute(`__import__("os").chdir(${JSON.stringify(cwd)})`, { internal: true });
-			if (result.status !== "ok") {
-				throw new Error(`Python kernel could not change directory: ${result.error?.evalue ?? result.stderr}`);
-			}
-		}
 		this.options.cwd = cwd;
+		if (!this.isRunning) return;
+		const result = await this.execute(`__import__("os").chdir(${JSON.stringify(cwd)})`, { internal: true });
+		if (result.status !== "ok") {
+			throw new Error(`Python kernel could not change directory: ${result.error?.evalue ?? result.stderr}`);
+		}
 	}
 
 	private scheduleSnapshot(): void {

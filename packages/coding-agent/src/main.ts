@@ -96,7 +96,6 @@ import {
 	type AgentConnection,
 	type AgentsViewScopeKey,
 	ClientPromptStashStore,
-	createAgentsViewResumeConfig,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
@@ -510,7 +509,7 @@ export async function createSessionManager(
 		if (readOnly) {
 			const dir = sessionDir ?? getDefaultSessionDir(cwd);
 			const path = findMostRecentSessionForCwd(dir, cwd);
-			return path ? readSessionManager(path, dir, cwd) : SessionManager.inMemory(cwd, dir);
+			return path ? readSessionManager(path, dir) : SessionManager.inMemory(cwd, dir);
 		}
 		return SessionManager.continueRecent(cwd, sessionDir);
 	}
@@ -1047,6 +1046,7 @@ async function createDaemonClientConnection(options: {
 	socketPath: string;
 	config: AgentSessionRuntimeConfig;
 	sessionPath?: string;
+	cwdOverride?: string;
 	continueRecent?: boolean;
 	activeSessionId?: string;
 	clientOwned?: boolean;
@@ -1099,6 +1099,7 @@ async function createDaemonClientConnection(options: {
 			type: "create",
 			config: options.config,
 			sessionPath: options.sessionPath,
+			cwdOverride: options.cwdOverride,
 			continueRecent: options.continueRecent,
 			noSession: options.noSession,
 			env: collectDaemonClientEnv(),
@@ -1507,22 +1508,17 @@ export async function main(args: string[], options?: MainOptions) {
 		// axis treats it as a draft (hidden, discarded on detach if never used), so
 		// no DeferredAgentConnection is needed to avoid creating it up front.
 		const isFreshDefaultSession = !activeDaemonSessionSummary && !sessionPath;
-		// The daemon reads config.cwd on a resume as an explicit override (see createAgentsViewResumeConfig); without --cwd or
-		// the missing-directory picker the session's own cwd must win.
-		const hasCwdOverride = parsed.cwd !== undefined || missingSessionCwdIssue !== undefined;
 		let connection: DaemonAgentConnection;
 		let summary: SessionSummary;
 		try {
 			({ connection, summary } = await createDaemonClientConnection({
 				socketPath: daemonSocketPath,
-				config:
-					sessionPath && !hasCwdOverride
-						? createAgentsViewResumeConfig(defaultSessionConfig)
-						: defaultSessionConfig,
+				config: defaultSessionConfig,
 				activeSessionId: activeDaemonSessionSummary
 					? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
 					: undefined,
 				sessionPath,
+				cwdOverride: sessionPath && sessionManager.hasCwdOverride ? sessionManager.getCwd() : undefined,
 				clientOwned: parsed.noSession,
 				noSession: parsed.noSession,
 				supportsExtensionUi: true,
@@ -1609,6 +1605,10 @@ export async function main(args: string[], options?: MainOptions) {
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
+				cwdOverride:
+					!parsed.noSession && sessionManager.getSessionFile() && sessionManager.hasCwdOverride
+						? sessionManager.getCwd()
+						: undefined,
 				continueRecent: parsed.continue,
 				clientOwned: isClientOwnedDaemonSession(appMode, parsed.noSession),
 				noSession: parsed.noSession,

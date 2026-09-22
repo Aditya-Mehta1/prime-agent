@@ -2478,7 +2478,7 @@ export class SessionManager {
 	/**
 	 * An explicit cwd override pins the cwd for the entire run (a later /cwd re-pins it) and persisted /cwd entries never
 	 * apply in an override run; otherwise the newest still-existing session_cwd_state entry on the active branch wins, else
-	 * the header cwd; /tree recomputes through this same path as open()/create().
+	 * the header cwd when it still exists, else the cwd stays; /tree recomputes through this same path as open()/create().
 	 */
 	private resolveCwd(): void {
 		if (this.hasCwdOverride) return;
@@ -2492,7 +2492,8 @@ export class SessionManager {
 				return;
 			}
 		}
-		this.cwd = this.getHeader()!.cwd;
+		const headerCwd = this.getHeader()!.cwd;
+		if (isExistingDirectory(headerCwd)) this.cwd = headerCwd;
 	}
 
 	buildSessionContext(): SessionContext {

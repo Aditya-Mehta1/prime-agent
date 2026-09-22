@@ -2114,16 +2114,29 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/** SessionManager re-resolved the cwd on the leaf move; follow it and drop queued [cwd-changed] notices, which described a transition on the old leaf. */
+	/** Follows SessionManager's re-resolved cwd and drops queued [cwd-changed] notices; a kernel that refuses the chdir is reported, not rolled back. */
 	private async _reloadCwdFromBranch(): Promise<void> {
 		this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter(
 			(message) => message.customType !== SESSION_CWD_CHANGED_CUSTOM_TYPE,
 		);
 		const cwd = this.sessionManager.getCwd();
 		if (cwd === this._cwd) return;
-		await this._ipythonKernelProvisioner?.setCwd(cwd);
+		const previousCwd = this._cwd;
 		this._cwd = cwd;
 		this._emit({ type: "cwd_changed", cwd });
+		try {
+			await this._ipythonKernelProvisioner?.setCwd(cwd);
+		} catch (error) {
+			void this.sendCustomMessage(
+				{
+					customType: SESSION_CWD_CHANGED_CUSTOM_TYPE,
+					content: cwdKernelStaleNotice(previousCwd, cwd, error),
+					display: true,
+					details: { cwd, previousCwd },
+				},
+				{ deliverAs: "nextTurn" },
+			).catch(() => {});
+		}
 	}
 
 	private _resolveRlmMaxDepth(): {
@@ -14184,20 +14197,20 @@ export class AgentSession {
 
 	/** Retarget this session's working directory; SessionManager records it on the branch so a resume restarts there. */
 	async setCwd(input: string): Promise<string> {
-		const cwd = resolve(this._cwd, expandTildePath(input.trim()));
-		if (!isExistingDirectory(cwd)) throw new Error(`Not a directory: ${cwd}`);
 		// Holding the admission fence keeps a concurrent prompt from starting a turn under the kernel chdir.
 		const admissionFence = await this._acquireDirectTurnAdmissionFence();
 		try {
 			if (this.isStreaming) throw new Error("Cannot change the working directory while the agent is running.");
+			const cwd = resolve(this._cwd, expandTildePath(input.trim()));
+			if (!isExistingDirectory(cwd)) throw new Error(`Not a directory: ${cwd}`);
 			if (cwd === this._cwd) return cwd;
 			const previousCwd = this._cwd;
-			// Kernel first: a dead kernel or a refused chdir records nothing.
-			await this._ipythonKernelProvisioner?.setCwd(cwd);
 			try {
+				// Kernel first: a dead kernel or a refused chdir records nothing.
+				await this._ipythonKernelProvisioner?.setCwd(cwd);
 				this.sessionManager.recordCwd(cwd);
 			} catch (error) {
-				await this._ipythonKernelProvisioner?.setCwd(previousCwd);
+				await this._ipythonKernelProvisioner?.setCwd(previousCwd).catch(() => {});
 				throw error;
 			}
 			this._cwd = cwd;
@@ -14877,5 +14890,16 @@ function cwdChangedNotice(previousCwd: string, cwd: string): string {
 		"",
 		`The user ran /cwd. This session's working directory is now ${cwd} (previously ${previousCwd}); it stays so for the rest of the session, including after a resume.`,
 		`The Python kernel's working directory is now ${cwd} (os.getcwd()): bash() and relative paths resolve there, and new subagents start there. The "Working directory" line in the system prompt is from session start and no longer applies. Do not chdir back unless the user asks.`,
+	].join("\n");
+}
+
+function cwdKernelStaleNotice(previousCwd: string, cwd: string, error: unknown): string {
+	return [
+		"[cwd-changed]",
+		"",
+		`Tree navigation moved this session's working directory to ${cwd} (previously ${previousCwd}), but the running Python kernel could not change directory: ${
+			error instanceof Error ? error.message : String(error)
+		}.`,
+		`bash() and relative paths in the kernel still resolve in ${previousCwd} until you run __import__("os").chdir(${JSON.stringify(cwd)}) or the kernel restarts (it starts in ${cwd}). New subagents and ! commands already use ${cwd}.`,
 	].join("\n");
 }

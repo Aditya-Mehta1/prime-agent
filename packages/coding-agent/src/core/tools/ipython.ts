@@ -405,11 +405,11 @@ export class IpythonKernelProvisioner {
 		return (await m?.listNamespaceNames(signal)) ?? null;
 	}
 
-	/** Retarget the kernel cwd: the pending/started manager now, the field for any future start. */
+	/** Retarget the kernel cwd: the pending/started manager now, the field for any future start; a refusal is thrown to the caller. */
 	async setCwd(cwd: string): Promise<void> {
+		this.cwd = cwd;
 		const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
 		await m?.setCwd(cwd);
-		this.cwd = cwd;
 	}
 
 	/** Dispose the kernel owned by this provisioner, including one still starting up. */

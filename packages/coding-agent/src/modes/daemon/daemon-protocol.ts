@@ -368,6 +368,7 @@ export interface DaemonUpdateRestartSession {
 	sessionFile: string;
 	cwd: string;
 	config: AgentSessionRuntimeConfig;
+	cwdOverride?: string;
 	runtimeMetadata?: AgentSessionRuntimeMetadata;
 	clientEnv?: Record<string, string>;
 	queue: DaemonUpdateRestartQueue;
@@ -419,6 +420,8 @@ export type DaemonCommand =
 			noSession?: boolean;
 			name?: string;
 			config?: AgentSessionRuntimeConfig;
+			/** Resume `sessionPath` pinned to this cwd for the whole run (--cwd, the missing-directory picker, an update restart of an override run). `config.cwd` is only the default for new sessions. */
+			cwdOverride?: string;
 			runtimeMetadata?: AgentSessionRuntimeMetadata;
 			lifecycle?: DaemonSessionLifecycle;
 	  } & DaemonClientEnv &
@@ -728,6 +731,7 @@ const DELETE_RLM_SUBAGENT_COMMAND = {
 } as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 const TELEMETRY_POLICY_COMMAND = { minProtocol: 7, minSchemaRevision: 14 } as const;
+const CREATE_CWD_OVERRIDE_COMMAND = { minProtocol: 7, minSchemaRevision: 31 } as const;
 const AUTHORITATIVE_CHILD_ROSTER_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 17,
@@ -999,6 +1003,7 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 		((command.type === "attach" || command.type === "reattach") && command.telemetryDisabled !== undefined) ||
 		(command.type === "create" && command.config?.telemetryDisabled !== undefined);
 	if (carriesTelemetryPolicy) requirements.push(TELEMETRY_POLICY_COMMAND);
+	if (command.type === "create" && command.cwdOverride !== undefined) requirements.push(CREATE_CWD_OVERRIDE_COMMAND);
 	if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 		requirements.push(PROMPT_ADMISSION_CANCELLATION_COMMAND);
 	}

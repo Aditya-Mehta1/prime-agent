@@ -1880,7 +1880,7 @@ export class AgentDaemon {
 		const cwd = resolve(config.cwd);
 		const agentDir = config.agentDir;
 		const clientEnv = filterClientEnv(command.env);
-		const cwdOverride = command.config?.cwd ? resolve(command.config.cwd) : undefined;
+		const cwdOverride = command.cwdOverride ? resolve(command.cwdOverride) : undefined;
 		const sessionPath = command.sessionPath
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
@@ -6611,10 +6611,11 @@ export class AgentDaemon {
 			activeSessionId: state.activeSessionId,
 			sessionId: session.sessionId,
 			sessionFile,
+			...(session.sessionManager.hasCwdOverride ? { cwdOverride: session.sessionManager.getCwd() } : {}),
 			cwd: session.sessionManager.getCwd(),
 			config: {
 				...state.runtime.runtimeConfig,
-				cwd: session.sessionManager.hasCwdOverride ? session.sessionManager.getCwd() : undefined,
+				cwd: session.sessionManager.getCwd(),
 			},
 			runtimeMetadata: state.runtime.metadata,
 			...(state.clientEnv ? { clientEnv: { ...state.clientEnv } } : {}),
