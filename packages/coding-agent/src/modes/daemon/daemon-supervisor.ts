@@ -1852,6 +1852,25 @@ export class DaemonSupervisor {
 		// peer from parking unbounded sockets or unterminated lines in memory.
 		const tcpAuthToken = connectionOptions.tcpAuthToken;
 		let tcpAuthenticated = false;
+		// The admission deadline is an explicit timer, not `socket.setTimeout`:
+		// Node refreshes a socket timeout on any I/O, so a peer dribbling bytes
+		// without ever completing a line would renew its own window and hold a
+		// connection slot until it filled `maxConnections`.
+		let admissionTimer: ReturnType<typeof setTimeout> | undefined;
+		const clearAdmissionDeadline = () => {
+			if (admissionTimer !== undefined) {
+				clearTimeout(admissionTimer);
+				admissionTimer = undefined;
+			}
+		};
+		const armAdmissionDeadline = (ms: number) => {
+			clearAdmissionDeadline();
+			admissionTimer = setTimeout(() => {
+				this.log("Closed unauthenticated TCP client connection");
+				socket.destroy();
+			}, ms);
+			admissionTimer.unref();
+		};
 		void this.ready.then(
 			() => {
 				if (!client.socket.destroyed && this.clients.has(client)) {
@@ -1879,7 +1898,7 @@ export class DaemonSupervisor {
 					// saw the handshake. An already-authenticated line keeps the idle
 					// window instead.
 					if (tcpAuthToken !== undefined && !tcpAuthenticated) {
-						socket.setTimeout(DAEMON_TCP_AUTH_TIMEOUT_MS);
+						armAdmissionDeadline(DAEMON_TCP_AUTH_TIMEOUT_MS);
 					}
 				}
 			},
@@ -1889,11 +1908,11 @@ export class DaemonSupervisor {
 		if (tcpAuthToken !== undefined) {
 			// Absolute admission budget from accept: it only matters when startup
 			// hangs before hello can re-arm the short deadline above.
-			socket.setTimeout(DAEMON_TCP_PRE_READY_TIMEOUT_MS);
+			armAdmissionDeadline(DAEMON_TCP_PRE_READY_TIMEOUT_MS);
+			// `socket.setTimeout` covers only the authenticated idle window, which
+			// is meant to reset on traffic.
 			socket.on("timeout", () => {
-				this.log(
-					tcpAuthenticated ? "Closed idle TCP client connection" : "Closed unauthenticated TCP client connection",
-				);
+				this.log("Closed idle TCP client connection");
 				socket.destroy();
 			});
 		}
@@ -1905,6 +1924,7 @@ export class DaemonSupervisor {
 						return;
 					}
 					tcpAuthenticated = true;
+					clearAdmissionDeadline();
 					socket.setTimeout(DAEMON_TCP_IDLE_TIMEOUT_MS);
 				}
 				void this.handleLine(client, line);
@@ -1927,6 +1947,7 @@ export class DaemonSupervisor {
 				return;
 			}
 			cleaned = true;
+			clearAdmissionDeadline();
 			clearTimeout(client.catchupRetryTimer);
 			client.catchupRetryTimer = undefined;
 			client.detachInput();

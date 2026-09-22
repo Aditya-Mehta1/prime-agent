@@ -700,12 +700,15 @@ describe("daemon supervisor tcp admission", () => {
 	const token = "mesh-token-value-0123456789";
 
 	it("bounds lines and deadlines untrusted TCP connections", async () => {
+		vi.useFakeTimers();
 		const supervisor = createHarness() as any;
 		supervisor.handleLine = vi.fn(async () => undefined);
 
 		const oversized = fakeTcpSocket();
 		supervisor.handleConnection(oversized, { tcpAuthToken: token });
-		expect(oversized.timeouts).toEqual([DAEMON_TCP_PRE_READY_TIMEOUT_MS]);
+		// No socket timeout is armed before auth, so dribbled bytes cannot renew
+		// the admission deadline.
+		expect(oversized.timeouts).toEqual([]);
 		oversized.write(`${"x".repeat(DAEMON_TCP_MAX_LINE_CHARS + 1)}\n`);
 		await waitFor(() => oversized.destroyed);
 		expect(supervisor.handleLine).not.toHaveBeenCalled();
@@ -713,27 +716,35 @@ describe("daemon supervisor tcp admission", () => {
 
 		const unauthenticated = fakeTcpSocket();
 		supervisor.handleConnection(unauthenticated, { tcpAuthToken: token });
-		unauthenticated.emit("timeout");
-		await waitFor(() => unauthenticated.destroyed);
+		unauthenticated.write("x");
+		vi.advanceTimersByTime(DAEMON_TCP_PRE_READY_TIMEOUT_MS);
+		expect(unauthenticated.destroyed).toBe(true);
 		expect(supervisor.log).toHaveBeenCalledWith("Closed unauthenticated TCP client connection");
 
 		const authenticated = fakeTcpSocket();
 		supervisor.handleConnection(authenticated, { tcpAuthToken: token });
 		authenticated.write(`${JSON.stringify({ id: "t1", type: "list", auth: { token } })}\n`);
 		await waitFor(() => supervisor.handleLine.mock.calls.length > 0);
-		expect(authenticated.timeouts).toEqual([DAEMON_TCP_PRE_READY_TIMEOUT_MS, DAEMON_TCP_IDLE_TIMEOUT_MS]);
+		expect(authenticated.timeouts).toEqual([DAEMON_TCP_IDLE_TIMEOUT_MS]);
 		authenticated.emit("timeout");
 		await waitFor(() => authenticated.destroyed);
 		expect(supervisor.log).toHaveBeenCalledWith("Closed idle TCP client connection");
+		vi.useRealTimers();
 	});
 	it("re-arms the auth deadline at hello so pre-ready TCP clients survive startup", async () => {
+		vi.useFakeTimers();
 		const ready = deferred<void>();
 		const supervisor = createHarness({ ready: ready.promise }) as any;
 		const preReady = fakeTcpSocket();
 		supervisor.handleConnection(preReady, { tcpAuthToken: token });
-		expect(preReady.timeouts).toEqual([DAEMON_TCP_PRE_READY_TIMEOUT_MS]);
+		// 60s of startup exceeds the 30s auth window but stays inside the connect budget.
+		vi.advanceTimersByTime(60_000);
+		expect(preReady.destroyed).toBe(false);
 		ready.resolve();
 		await waitFor(() => supervisor.write.mock.calls.length > 0);
-		expect(preReady.timeouts).toEqual([DAEMON_TCP_PRE_READY_TIMEOUT_MS, DAEMON_TCP_AUTH_TIMEOUT_MS]);
+		vi.advanceTimersByTime(DAEMON_TCP_AUTH_TIMEOUT_MS);
+		expect(preReady.destroyed).toBe(true);
+		expect(supervisor.log).toHaveBeenCalledWith("Closed unauthenticated TCP client connection");
+		vi.useRealTimers();
 	});
 });
