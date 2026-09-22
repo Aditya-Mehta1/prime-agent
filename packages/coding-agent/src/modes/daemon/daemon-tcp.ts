@@ -150,9 +150,11 @@ function isExclusiveCreateConflict(error: unknown): boolean {
 }
 
 /**
- * Check that a TCP command line carries the expected per-machine token.
- * Supports both the raw format ({"id","type","auth":{"token"}}) and the
- * daemon envelope format ({"type":"command","command":{...},"auth":{"token"}}).
+ * Check that a TCP command line carries the expected per-machine token. Only
+ * the daemon envelope ({"type":"command","command":{...},"auth":{"token"}}) is
+ * dispatchable: the supervisor requires the envelope protocol for every client,
+ * unix included, so a raw {"id","type","auth":{...}} record authenticates here
+ * and is then refused by the dispatcher with the protocol-version error.
  */
 export function checkDaemonTcpLineAuth(line: string, expectedToken: string): DaemonTcpAuthVerdict {
 	let parsed: {
@@ -172,9 +174,9 @@ export function checkDaemonTcpLineAuth(line: string, expectedToken: string): Dae
 		return { ok: false, id: "unknown", command: undefined, reason: "invalid_json" };
 	}
 	const id = typeof parsed.id === "string" ? parsed.id : "unknown";
-	// An envelope names the real command in `command.type` and carries
-	// `type: "command"` for the envelope itself, so the inner name wins there; a
-	// raw line has no `command` and names the command in `type`.
+	// An envelope carries `type: "command"` and names the real command in
+	// `command.type`, so the inner name wins; `type` stays the fallback for a
+	// line that never reaches the dispatcher.
 	const envelopeCommand = parsed.command?.type;
 	const command = typeof envelopeCommand === "string" ? envelopeCommand : parsed.type;
 	const token = parsed.auth?.token;
