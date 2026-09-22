@@ -7948,6 +7948,7 @@ interface WorkerRosterReporterState {
 const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
 	"turn_start",
 	"turn_end",
+	"agent_end",
 	"bash_start",
 	"bash_end",
 	"compaction_start",
