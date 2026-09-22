@@ -60,7 +60,8 @@ export function providerStreamFailureStatus(message: AssistantMessage): number |
  * Deterministic rejections never retry; auth gets one retry before it can be
  * marked stale. A 404 is the exception: a live model briefly 404s on routing
  * blips (observed 2026-09-13 killing every active session), so it counts as
- * transient unavailability, not a permanent rejection.
+ * transient unavailability, not a permanent rejection. Safety filters
+ * deterministically reject identical requests, so they never retry.
  */
 export function isPermanentProviderFailureKind(
 	kind: string | undefined,
@@ -70,7 +71,7 @@ export function isPermanentProviderFailureKind(
 	if (kind === "invalid_request" && status === 404) {
 		return false;
 	}
-	if (kind === "invalid_request" || kind === "refusal" || kind === "permission") {
+	if (kind === "invalid_request" || kind === "refusal" || kind === "permission" || kind === "safety") {
 		return true;
 	}
 	return retriesPerformed > 0 && kind === "auth";
