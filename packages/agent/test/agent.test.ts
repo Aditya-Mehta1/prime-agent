@@ -415,7 +415,7 @@ describe("Agent", () => {
 		expect(agent.state.isStreaming).toBe(false);
 	});
 
-	it("#2453: preserves the original failure and the run's model when the recovery agent_end listener throws", async () => {
+	it("preserves the original failure and the run's model when the recovery agent_end listener throws", async () => {
 		const agent = new Agent({
 			streamFn: () => {
 				const stream = new MockAssistantStream();
