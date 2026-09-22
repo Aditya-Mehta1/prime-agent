@@ -76,7 +76,12 @@ import {
 } from "./agent-roster.js";
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
-import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
+import {
+	DAEMON_CATALOG_AMBIGUOUS_SELECTOR_PREFIX,
+	DAEMON_CATALOG_ROLE_ENV,
+	DaemonCatalogClient,
+	isDaemonCatalogSessionMiss,
+} from "./daemon-catalog-process.js";
 import {
 	DaemonSessionRecoveringError,
 	deserializeDaemonError,
@@ -2946,7 +2951,8 @@ export class DaemonSupervisor {
 				// instead, so warm the mesh before consulting it. Local rows keep
 				// precedence everywhere — live workers above, the saved-local wake
 				// below — and a remote name match only delivers after the catalog
-				// lookup misses too; otherwise a tailnet sibling that shares a name
+				// reports a confirmed local miss (never on a catalog outage, which
+				// fails closed); otherwise a tailnet sibling that shares a name
 				// would intercept a message that resumes the saved local session.
 				// Session names are unique per daemon, not per tailnet: two remote
 				// daemons can each own a "worker", but two remote matches only turn
@@ -2965,9 +2971,16 @@ export class DaemonSupervisor {
 				} catch (catalogError) {
 					// Preserve selector ambiguity so a2a senders can distinguish it from
 					// the original unknown-active-session lookup failure.
-					if (catalogError instanceof Error && catalogError.message.startsWith("Ambiguous session selector")) {
+					if (
+						catalogError instanceof Error &&
+						catalogError.message.startsWith(DAEMON_CATALOG_AMBIGUOUS_SELECTOR_PREFIX)
+					) {
 						throw catalogError;
 					}
+					// Only a confirmed catalog miss reaches the mesh: an outage
+					// (disconnected or dead catalog) must fail closed rather than
+					// hand message contents to a same-named remote agent.
+					if (!isDaemonCatalogSessionMiss(catalogError)) throw catalogError;
 					// The catalog missed as well: only now may remote siblings claim
 					// the message — a single one delivers, two stay ambiguous exactly
 					// like the local path.
@@ -3157,11 +3170,15 @@ export class DaemonSupervisor {
 				active.push(summary);
 			}
 		}
-		// Roster queries are the mesh's on-demand trigger: refresh, then serve the
-		// merged view. Remote rows carry no sessionFile, so they never collide with
-		// the file-based merge paths below.
-		await this.refreshRemoteMesh();
-		active.push(...(this.remoteAgentMeshState?.sessionSummaries() ?? []));
+		// Remote rows are a view opt-in. `sessions` stays a local-residency response by
+		// default: stale-daemon replacement and update-restart recovery read it and must
+		// never mistake a tailnet peer for a local session. An opting-in caller still
+		// drives the mesh's on-demand refresh, and remote rows carry no sessionFile, so
+		// they never collide with the file-based merge paths below.
+		if (command.includeRemoteMesh === true) {
+			await this.refreshRemoteMesh();
+			active.push(...(this.remoteAgentMeshState?.sessionSummaries() ?? []));
+		}
 		const data = {
 			sessions: active,
 			...(command.includeClientOwned ? { busyClientOwnedSessionCount } : {}),

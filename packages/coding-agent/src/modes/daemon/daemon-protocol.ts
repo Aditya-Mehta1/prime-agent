@@ -409,6 +409,8 @@ export type DaemonCommand =
 			cwd?: string;
 			sessionDir?: string;
 			includeClientOwned?: boolean;
+			/** View opt-in: merge cached tailnet mesh rows into `sessions`. */
+			includeRemoteMesh?: boolean;
 	  }
 	| DaemonSavedSessionListCommand
 	| { id?: string; type: "list_agent_peers"; workerToken: string }

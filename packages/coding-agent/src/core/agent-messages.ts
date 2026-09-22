@@ -209,7 +209,10 @@ export function assertAgentSessionNameAvailable(
 	catalog: readonly AgentFamilyCatalogEntry[],
 	input: AgentSessionNameAvailabilityInput,
 ): void {
-	const conflict = catalog.some(
+	// Session names are unique per daemon, not per tailnet: a remote mesh row can
+	// never make a local name look taken.
+	const localCatalog = catalog.filter((entry) => entry.remoteHost === undefined);
+	const conflict = localCatalog.some(
 		(entry) =>
 			entry.id !== input.ignoreSessionId &&
 			entry.name === input.name &&

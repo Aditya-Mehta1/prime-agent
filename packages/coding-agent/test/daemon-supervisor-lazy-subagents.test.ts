@@ -865,6 +865,7 @@ describe("daemon supervisor remote mesh routing", () => {
 			},
 			findMessageTargets: () => (consume() ? targets : []),
 			peerSummaries: () => (consume() ? [{ sessionName: "remote-agent" }] : []),
+			sessionSummaries: () => (consume() ? [{ id: "r", remoteHost: "milk.tailnet.ts.net" }] : []),
 			sendAgentMessage: async (delivery: { message: string }) => {
 				deliveries.push(delivery);
 				return { id: "r", target: {}, message: delivery.message, deliveryStatus: "delivered" };
@@ -905,8 +906,19 @@ describe("daemon supervisor remote mesh routing", () => {
 		expect(peers.data.peers.map((peer) => peer.sessionName)).toContain("remote-agent");
 		expect(mesh.waits[0]).toBeLessThan(AGENT_PEER_LIST_REQUEST_TIMEOUT_MS);
 
-		// No saved local names "remote-agent": the catalog miss lets the remote sibling claim the send.
-		supervisor.catalog.resolve = vi.fn().mockRejectedValue(new Error("Unknown saved session"));
+		// Local residency is the default: only a view caller opts the mesh rows in.
+		const listHosts = async (command: { type: "list"; includeRemoteMesh?: boolean }) =>
+			(
+				(await supervisor.handleCommand(client, command)) as { data: { sessions: { remoteHost?: string }[] } }
+			).data.sessions.map((row) => row.remoteHost);
+		expect(await listHosts({ type: "list" })).not.toContain("milk.tailnet.ts.net");
+		expect(await listHosts({ type: "list", includeRemoteMesh: true })).toContain("milk.tailnet.ts.net");
+		// A catalog outage is not a miss: fail closed rather than deliver to the name match.
+		supervisor.catalog.resolve = vi.fn().mockRejectedValue(new Error("Daemon catalog is not connected"));
+		await expect(supervisor.handleCommand(client, send("outage"))).rejects.toThrow("Daemon catalog is not connected");
+
+		// A confirmed catalog miss is what lets the remote sibling claim the send.
+		supervisor.catalog.resolve = vi.fn().mockRejectedValue(new Error("No session found matching 'remote-agent'"));
 		await supervisor.handleCommand(client, send("hi tailnet", true));
 		expect(deliveries[0]).toMatchObject({ message: "hi tailnet", fromRelationship: "sibling" });
 
