@@ -20,23 +20,10 @@ import type { ToolExecutionComponent } from "../src/modes/interactive/components
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { createDeferred } from "./suite/scheduling.js";
 
 function renderAll(container: Container, width = 120): string {
 	return container.children.flatMap((child) => child.render(width)).join("\n");
-}
-
-function createDeferred<T>(): {
-	promise: Promise<T>;
-	resolve(value: T): void;
-	reject(error: unknown): void;
-} {
-	let resolve!: (value: T) => void;
-	let reject!: (error: unknown) => void;
-	const promise = new Promise<T>((nextResolve, nextReject) => {
-		resolve = nextResolve;
-		reject = nextReject;
-	});
-	return { promise, resolve, reject };
 }
 
 function createConnectionState(overrides: Partial<AgentConnectionState> = {}): AgentConnectionState {
@@ -532,6 +519,27 @@ describe("InteractiveMode connection events", () => {
 		expect(bashComponent.setComplete).toHaveBeenCalledWith(undefined, false);
 		expect(fakeThis.activeBashComponent).toBeUndefined();
 		expect(fakeThis.flushPendingBashComponents).toHaveBeenCalledOnce();
+	});
+
+	test("RES-1306: shows a queued turn's prompt while its own pre-turn compaction holds it in preparing", () => {
+		initTheme("dark");
+		const queuedMessagesContainer = new Container();
+		const fakeThis = createResyncHarness({
+			queuedMessagesContainer,
+			pendingMessagesContainer: new Container(),
+			pendingBashComponents: [],
+		});
+		delete fakeThis.updatePendingMessagesDisplay;
+		const render = (phase: "preparing" | "running") => {
+			const active = { kind: "turn" as const, phase, label: "queued before compaction" };
+			fakeThis.connectionState = createConnectionState({
+				sessionActions: { queuedCount: 0, steering: [], followUps: [], active },
+			});
+			fakeThis.updatePendingMessagesDisplay();
+			return renderAll(queuedMessagesContainer);
+		};
+		expect(render("preparing")).toContain("queued before compaction");
+		expect(render("running")).toBe("");
 	});
 
 	test("renderCurrentSessionState waits for replacement handling before rendering", async () => {

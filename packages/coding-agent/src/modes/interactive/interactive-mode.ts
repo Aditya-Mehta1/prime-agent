@@ -360,13 +360,13 @@ function isLabeledQueuedPreview(message: string): boolean {
 	);
 }
 
-export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
+export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up" | "Starting"): string {
 	return isLabeledQueuedPreview(message) ? message : `${label}: ${message}`;
 }
 
 export function styleQueuedMessagePreview(
 	message: string,
-	label: "Steering" | "Follow-up",
+	label: "Steering" | "Follow-up" | "Starting",
 	isRecognizedSlashCommand: (name: string) => boolean,
 ): string {
 	const preview = formatQueuedMessagePreview(message, label);
@@ -8221,9 +8221,18 @@ export class InteractiveMode {
 		// their own container below the execution indicator and recap.
 		this.queuedMessagesContainer.clear();
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
+		const active = this.connectionState?.sessionActions.active;
+		// A queued turn leaves its lane once the pump selects it; its own pre-turn compaction can hold it here for minutes.
+		const startingTurn = active?.kind === "turn" && active.phase === "preparing" ? active.label : undefined;
 		const hasQueuedMessages = steeringMessages.length > 0 || followUpMessages.length > 0;
-		if (hasQueuedMessages) {
+		if (hasQueuedMessages || startingTurn !== undefined) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
+			if (startingTurn !== undefined) {
+				const text = styleQueuedMessagePreview(startingTurn, "Starting", (name) =>
+					this.isRecognizedSlashCommand(name),
+				);
+				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
+			}
 			for (const message of steeringMessages) {
 				const text = styleQueuedMessagePreview(message, "Steering", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
@@ -8232,6 +8241,8 @@ export class InteractiveMode {
 				const text = styleQueuedMessagePreview(message, "Follow-up", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
+		}
+		if (hasQueuedMessages) {
 			const dequeueHint = this.getAppKeyDisplay("app.message.navigateOlder");
 			const hintText = theme.fg("dim", `╰─ ${dequeueHint} to browse and edit queued messages`);
 			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));

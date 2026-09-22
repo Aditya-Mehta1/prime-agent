@@ -7695,7 +7695,7 @@ export class AgentSession {
 						active: {
 							kind: active.payload.kind,
 							phase,
-							label: compactRlmText(active.payload.text),
+							label: compactRlmText(queuedAgentMessagePreview(active)),
 						},
 					}
 				: {}),
