@@ -33,7 +33,9 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// timeout so a long turn cannot expire the request.
 pub const LONG_RUNNING_REQUEST_TIMEOUT_MS: u64 = 600_000;
 const CONNECT_TIMEOUT_MS: u64 = 3_000;
-const HELLO_TIMEOUT_MS: u64 = 3_000;
+/// Hello handshake budget. A daemon loading a very large session can take
+/// well over the 3s TS default to greet.
+const HELLO_TIMEOUT_MS: u64 = 15_000;
 
 /// A non-response frame forwarded to the UI event loop. Payloads that are
 /// owned by the session engine stay raw JSON (`Value`) so the client keeps

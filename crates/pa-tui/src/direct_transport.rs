@@ -31,8 +31,9 @@ use crate::daemon_client::{client_event_from_value, DaemonClientEvent, Shared};
 
 /// TS `DaemonWorkerClient.connect` budget for the worker socket.
 const CONNECT_TIMEOUT_MS: u64 = 1_000;
-/// TS `waitForHello` / `authenticatePeer` budget.
-const HELLO_TIMEOUT_MS: u64 = 3_000;
+/// TS `waitForHello` / `authenticatePeer` budget, raised from 3s to 15s
+/// so daemons busy loading large sessions can still greet in time.
+const HELLO_TIMEOUT_MS: u64 = 15_000;
 /// TS `get_direct_worker_transport` request budget in
 /// `createDaemonSessionTransport` (with `recoverable: false`).
 pub(crate) const TICKET_TIMEOUT_MS: u64 = 5_000;

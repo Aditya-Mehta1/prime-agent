@@ -26,8 +26,9 @@ use crate::config;
 
 /// Default response timeout, mirroring `DEFAULT_DAEMON_REQUEST_TIMEOUT_MS`.
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
-/// Greeting timeout, mirroring the TS `waitForHello` default.
-const HELLO_TIMEOUT_MS: u64 = 3_000;
+/// Greeting timeout. The TS `waitForHello` default is 3s; raised to 15s
+/// so daemons busy loading large sessions can still greet in time.
+const HELLO_TIMEOUT_MS: u64 = 15_000;
 /// Read poll granularity for deadline-driven reads.
 const READ_POLL: Duration = Duration::from_millis(50);
 
