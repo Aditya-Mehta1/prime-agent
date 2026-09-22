@@ -60,7 +60,16 @@ rows deliberately deferred (below).
 
 ## Lane details
 
-### 1. `editor-wrap-unicode` — P0, crash class
+### 1. `editor-wrap-unicode` — P0, crash class — **SHIPPED** (lane branch
+lane/lane/editor-wrap-unicode; wrap core landed earlier in #269, the lane
+closed the remaining rows: visibleWidth/tab+base classes, stripAnsi,
+normalizeTerminalOutput, Input grapheme model, marker-scan strictness,
+sliceByColumn, ASCII wrap replay goldens; verifier
+`scripts/editor_unicode_parity.py` — CORE session gates, cluster states are
+a root-caused non-gating known gap: the box tmux 3.2a predates grapheme
+joining so the per-cell ratatui diff collides with TS-only on multi-char
+clusters; the model/bytes are byte-exact via pty capture — needs a
+paint-backend follow-up lane).
 
 **Why first:** `word_wrap_line` mixes grapheme-ordinal `Segment.index` with byte slicing
 (`crates/pa-tui/src/editor/wrap.rs:39-47`, slice at `wrap.rs:193`), so **any non-ASCII prompt
