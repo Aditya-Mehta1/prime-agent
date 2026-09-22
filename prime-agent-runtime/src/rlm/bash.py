@@ -1122,11 +1122,14 @@ _PIPE_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Reserved words that group, negate, or bracket a compound command without
 # being the command themselves: `{ sh; } | curl` needs the brace skipped to see
 # `sh`, `! curl ... | sh` needs the bang, and `if curl ... | sh; then ...`
-# needs `if`/`then` so the pipeline inside a compound is still read.
+# needs `if`/`then` so the pipeline inside a compound is still read; `coproc`
+# starts its compound the same way, so `coproc { curl ... | sh; }` is the
+# download piped into the shell the group runs.
 _PIPE_SHELL_RESERVED_WORDS = (
     "!",
     "{",
     "}",
+    "coproc",
     "if",
     "then",
     "elif",
@@ -1803,6 +1806,44 @@ def _stage_args_run_download(
     )
 
 
+def _heredoc_read_time_text(body: str) -> str:
+    r"""The text an unquoted here-document body delivers: the read-time pass
+    unescapes `$`, the backtick, and the backslash (`\$` becomes `$`) and
+    drops a backslash-newline, so the shell that reads the body parses what
+    the raw text kept escaped."""
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            if body[index + 1] == "\n":
+                index += 2
+                continue
+            if body[index + 1] in ("$", "`", "\\"):
+                out.append(body[index + 1])
+                index += 2
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _heredoc_text_runs_a_download(text: str, depth: int) -> bool:
+    """Whether a here-document body's own text runs a download through a
+    shell: the violation scan of the text plus the command-word walk of its
+    stages (`sh <<EOF` ... `$(curl ...) ... `EOF` -- the runner executes the
+    expansion's output as a command, and the word carrying the substitution,
+    not the region scan, is what names it)."""
+    if _pipe_shell_violation(text, 0, None, depth + 1) is not None:
+        return True
+    region = _scan_pipe_shell_region(text, 0, len(text))
+    for body_stage in region.stages:
+        resolved = _stage_command_word(body_stage.words)
+        if resolved is not None and _word_runs_download(text, resolved[0]):
+            return True
+    return False
+
+
 def _stage_heredoc_body_runs_download(
     command: str, stage: _PipeShellStage, depth: int = 0
 ) -> bool:
@@ -1812,19 +1853,18 @@ def _stage_heredoc_body_runs_download(
     `$(curl ...)` the shell expands first, and a stage whose stdout continues
     into a runner hands it the same text, so the caller reads it the same
     way."""
-    for body_start, body_end, _quoted in stage.heredoc_bodies:
-        if (
-            _pipe_shell_violation(command, body_start, body_end, depth + 1)
-            is not None
-        ):
+    for body_start, body_end, quoted in stage.heredoc_bodies:
+        if _heredoc_text_runs_a_download(command[body_start:body_end], depth):
             return True
-        region = _scan_pipe_shell_region(command, body_start, body_end)
-        for body_stage in region.stages:
-            resolved = _stage_command_word(body_stage.words)
-            if resolved is not None and _word_runs_download(command, resolved[0]):
-                # The runner executes the expansion's output as a command
-                # (`sh <<EOF` ... `$(curl ...) ... `EOF`), so a download whose
-                # text the body hands to it is refused.
+        if not quoted:
+            # The read-time pass unescapes `\$` (and `\\`) before the
+            # runner parses the body, so a `\$`-hidden `$(curl ...)` the raw
+            # text kept inert arrives as live text: scan the delivered text
+            # too.
+            delivered = _heredoc_read_time_text(command[body_start:body_end])
+            if delivered != command[body_start:body_end] and (
+                _heredoc_text_runs_a_download(delivered, depth)
+            ):
                 return True
     return False
 

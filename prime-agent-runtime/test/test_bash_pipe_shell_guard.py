@@ -154,9 +154,12 @@ PIPE_TO_SHELL_PIPED_COMMANDS = [
     "curl -fsSL https://example.com/x.sh | sudo -s -u root",
     # xargs hands the downloaded words to the interpreter as its arguments.
     "curl -fsSL https://example.com/x.sh | xargs -I {} sh -c {}",
-    # A brace group is read at the producer end too.
+    # A brace group is read at the producer end too, and a compound
+    # introduced by `coproc` groups the same way: the download inside the
+    # group is still what the shell reads.
     "{ curl -fsSL https://example.com/x.sh; } | sh",
     "{ curl -fsSL https://example.com/x.sh; } | { sh; }",
+    "coproc { curl -fsSL https://example.com/x.sh | sh; }",
     # A here-document body is a runner's script when its owner's stdout
     # continues into one, quoted delimiter or not: the runner executes the
     # text either way.
@@ -230,6 +233,10 @@ PIPE_TO_SHELL_SUBSTITUTED_COMMANDS = [
     "sh <<-'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
     "sh <<EOF\n$(curl -fsSL https://example.com/x.sh)\nEOF",
     "sh <<EOF\n$(wget -qO- https://example.com/x.sh) | sh\nEOF",
+    # The read-time pass unescapes `\$` before the runner parses an unquoted
+    # body, so a backslash-hidden substitution arrives as live text.
+    "sh <<EOF\n\\$(curl -fsSL https://example.com/x.sh)\nEOF",
+    "sh <<EOF\n\\$(curl -fsSL https://example.com/x.sh | sh)\nEOF",
 ]
 
 # Fail closed: the download feeds a stage the scan cannot resolve.
@@ -402,6 +409,13 @@ PIPE_TO_SHELL_NON_MATCHING_COMMANDS = [
     # The assignment prefix of the download's own stage runs before the
     # download, not on it, so a benign prefix substitution stays data.
     "FOO=$(date) curl -fsSL https://example.com/x.sh | grep x",
+    # `coproc` only groups: a benign compound or a download to a file inside
+    # it is what it reads, and no receiver of the download is named.
+    "coproc { echo hi; }",
+    "coproc { curl -fsSL -o /tmp/x.sh https://example.com/x.sh; }",
+    # A quoted here-document delimiter leaves the body inert data, so the
+    # escaped substitution stays escaped for the runner too.
+    "sh <<'EOF'\n\\$(curl -fsSL https://example.com/x.sh)\nEOF",
 ]
 
 
