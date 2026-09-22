@@ -34,6 +34,10 @@ PROTOCOL_VERSION = 3
 DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
 
+# Plain ASCII, never a pickle start: _restore_state sniffs it to tell v2 framed
+# payloads from legacy (single dill-pickled dict) ones.
+_SNAPSHOT_MAGIC = b"PRIME-AGENT-KERNEL-SNAPSHOT-V2\n"
+
 # Stream writes must fit one protocol frame: the host buffers whole lines
 # before its per-execution truncation, and raw fd writes already arrive as
 # 64 KiB pump chunks.
@@ -681,6 +685,32 @@ class _CappedWriter:
         return size
 
 
+def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
+    """Framing damage is a corrupt snapshot: a restore error, never a partial namespace.
+    Length fields are bounds-checked before their reads, so a corrupt header cannot force a huge allocation."""
+    fh.seek(0, os.SEEK_END)
+    size = fh.tell()
+    fh.seek(len(_SNAPSHOT_MAGIC))
+    records: dict[str, bytes] = {}
+    while fh.tell() < size:
+        header = fh.read(4)
+        if len(header) < 4:
+            raise ValueError("truncated snapshot record")
+        name_len = int.from_bytes(header, "little")
+        if fh.tell() + name_len + 8 > size:
+            raise ValueError("truncated snapshot record")
+        name = fh.read(name_len)
+        raw_len = fh.read(8)
+        blob_len = int.from_bytes(raw_len, "little")
+        if len(raw_len) < 8 or fh.tell() + blob_len > size:
+            raise ValueError("truncated snapshot record")
+        blob = fh.read(blob_len)
+        if len(blob) < blob_len:
+            raise ValueError("truncated snapshot record")
+        records[name.decode("utf-8")] = blob
+    return records
+
+
 def _snapshot_state(
     ns: dict[str, Any],
     path: str,
@@ -699,41 +729,10 @@ def _snapshot_state(
         return {"error": f"dill unavailable: {err}"}
     dill.settings["recurse"] = True
 
-    payload: dict[str, bytes] = {}
+    saved: list[str] = []
     skipped: list[dict[str, str]] = []
     oversized: list[str] = []
-    total = 0
     missing = object()
-    for name in list(ns.keys()):
-        if name.startswith("_") or name in _ALWAYS_SKIP:
-            continue
-        value = ns.get(name, missing)
-        if value is missing:
-            # A background thread deleted the name after the key listing.
-            skipped.append({"name": name, "reason": "deleted during snapshot"})
-            continue
-        remaining = max_bytes - total
-        limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
-        buffer = io.BytesIO()
-        try:
-            dill.dump(value, _CappedWriter(buffer, limit))
-            blob = buffer.getvalue()
-        except _SnapshotSizeLimitExceeded:
-            if not prune_oversized and remaining < max_variable_bytes:
-                skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
-            else:
-                skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
-                oversized.append(name)
-            continue
-        except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
-            skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
-            continue
-        if total + len(blob) > max_bytes:
-            skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
-            continue
-        payload[name] = blob
-        total += len(blob)
-
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     temps: list[str] = []
 
@@ -765,56 +764,69 @@ def _snapshot_state(
     previous = None
     try:
         try:
+            if max_bytes < len(_SNAPSHOT_MAGIC):
+                # Even the header alone busts the cap: keep the committed-payload <= cap invariant.
+                return {"error": "write failed: snapshot exceeds aggregate snapshot size cap"}
             fh, tmp = stage_temp(path, "wb")
             with fh:
-                def dump_to_temp(candidate: dict[str, bytes]) -> int | None:
-                    writer = _CappedWriter(fh, max_bytes)
+                # Single pass: each variable is dill-serialized exactly once, streamed
+                # into the staged temp. The record header is charged against the aggregate
+                # cap up front, so a completed record can never overflow it (no prefix re-dump).
+                total = fh.write(_SNAPSHOT_MAGIC)
+                for name in list(ns.keys()):
+                    if name.startswith("_") or name in _ALWAYS_SKIP:
+                        continue
+                    value = ns.get(name, missing)
+                    if value is missing:
+                        # A background thread deleted the name after the key listing.
+                        skipped.append({"name": name, "reason": "deleted during snapshot"})
+                        continue
+                    encoded = name.encode("utf-8")
+                    # Record header: 4-byte name length + 8-byte blob length, plus the name itself.
+                    budget = max_bytes - total - 12 - len(encoded)
+                    # Prune mode measures at the full per-variable cap: only that cap decides
+                    # pruned-ness, and the write always re-measures — in-place mutation
+                    # defeats any name-based size tracking from an earlier dump.
+                    limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, budget)
+                    buffer = io.BytesIO()
                     try:
-                        dill.dump(candidate, writer)
+                        dill.dump(value, _CappedWriter(buffer, limit))
+                        blob = buffer.getvalue()
                     except _SnapshotSizeLimitExceeded:
-                        return None
-                    return writer.written
-
-                def redump_to_temp(candidate: dict[str, bytes]) -> int | None:
-                    fh.seek(0)
-                    fh.truncate()
-                    return dump_to_temp(candidate)
-
-                bytes_written = dump_to_temp(payload)
-                if bytes_written is None:
-                    # Prefix pickle size is monotonic because each prefix only adds a string key and bytes value.
-                    items = list(payload.items())
-                    if redump_to_temp({}) is None:
-                        return {"error": "write failed: snapshot exceeds aggregate snapshot size cap"}
-                    low, high = 0, len(items) - 1
-                    while low < high:
-                        mid = (low + high + 1) // 2
-                        if redump_to_temp(dict(items[:mid])) is None:
-                            high = mid - 1
+                        if not prune_oversized and budget < max_variable_bytes:
+                            skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
                         else:
-                            low = mid
-                    for name, _ in items[low:]:
+                            skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
+                            oversized.append(name)
+                        continue
+                    except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
+                        skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+                        continue
+                    if total + 12 + len(encoded) + len(blob) > max_bytes:
+                        # Only reachable in prune mode, where the measurement cap ignores the budget.
                         skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
-                    payload = dict(items[:low])
-                    # The search's last attempt may have overflowed the temp; rewrite the chosen prefix.
-                    bytes_written = redump_to_temp(payload)
-                    if bytes_written is None:
-                        return {"error": "write failed: snapshot exceeds aggregate snapshot size cap"}
-            saved = sorted(payload.keys())
-            pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
-            manifest = {
-                "version": 1,
-                "savedNames": saved,
-                "skipped": skipped,
-                "pruned": pruned,
-                "bytes": bytes_written,
-                "pythonVersion": sys.version.split()[0],
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            }
-            stage = "manifest write"
-            fh, manifest_tmp = stage_temp(manifest_path, "w")
-            with fh:
-                json.dump(manifest, fh)
+                        continue
+                    fh.write(len(encoded).to_bytes(4, "little"))
+                    fh.write(encoded)
+                    fh.write(len(blob).to_bytes(8, "little"))
+                    fh.write(blob)
+                    total += 12 + len(encoded) + len(blob)
+                    saved.append(name)
+                saved.sort()
+                pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
+                manifest = {
+                    "version": 1,
+                    "savedNames": saved,
+                    "skipped": skipped,
+                    "pruned": pruned,
+                    "bytes": total,
+                    "pythonVersion": sys.version.split()[0],
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                }
+                stage = "manifest write"
+                fh, manifest_tmp = stage_temp(manifest_path, "w")
+                with fh:
+                    json.dump(manifest, fh)
         except BaseException as err:  # noqa: BLE001 - Exception -> error dict, rest propagates
             if not isinstance(err, Exception):
                 raise  # e.g. KeyboardInterrupt: clean up (outer finally), then propagate
@@ -836,7 +848,7 @@ def _snapshot_state(
             return {"error": f"manifest write failed: {err}"}
         for name in pruned:
             ns.pop(name, None)
-        result = {"saved": saved, "skipped": skipped, "pruned": pruned, "bytes": bytes_written}
+        result = {"saved": saved, "skipped": skipped, "pruned": pruned, "bytes": total}
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
@@ -868,7 +880,12 @@ def _restore_state(
         return {"error": f"dill unavailable: {err}"}
     try:
         with open(path, "rb") as fh:
-            payload = dill.load(fh)
+            if fh.read(len(_SNAPSHOT_MAGIC)) == _SNAPSHOT_MAGIC:
+                payload = _read_snapshot_records(fh)
+            else:
+                # Legacy: one dill-pickled dict; old snapshot files must keep restoring.
+                fh.seek(0)
+                payload = dill.load(fh)
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):

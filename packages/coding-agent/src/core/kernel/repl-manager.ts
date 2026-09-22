@@ -52,6 +52,7 @@ import {
 	parseAttachmentDisplay,
 	parseDiffDisplay,
 	parseSentAgentMessage,
+	RESTORE_EXECUTION_TIMEOUT_MS,
 	raceStartupWithAbort,
 	SNAPSHOT_EXECUTION_TIMEOUT_MS,
 } from "./shared.js";
@@ -87,6 +88,15 @@ const KERNEL_STDERR_LOG_BUDGET_MARKER = "[stderr log budget exhausted]\n";
 const KERNEL_STDERR_LOG_DIR_MODE = 0o700;
 // Owner-only file bits; kernel stderr can carry exception payloads.
 const KERNEL_STDERR_LOG_MODE = 0o600;
+
+function manifestStatOf(path: string): { mtimeMs: number; size: number } | null {
+	try {
+		const stat = statSync(path);
+		return { mtimeMs: stat.mtimeMs, size: stat.size };
+	} catch {
+		return null;
+	}
+}
 
 /** fs.writeSync may write fewer bytes than asked (partial ENOSPC, signals); loop until done. */
 function writeFullySync(fd: number, data: Buffer): void {
@@ -235,6 +245,13 @@ export class ReplKernelManager {
 	private pendingRebootstrap = false;
 	/** Restore the saved namespace on that fresh start too (false when the snapshot itself is the declared culprit). */
 	private pendingRestore = false;
+	private completedExecutions = 0;
+	/** Tri-state: undefined = no non-repair restore attempted yet, null = manifest was missing at that attempt. */
+	private restoredManifestStat?: { mtimeMs: number; size: number } | null;
+	private restoredNamespaceSkip?: {
+		manifestStat: { mtimeMs: number; size: number } | null;
+		completedExecutions: number;
+	};
 	private rebootstrapPromise?: Promise<boolean>;
 	private teardownInFlight = 0;
 
@@ -1160,6 +1177,7 @@ export class ReplKernelManager {
 		}
 		if (!execution.settled) {
 			execution.settled = true;
+			this.completedExecutions += 1;
 			if (execution.opts.onLateSentAgentMessage) {
 				this.registerLateSentAgentMessageHandler(execution.requestId, execution.opts.onLateSentAgentMessage);
 			}
@@ -1630,17 +1648,22 @@ export class ReplKernelManager {
 	private async performRestore(protocolRepair: boolean): Promise<RestoreResult | null> {
 		const cfg = this.options.snapshot;
 		if (!cfg) return null;
+		// Before the attempt, so a failed or timed-out restore still arms the skip;
+		// repair retries (reprovision after a failed first restore) keep the non-repair stat.
+		if (!protocolRepair) this.restoredManifestStat = manifestStatOf(cfg.manifestPath);
 		try {
 			const r = await this.enqueueRequest(
 				{ type: "restore", path: cfg.path },
 				"",
 				{ internal: true, protocolRepair },
-				protocolRepair ? REPAIR_STEP_TIMEOUT_MS : undefined,
+				protocolRepair ? REPAIR_STEP_TIMEOUT_MS : RESTORE_EXECUTION_TIMEOUT_MS,
 			);
 			if (r.status !== "ok" || !r.doneFields) {
 				this.appendKernelDiagnostic(
 					`state restore ${r.status === "aborted" ? "timed out" : "failed"}: ${r.error?.evalue ?? r.stderr}`,
 				);
+				// The namespace never got the saved state, so the on-disk payload must stay the fresher copy.
+				if (!protocolRepair) this.pendingRestore = true;
 				return null;
 			}
 			this.pendingRestore = false;
@@ -1651,8 +1674,24 @@ export class ReplKernelManager {
 			};
 		} catch (error) {
 			this.appendKernelDiagnostic(`state restore error: ${errorMessage(error)}`);
+			if (!protocolRepair) this.pendingRestore = true;
 			return null;
 		}
+	}
+
+	/**
+	 * Arm the one-shot post-restore snapshot skip: the bootstrap-scheduled snapshot would
+	 * rewrite identical content, or after a failed restore clobber the healthy on-disk
+	 * copy with a skills-only payload. Call after the bootstrap succeeds — its own
+	 * settled execution must not defeat the arm.
+	 */
+	markRestoredNamespaceFresh(): void {
+		if (this.restoredManifestStat === undefined) return; // no attempted non-repair restore to match
+		this.restoredNamespaceSkip = {
+			manifestStat: this.restoredManifestStat,
+			completedExecutions: this.completedExecutions,
+		};
+		this.restoredManifestStat = undefined;
 	}
 
 	/** Live user-defined top-level names, or null if the kernel isn't running. Never throws. */
@@ -1677,11 +1716,22 @@ export class ReplKernelManager {
 		if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
 		this.snapshotTimer = globalThis.setTimeout(() => {
 			this.snapshotTimer = undefined;
+			if (this.consumeRestoredSnapshotSkip()) return;
 			void this.captureSnapshot({ executionTimeoutMs: SNAPSHOT_EXECUTION_TIMEOUT_MS });
 		}, cfg.debounceMs ?? DEFAULT_SNAPSHOT_DEBOUNCE_MS);
 		if (this.snapshotTimer && typeof this.snapshotTimer === "object" && "unref" in this.snapshotTimer) {
 			this.snapshotTimer.unref();
 		}
+	}
+
+	private consumeRestoredSnapshotSkip(): boolean {
+		const skip = this.restoredNamespaceSkip;
+		this.restoredNamespaceSkip = undefined; // one-shot: consumed whether or not it fires
+		if (!skip || !this.options.snapshot) return false;
+		if (this.completedExecutions !== skip.completedExecutions) return false;
+		const stat = manifestStatOf(this.options.snapshot.manifestPath);
+		if (stat === null || skip.manifestStat === null) return stat === skip.manifestStat;
+		return stat.mtimeMs === skip.manifestStat.mtimeMs && stat.size === skip.manifestStat.size;
 	}
 
 	private clearSnapshotTimer(): void {

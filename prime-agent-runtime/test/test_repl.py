@@ -682,6 +682,23 @@ class ReplTest(unittest.TestCase):
             events = self.repl.execute("p3", "'big' in dir()")
             self.assertEqual(one(events, "result")["text"], "False")
 
+    def test_prune_measures_the_current_value_2478(self):
+        # Redefinition or in-place shrink after an oversized skip: prune must re-measure.
+        for cell in ("def big(): pass", "big.clear()"):
+            with self.subTest(cell=cell):
+                with tempfile.TemporaryDirectory() as tmp:
+                    base = {"type": "snapshot", "path": os.path.join(tmp, "kernel-state.dill"),
+                            "manifest_path": os.path.join(tmp, "kernel-state.json"), "max_variable_bytes": 1024}
+                    self.repl.execute("pk1", "big = bytearray(b'x' * 100_000)\nkeep = 1")
+                    self.repl.send({"id": "pk2", **base})
+                    self.assertEqual(one(self.repl.until_done("pk2"), "done")["status"], "ok")
+                    self.repl.execute("pk3", cell)
+                    self.repl.send({"id": "pk4", "prune_oversized": True, **base})
+                    done = one(self.repl.until_done("pk4"), "done")
+                    self.assertEqual(done["status"], "ok")
+                    self.assertEqual(done["pruned"], [])
+                    self.assertEqual(done["saved"], ["big", "keep"])
+
     def test_emit_display(self):
         payloads = {
             "application/vnd.prime-agent.diff+json": {
@@ -2126,11 +2143,10 @@ class SnapshotTempCleanupTest(unittest.TestCase):
 
             real_dump = dill.dump
 
-            def interrupted_dump(payload, fh):
-                if isinstance(payload, dict):  # the complete payload, not a per-variable value
-                    fh.write(b"partial")
-                    raise KeyboardInterrupt
-                return real_dump(payload, fh)
+            def interrupted_dump(value, fh):
+                # Interrupt mid-dump, after partial bytes landed in the staged temp.
+                fh.write(b"partial")
+                raise KeyboardInterrupt
 
             with unittest_mock.patch.object(dill, "dump", interrupted_dump):
                 with self.assertRaises(KeyboardInterrupt):
@@ -2222,19 +2238,22 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
     def test_near_cap_payload_skips_tail_instead_of_failing_snapshot(self):
         import dill
 
+        from rlm.repl import _SNAPSHOT_MAGIC, _restore_state
+
         dill.settings["recurse"] = True
         source = {"a": "first", "b": "second"}
         blobs = {name: dill.dumps(value) for name, value in source.items()}
-        cap = len(dill.dumps(blobs)) - 1
-        self.assertLessEqual(sum(map(len, blobs.values())), cap)
-        self.assertLessEqual(len(dill.dumps({"a": blobs["a"]})), cap)
+        # One byte short of the full single-pass payload (magic + both records),
+        # so "a" fits exactly and "b" overflows the remaining aggregate budget.
+        cap = len(_SNAPSHOT_MAGIC) + 13 + len(blobs["a"]) + 13 + len(blobs["b"]) - 1
 
         result = self._snap(source, max_bytes=cap, max_variable_bytes=cap)
         self.assertEqual(result["saved"], ["a"])
         self.assertEqual(result["skipped"], [{"name": "b", "reason": "exceeds aggregate snapshot size cap"}])
         self.assertLessEqual(result["bytes"], cap)
-        with open(self.path, "rb") as fh:
-            self.assertEqual(list(dill.load(fh)), ["a"])
+        ns: dict = {}
+        self.assertNotIn("error", _restore_state(ns, self.path))
+        self.assertEqual(ns, {"a": "first"})
 
     def test_manifest_write_failure_preserves_prior_pair(self):
         old_payload, old_manifest = self._old_pair()
@@ -2418,6 +2437,28 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
                 with open(manifest_path) as fh:
                     self.assertEqual(json.load(fh)["savedNames"], ["keep"])
                 self.assertEqual(sorted(os.listdir(d)), sorted([payload_name, manifest_name]))
+
+    def test_each_variable_serialized_once_and_payload_is_not_a_pickle(self):
+        import dill
+
+        from rlm.repl import _SNAPSHOT_MAGIC
+
+        real_dump = dill.dump
+        dumped: list[object] = []
+
+        def counting_dump(value, writer):
+            dumped.append(value)
+            return real_dump(value, writer)
+
+        with mock.patch.object(dill, "dump", counting_dump):
+            result = self._snap({"a": 1, "b": 2, "c": 3})
+        self.assertEqual(result["saved"], ["a", "b", "c"])
+        self.assertEqual(dumped, [1, 2, 3])
+        self.assertEqual(result["bytes"], os.path.getsize(self.path))
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(len(_SNAPSHOT_MAGIC)), _SNAPSHOT_MAGIC)
+            with self.assertRaises(Exception):
+                dill.load(fh)
 
 
 class OwnerWatchdogTest(unittest.TestCase):
