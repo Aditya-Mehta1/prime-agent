@@ -389,6 +389,20 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         result = await self._run("chmod -R --reference=/etc/hosts 755 sub")
         self.assertNotEqual(result.exit_code, 0)
 
+    async def test_double_dash_ends_recursive_flag_scan(self):
+        # `--` ends option parsing, so a `-R` after it names a file operand
+        # instead of the recursive flag; the flag before it stays recursive.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        with mock.patch.dict(os.environ, {"HOME": home.name}):
+            # Non-recursive per bash: `-- -R ~` chmods files named `-R` and
+            # `~` itself, out of this guard's recursion-only scope, so the
+            # command reaches the shell (BSD chmod errors on `--` itself).
+            result = await self._run("chmod 755 -- -R ~")
+            self.assertNotIn("Refusing to run", result.output)
+            with self.assertRaises(DestructiveChmodRefusalError):
+                await self._run("chmod -R -- 755 ~")
+
     async def test_non_recursive_chmod_chown_untouched(self):
         self._make_tree()
         Path(self.test_dir, ".git").mkdir()
@@ -1253,6 +1267,19 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             result = await self._run(command)
             self.assertEqual(result.exit_code, 0)
 
+    async def test_hash_registration_reads_command_slot_only(self):
+        # Only a command-slot `hash` registers; an argument-position `hash`
+        # is data. The slot passes through assignment prefixes, so
+        # `FOO=1 hash -p ...` still registers.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        command = "FOO=1 hash -p /bin/chmod safe; safe -R 755 ~"
+        self.assertIn("Refusing to run", await self._refused(command, home=home.name))
+        # Real bash runs `safe` and finds no such command: the argument
+        # `hash` armed nothing, so the command reaches the shell.
+        result = await self._run("echo hash -p /bin/chmod safe; safe -R 755 ~")
+        self.assertNotIn("Refusing to run", result.output)
+
     async def test_refuses_hash_registered_command_names(self):
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
@@ -1292,6 +1319,18 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("starts a login or interactive shell", await self._refused(command))
         for command in ["bash -xc 'echo hi'", "bash --rcfile /tmp/guard-rc ./guard-ok.sh"]:
             self.assertEqual((await self._run(command)).exit_code, 0)
+
+    async def test_bash_script_argument_searches_path(self):
+        # A slash-free script name the current directory does not hold is
+        # PATH-searched by bash itself: a hit outside the workspace is
+        # refused, and a miss everywhere is a harmless bash error.
+        outside = tempfile.mkdtemp(prefix="outside-bin-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        Path(outside, "outside-script").write_text(":\n")
+        with mock.patch.dict(os.environ, {"PATH": outside + os.pathsep + os.environ["PATH"]}):
+            message = await self._refused("bash outside-script")
+            self.assertIn("script", message)
+            self.assertNotEqual((await self._run("bash missing-script.sh")).exit_code, 0)
 
     async def test_command_prefix_relocation_refuses_wrapper_scripts(self):
         self._make_tree()
@@ -1558,6 +1597,13 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             message = await self._refused("chmod -R 755 sub")
         self.assertIn("changes directory", message)
 
+    async def test_obfuscated_prefix_cd_still_relocates(self):
+        # The prefix cd check reads shell-folded words, so `c\d /` or `c"d" /`
+        # (which bash runs as `cd /`) relocates the spawn like a plain cd.
+        with mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "c\\d /"}):
+            message = await self._refused("chmod -R 755 .")
+        self.assertIn("changes directory", message)
+
     async def test_command_prefix_with_escapes_does_not_skip_user_cds(self):
         # A prefix containing shell escapes must not shift the prefix
         # boundary: the user cd out of the workspace must still be resolved
@@ -1594,11 +1640,9 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /safe"}):
             with mock.patch.object(bash_module, "_prefix_command", side_effect=flip_then_build):
                 handle = bash("echo hi")
-        try:
-            self.assertEqual(seen, [("echo hi", "cd /safe")])
-            self.assertEqual(handle._script, "cd /safe\necho hi")
-        finally:
-            handle.kill()
+        self.assertEqual(seen, [("echo hi", "cd /safe")])
+        self.assertEqual(handle._script, "cd /safe\necho hi")
+        handle.kill()
 
     async def test_wrapper_script_gate_uses_the_captured_prefix(self):
         # The wrapper-script relocation gate reads the captured prefix, not a
@@ -1611,30 +1655,24 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             return real_guard(script, allow, prefix)
 
         with mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"}):
-            with mock.patch.object(
-                bash_module, "_guard_destructive_chmod", side_effect=flip_and_guard
-            ):
+            with mock.patch.object(bash_module, "_guard_destructive_chmod", side_effect=flip_and_guard):
                 message = await self._refused("bash safe-name.sh")
         self.assertIn("changes directory", message)
 
-    async def test_handle_script_argument_is_guarded(self):
-        # A caller-supplied script is guarded at construction, with no trusted
-        # prefix region: the script parameter is not a way around the guard.
-        home = tempfile.TemporaryDirectory()
-        self.addCleanup(home.cleanup)
-        with mock.patch.dict(
-            os.environ, {"HOME": home.name, "PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"}
-        ):
-            with self.assertRaises(DestructiveChmodRefusalError):
-                bash_module.BashHandle("echo ok", script="chmod -R 755 ~")
-
     async def test_direct_handle_construction_is_still_guarded(self):
-        # A handle built directly (script=None) is guarded at construction.
+        # A handle built directly is guarded at construction, whether the
+        # text comes from `command` or a caller-supplied `script` (which has
+        # no trusted prefix region, so an armed prefix cannot hide words).
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         with mock.patch.dict(os.environ, {"HOME": home.name}):
             with self.assertRaises(DestructiveChmodRefusalError):
                 bash_module.BashHandle("chmod -R 755 ~")
+        with mock.patch.dict(
+            os.environ, {"HOME": home.name, "PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"}
+        ):
+            with self.assertRaises(DestructiveChmodRefusalError):
+                bash_module.BashHandle("echo ok", script="chmod -R 755 ~")
 
 
 class FrozenBypassEnvLaunchTest(unittest.TestCase):

@@ -1726,8 +1726,12 @@ _RECURSIVE_LONG_FLAGS = (
 def _is_recursive_chmod_chown_token_run(tokens: list[str]) -> bool:
     """True when a token run contains a recursive flag: `-R` (bundled with
     other short options anywhere), `--recursive`, or any unambiguous GNU
-    abbreviation of it (`--rec` through `--recursiv`)."""
+    abbreviation of it (`--rec` through `--recursiv`). The `--` terminator
+    ends option parsing, so a `-R` after it is an operand naming a file,
+    not the recursive flag."""
     for token in tokens:
+        if token == "--":
+            break
         if token in _RECURSIVE_LONG_FLAGS:
             return True
         if token.startswith("-") and not token.startswith("--") and "R" in token[1:]:
@@ -1801,6 +1805,23 @@ def _chmod_hash_registered_command_names(
     for index, word in enumerate(words):
         if os.path.basename(word.value) != _CHMOD_HASH_BUILTIN:
             continue
+        # The builtin only registers from the command slot; an argument like
+        # `echo hash hash` is data, and rescanning its suffix would make the
+        # guard quadratic on command-text length. The slot passes through
+        # assignment prefixes and grouping tokens the way the wrapper chain
+        # reads them, so `FOO=1 hash -p ...` still registers while an
+        # argument-position `hash` does not.
+        if not word.starts_command:
+            slot = True
+            for before in reversed(words[:index]):
+                if _CHMOD_ASSIGNMENT_WORD.match(before.value) or before.value in _COMMAND_SLOT_NOISE:
+                    if before.starts_command:
+                        break  # an assignment/grouping run head passes the slot
+                    continue
+                slot = False  # an argument or command word takes the slot
+                break
+            if not slot:
+                continue
         has_pathname_option = False
         attached: str | None = None
         operands: list[str] = []
@@ -2842,6 +2863,24 @@ _WRAPPER_LONG_OPTIONS = (
 _WRAPPER_LONG_OPTIONS_WITH_VALUE = ("--rcfile", "--init-file")
 
 
+def _path_hit(candidate: str) -> str | None:
+    """The first PATH entry holding `candidate` as a file, or None.
+
+    Shared by the slash-free script-name resolutions (`source` operands and
+    interpreter script arguments): bash searches PATH for those, so the
+    guard resolves the same file the shell will read."""
+    for path_dir in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not path_dir:
+            continue
+        hit = os.path.join(path_dir, candidate)
+        try:
+            if os.path.isfile(hit):
+                return hit
+        except OSError:
+            continue
+    return None
+
+
 def _script_input_violation(
     resolved: str | None, workspace: str, home_real: str | None
 ) -> bool:
@@ -2857,6 +2896,25 @@ def _script_input_violation(
     if home_real is not None and resolved == home_real:
         return True
     return resolved != workspace and not resolved.startswith(workspace + os.sep)
+
+
+def _prefix_relocates(prefix: str | None) -> bool:
+    """True when the command prefix moves the shell (cd/pushd/popd) in any
+    spelling the shell builds. The raw-text check stays first (any textual
+    mention refuses, exactly as before); escapes and quoting then fold into
+    command words, so `c\\d /` or `c"d" /` relocates without the raw text
+    spelling the builtin, and the guard must not validate operands against
+    a workspace the shell has already left."""
+    if not prefix:
+        return False
+    if re.search(r"\b(?:cd|pushd|popd)\b", prefix):
+        return True
+    resolved = _chmod_mask_shell_redirections(_chmod_normalize_line_continuations(prefix))
+    normalized, _index_map = _chmod_strip_shell_escapes(resolved)
+    return any(
+        word.starts_command and word.value in ("cd", "pushd", "popd")
+        for word in _chmod_scan_shell_words(normalized)
+    )
 
 
 def _unscanned_wrapper_script_reason(
@@ -2889,9 +2947,7 @@ def _unscanned_wrapper_script_reason(
         except (OSError, RuntimeError, ValueError):
             home_real = None
     prefix = command_prefix
-    prefix_relocates = bool(prefix) and bool(
-        re.search(r"\b(?:cd|pushd|popd)\b", prefix)
-    )
+    prefix_relocates = _prefix_relocates(prefix)
     head: _ChmodShellWord | None = None
     for index, word in enumerate(words):
         if word.starts_command and not _contained_in_later_word(words, index):
@@ -3001,17 +3057,7 @@ def _unscanned_wrapper_script_reason(
                 # looking entry cannot smuggle `..` or a symlink outside.
                 if _PATH_ASSIGNMENT.search(normalized):
                     return candidate
-                found = None
-                for path_dir in (os.environ.get("PATH") or "").split(os.pathsep):
-                    if not path_dir:
-                        continue
-                    hit = os.path.join(path_dir, candidate)
-                    try:
-                        if os.path.isfile(hit):
-                            found = hit
-                            break
-                    except OSError:
-                        continue
+                found = _path_hit(candidate)
                 if found is None:
                     continue  # bash errors on a missing PATH hit; harmless
                 try:
@@ -3020,6 +3066,29 @@ def _unscanned_wrapper_script_reason(
                     resolved = None
             else:
                 resolved = _resolve_chmod_operand(candidate, base, home_env)
+                if (
+                    reader in _SHELL_C_INTERPRETERS
+                    and "/" not in candidate
+                    and resolved is not None
+                    and not os.path.isfile(resolved)
+                ):
+                    # The script is not in the current directory, so bash
+                    # falls back to searching PATH for a slash-free name (no
+                    # execute bit needed: bash reads the file). A hit outside
+                    # the workspace runs shell code the guard never scanned,
+                    # and a PATH assignment makes that search unresolvable
+                    # statically. A miss everywhere is a bash error, and the
+                    # current-directory resolution below still decides.
+                    if _PATH_ASSIGNMENT.search(normalized):
+                        return candidate
+                    found = _path_hit(candidate)
+                    if found is not None:
+                        try:
+                            hit_real = os.path.realpath(found)
+                        except (OSError, RuntimeError, ValueError):
+                            hit_real = None
+                        if _script_input_violation(hit_real, workspace, home_real):
+                            return candidate
             if _script_input_violation(resolved, workspace, home_real):
                 return candidate
     return None
@@ -3689,7 +3758,7 @@ def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command
     # The command prefix is user-configured shell setup replayed before every
     # command; a cd in it relocates everything, which the resolver cannot
     # track from model text alone.
-    if command_prefix and re.search(r"\b(?:cd|pushd|popd)\b", command_prefix):
+    if _prefix_relocates(command_prefix):
         raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
     _warn_once_about_late_destructive_chmod_bypass()
     try:
