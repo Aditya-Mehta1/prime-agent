@@ -236,13 +236,15 @@ export class RemoteAgentMeshState {
 	 * roster push when it completes. The wait never starts a second scan.
 	 */
 	async refreshAwaiting(waitMs: number): Promise<void> {
-		await Promise.race([
-			this.refreshIfStale(),
-			new Promise<void>((resolve) => {
-				const timer = setTimeout(resolve, waitMs);
-				timer.unref?.();
-			}),
-		]);
+		// Clear the timer when the refresh wins the race, so frequent polling does
+		// not retain a timeout closure per request.
+		const timer = setTimeout(() => undefined, waitMs);
+		timer.unref?.();
+		try {
+			await Promise.race([this.refreshIfStale(), new Promise<void>((resolve) => setTimeout(resolve, waitMs))]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	/** Force a scan ignoring the TTL (tests; PR 3's forced surfaces bypass this state). */
