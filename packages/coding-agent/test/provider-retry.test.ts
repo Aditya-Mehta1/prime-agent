@@ -37,6 +37,14 @@ function providerError(kind?: string): AssistantMessage {
 }
 
 describe("completeWithProviderRetry", () => {
+	it("jitters the computed backoff while honoring a server wait exactly", () => {
+		const policy = { baseDelayMs: 2000, maxRetryDelayMs: 60_000 };
+		expect(providerRetryDelay(1, undefined, policy, () => 0)).toEqual({ kind: "wait", delayMs: 1500 });
+		expect(providerRetryDelay(1, undefined, policy, () => 1)).toEqual({ kind: "wait", delayMs: 2500 });
+		expect(providerRetryDelay(1, 5000, policy, () => 1)).toEqual({ kind: "wait", delayMs: 5000 });
+		expect(providerRetryDelay(3, 7000, policy, () => 0)).toEqual({ kind: "wait", delayMs: 7000 });
+	});
+
 	it("returns an aborted result instead of the provider error when cancelled during backoff", async () => {
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 10);
