@@ -544,6 +544,7 @@ export class IpythonKernelProvisioner {
 				bootstrapCode,
 			});
 			let pendingRestore: RestoreResult | undefined;
+			let snapshotExisted = false;
 			try {
 				// Emitted synchronously (before the permit await) so a listener attaching
 				// mid-flight can replay the current stage.
@@ -564,7 +565,7 @@ export class IpythonKernelProvisioner {
 				// Revive a prior session's namespace before the bootstrap, so the bootstrap
 				// then overwrites live handles (rlm, skills) on top of anything restored.
 				if (snapshotDir) {
-					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
+					snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
 					this.emitStartupProgress("Restoring Python state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
 					if (snapshotExisted) {
@@ -578,6 +579,9 @@ export class IpythonKernelProvisioner {
 				if (bootstrap.status !== "ok") {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
 					throw new Error(`Failed to initialize rlm runtime in the Python kernel:\n${details}`);
+				}
+				if (snapshotExisted) {
+					m.markRestoredNamespaceFresh();
 				}
 				// Broken skills stay importable-looking placeholders; report them so the
 				// model learns before its first call, not from the placeholder's error.

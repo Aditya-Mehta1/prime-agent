@@ -1052,6 +1052,7 @@ async function createDaemonClientConnection(options: {
 	clientOwned?: boolean;
 	noSession?: boolean;
 	supportsExtensionUi?: boolean;
+	tracksHeartbeats?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
 	// Caller must have awaited ensureInteractiveDaemonRunning for this socket.
 	const client = new DaemonClient(options.socketPath);
@@ -1066,6 +1067,7 @@ async function createDaemonClientConnection(options: {
 				ownedSession: options.clientOwned,
 				ownedSessionRecoveryConfig: options.clientOwned ? options.config : undefined,
 				supportsExtensionUi: options.supportsExtensionUi,
+				tracksHeartbeats: options.tracksHeartbeats,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
 			});
@@ -1611,6 +1613,8 @@ export async function main(args: string[], options?: MainOptions) {
 				clientOwned: isClientOwnedDaemonSession(appMode, parsed.noSession),
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
+				// ACP never issues a scheduled-job command, so attach opts it into heartbeats_changed pushes.
+				tracksHeartbeats: appMode === "acp",
 			}));
 		} catch (error) {
 			if (error instanceof SessionAlreadyActiveError || error instanceof DaemonSessionCreateError) {
