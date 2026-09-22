@@ -302,7 +302,17 @@ export async function copySourceCatalogAssets(options = {}) {
 	if (allSourcesPresent) {
 		cpSync(join(sourceDir, "models.bundled.json"), targets.models);
 		cpSync(join(sourceDir, "mcp-services.bundled.json"), targets.mcpServices);
-		return validateBundledCatalogDir(outDir, options);
+		// The deterministic `--fixture` output is the one intentionally-small asset set a
+		// source build may package (pack smoke without catalog access). Anything else
+		// must be a real catalog and validates with full minimum counts.
+		const fixtureBodies = fixtureCatalogBodies();
+		const isFixture =
+			readFileSync(targets.models, "utf8") === fixtureBodies.models &&
+			readFileSync(targets.mcpServices, "utf8") === fixtureBodies.mcpServices;
+		return validateBundledCatalogDir(outDir, {
+			...options,
+			allowSmallFixture: options.allowSmallFixture === true || isFixture,
+		});
 	}
 
 	const allTargetsPresent = bundledCatalogFiles.every((file) => existsSync(join(outDir, file)));
