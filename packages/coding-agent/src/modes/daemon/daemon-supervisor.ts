@@ -142,6 +142,7 @@ import {
 	DAEMON_TCP_IDLE_TIMEOUT_MS,
 	DAEMON_TCP_MAX_CONNECTIONS,
 	DAEMON_TCP_MAX_LINE_CHARS,
+	DAEMON_TCP_PRE_READY_TIMEOUT_MS,
 	loadOrCreateDaemonTcpToken,
 	resolveDaemonTcpPort,
 } from "./daemon-tcp.js";
@@ -1665,6 +1666,11 @@ export class DaemonSupervisor {
 		this.sessionInputPauseEpochs.set(client, 0);
 		this.detachingInputPauseSessions.set(client, new Set());
 		this.clients.add(client);
+		// Remote TCP sockets are the only untrusted connection source: a short
+		// admission deadline, a line-length bound, and per-line auth keep a remote
+		// peer from parking unbounded sockets or unterminated lines in memory.
+		const tcpAuthToken = connectionOptions.tcpAuthToken;
+		let tcpAuthenticated = false;
 		void this.ready.then(
 			() => {
 				if (!client.socket.destroyed && this.clients.has(client)) {
@@ -1684,18 +1690,25 @@ export class DaemonSupervisor {
 						clientId: client.id,
 						serverCapabilities: SUPERVISOR_SERVER_CAPABILITIES,
 					});
+					// daemon_hello is written only once startup completes, and the TCP
+					// listener binds before worker adoption, which can spend the whole
+					// connect budget; mesh clients wait for hello before sending their
+					// first token. The auth deadline therefore runs from hello, not
+					// from accept, so a pre-ready client is not closed before it ever
+					// saw the handshake. An already-authenticated line keeps the idle
+					// window instead.
+					if (tcpAuthToken !== undefined && !tcpAuthenticated) {
+						socket.setTimeout(DAEMON_TCP_AUTH_TIMEOUT_MS);
+					}
 				}
 			},
 			() => client.socket.destroy(),
 		);
 
-		// Remote TCP sockets are the only untrusted connection source: a short
-		// admission deadline, a line-length bound, and per-line auth keep a remote
-		// peer from parking unbounded sockets or unterminated lines in memory.
-		const tcpAuthToken = connectionOptions.tcpAuthToken;
-		let tcpAuthenticated = false;
 		if (tcpAuthToken !== undefined) {
-			socket.setTimeout(DAEMON_TCP_AUTH_TIMEOUT_MS);
+			// Absolute admission budget from accept: it only matters when startup
+			// hangs before hello can re-arm the short deadline above.
+			socket.setTimeout(DAEMON_TCP_PRE_READY_TIMEOUT_MS);
 			socket.on("timeout", () => {
 				this.log(
 					tcpAuthenticated ? "Closed idle TCP client connection" : "Closed unauthenticated TCP client connection",

@@ -13,6 +13,14 @@ export const DAEMON_TCP_MAX_CONNECTIONS = 256;
 export const DAEMON_TCP_AUTH_TIMEOUT_MS = 30_000;
 /** Idle window for an authenticated TCP socket; any traffic resets it. */
 export const DAEMON_TCP_IDLE_TIMEOUT_MS = 10 * 60_000;
+/**
+ * Absolute admission budget for a TCP socket accepted before daemon_hello can
+ * be written: the listener binds before worker adoption, which can spend the
+ * whole worker connect budget (90s on slow Windows starts) before hello goes
+ * out, and mesh clients wait for hello before sending their first token. The
+ * short auth deadline re-arms from the moment hello is written.
+ */
+export const DAEMON_TCP_PRE_READY_TIMEOUT_MS = 120_000;
 
 /** Auth verdict for one TCP command line. */
 export interface DaemonTcpAuthVerdict {

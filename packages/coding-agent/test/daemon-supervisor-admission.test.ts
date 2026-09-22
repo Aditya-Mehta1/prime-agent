@@ -13,6 +13,7 @@ import {
 	DAEMON_TCP_AUTH_TIMEOUT_MS,
 	DAEMON_TCP_IDLE_TIMEOUT_MS,
 	DAEMON_TCP_MAX_LINE_CHARS,
+	DAEMON_TCP_PRE_READY_TIMEOUT_MS,
 } from "../src/modes/daemon/daemon-tcp.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 import { type Deferred, createDeferred as deferred } from "./suite/scheduling.js";
@@ -704,7 +705,7 @@ describe("daemon supervisor tcp admission", () => {
 
 		const oversized = fakeTcpSocket();
 		supervisor.handleConnection(oversized, { tcpAuthToken: token });
-		expect(oversized.timeouts).toEqual([DAEMON_TCP_AUTH_TIMEOUT_MS]);
+		expect(oversized.timeouts).toEqual([DAEMON_TCP_PRE_READY_TIMEOUT_MS]);
 		oversized.write(`${"x".repeat(DAEMON_TCP_MAX_LINE_CHARS + 1)}\n`);
 		await waitFor(() => oversized.destroyed);
 		expect(supervisor.handleLine).not.toHaveBeenCalled();
@@ -720,9 +721,19 @@ describe("daemon supervisor tcp admission", () => {
 		supervisor.handleConnection(authenticated, { tcpAuthToken: token });
 		authenticated.write(`${JSON.stringify({ id: "t1", type: "list", auth: { token } })}\n`);
 		await waitFor(() => supervisor.handleLine.mock.calls.length > 0);
-		expect(authenticated.timeouts).toEqual([DAEMON_TCP_AUTH_TIMEOUT_MS, DAEMON_TCP_IDLE_TIMEOUT_MS]);
+		expect(authenticated.timeouts).toEqual([DAEMON_TCP_PRE_READY_TIMEOUT_MS, DAEMON_TCP_IDLE_TIMEOUT_MS]);
 		authenticated.emit("timeout");
 		await waitFor(() => authenticated.destroyed);
 		expect(supervisor.log).toHaveBeenCalledWith("Closed idle TCP client connection");
+	});
+	it("re-arms the auth deadline at hello so pre-ready TCP clients survive startup", async () => {
+		const ready = deferred<void>();
+		const supervisor = createHarness({ ready: ready.promise }) as any;
+		const preReady = fakeTcpSocket();
+		supervisor.handleConnection(preReady, { tcpAuthToken: token });
+		expect(preReady.timeouts).toEqual([DAEMON_TCP_PRE_READY_TIMEOUT_MS]);
+		ready.resolve();
+		await waitFor(() => supervisor.write.mock.calls.length > 0);
+		expect(preReady.timeouts).toEqual([DAEMON_TCP_PRE_READY_TIMEOUT_MS, DAEMON_TCP_AUTH_TIMEOUT_MS]);
 	});
 });
