@@ -84,6 +84,31 @@ async function readBoundedResponseText(response, label) {
 	return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
+async function fetchCatalogViaContentsApi(rawUrl, label, options = {}) {
+	// Sandboxes and restrictive proxies may block raw.githubusercontent.com while still
+	// reaching the GitHub API; the public catalog is readable through the contents API
+	// without credentials. Only invoked for the trusted catalog origin URLs.
+	const match = rawUrl.match(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/);
+	if (!match) throw new Error(`Cannot map ${rawUrl} to the GitHub contents API`);
+	const [, owner, repo, ref, path] = match;
+	const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${ref}`;
+	let response;
+	try {
+		response = await fetch(apiUrl, {
+			headers: { ...authHeaders(apiUrl, options), accept: "application/vnd.github.raw+json" },
+			signal: AbortSignal.timeout(5_000),
+			redirect: "error",
+		});
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		throw new Error(`Failed to fetch ${label} catalog from ${apiUrl}: ${reason}`);
+	}
+	if (!response.ok) {
+		throw new Error(`Failed to fetch ${label} catalog from ${apiUrl}: HTTP ${response.status}`);
+	}
+	return await readBoundedResponseText(response, label);
+}
+
 async function fetchCatalog(url, label, options = {}) {
 	let response;
 	try {
@@ -94,9 +119,15 @@ async function fetchCatalog(url, label, options = {}) {
 		});
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);
+		const viaApi = await fetchCatalogViaContentsApi(url, label, options).catch(() => undefined);
+		if (viaApi !== undefined) return viaApi.endsWith("\n") ? viaApi : `${viaApi}\n`;
 		throw new Error(`Failed to fetch ${label} catalog from ${url}: ${reason}`);
 	}
 	if (!response.ok) {
+		if (response.status === 401 || response.status === 404) {
+			const viaApi = await fetchCatalogViaContentsApi(url, label, options).catch(() => undefined);
+			if (viaApi !== undefined) return viaApi.endsWith("\n") ? viaApi : `${viaApi}\n`;
+		}
 		const privateRepoHint =
 			response.status === 401 || response.status === 404
 				? " The catalog repo is private; set GITHUB_TOKEN or PRIME_CATALOG_REPO_TOKEN."
@@ -327,12 +358,20 @@ export async function copySourceCatalogAssets(options = {}) {
 		writeFileSync(targets.mcpServices, mcpServiceBody);
 		return validateBundledCatalogDir(outDir, options);
 	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
 		const message =
-			"Missing generated catalog assets and failed to fetch public catalog assets. Run `npm run catalog:assets -- --catalog-dir /path/to/prime-agent-catalog` or set PRIME_CATALOG_REPO_TOKEN and run `npm run catalog:assets`.";
+			"Missing generated catalog assets and failed to fetch public catalog assets. Run `npm run catalog:assets -- --catalog-dir /path/to/prime-agent-catalog` or set GITHUB_TOKEN or PRIME_CATALOG_REPO_TOKEN and run `npm run catalog:assets`.";
 		if (options.optional) {
-			const reason = error instanceof Error ? error.message : String(error);
-			console.warn(`${message} ${reason} Continuing without bundled catalog assets; source runs will use the compiled fallback and runtime cache refresh.`);
-			return { skipped: true, reason: "missing-source-catalog" };
+			// The optional path (source builds, benchmark harnesses without catalog
+			// credentials) still packages a VALID bundled snapshot: the deterministic
+			// fixture. Release builds never pass --optional and hard-fail instead.
+			const fixtureBodies = fixtureCatalogBodies();
+			writeFileSync(targets.models, fixtureBodies.models);
+			writeFileSync(targets.mcpServices, fixtureBodies.mcpServices);
+			console.warn(
+				`${message} ${reason} Continuing with the deterministic fixture snapshot; source runs will fetch the real catalog at runtime.`,
+			);
+			return validateBundledCatalogDir(outDir, { ...options, allowSmallFixture: true });
 		}
 		throw new Error(message, { cause: error });
 	}

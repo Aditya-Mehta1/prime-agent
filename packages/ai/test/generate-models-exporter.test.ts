@@ -330,6 +330,62 @@ describe("model catalog exporter emit", () => {
 			restoreFetch();
 		}
 	});
+
+	test("sources Kimi For Coding from the kimi-code-plan-cn slug", async () => {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (url: string | URL | Request) => {
+			const href = String(url);
+			if (href === "https://models.dev/api.json") {
+				return new Response(
+					JSON.stringify({
+						"kimi-code-plan-cn": {
+							models: {
+								"kimi-for-coding": {
+									id: "kimi-for-coding",
+									name: "Kimi K2.7 Code",
+									tool_call: true,
+									reasoning: true,
+									modalities: { input: ["text", "image"] },
+									cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+									limit: { context: 262144, output: 32768 },
+								},
+							},
+						},
+					}),
+				);
+			}
+			if (href === "https://openrouter.ai/api/v1/models") {
+				return new Response(JSON.stringify({ data: [] }));
+			}
+			throw new Error(`unexpected fetch ${href}`);
+		}) as typeof fetch;
+		try {
+			const root = catalogPolicyFixture();
+			writeFileSync(
+				join(root, "models", "whitelist", "kimi-coding.yml"),
+				'source: "kimi-code-plan-cn"\nids:\n  - "kimi-for-coding"\nglobs: []\n',
+			);
+			writeFileSync(
+				join(root, "models", "catalog.v1.json"),
+				`${JSON.stringify({ schemaVersion: 1, models: [] }, null, "	")}\n`,
+			);
+
+			await expect(syncCatalog(root)).resolves.toBe(0);
+
+			const catalog = JSON.parse(readFileSync(join(root, "models", "catalog.v1.json"), "utf8"));
+			expect(catalog.models).toEqual([
+				expect.objectContaining({
+					id: "kimi-for-coding",
+					provider: "kimi-coding",
+					api: "anthropic-messages",
+					baseUrl: "https://api.kimi.com/coding",
+				}),
+			]);
+			expect(catalog.models[0]).not.toHaveProperty("headers");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
 
 describe("model catalog exporter policy", () => {
