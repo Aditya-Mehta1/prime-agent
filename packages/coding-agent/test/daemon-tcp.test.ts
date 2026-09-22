@@ -112,6 +112,8 @@ describe("daemon tcp line auth", () => {
 		expect(wrong).toMatchObject({ ok: false, reason: "wrong_token", id: "t4" });
 		const empty = checkDaemonTcpLineAuth(`{"id":"t5","type":"list","auth":{"token":""}}`, token);
 		expect(empty).toMatchObject({ ok: false, reason: "missing_token" });
+		const envelopeLine = `{"type":"command","id":"t6","command":{"type":"list"},"auth":{"token":"x"}}`;
+		expect(checkDaemonTcpLineAuth(envelopeLine, token)).toMatchObject({ ok: false, id: "t6", command: "list" });
 		expect(checkDaemonTcpLineAuth("not json at all", token)).toMatchObject({ ok: false, reason: "invalid_json" });
 	});
 

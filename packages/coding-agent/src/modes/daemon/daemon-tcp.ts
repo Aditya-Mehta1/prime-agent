@@ -172,7 +172,11 @@ export function checkDaemonTcpLineAuth(line: string, expectedToken: string): Dae
 		return { ok: false, id: "unknown", command: undefined, reason: "invalid_json" };
 	}
 	const id = typeof parsed.id === "string" ? parsed.id : "unknown";
-	const command = parsed.type ?? parsed.command?.type;
+	// An envelope names the real command in `command.type` and carries
+	// `type: "command"` for the envelope itself, so the inner name wins there; a
+	// raw line has no `command` and names the command in `type`.
+	const envelopeCommand = parsed.command?.type;
+	const command = typeof envelopeCommand === "string" ? envelopeCommand : parsed.type;
 	const token = parsed.auth?.token;
 	if (typeof token === "string" && token.length > 0 && daemonTcpTokensMatch(token, expectedToken)) {
 		return { ok: true, id, command, reason: "" };
