@@ -22,7 +22,6 @@ use super::private_auth::{
     PRIVATE_BACKGROUND_TIMEOUT_MS, PRIVATE_MODEL_TIMEOUT_MS,
     PRIVATE_PRIME_AUTHORIZATION_CACHE_TTL_MS,
 };
-use super::provider_catalog::ProviderModelCatalog;
 
 /// Request-auth bits a provider can configure in models.json.
 #[derive(Debug, Clone, Default)]
@@ -32,15 +31,6 @@ pub struct ProviderRequestConfig {
     /// that providers iterate deterministically.
     pub headers: Option<BTreeMap<String, String>>,
     pub auth_header: Option<bool>,
-}
-
-/// The `get_model_catalog` snapshot (TS `ModelCatalogSnapshot`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModelCatalogSnapshot {
-    /// The full catalog minus unauthorized private Prime Inference models.
-    pub models: Vec<Model>,
-    /// Providers with configured auth.
-    pub configured_providers: Vec<String>,
 }
 
 /// The result of `getApiKeyAndHeaders`.
@@ -67,7 +57,6 @@ pub struct ModelRegistry {
     authorized_private_models: Vec<Model>,
     authorized_team_id: Option<String>,
     live_prime_inference_models: Option<Vec<Model>>,
-    provider_catalog: ProviderModelCatalog,
 }
 
 impl ModelRegistry {
@@ -80,7 +69,6 @@ impl ModelRegistry {
     }
 
     fn new(auth: AuthStorage, models_json_path: Option<PathBuf>) -> Self {
-        let provider_catalog = ProviderModelCatalog::new(models_json_path.as_deref());
         let mut registry = Self {
             auth,
             models_json_path,
@@ -93,7 +81,6 @@ impl ModelRegistry {
             authorized_private_models: Vec::new(),
             authorized_team_id: None,
             live_prime_inference_models: None,
-            provider_catalog,
         };
         registry.load_models();
         registry
@@ -226,16 +213,9 @@ impl ModelRegistry {
         })
     }
 
-    /// The bundled Prime Inference entries (TS `bundledPrimeInferenceModels`
-    /// on the catalog-client branch): the bundled catalog's Prime Inference
-    /// `openai-completions` subset.
-    fn bundled_prime_inference_models(&self) -> Vec<Model> {
-        self.provider_catalog
-            .bundled_models()
-            .iter()
-            .filter(|model| {
-                model.provider == PRIME_INFERENCE_PROVIDER_ID && model.api == "openai-completions"
-            })
+    fn bundled_prime_inference_models() -> Vec<Model> {
+        pa_ai::models_generated::get_models(PRIME_INFERENCE_PROVIDER_ID)
+            .into_iter()
             .cloned()
             .collect()
     }
@@ -261,7 +241,7 @@ impl ModelRegistry {
             if let Some(cache_path) = self.prime_inference_cache_path() {
                 self.live_prime_inference_models = read_cached_prime_inference_models(
                     &cache_path,
-                    &self.bundled_prime_inference_models(),
+                    &Self::bundled_prime_inference_models(),
                 );
             }
         }
@@ -369,18 +349,14 @@ impl ModelRegistry {
     }
 
     fn load_built_in_models(&self, custom: &CustomModelsResult) -> Vec<Model> {
-        // The no-cold-start chain (TS `loadBuiltInModels` on the
-        // catalog-client branch): a validated last-good remote snapshot
-        // plus the bundled Prime Inference entries; without one, the
-        // bundled catalog models (the packaged snapshot, else the compiled
-        // fallback).
-        let bundled: Vec<Model> = match self.provider_catalog.remote_models() {
-            Some(mut remote) => {
-                remote.extend(self.bundled_prime_inference_models());
-                remote
-            }
-            None => self.provider_catalog.bundled_models().to_vec(),
-        };
+        let bundled: Vec<Model> = pa_ai::models_generated::get_providers()
+            .into_iter()
+            .flat_map(|provider| {
+                pa_ai::models_generated::get_models(provider)
+                    .into_iter()
+                    .cloned()
+            })
+            .collect();
         merge_prime_inference_models(&bundled, self.live_prime_inference_models.as_deref())
             .into_iter()
             .map(|mut model| {
@@ -428,29 +404,10 @@ impl ModelRegistry {
         let previous_models = self.authorized_private_models.clone();
         self.refresh();
         if let Some(cache_path) = self.prime_inference_cache_path() {
-            // The live Prime Inference catalog fetch carries the current
-            // credentials (TS refreshAvailableModels on the
-            // catalog-client branch): the account's provider headers plus
-            // the bearer token, so entitled models surface.
-            let prime_headers = self
-                .auth
-                .get_api_key(PRIME_INFERENCE_PROVIDER_ID)
-                .map(|api_key| {
-                    let mut headers = self
-                        .auth
-                        .get_provider_headers(PRIME_INFERENCE_PROVIDER_ID)
-                        .unwrap_or_default();
-                    headers.insert("Authorization".to_string(), format!("Bearer {api_key}"));
-                    headers
-                });
-            let bundled = self.bundled_prime_inference_models();
-            if let Some(models) = refresh_prime_inference_models(
-                &cache_path,
-                &bundled,
-                is_offline_mode_enabled(),
-                prime_headers.as_ref(),
-            )
-            .await
+            let bundled = Self::bundled_prime_inference_models();
+            if let Some(models) =
+                refresh_prime_inference_models(&cache_path, &bundled, is_offline_mode_enabled())
+                    .await
             {
                 self.live_prime_inference_models = Some(models);
                 self.load_models();
@@ -462,65 +419,7 @@ impl ModelRegistry {
             previous_models,
         )
         .await;
-        // The provider catalog refresh (TS `refreshProviderCatalog(false)`):
-        // hourly-gated, fire-and-forget safe, never surfaced; only a
-        // registry with a models.json participates (in-memory registries
-        // have no disk cache).
-        if self.models_json_path.is_some() {
-            self.provider_catalog.refresh(false).await;
-            self.load_models();
-        }
         self.get_available().into_iter().cloned().collect()
-    }
-
-    /// The `get_model_catalog` snapshot (TS `refreshModelCatalog`): refresh
-    /// the provider catalog (picker-open cadence), then the live
-    /// entitlements, and return the full catalog minus private Prime
-    /// Inference models the current credentials do not authorize, plus the
-    /// providers with configured auth.
-    pub async fn refresh_model_catalog(&mut self) -> ModelCatalogSnapshot {
-        self.provider_catalog.refresh(false).await;
-        self.load_models();
-        let available = self.refresh_available_models().await;
-        let configured_providers: Vec<String> = {
-            let mut providers: Vec<String> = available
-                .iter()
-                .map(|model| model.provider.clone())
-                .collect();
-            providers.sort();
-            providers.dedup();
-            providers
-        };
-        let available_keys: HashSet<String> = available
-            .iter()
-            .map(|model| format!("{}/{}", model.provider, model.id))
-            .collect();
-        let models: Vec<Model> = self
-            .get_all()
-            .iter()
-            .filter(|model| {
-                !is_private_prime_inference_model(model)
-                    || available_keys.contains(&format!("{}/{}", model.provider, model.id))
-            })
-            .cloned()
-            .collect();
-        ModelCatalogSnapshot {
-            models,
-            configured_providers,
-        }
-    }
-
-    /// The auth-change refresh (TS `authStorage.onChange` →
-    /// `scheduleCatalogRefresh`): the provider-catalog fetch runs past the
-    /// hourly gate (forced), then the live entitlements refresh. Fire and
-    /// forget: every failure keeps the last-good snapshot, nothing
-    /// surfaces, and no session model is retargeted.
-    pub async fn refresh_after_auth_change(&mut self) {
-        if self.models_json_path.is_some() {
-            self.provider_catalog.refresh(true).await;
-            self.load_models();
-        }
-        let _ = self.refresh_available_models().await;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -582,7 +481,7 @@ impl ModelRegistry {
             .live_prime_inference_models
             .as_deref()
             .map(|models| models.iter().map(|model| model.id.clone()).collect())
-            .unwrap_or_else(|| self.bundled_public_ids());
+            .unwrap_or_else(Self::bundled_public_ids);
         let fetched = fetch_authorized_private_prime_inference_models(
             &api_key,
             &team_headers,
@@ -629,7 +528,7 @@ impl ModelRegistry {
             .live_prime_inference_models
             .as_deref()
             .map(|models| models.iter().map(|model| model.id.clone()).collect())
-            .unwrap_or_else(|| self.bundled_public_ids());
+            .unwrap_or_else(Self::bundled_public_ids);
         let Ok(models) = fetch_authorized_private_prime_inference_models(
             &api_key,
             &team_headers,
@@ -658,8 +557,8 @@ impl ModelRegistry {
         );
     }
 
-    fn bundled_public_ids(&self) -> HashSet<String> {
-        self.bundled_prime_inference_models()
+    fn bundled_public_ids() -> HashSet<String> {
+        Self::bundled_prime_inference_models()
             .into_iter()
             .map(|model| model.id)
             .collect()
@@ -910,8 +809,7 @@ mod tests {
         .unwrap();
         // A live-catalog cache: one bundled model repriced, one new entry,
         // well past the coverage floor so the build accepts it.
-        let registry = ModelRegistry::in_memory(auth_with(serde_json::json!({})));
-        let bundled = registry.bundled_prime_inference_models();
+        let bundled = super::ModelRegistry::bundled_prime_inference_models();
         // The live catalog carries public models only: reprice the first
         // public bundled entry (private models stay on the bundled table).
         let repriced_index = bundled

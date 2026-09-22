@@ -15,7 +15,6 @@ thiserror.workspace = true
 tracing.workspace = true
 pa-types.workspace = true
 pa-ai.workspace = true
-pa-models = { path = "../pa-models" }
 pa-agent.workspace = true
 pa-telemetry.workspace = true
 base64 = "0.22"

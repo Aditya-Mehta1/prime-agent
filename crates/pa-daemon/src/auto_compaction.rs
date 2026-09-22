@@ -55,7 +55,7 @@ impl AgentSessionEngine {
         };
         let due = {
             let guard = self.session.blocking_lock();
-            match guard.as_deref() {
+            match guard.as_ref() {
                 Some(engine) => self.runtime.block_on(async {
                     engine
                         .session
@@ -92,7 +92,7 @@ impl AgentSessionEngine {
         let api_key = self.resolve_request_api_key(&model);
         let outcome = {
             let guard = self.session.blocking_lock();
-            let Some(engine) = guard.as_deref() else {
+            let Some(engine) = guard.as_ref() else {
                 self.clear_auto_compaction_abort(&controller);
                 return AutoCompactionRun::NotDue;
             };
@@ -128,9 +128,8 @@ impl AgentSessionEngine {
                 // every completed compaction into the active run).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(telemetry) = guard
-                        .as_deref()
-                        .and_then(|engine| engine.telemetry.as_ref())
+                    if let Some(telemetry) =
+                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
                     {
                         telemetry.note_compaction();
                     }

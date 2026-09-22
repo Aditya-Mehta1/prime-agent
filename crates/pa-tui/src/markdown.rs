@@ -29,13 +29,6 @@ pub struct MarkdownStyle {
     /// The fenced-code indent string (`markdown.codeBlockIndent` in
     /// settings, TS `codeBlockIndent` on the markdown theme; default "  ").
     pub code_block_indent: String,
-    /// The `syntax*` palette for fenced-code token colors (TS
-    /// `highlightCode`, cli-highlight over the highlight.js grammar).
-    /// `None` renders every code line uniform in `code_block` — the TS
-    /// no-valid-language fallback, and the quiet thinking theme (TS
-    /// `getThinkingMarkdownTheme` replaces `highlightCode` with dim
-    /// uniform lines).
-    pub(crate) syntax: Option<crate::tool_card::highlight::SyntaxPalette>,
 }
 
 impl Default for MarkdownStyle {
@@ -76,28 +69,12 @@ impl MarkdownStyle {
             italic: Modifier::empty(),
             strikethrough: Modifier::empty(),
             code_block_indent: "  ".to_string(),
-            syntax: Some(crate::tool_card::highlight::SyntaxPalette::from_theme(
-                theme,
-            )),
         }
     }
 }
 
 /// Rendered markdown document as styled lines.
 pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<Line> {
-    render_markdown_tagged(text, width, style, "", &mut MarkdownBlockCache::default())
-}
-
-/// Cached render with a style discriminator (see [`MarkdownBlockCache`]):
-/// the same raw text rendered under different styles (the dim thinking
-/// block) must not hit the other style's rows.
-pub fn render_markdown_tagged(
-    text: &str,
-    width: usize,
-    style: &MarkdownStyle,
-    style_tag: &str,
-    cache: &mut MarkdownBlockCache,
-) -> Vec<Line> {
     let content_width = width.max(1);
     if text.trim().is_empty() {
         return Vec::new();
@@ -105,9 +82,6 @@ pub fn render_markdown_tagged(
     let normalized = text.replace('\t', "   ");
     let mut lines: Vec<Line> = Vec::new();
     let blocks = parse_blocks(&normalized);
-    // The next render's cache: starts from the current map (a hit keeps
-    // its entry alive) and drops everything this document did not use.
-    let mut next_cache = std::mem::take(&mut cache.0);
     for (i, block) in blocks.iter().enumerate() {
         let next = blocks.get(i + 1);
         // A blank source line separates blocks: TS's lexer emits one `space`
@@ -118,88 +92,9 @@ pub fn render_markdown_tagged(
         if block.sep_blank {
             lines.push(Vec::new());
         }
-        let is_final = i == blocks.len() - 1;
-        let key = is_final.then(|| block_cache_key(style_tag, block, next, content_width));
-        let mut block_lines: Option<Vec<Line>> = None;
-        if let Some(key) = &key {
-            if let Some(cached) = next_cache.get(key) {
-                lines.extend(cached.iter().cloned());
-                block_lines = Some(cached.clone());
-            }
-        }
-        if block_lines.is_none() {
-            let mut rendered = Vec::new();
-            render_block(block, next, content_width, style, &mut rendered);
-            lines.extend(rendered.iter().cloned());
-            if let Some(key) = &key {
-                rendered.shrink_to_fit();
-                next_cache.insert(key.clone(), rendered);
-            }
-        }
+        render_block(block, next, content_width, style, &mut lines);
     }
-    cache.0 = next_cache;
     lines
-}
-
-/// Per-block render cache (TS `Markdown.blockCache`, markdown.ts): a
-/// streaming append re-renders only the changing final block — every
-/// earlier block replays its rendered rows by `(width, kind, next kind,
-/// raw)` key instead of re-running inline styling and wrapping. The map
-/// is rebuilt on every render (TS swaps `nextCache` in), so it stays
-/// bounded to the current document's blocks, and the final block is
-/// never cached: while streaming, appended text can reinterpret an open
-/// block (unterminated fences, growing lists); once a block is no longer
-/// last, its raw text is final.
-#[derive(Default)]
-pub struct MarkdownBlockCache(std::collections::HashMap<String, Vec<Line>>);
-
-/// The cache key (TS: `${width}|${token.type}|${nextTokenType}|${token.raw}`):
-/// the style discriminator (the dim thinking block), width, this block's
-/// kind, the following kind (a block's trailing blank row depends on it),
-/// and the raw block lines.
-fn block_cache_key(style_tag: &str, block: &Block, next: Option<&Block>, width: usize) -> String {
-    let mut key = String::with_capacity(64);
-    key.push_str(style_tag);
-    key.push('|');
-    key.push_str(&width.to_string());
-    key.push('|');
-    key.push_str(block_kind_name(&block.kind));
-    if let BlockKind::Code { lang } = &block.kind {
-        // TS's key carries `token.raw`, which includes the fence info
-        // string: the same content under a different lang renders
-        // different token colors (```python vs ```json), so the lang is
-        // part of the block's identity.
-        key.push('<');
-        key.push_str(lang.as_deref().unwrap_or(""));
-        key.push('>');
-    }
-    key.push('|');
-    if let Some(next) = next {
-        // The trailing-blank decision reads `next.sep_blank` (TS encodes
-        // it as the next token being a `space` token, part of its key).
-        if next.sep_blank {
-            key.push_str("space|");
-        }
-        key.push_str(block_kind_name(&next.kind));
-    }
-    key.push('|');
-    for line in &block.lines {
-        key.push_str(line);
-        key.push('\n');
-    }
-    key
-}
-
-fn block_kind_name(kind: &BlockKind) -> &'static str {
-    match kind {
-        BlockKind::Heading => "heading",
-        BlockKind::Paragraph => "paragraph",
-        BlockKind::Code { .. } => "code",
-        BlockKind::List { .. } => "list",
-        BlockKind::Quote => "quote",
-        BlockKind::Hr => "hr",
-        BlockKind::Table { .. } => "table",
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -438,44 +333,6 @@ fn marker_width(t: &str) -> usize {
     }
 }
 
-/// The fence languages the port highlights. TS `highlightCode` validates
-/// through cli-highlight's `supportsLanguage` = highlight.js
-/// `getLanguage(name)`, which lowercases and matches the grammar's
-/// registered names and aliases: python 10.7.3 registers `python` with
-/// aliases `py`, `gyp`, `ipython`. `lang` here is marked's whole trimmed
-/// info string, so ```python foo=1 stays uniform (hljs has no such
-/// language); only these exact spellings highlight.
-fn is_highlighted_lang(lang: &str) -> bool {
-    matches!(
-        lang.to_ascii_lowercase().as_str(),
-        "python" | "py" | "gyp" | "ipython"
-    )
-}
-
-/// The block's highlighted lines (TS `theme.highlightCode(text, lang)`:
-/// one highlight.js pass over the whole block, so multi-line strings
-/// carry across lines; the fallback paths — no palette (the quiet
-/// thinking theme), an unsupported language, or no language — render
-/// `None` so the caller keeps the uniform `mdCodeBlock` rows).
-fn highlighted_code_lines(
-    block: &Block,
-    lang: Option<&str>,
-    style: &MarkdownStyle,
-) -> Option<Vec<Line>> {
-    let palette = style.syntax.as_ref()?;
-    if !lang.is_some_and(is_highlighted_lang) {
-        return None;
-    }
-    if block.lines.is_empty() {
-        // An empty block renders through the uniform empty-row path.
-        return None;
-    }
-    Some(crate::tool_card::highlight::highlight_python(
-        &block.lines.join("\n"),
-        palette,
-    ))
-}
-
 fn render_block(
     block: &Block,
     next: Option<&Block>,
@@ -522,7 +379,7 @@ fn render_block(
                 out.push(Vec::new());
             }
         }
-        BlockKind::Code { lang } => {
+        BlockKind::Code { .. } => {
             // TS `renderCodeBlock`: no borders in the chat markdown - the
             // block is `codeBlockIndent` (settings-driven, default "  ")
             // outside the styled code line, each source line rendered with
@@ -530,22 +387,11 @@ fn render_block(
             // in the TS MarkdownTheme too and is unused by the renderer on
             // both sides.
             let indent = style.code_block_indent.as_str();
-            match highlighted_code_lines(block, lang.as_deref(), style) {
-                Some(code_lines) => {
-                    for line in code_lines {
-                        let mut row: Line = vec![Span::raw(indent)];
-                        row.extend(line);
-                        out.push(row);
-                    }
-                }
-                None => {
-                    for line in &block.lines {
-                        out.push(vec![
-                            Span::raw(indent),
-                            Span::styled(line.clone(), style.code_block),
-                        ]);
-                    }
-                }
+            for line in &block.lines {
+                out.push(vec![
+                    Span::raw(indent),
+                    Span::styled(line.clone(), style.code_block),
+                ]);
             }
             if block.lines.is_empty() {
                 // An empty block still renders one indented empty line
@@ -794,17 +640,9 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
         out.push(spans.to_vec());
         return;
     }
-    // TS `wrapSingleLine` returns a fitting line UNCHANGED (`visibleLength
-    // <= width`), so its spacing never re-tokenizes.
-    let joined_width: usize = spans.iter().map(|s| str_width(&s.content)).sum();
-    if joined_width <= width {
-        out.push(spans.to_vec());
-        return;
-    }
-    // tokens: (text, style); alternating words and whitespace-run gaps. TS
-    // `splitIntoTokensWithAnsi` keeps each whitespace RUN whole (a run at a
-    // span boundary joins the previous gap token), never collapsing it to a
-    // single space.
+    // tokens: (text, style); alternating words and single-space gaps. A gap
+    // at a span boundary must survive (bold text followed by " plain"), so
+    // whitespace runs collapse to one gap token across the whole line.
     let mut tokens: Vec<(String, Style)> = Vec::new();
     for span in spans {
         let mut word = String::new();
@@ -813,9 +651,9 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
                 if !word.is_empty() {
                     tokens.push((std::mem::take(&mut word), span.style));
                 }
-                match tokens.last_mut() {
-                    Some((text, _)) if text.chars().all(|c| c == ' ') => text.push(' '),
-                    _ => tokens.push((" ".to_string(), span.style)),
+                let gap_already_emitted = tokens.last().is_some_and(|(text, _)| text == " ");
+                if !gap_already_emitted {
+                    tokens.push((" ".to_string(), span.style));
                 }
             } else {
                 word.push(ch);
@@ -931,11 +769,9 @@ pub fn to_ratatui_line(line: &Line) -> rt::Line<'static> {
     let mut stripped = line.clone();
     crate::osc133::strip(&mut stripped);
     crate::hyperlinks::strip_osc8(&mut stripped);
-    // TS `applyLineResets` normalizes every painted line right before the
-    // differential paint (Thai/Lao AM decomposition, tabs to three spaces).
     let spans: Vec<rt::Span<'static>> = stripped
         .iter()
-        .map(|s| rt::Span::styled(crate::width::normalize_terminal_output(&s.content), s.style))
+        .map(|s| rt::Span::styled(s.content.clone(), s.style))
         .collect();
     rt::Line::from(spans)
 }
@@ -1052,111 +888,6 @@ mod tests {
     }
 
     #[test]
-    fn python_fence_renders_the_ts_token_colors() {
-        // The TS markdown theme highlights ```python fences through
-        // cli-highlight (the same highlight.js pass the expanded ipython
-        // cell uses); the fence line's spans carry the syntax palette
-        // colors, the indent stays outside them.
-        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
-        let style = MarkdownStyle::from_theme(&theme);
-        let keyword = theme.fg_style(crate::theme::ThemeColor::SyntaxKeyword);
-        let number = theme.fg_style(crate::theme::ThemeColor::SyntaxNumber);
-        let string = theme.fg_style(crate::theme::ThemeColor::SyntaxString);
-        let lines = render_markdown("```python\nx = 1\nflag = 'yes'\n```", 40, &style);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0][0].content, "  ");
-        // `x = 1`: plain identifier and punctuation, then the number.
-        assert_eq!(lines[0][1].content, "x = ");
-        assert_eq!(lines[0][1].style, Style::default());
-        assert_eq!(lines[0][2].content, "1");
-        assert_eq!(lines[0][2].style, number);
-        assert_eq!(lines[1][2].content, "'yes'");
-        assert_eq!(lines[1][2].style, string);
-        // The keyword scope lands on a reserved word.
-        let keyword_lines = render_markdown("```python\nreturn x\n```", 40, &style);
-        assert_eq!(keyword_lines[0][1].content, "return");
-        assert_eq!(keyword_lines[0][1].style, keyword);
-    }
-
-    #[test]
-    fn python_fence_lang_matches_the_hljs_aliases() {
-        let style = MarkdownStyle::default();
-        // `getLanguage` lowercases; python registers py/gyp/ipython, and
-        // marked passes the whole trimmed info string, so an info string
-        // with attributes stays uniform.
-        for fence in ["py", "PYTHON", "ipython"] {
-            let lines = render_markdown(&format!("```{fence}\nx = 'y'\n```"), 40, &style);
-            assert!(
-                lines[0].iter().any(|s| s.style != Style::default()),
-                "{fence} must highlight"
-            );
-        }
-        let uniform = render_markdown("```python foo=1\nx = 'y'\n```", 40, &style);
-        assert!(uniform[0]
-            .iter()
-            .skip(1)
-            .all(|s| s.style == style.code_block));
-    }
-
-    #[test]
-    fn quiet_style_renders_python_fences_uniform() {
-        // The thinking theme replaces TS `highlightCode` with dim lines:
-        // with no palette the block keeps the uniform code_block color.
-        let style = MarkdownStyle {
-            syntax: None,
-            ..MarkdownStyle::default()
-        };
-        let lines = render_markdown("```python\nx = 1\n```", 40, &style);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0][1].content, "x = 1");
-        assert_eq!(lines[0][1].style, style.code_block);
-    }
-
-    /// The block cache must not serve one lang's token colors to another:
-    /// TS's key carries `token.raw` (the fence info string included), so
-    /// frame 2's ```json block (same content as frame 1's cached ```python
-    /// block) re-renders uniform instead of replaying python colors.
-    #[test]
-    fn block_cache_does_not_carry_token_colors_across_langs() {
-        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
-        let style = MarkdownStyle::from_theme(&theme);
-        let number = theme.fg_style(crate::theme::ThemeColor::SyntaxNumber);
-        let mut cache = MarkdownBlockCache::default();
-        let first =
-            render_markdown_tagged("intro\n\n```python\nx = 1\n```", 40, &style, "", &mut cache);
-        assert_eq!(first.last().unwrap()[2].style, number);
-        let second = render_markdown_tagged(
-            "intro\n\n```python\nx = 1\n```\n\nbetween\n\n```json\nx = 1\n```",
-            40,
-            &style,
-            "",
-            &mut cache,
-        );
-        // The final ```json block: one uniform code_block span, not the
-        // cached python token spans.
-        let json_row = second.last().unwrap();
-        assert_eq!(json_row.len(), 2);
-        assert_eq!(json_row[0].content, "  ");
-        assert_eq!(json_row[1].content, "x = 1");
-        assert_eq!(json_row[1].style, style.code_block);
-    }
-
-    #[test]
-    fn python_fence_multiline_string_carries_across_rows() {
-        // One highlight.js pass over the whole block: a triple-quoted
-        // string keeps the string color on every row it spans.
-        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
-        let style = MarkdownStyle::from_theme(&theme);
-        let string = theme.fg_style(crate::theme::ThemeColor::SyntaxString);
-        let lines = render_markdown("```python\ns = '''a\nb'''\n```", 40, &style);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0][2].content, "'''a");
-        assert_eq!(lines[0][2].style, string);
-        assert_eq!(lines[1][1].content, "b'''");
-        assert_eq!(lines[1][1].style, string);
-    }
-
-    #[test]
     fn list_render() {
         let style = MarkdownStyle::default();
         let lines = render_markdown("- one\n- two", 40, &style);
@@ -1265,14 +996,10 @@ mod tests {
         let lines = render_markdown("**Hello.** I can render", 80, &style);
         let joined: String = lines[0].iter().map(|s| s.content.as_str()).collect();
         assert_eq!(joined, "Hello. I can render");
-        // Whitespace runs keep their length across spans: TS
-        // `splitIntoTokensWithAnsi` holds each run as ONE token and a
-        // fitting line passes through unchanged (wrapSingleLine's
-        // visibleLength early return) — verified against the TS dist
-        // (wrapTextWithAnsi renders "a b   c ...").
+        // Whitespace runs still collapse to a single gap across spans.
         let spans = render_inline("a **b**   c", &style);
         let wrapped = wrap_spans_to_text(&spans, 40);
-        assert_eq!(wrapped, "a b   c");
+        assert_eq!(wrapped, "a b c");
     }
 
     fn wrap_spans_to_text(spans: &[Span], width: usize) -> String {
@@ -1301,16 +1028,5 @@ mod tests {
         let lines = render_markdown("> wisdom", 40, &style);
         assert_eq!(lines[0][0].content, "▐ ");
         assert_eq!(lines[0][1].content, "wisdom");
-    }
-
-    #[test]
-    fn probe_inline_spaces() {
-        let md = crate::markdown::MarkdownStyle::default();
-        let line = crate::markdown::render_inline("a   b c", &md);
-        let s: String = line.iter().map(|sp| sp.content.as_str()).collect();
-        eprintln!("inline row: {s:?}");
-        let line2 = crate::markdown::render_inline("a\u{9}b", &md);
-        let s2: String = line2.iter().map(|sp| sp.content.as_str()).collect();
-        eprintln!("inline tab row: {s2:?}");
     }
 }

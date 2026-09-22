@@ -80,4 +80,3 @@ pub(crate) mod update_stop;
 pub(crate) mod user_bash;
 pub mod util;
 pub mod worker;
-mod worker_signals;

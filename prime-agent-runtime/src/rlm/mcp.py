@@ -16,7 +16,7 @@ from typing import Any, TypeVar
 from . import host_request
 from .mcp_base import _parse_result, _read_auth, _resolve_config_value
 
-__all__ = ["McpCredentialsUnavailable", "McpStartupError", "call_tool", "close", "list_tools", "reload"]
+__all__ = ["McpStartupError", "call_tool", "close", "list_tools", "reload"]
 
 _DEFAULT_STARTUP_TIMEOUT = 20.0
 _DEFAULT_CALL_TIMEOUT = 60.0
@@ -32,13 +32,6 @@ _CONTROL_CHAR = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 class McpStartupError(RuntimeError):
     """A stdio server failed while completing the MCP startup handshake."""
-
-
-class McpCredentialsUnavailable(RuntimeError):
-    """Raised when a configured connection has no usable credentials.
-
-    The user must connect the service first (`/plugins` or
-    `/mcp login <service>`)."""
 
 
 class _StderrTail(io.TextIOBase):
@@ -561,21 +554,7 @@ def _bound_auth(provider: str, config: dict[str, Any]) -> dict[str, Any] | None:
     return cred
 
 
-def _credentials_unavailable(server: str) -> McpCredentialsUnavailable:
-    return McpCredentialsUnavailable(
-        f"MCP credentials for '{server}' are not available. Ask the user to connect it "
-        f"(/plugins or /mcp login {server}); do not ask them to set environment variables."
-    )
-
-
 async def _auth_identity(server: str, config: dict[str, Any]) -> str:
-    if config.get("credentialSource") == "static-token":
-        # A pasted static token has no refresh concept: it either resolves from
-        # the bound stored credential or the connection fails closed.
-        token = _static_token(server, config)
-        if not token:
-            raise _credentials_unavailable(server)
-        return hashlib.sha256(token.encode()).hexdigest()
     env_name = config.get("bearerTokenEnvVar")
     token = os.environ.get(env_name, "").strip() if isinstance(env_name, str) else ""
     if config.get("oauth") is True and not token:
@@ -596,32 +575,12 @@ async def _auth_identity(server: str, config: dict[str, Any]) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def _static_token(server: str, config: dict[str, Any]) -> str:
-    """The pasted static token for a ``static-token`` connection.
-
-    Only the endpoint-BOUND stored credential counts (``_bound_auth``): a token
-    pasted for another endpoint never attaches here. The bearer is a literal
-    pasted value — never resolved as an env-var name or a ``!command``.
-    """
-    cred = _bound_auth(f"mcp:{server}", config)
-    bearer = (cred or {}).get("bearer")
-    if not isinstance(bearer, str):
-        return ""
-    return bearer.strip()
-
-
 async def _headers(server: str, config: dict[str, Any]) -> dict[str, str]:
     raw = config.get("headers", {})
     if not isinstance(raw, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in raw.items()):
         raise ValueError("MCP HTTP headers must contain strings")
     headers = dict(raw)
     if config.get("credentialSource") == "acp":
-        return headers
-    if config.get("credentialSource") == "static-token":
-        token = _static_token(server, config)
-        if not token:
-            raise _credentials_unavailable(server)
-        headers["Authorization"] = f"Bearer {token}"
         return headers
     env_name = config.get("bearerTokenEnvVar")
     token = os.environ.get(env_name, "").strip() if isinstance(env_name, str) else ""

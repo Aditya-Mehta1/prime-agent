@@ -133,7 +133,6 @@ impl AgentCronSchedulerHooks for QueueHooks {
                 images: Vec::new(),
                 queue_key,
                 done: Some(done_tx),
-                queue_visible: true,
             });
         }
         self.work_notify.notify_one();

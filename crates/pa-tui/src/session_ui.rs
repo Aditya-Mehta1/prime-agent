@@ -227,7 +227,6 @@ pub(crate) struct SessionUi {
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
     pending_model: Option<String>,
-    pending_model_provider: Option<String>,
     /// Snapshot queue state for the next rebuild (attach re-sync).
     pending_queue: Option<crate::queued::QueuedMessages>,
     /// The parked-message browse state (TS `QueueSelection`): which queued
@@ -349,24 +348,6 @@ pub(crate) struct SessionUi {
     /// "clear", taken by the second press inside the 500ms window.
     escape_repeat_action: Option<&'static str>,
     escape_repeat_until: Option<Instant>,
-    /// The `!`/`!!` user-bash lane (TS interactive-mode onSubmit): the
-    /// client-side running flag (optimistic on submit, patched by the
-    /// `bash_start`/`bash_end` events), the mounted transcript card id,
-    /// and the raw output the streamed chunks accumulated for its fold.
-    user_bash_running: bool,
-    user_bash_card: Option<String>,
-    user_bash_output: String,
-    user_bash_counter: u64,
-    /// An in-flight side-conversation bash run (TS `sideQuestionBash`):
-    /// its pane-mounted identity plus whether the run seeds follow-up
-    /// side questions (the `!`, not the `!!`, variant).
-    side_bash: Option<SideBashRun>,
-    /// A discarded side-bash run whose `bash_*` events are swallowed
-    /// until its own `bash_end` (TS `sideQuestionBashDiscarded`).
-    side_bash_discarded: Option<String>,
-    /// The next side-bash run id (TS `randomUUID`; a client-local counter
-    /// is enough identity for event matching).
-    side_bash_counter: u64,
     /// `app.suspend` (default ctrl+z, TS `handleCtrlZ`) requested the
     /// process-group suspend: the interactive loop performs the cycle
     /// right after dispatch, because the renderer is the loop's terminal.
@@ -387,17 +368,6 @@ pub(crate) struct SessionUi {
     /// Texts copied out by finished selections this run (headless runs
     /// have no terminal to write OSC 52 to; the verifier reads these).
     pub(crate) copies: Vec<String>,
-}
-
-/// One in-flight side-conversation bash run (TS `sideQuestionBash`): the
-/// `runId` the daemon echoes on the run's `bash_*` events, the raw input
-/// (`!command`) that seeded it, and whether its output seeds follow-up
-/// side questions (the `!`, not the `!!`, variant).
-#[derive(Debug, Clone)]
-struct SideBashRun {
-    run_id: String,
-    input: String,
-    seed_transcript: bool,
 }
 
 /// One armed auto-scroll (TS `selectionAutoScrollTimer` state): the drag's
@@ -468,7 +438,6 @@ impl SessionUi {
             next_image_marker_id: 1,
             pending_snapshot: None,
             pending_model: None,
-            pending_model_provider: None,
             pending_queue: None,
             queue_selection: crate::queued::QueueSelection::default(),
             context: None,
@@ -514,13 +483,6 @@ impl SessionUi {
             exit_guard: crate::exit_guard::ExitGuard::new(),
             escape_repeat_action: None,
             escape_repeat_until: None,
-            user_bash_running: false,
-            user_bash_card: None,
-            user_bash_output: String::new(),
-            user_bash_counter: 0,
-            side_bash: None,
-            side_bash_discarded: None,
-            side_bash_counter: 0,
             suspend_requested: false,
             pending_client_command: None,
             suspend_adoption_emitted: false,
@@ -668,7 +630,6 @@ impl SessionUi {
         self.heartbeat_catalog.clear();
         self.spawn_heartbeat_refresh();
         self.pending_model = reconstructed.model_id;
-        self.pending_model_provider = reconstructed.model_provider;
         self.last_assistant_text = reconstructed
             .chat
             .iter()
@@ -851,7 +812,6 @@ impl SessionUi {
         }
         if let Some(model) = self.pending_model.take() {
             view.chrome.model_id = Some(model);
-            view.chrome.model_provider = self.pending_model_provider.take();
         }
         view.queued = self.pending_queue.take().unwrap_or_default();
         // A rebuilt view starts from the snapshot's queue: any browse
@@ -1060,29 +1020,6 @@ impl SessionUi {
         .map(|_| ())
     }
 
-    /// Detach on the agents-view handoff without blocking it: the request
-    /// goes on the wire immediately and a background task owns the
-    /// connection until the daemon answers (or the exit cap fires), then
-    /// closes it. Attached-client bookkeeping must not delay the switch;
-    /// the supervisor also detaches this client when the socket closes, so
-    /// the response is not a handoff dependency.
-    pub(crate) fn detach_for_handoff(&self) {
-        let client = self.client.clone();
-        let active_session_id = self.active_session_id.clone();
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(EXIT_DETACH_TIMEOUT_MS),
-                client.request_ok(DaemonCommand::Detach {
-                    id: None,
-                    active_session_id: Some(active_session_id),
-                    rest: Default::default(),
-                }),
-            )
-            .await;
-            client.close();
-        });
-    }
-
     /// Detach during the exit path, bounded hard: a wedged worker socket can
     /// never hold the client open (the exit contract is exit-within-1s even
     /// then, so this must stay well under the bound).
@@ -1259,15 +1196,8 @@ impl SessionUi {
             .into_iter()
             .map(|(id, image)| (id, image.clone()))
             .collect();
-        // TS `snapshotPromptStashFrom`: a collapsed paste's content lives in
-        // the editor's registry, not in the text, so the registry must
-        // travel with the draft or the restored marker would stay literal
-        // instead of expanding on submit.
-        let snapshot = view.editor.get_paste_snapshot();
-        let paste_snapshot = (!snapshot.pastes.is_empty()).then_some(snapshot);
         Some(PromptStash {
             text,
-            paste_snapshot,
             images,
             restore_on_open: true,
         })
@@ -1358,12 +1288,6 @@ impl SessionUi {
             self.next_image_marker_id = self.next_image_marker_id.max(id + 1);
         }
         view.editor.set_text(&stash.text);
-        // TS `restorePromptStash` -> `restorePasteSnapshot`: the collapsed
-        // pastes re-enter the editor's registry so the restored markers
-        // stay atomic and expand on submit.
-        if let Some(snapshot) = &stash.paste_snapshot {
-            view.editor.restore_paste_snapshot(snapshot.clone());
-        }
         if let Some(telemetry) = self.telemetry.clone() {
             let had_images = !stash.images.is_empty();
             tokio::spawn(async move {
@@ -1379,12 +1303,13 @@ impl SessionUi {
     /// startup catalog; unknown models are assumed capable (the daemon
     /// re-checks against the resolved model anyway).
     fn model_supports_images(&self, view: &AgentView) -> bool {
-        match self.current_catalog_model(view) {
-            Some(model) => model.input.contains(&pa_types::ai::ModelInput::Image),
-            // Unknown models are assumed capable (the daemon re-checks
-            // against the resolved model anyway).
-            None => true,
-        }
+        let Some(model_id) = view.chrome.model_id.as_deref() else {
+            return true;
+        };
+        let Some(model) = self.model_catalog.iter().find(|model| model.id == model_id) else {
+            return true;
+        };
+        model.input.contains(&pa_types::ai::ModelInput::Image)
     }
 
     /// Submit a prompt (the Enter path). The user message arrives back as a
@@ -1394,19 +1319,6 @@ impl SessionUi {
         let text = text.trim();
         if text.is_empty() {
             return Ok(());
-        }
-        // TS `!`/`!!` (interactive-mode onSubmit): the bash shortcut
-        // routes before the side-question capture and every prompt path.
-        // A bare `!`/`!!` is bash mode with nothing to run — it is never
-        // sent as a prompt; a command runs directly through the
-        // user-bash slot, no model turn involved.
-        if let Some(bang) = crate::bash_bang::parse_bash_bang(text) {
-            return match bang {
-                crate::bash_bang::BashBang::Bare => Ok(()),
-                crate::bash_bang::BashBang::Run(shortcut) => {
-                    self.run_chat_bash(text, &shortcut, view).await
-                }
-            };
         }
         // An open side-question pane captures the submission (TS's ladder
         // order): builtin slash commands get the in-pane notice, a reply
@@ -1570,21 +1482,6 @@ impl SessionUi {
     /// run aborts fire-and-forget (the daemon emits the cancelled event,
     /// which finds the pane already gone).
     async fn clear_side_question(&mut self, abort: bool, view: &mut AgentView) {
-        // A side-conversation bash run dies with its pane: its `bash_*`
-        // events may still be in flight (even bash_start), so they are
-        // swallowed until its bash_end, and a run we observed starting
-        // aborts (abort_bash is session-scoped, so only a run whose
-        // bash_start we saw is aborted).
-        if let Some(run) = self.side_bash.take() {
-            let started = view
-                .side_pane
-                .as_ref()
-                .is_some_and(|pane| pane.bash.is_some());
-            self.side_bash_discarded = Some(run.run_id);
-            if started {
-                self.abort_user_bash();
-            }
-        }
         let active = self.active_side_question_id.take();
         if abort {
             if let Some(side_question_id) = active {
@@ -1676,113 +1573,6 @@ impl SessionUi {
                 })
                 .collect(),
         ))
-    }
-
-    /// TS `!command` / `!!command` (interactive-mode `onSubmit`): run the
-    /// command through the daemon's user-bash slot — no model turn. `!`
-    /// output enters the session context (the daemon records the durable
-    /// `bashExecution` row, so follow-up prompts answer it); `!!` stays
-    /// excluded. Inside a side conversation the run is transient: it
-    /// renders in the pane, stays out of the main context, and (for `!`)
-    /// seeds follow-up side questions.
-    async fn run_chat_bash(
-        &mut self,
-        text: &str,
-        shortcut: &crate::bash_bang::BashShortcut,
-        view: &mut AgentView,
-    ) -> Result<()> {
-        // Every prompt submission dismisses the `?` shortcut guide (TS
-        // `clearShortcutGuide` at onSubmit's top).
-        view.shortcut_guide = None;
-        // A running user command blocks a second one (TS `isBashRunning`
-        // guard); the editor buffer already cleared on submit, so the
-        // draft is not restored.
-        if self.user_bash_running {
-            self.note_as(
-                &already_running_warning(&self.keybindings),
-                StatusKind::Warning,
-                view,
-            );
-            return Ok(());
-        }
-        // A streaming side turn blocks bash like it blocks follow-up
-        // replies: overlapping pane turns would seed out of order; the
-        // draft returns to the editor (TS `editor.setText(text)`).
-        if view.side_pane.is_some() && self.active_side_question_id.is_some() {
-            view.editor.set_text(text);
-            self.note_as(
-                "\u{26a0} Wait for the current side question to finish or cancel it first.",
-                StatusKind::Warning,
-                view,
-            );
-            return Ok(());
-        }
-        // Inside a side conversation the command runs inside the pane
-        // (its bash_start mounts the row there), stays out of the
-        // main-session context, and (for `!`, not `!!`) seeds follow-up
-        // side questions.
-        let side_bash = view.side_pane.is_some().then(|| {
-            self.side_bash_counter += 1;
-            SideBashRun {
-                run_id: format!("side-bash-{}", self.side_bash_counter),
-                input: text.to_string(),
-                seed_transcript: !shortcut.excluded,
-            }
-        });
-        if side_bash.is_none() {
-            // Main-thread bash clears any side-question state first (TS
-            // `clearSideQuestion({ abort: true })`).
-            self.clear_side_question(true, view).await;
-        }
-        view.editor.add_to_history(text);
-        // Optimistic running flag (TS `patchConnectionState({
-        // isBashRunning: true })`): bash_start only fires after the
-        // dispatch, and the clear key must already route to abort_bash
-        // in that window.
-        self.user_bash_running = true;
-        if let Some(telemetry) = self.telemetry.clone() {
-            let excluded = shortcut.excluded;
-            let side_conversation = side_bash.is_some();
-            tokio::spawn(async move {
-                telemetry
-                    .bash_shortcut_used(excluded, side_conversation)
-                    .await;
-            });
-        }
-        let run_id = side_bash.as_ref().map(|run| run.run_id.clone());
-        let excluded = shortcut.excluded || side_bash.is_some();
-        if let Some(run) = side_bash {
-            self.side_bash = Some(run);
-        }
-        let request = DaemonCommand::ExecuteBash {
-            id: None,
-            active_session_id: self.active_session_id.clone(),
-            command: shortcut.command.clone(),
-            exclude_from_context: Some(excluded),
-            transient: run_id.is_some().then_some(true),
-            run_id: run_id.clone(),
-            rest: Default::default(),
-        };
-        if let Err(error) = self
-            .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), request)
-            .await
-        {
-            // The rejection may mean another client's bash run already
-            // holds the slot (TS re-syncs from the daemon state; the
-            // settled events patch it either way) — assume idle.
-            self.user_bash_running = false;
-            if run_id.is_some() && self.side_bash.as_ref().map(|run| run.run_id.clone()) == run_id {
-                self.side_bash = None;
-            }
-            if run_id.is_some() && self.side_bash_discarded == run_id {
-                // The pane discarded this run, but it never started, so
-                // no bash_end will arrive to consume the marker.
-                self.side_bash_discarded = None;
-            }
-            self.error_row(&format!("{error:#}"), view);
-        }
-        self.dirty = true;
-        Ok(())
     }
 
     async fn send_prompt(
@@ -3603,7 +3393,8 @@ impl SessionUi {
     /// The catalog entry for the current model (the `/fast` eligibility
     /// check needs the provider and api, not just the id).
     fn current_model_entry(&self, view: &AgentView) -> Option<&pa_types::ai::Model> {
-        self.current_catalog_model(view)
+        let model_id = view.chrome.model_id.as_deref()?;
+        self.model_catalog.iter().find(|model| model.id == model_id)
     }
 
     /// Recompute the `/fast` autocomplete filter (TS
@@ -4459,13 +4250,6 @@ impl SessionUi {
                 // flow — the same command path as `/mcp login <name>`.
                 self.pending_client_command = Some(format!("/mcp login {server}"));
             }
-            Some(crate::mcp_view::McpViewAction::Paste(server)) => {
-                view.mcp_view = None;
-                self.dirty = true;
-                // The inline paste panel's client surface: prompt for the
-                // token, store it bound to the service endpoint, verify.
-                self.pending_client_command = Some(format!("/mcp paste {server}"));
-            }
             None => {}
         }
         Ok(())
@@ -5175,23 +4959,15 @@ impl SessionUi {
         }
     }
 
-    /// The session's current model's catalog entry: the TS
-    /// `modelsAreEqual` key (provider plus id) — live-catalog ids repeat
-    /// across providers, so a reported provider disambiguates.
-    fn current_catalog_model<'s>(&'s self, view: &AgentView) -> Option<&'s pa_types::ai::Model> {
-        let model_id = view.chrome.model_id.as_deref()?;
-        match view.chrome.model_provider.as_deref() {
-            Some(provider) => self
-                .model_catalog
-                .iter()
-                .find(|model| model.provider == provider && model.id == model_id),
-            None => self.model_catalog.iter().find(|model| model.id == model_id),
-        }
-    }
-
-    /// The picker's `current` key ([`Self::current_catalog_model`]).
+    /// The session's current model, matched against the picker catalog (the
+    /// daemon state reports the id; the catalog entry supplies the
+    /// provider).
     fn current_model(&self, view: &AgentView) -> Option<CurrentModel> {
-        let model = self.current_catalog_model(view)?;
+        let model_id = view.chrome.model_id.as_deref()?;
+        let model = self
+            .model_catalog
+            .iter()
+            .find(|model| model.id == model_id)?;
         Some(CurrentModel {
             provider: model.provider.clone(),
             model_id: model.id.clone(),
@@ -5416,18 +5192,13 @@ impl SessionUi {
             )
             .await;
         if let Ok(data) = state {
-            let model = data.get("model");
-            let model_id = model
+            let model_id = data
+                .get("model")
                 .and_then(|model| model.get("id"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| picked_model_id.to_string());
-            let model_provider = model
-                .and_then(|model| model.get("provider"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
             view.chrome.model_id = Some(model_id);
-            view.chrome.model_provider = model_provider;
             self.dirty = true;
         }
     }
@@ -5449,143 +5220,6 @@ impl SessionUi {
                 .await;
             if let Err(error) = result {
                 let _ = notes.send(format!("the abort failed: {error:#}"));
-            }
-        });
-    }
-
-    /// TS `interruptOrClearInput`: the interrupt key's fire-and-forget
-    /// abort ladder. Every branch checks its own live state, spawns its
-    /// request off the UI loop (a failure surfaces later as a transcript
-    /// note), and reports its `tui interrupt issued` adoption event — the
-    /// primitive target enum only, never any content. Shared by the Ctrl+C
-    /// interrupt and the Escape arm-and-interrupt.
-    fn interrupt_or_clear_input(&mut self, view: &mut AgentView) {
-        // A running side question is aborted first (its failure reported
-        // through the note channel, unlike the silent pane-close abort);
-        // the pane stays mounted and renders the cancelled turn when the
-        // run's terminal event streams back.
-        if self.active_side_question_id.is_some() {
-            self.abort_side_question();
-            self.track_interrupt("side_question");
-        }
-        // TS `getRetryAttempt() > 0`: a retry countdown is in flight (the
-        // loader shows it); `abortRetry` stops the retry without
-        // aborting the turn behind it.
-        if view.retry.is_some() {
-            self.abort_retry();
-            self.track_interrupt("retry");
-        }
-        if view.compaction.is_some() {
-            // The compaction loader is up (TS `isAgentCompacting()`): the
-            // interrupt cancels the compaction run and its branch summary
-            // only — the agent is not streaming, so no turn abort goes out,
-            // exactly like the TS interrupt key.
-            self.abort_compaction();
-            self.abort_branch_summary();
-            self.track_interrupt("compaction");
-            self.track_interrupt("branch_summary");
-        } else if self.turn_active {
-            // TS fires `void abortAndSendQueued()` and reports nothing on
-            // success — the aborted assistant row is the visible outcome
-            // (a failed request surfaces through the note channel).
-            self.abort_turn();
-            self.track_interrupt("stream");
-        }
-        // A running user-bash command aborts the same way (TS
-        // `interruptOrClearInput` fires `void abortBash()`): the
-        // settled run reports cancelled through its bash_end.
-        if self.user_bash_running {
-            self.abort_user_bash();
-            self.track_interrupt("bash");
-        }
-    }
-
-    /// TS `hasInterruptibleWork` (the states this client tracks): the
-    /// arm decision for the Escape repeat — the second press opens the
-    /// tree while work is interruptible or the editor is empty, and
-    /// clears the input otherwise.
-    fn has_interruptible_work(&self, view: &AgentView) -> bool {
-        self.turn_active
-            || self.user_bash_running
-            || view.retry.is_some()
-            || view.compaction.is_some()
-            || self.active_side_question_id.is_some()
-    }
-
-    /// One interrupt target fired (`tui interrupt issued`): a primitive
-    /// enum only, fire-and-forget like the other adoption events — the
-    /// keypress never waits on the telemetry flush.
-    fn track_interrupt(&self, target: &'static str) {
-        if let Some(telemetry) = self.telemetry.clone() {
-            tokio::spawn(async move {
-                telemetry.interrupt_issued(target).await;
-            });
-        }
-    }
-
-    /// Abort a running side question off the UI loop (the report-error
-    /// variant TS `interruptOrClearInput` fires): the pane stays mounted;
-    /// a failure surfaces as a background note.
-    fn abort_side_question(&self) {
-        let Some(side_question_id) = self.active_side_question_id.clone() else {
-            return;
-        };
-        let client = self.client.clone();
-        let active_session_id = self.active_session_id.clone();
-        let notes = self.notes.clone();
-        tokio::spawn(async move {
-            if let Err(error) = client
-                .request_ok(DaemonCommand::AbortSideQuestion {
-                    id: None,
-                    active_session_id,
-                    side_question_id,
-                    rest: Default::default(),
-                })
-                .await
-            {
-                let _ = notes.send(format!("the side question abort failed: {error:#}"));
-            }
-        });
-    }
-
-    /// Stop an in-flight retry off the UI loop (TS
-    /// `interruptOrClearInput` fires `void abortRetry()` when the retry
-    /// attempt is live): the retry stops without aborting the turn.
-    fn abort_retry(&self) {
-        let client = self.client.clone();
-        let active_session_id = self.active_session_id.clone();
-        let notes = self.notes.clone();
-        tokio::spawn(async move {
-            let result = client
-                .request_ok(DaemonCommand::AbortRetry {
-                    id: None,
-                    active_session_id,
-                    rest: Default::default(),
-                })
-                .await;
-            if let Err(error) = result {
-                let _ = notes.send(format!("the retry abort failed: {error:#}"));
-            }
-        });
-    }
-
-    /// Abort the in-flight branch summary off the UI loop (TS fires
-    /// `void abortBranchSummary()` next to the compaction abort — the
-    /// summary is part of the compaction run's tree navigation).
-    fn abort_branch_summary(&self) {
-        let client = self.client.clone();
-        let active_session_id = self.active_session_id.clone();
-        let notes = self.notes.clone();
-        tokio::spawn(async move {
-            let result = client
-                .request_ok(DaemonCommand::AbortBranchSummary {
-                    id: None,
-                    active_session_id,
-                    rest: Default::default(),
-                })
-                .await;
-            if let Err(error) = result {
-                let _ = notes.send(format!("the branch summary abort failed: {error:#}"));
             }
         });
     }
@@ -5918,19 +5552,12 @@ impl SessionUi {
                 self.dirty = true;
                 return Ok(());
             }
-            let action =
-                if self.has_interruptible_work(view) || view.editor.get_text().trim().is_empty() {
-                    "tree"
-                } else {
-                    "clear"
-                };
+            let action = if self.turn_active || view.editor.get_text().trim().is_empty() {
+                "tree"
+            } else {
+                "clear"
+            };
             self.arm_escape_repeat(action);
-            // TS `handleEscape` arms the repeat and then interrupts: the
-            // same Escape press aborts whatever is interruptible — the
-            // stream, a retry, a compaction, a user-bash run (the arm only
-            // decides the *next* press's action).
-            self.interrupt_or_clear_input(view);
-            self.dirty = true;
             return Ok(());
         }
         if view.editor.keybindings().matches(&id, "app.exit") && view.editor.get_text().is_empty() {
@@ -5960,9 +5587,39 @@ impl SessionUi {
                 *running = false;
                 return Ok(());
             }
-            // TS `handleInterruptKey` -> `interruptOrClearInput`: the
-            // interrupt key's abort ladder, then the exit hint.
-            self.interrupt_or_clear_input(view);
+            // TS `interruptOrClearInput`: a running side question is
+            // aborted first (its failure reported through the note
+            // channel, unlike the silent pane-close abort); the pane stays
+            // mounted and renders the cancelled turn when the run's
+            // terminal event streams back.
+            if let Some(side_question_id) = self.active_side_question_id.clone() {
+                let client = self.client.clone();
+                let active_session_id = self.active_session_id.clone();
+                let notes = self.notes.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = client
+                        .request_ok(DaemonCommand::AbortSideQuestion {
+                            id: None,
+                            active_session_id,
+                            side_question_id,
+                            rest: Default::default(),
+                        })
+                        .await
+                    {
+                        let _ = notes.send(format!("the side question abort failed: {error:#}"));
+                    }
+                });
+            }
+            if view.compaction.is_some() {
+                // The compaction loader is up (TS `isAgentCompacting()`):
+                // the interrupt cancels the compaction run only — the agent
+                // is not streaming, so no turn abort goes out, exactly like
+                // the TS interrupt key.
+                self.abort_compaction();
+            } else if self.turn_active {
+                self.abort_turn();
+                self.note("aborting the current turn", view);
+            }
             self.show_ctrl_c_hint();
             self.dirty = true;
             return Ok(());
@@ -6430,17 +6087,7 @@ impl SessionUi {
                 self.start_loader(view);
             }
             TurnUpdate::UserMessage(text) => {
-                // TS `addMessageToChat`'s user case: a skill block parses
-                // into the skill-invocation card plus the trailing
-                // argument text as its own user block.
-                match crate::custom_message::skill_invocation_entries(&text) {
-                    Some(entries) => {
-                        for entry in entries {
-                            view.push_entry(entry);
-                        }
-                    }
-                    None => view.push_entry(ChatEntry::User { text }),
-                }
+                view.push_entry(ChatEntry::User { text });
             }
             // `session_info_changed`: the display name moved (the `/name`
             // path also sets it locally; this is the other-client arm).
@@ -6637,37 +6284,6 @@ impl SessionUi {
             TurnUpdate::GoalUpdate(goal) => {
                 self.apply_goal_update(goal, view);
             }
-            TurnUpdate::BashStart {
-                command,
-                exclude_from_context: _,
-                transient,
-                run_id,
-            } => {
-                self.apply_bash_start(command, transient, run_id, view);
-            }
-            TurnUpdate::BashOutput { chunk } => {
-                self.apply_bash_output(&chunk, view);
-            }
-            TurnUpdate::BashEnd {
-                exit_code,
-                cancelled,
-                truncated,
-                full_output_path,
-                error_message,
-                transient,
-                run_id,
-            } => {
-                self.apply_bash_end(
-                    exit_code,
-                    cancelled,
-                    truncated,
-                    full_output_path,
-                    error_message,
-                    transient,
-                    run_id,
-                    view,
-                );
-            }
             TurnUpdate::QueueUpdated {
                 steering,
                 follow_ups,
@@ -6698,247 +6314,6 @@ impl SessionUi {
             TurnUpdate::StatusUpdate => {}
         }
         self.dirty = true;
-    }
-
-    /// `bash_start` (TS the interactive `bash_start` case): a user-bash run
-    /// began. The client's running flag patches first (the slot is
-    /// session-scoped), then a discarded side run's events are swallowed
-    /// (aborting by its identity so the slot frees), a foreign transient
-    /// run renders only in its owning client's pane, an own side run
-    /// mounts its row in the pane, and a main-thread run mounts the usual
-    /// bash transcript card.
-    fn apply_bash_start(
-        &mut self,
-        command: String,
-        transient: bool,
-        run_id: Option<String>,
-        view: &mut AgentView,
-    ) {
-        self.user_bash_running = true;
-        if let Some(discarded) = self.side_bash_discarded.clone() {
-            if run_id.as_deref() == Some(&discarded) {
-                // The discarded run now owns the bash slot: abort only
-                // after matching its identity, so a foreign run is never
-                // killed (TS aborts the same way).
-                self.abort_user_bash();
-                return;
-            }
-            // A different run claimed the slot, so the discarded run lost
-            // the race and can never start: render this run normally.
-            self.side_bash_discarded = None;
-        }
-        let own_side_bash = self
-            .side_bash
-            .as_ref()
-            .is_some_and(|run| run_id.as_deref() == Some(run.run_id.as_str()));
-        if transient && !own_side_bash {
-            // Another client's side-conversation run: it renders only in
-            // that client's pane, never in this window's chat.
-            return;
-        }
-        if own_side_bash && view.side_pane.is_some() {
-            // The same component as the main thread, mounted inside the
-            // pane (TS `sideQuestionComponent.addBash`).
-            if let Some(pane) = view.side_pane.as_mut() {
-                pane.bash = Some(crate::side_question::PaneBash::new_running(&command));
-            }
-            self.user_bash_card = None;
-            self.user_bash_output.clear();
-            return;
-        }
-        // The main-thread card (the same bash transcript item a replayed
-        // `bashExecution` row renders).
-        self.user_bash_counter += 1;
-        let id = format!("user-bash-{}", self.user_bash_counter);
-        view.push_entry(ChatEntry::Tool(Box::new(crate::tool_card::ToolCallCard {
-            id: id.clone(),
-            name: "bash".to_string(),
-            args: serde_json::json!({ "command": command }),
-            started: true,
-            started_at: Some(std::time::Instant::now()),
-            ..Default::default()
-        })));
-        self.user_bash_card = Some(id);
-        self.user_bash_output.clear();
-    }
-
-    /// `bash_output` (TS the `bash_output` case): one streamed chunk
-    /// appends to the active surface — the pane's row for a side run, the
-    /// transcript card's partial result otherwise. Discarded runs
-    /// swallow their chunks.
-    fn apply_bash_output(&mut self, chunk: &str, view: &mut AgentView) {
-        if self.side_bash_discarded.is_some() {
-            return;
-        }
-        if let Some(pane) = view.side_pane.as_mut() {
-            if let Some(bash) = pane.bash.as_mut() {
-                bash.output.push_str(chunk);
-                return;
-            }
-        }
-        let Some(card_id) = self.user_bash_card.clone() else {
-            return;
-        };
-        self.user_bash_output.push_str(chunk);
-        self.fold_bash_result(&card_id, self.user_bash_output.clone(), false, true, view);
-    }
-
-    /// `bash_end` (TS the `bash_end` case): the settled run patches the
-    /// running flag, completes the mounted row (or surfaces the failure
-    /// when no row is mounted), and an own pane-mounted run seeds the
-    /// follow-up side questions (the `!`, not `!!`, variant — unless it
-    /// was cancelled or failed).
-    #[allow(clippy::too_many_arguments)]
-    fn apply_bash_end(
-        &mut self,
-        exit_code: Option<i64>,
-        cancelled: bool,
-        truncated: bool,
-        full_output_path: Option<String>,
-        error_message: Option<String>,
-        transient: bool,
-        run_id: Option<String>,
-        view: &mut AgentView,
-    ) {
-        self.user_bash_running = false;
-        if let Some(discarded) = self.side_bash_discarded.clone() {
-            if run_id.as_deref() == Some(&discarded) {
-                // Only the discarded run's own end consumes the marker
-                // (bash_start already cleared it for any other run that
-                // claimed the slot).
-                self.side_bash_discarded = None;
-                self.user_bash_card = None;
-                return;
-            }
-        }
-        // An own side run: settle the pane's row and seed the follow-up
-        // transcript (TS `finishSideQuestionBash`).
-        if let Some(run) = self.side_bash.take() {
-            let own_run = run_id.as_deref() == Some(run.run_id.as_str());
-            let pane_mounted = view
-                .side_pane
-                .as_ref()
-                .is_some_and(|pane| pane.bash.is_some());
-            if own_run && pane_mounted {
-                let pane = view.side_pane.as_mut().expect("checked");
-                if let Some(bash) = pane.bash.as_mut() {
-                    bash.running = false;
-                    bash.exit_code = exit_code;
-                    bash.cancelled = cancelled;
-                    bash.truncated = truncated;
-                    bash.full_output_path = full_output_path.clone();
-                    bash.error_message = error_message.clone();
-                }
-                if run.seed_transcript && !cancelled && error_message.is_none() {
-                    let raw = pane
-                        .bash
-                        .as_ref()
-                        .map(|bash| bash.output.clone())
-                        .unwrap_or_default();
-                    let (tail, tail_truncated) = crate::bash_bang::truncate_tail(&raw);
-                    let output = tail.trim_end_matches('\n').to_string();
-                    let answer = crate::bash_bang::bash_output_to_text(
-                        &output,
-                        exit_code,
-                        truncated || tail_truncated,
-                        full_output_path.as_deref(),
-                    );
-                    pane.extra_seeds.push((run.input.clone(), answer));
-                }
-            }
-        }
-        // The main-thread transcript card settles (an error status when
-        // the run failed or exited non-zero, TS `setComplete`/
-        // `setFailed`).
-        if let Some(card_id) = self.user_bash_card.take() {
-            let failed = error_message.is_some() || exit_code.is_some_and(|code| code != 0);
-            self.fold_bash_result(&card_id, self.user_bash_output.clone(), failed, false, view);
-            let card_index = view
-                .chat
-                .iter()
-                .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == card_id));
-            if let Some(index) = card_index {
-                if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
-                    card.ended_at = Some(std::time::Instant::now());
-                    card.result_partial = false;
-                    let mut details = serde_json::json!({
-                        "cancelled": cancelled,
-                        "truncated": truncated,
-                    });
-                    if let Some(code) = exit_code {
-                        details["exitCode"] = serde_json::json!(code);
-                    }
-                    if let Some(path) = &full_output_path {
-                        details["fullOutputPath"] = serde_json::json!(path);
-                    }
-                    if let Some(message) = &error_message {
-                        details["errorMessage"] = serde_json::json!(message);
-                    }
-                    if truncated {
-                        details["truncation"] = serde_json::json!({ "truncated": true });
-                    }
-                    if let Some(result) = card.result.as_mut() {
-                        result.details = details;
-                    }
-                    view.mark_entry_stale(index);
-                }
-            }
-        } else if let Some(message) = error_message {
-            // Transient failures surface in the owning client's pane,
-            // not here (TS `showError`: the `⚠ Error:` row).
-            if !transient {
-                self.error_row(&format!("Bash command failed: {message}"), view);
-            }
-        }
-    }
-
-    /// Fold the user-bash output onto the mounted transcript card: the
-    /// accumulated text as a (partial or final) result frame.
-    fn fold_bash_result(
-        &self,
-        card_id: &str,
-        output: String,
-        is_error: bool,
-        partial: bool,
-        view: &mut AgentView,
-    ) {
-        let result = ToolResultView {
-            content: vec![serde_json::json!({ "type": "text", "text": output })],
-            details: serde_json::Value::Null,
-            is_error,
-        };
-        let card_index = view
-            .chat
-            .iter()
-            .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == card_id));
-        if let Some(index) = card_index {
-            if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
-                card.result = Some(result);
-                card.result_partial = partial;
-                view.mark_entry_stale(index);
-            }
-        }
-    }
-
-    /// `abort_bash` off the UI loop (TS `interruptOrClearInput` fires
-    /// `void abortBash()`): the request never blocks key handling, and a
-    /// failure surfaces as a background note.
-    fn abort_user_bash(&self) {
-        let client = self.client.clone();
-        let active_session_id = self.active_session_id.clone();
-        let notes = self.notes.clone();
-        tokio::spawn(async move {
-            if let Err(error) = client
-                .request_ok(DaemonCommand::AbortBash {
-                    id: None,
-                    active_session_id,
-                    rest: Default::default(),
-                })
-                .await
-            {
-                let _ = notes.send(format!("the bash abort failed: {error:#}"));
-            }
-        });
     }
 
     /// Apply an assistant message frame: an open streaming message is
@@ -7032,40 +6407,7 @@ impl SessionUi {
         }
         if !streaming {
             let open = self.streaming_index.take();
-            let mut error = crate::snapshot::assistant_error_row(message, &tool_calls);
-            if let Some(error) = error.as_mut().filter(|error| error.aborted) {
-                // TS `message_end` (aborted): the live row always carries
-                // the working elapsed and names the pending retry attempt
-                // ("Operation aborted · 4s" / "Aborted after 2 retry
-                // attempts · 1m 05s"); the pending cards share the same
-                // text. The replay path (`assistant_value_to_entries`)
-                // keeps the stored errorMessage instead, exactly like TS's
-                // transcript rebuild.
-                let elapsed = view
-                    .working_since
-                    .map(|since| {
-                        format!(
-                            " · {}",
-                            crate::chat::format_working_elapsed(since.elapsed().as_secs())
-                        )
-                    })
-                    .unwrap_or_default();
-                error.text = match view.retry.as_ref().map(|retry| retry.attempt) {
-                    Some(attempt) => format!(
-                        "Aborted after {attempt} retry attempt{}{elapsed}",
-                        if attempt > 1 { "s" } else { "" }
-                    ),
-                    None => format!("Operation aborted{elapsed}"),
-                };
-                error.error_text = error.text.clone();
-            }
-            if let Some(error) = &error {
-                // TS `message_end` (aborted/error): every pending tool
-                // card gets the error result, then the pending state
-                // resets — no card keeps its spinner after the run died.
-                crate::snapshot::settle_pending_tool_cards(&error.error_text, view);
-            }
-            self.finalize_assistant_error(error, open, view);
+            self.finalize_assistant_error(message, &tool_calls, open, view);
         }
     }
 
@@ -7080,11 +6422,12 @@ impl SessionUi {
     /// previous reply (TS `AssistantMessageComponent.rebuild`).
     fn finalize_assistant_error(
         &mut self,
-        error: Option<crate::snapshot::AssistantErrorRow>,
+        message: &Value,
+        tool_calls: &[(String, String, Value)],
         open: Option<usize>,
         view: &mut AgentView,
     ) {
-        let Some(error) = error else {
+        let Some(error) = crate::snapshot::assistant_error_row(message, tool_calls) else {
             return;
         };
         self.turn_error_shown = true;
@@ -7134,12 +6477,6 @@ impl SessionUi {
             .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == tool_call_id));
         if let Some(index) = card_index {
             if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
-                // A card settled by the abort keeps its error text: the
-                // pending state reset with the dead run (TS finds no
-                // component in `pendingTools` for the late frame).
-                if card.aborted {
-                    return;
-                }
                 card.result = Some(result);
                 card.result_partial = partial;
                 if !partial {
@@ -7198,18 +6535,6 @@ fn sorted_session_rows(mut sessions: Vec<Value>) -> Vec<Value> {
         right.cmp(&left)
     });
     sessions
-}
-
-/// TS `isBashRunning` guard's warning: the clear key (app.clear) cancels
-/// the running user command, spelled through the effective keybindings.
-fn already_running_warning(keybindings: &crate::keybindings::KeybindingsManager) -> String {
-    let key = keybindings
-        .first_key("app.clear")
-        .map(|key| crate::keybindings::format_key_text(&key))
-        .unwrap_or_else(|| "Ctrl+C".to_string());
-    // TS `showWarning` renders `⚠ ${message}`: the prefix travels with the
-    // row text (the StatusKind tier is color only).
-    format!("\u{26a0} A bash command is already running. Press {key} to cancel it first.")
 }
 
 /// TS `formatResumeHint` (resume-hint.ts): the post-exit hint names how to
@@ -7300,25 +6625,6 @@ async fn create_session(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| anyhow!("the daemon did not report a session id for the new session"))
-}
-
-#[cfg(test)]
-mod bash_bang_tests {
-    use super::already_running_warning;
-    use crate::keybindings::KeybindingsManager;
-
-    /// TS `isBashRunning` guard: the warning spells the clear key
-    /// through the effective bindings (the default is ctrl+c).
-    #[test]
-    fn the_running_guard_names_the_clear_key() {
-        let warning = already_running_warning(&KeybindingsManager::new());
-        assert!(
-            warning.starts_with("\u{26a0} A bash command is already running. Press ")
-                && warning.ends_with(" to cancel it first."),
-            "the guard sentence matches TS: {warning}"
-        );
-        assert!(warning.contains("Ctrl+C"));
-    }
 }
 
 #[cfg(test)]

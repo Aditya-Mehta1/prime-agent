@@ -39,7 +39,7 @@ use crate::goal_continuation::GoalBoundary;
 use crate::rlm_children::{ParentIdentity, SupervisorChildSessions, DEFAULT_RLM_MAX_DEPTH};
 
 /// Configuration for the real engine.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentEngineConfig {
     pub cwd: std::path::PathBuf,
     pub agent_dir: std::path::PathBuf,
@@ -74,11 +74,6 @@ pub struct AgentEngineConfig {
     /// The binding is enriched per build from the worker's live/durable
     /// session identity.
     pub cron_store: Option<pa_core::session_engine::runtime_wiring::KernelCronWiring>,
-    /// TS `_steeringStopPending` (the session's stop hooks): `true` while
-    /// the worker's steering lane holds a queued item, so the running turn
-    /// stops at the next turn boundary and the steer delivers as the next
-    /// input (the follow-up lane never stops the run).
-    pub queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Supervisor-link coordinates for a daemon worker.
@@ -168,18 +163,8 @@ pub struct AgentSessionEngine {
     /// Resolved at create time (before any turn) so summary/state polls
     /// during a live turn stay side-effect-free.
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
-    /// Built once on the first prompt, reused across prompts, shared
-    /// behind an Arc: a running model turn (the admission in
-    /// `run_turn_once`), a compaction summarizer, and a refinement run
-    /// clone the Arc and release this mutex before their long awaits, so
-    /// every read seam (`system_prompt`, `tool_definition`,
-    /// `connection_commands`, `resource_snapshot`, ...) answers while a
-    /// turn streams — the TS bar, where the daemon-mode
-    /// `get_system_prompt` arm reads `session.systemPrompt` on the same
-    /// event loop that streams the turn and the provider awaits yield to
-    /// it. Short critical sections only: no model call may hold this
-    /// mutex.
-    pub(crate) session: tokio::sync::Mutex<Option<Arc<CoreSessionEngine>>>,
+    /// Built once on the first prompt, reused across prompts.
+    pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
     /// The session-build gate: at most one `build_session` in flight. The
     /// eager create-time build (TS parity: the prewarm starts at create)
     /// races the first demand seam; the guard makes them meet at one
@@ -342,8 +327,6 @@ impl AgentSessionEngine {
         // `mcp_gating` extraction (agentDir + project settings.json).
         let mcp_cwd = std::sync::Arc::clone(&cwd);
         let mcp_agent_dir = agent_dir.clone();
-        let catalog_cwd = std::sync::Arc::clone(&cwd);
-        let catalog_agent_dir = agent_dir.clone();
         let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: pa_core::auth::AuthStorage::create_with_oauth(
                 &agent_dir,
@@ -375,22 +358,6 @@ impl AgentSessionEngine {
                 )
             }),
             begin_login: None,
-            agent_dir: Some(agent_dir.clone()),
-            get_catalog_sources: Some(Box::new(move || {
-                // Declared local service-catalog sources (TS
-                // `settingsManager.getMcpCatalogSources()`), re-read per
-                // resolve so settings changes reach the next refresh.
-                let catalog_cwd = catalog_cwd.read().expect("engine cwd lock").clone();
-                let settings =
-                    pa_core::settings::SettingsManager::create(&catalog_cwd, &catalog_agent_dir);
-                settings
-                    .settings()
-                    .mcp_catalog_sources
-                    .clone()
-                    .unwrap_or_default()
-            })),
-            remote_source: None,
-            probe_override: None,
         });
         // The kernel's `mcp.begin_login` host request: the worker runs the
         // OAuth login (browser + local callback) and persists the
@@ -467,29 +434,6 @@ impl AgentSessionEngine {
         self.cwd.read().expect("engine cwd lock").clone()
     }
 
-    /// Expand a `/skill:<name>` submission for the accepted-turn user row
-    /// (TS `_normalizeSubmission` persists the expanded text as the user
-    /// message): build the core session when needed (it loads the skill
-    /// inventory), then expand against it. Non-skill inputs and build
-    /// failures pass the text through unchanged — the turn then surfaces
-    /// the failure it would have surfaced anyway.
-    pub(crate) fn expand_skill_submission(&self, text: &str) -> String {
-        let Ok(model) = self.resolve_model() else {
-            return text.to_string();
-        };
-        if let Err(error) = self.ensure_core_session(&model) {
-            eprintln!("skill submission expansion skipped: session build failed: {error:#}");
-            return text.to_string();
-        }
-        self.runtime.block_on(async {
-            let guard = self.session.lock().await;
-            match guard.as_deref() {
-                Some(engine) => engine.expand_skill_submission(text),
-                None => text.to_string(),
-            }
-        })
-    }
-
     /// The async build of the core session (the same funnel as
     /// `ensure_core_session`, awaited on the caller's runtime instead of
     /// parked on the engine's own): read seams (`get_system_prompt`)
@@ -505,7 +449,7 @@ impl AgentSessionEngine {
         }
         let built = self.build_session(model).await?;
         self.adopt_built_session(&built).await?;
-        self.session.lock().await.replace(Arc::new(built));
+        self.session.lock().await.replace(built);
         Ok(())
     }
 
@@ -657,7 +601,7 @@ impl AgentSessionEngine {
     /// exit — so the kernel process never outlives the session that owns it.
     pub async fn dispose_kernel(&self) {
         let guard = self.session.lock().await;
-        if let Some(engine) = guard.as_deref() {
+        if let Some(engine) = guard.as_ref() {
             engine.dispose_kernel().await;
         }
     }
@@ -686,18 +630,13 @@ impl AgentSessionEngine {
             global_harness_dir: self.config.agent_dir.clone(),
             autonomous: &mut autonomous,
         };
-        // The lock covers the clone only (see `run_turn_once`): a
-        // session command can run a summarizer model call (`/compact`),
-        // so holding the mutex across the execution serialized every
-        // client read seam behind it.
-        let core = self
-            .session
-            .blocking_lock()
-            .clone()
+        let guard = self.session.blocking_lock();
+        let core = guard
+            .as_ref()
             .expect("session built by ensure_core_session");
         Ok(self
             .runtime
-            .block_on(async { execute_session_command(&core, &mut params, command).await }))
+            .block_on(async { execute_session_command(core, &mut params, command).await }))
     }
 
     /// The current explicit selection (create-config flags merged over the
@@ -981,10 +920,6 @@ impl AgentSessionEngine {
             // purge, so the session engine's surfaces withdraw queued
             // minted continuations.
             queued_goal_context_purge,
-            // TS `_steeringStopPending`: the worker's steering lane owns
-            // the stop hooks (a queued steer cuts the run at the next
-            // turn boundary; the runner delivers it as the next turn).
-            queued_steering_probe: self.config.queued_steering_probe.clone(),
             // The worker's shared scheduled-jobs store with the session
             // identity the kernel binding needs: the live active session
             // id the supervisor routes commands by, and the durable session
@@ -1326,7 +1261,7 @@ impl SessionEngine for AgentSessionEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let session = self.session.lock().await;
-            let Some(engine) = session.as_deref() else {
+            let Some(engine) = session.as_ref() else {
                 return;
             };
             let Some(telemetry) = &engine.telemetry else {
@@ -1357,7 +1292,7 @@ impl SessionEngine for AgentSessionEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let session = self.session.lock().await;
-            let Some(engine) = session.as_deref() else {
+            let Some(engine) = session.as_ref() else {
                 return;
             };
             let Some(telemetry) = &engine.telemetry else {
@@ -1458,7 +1393,7 @@ impl SessionEngine for AgentSessionEngine {
             });
         }
         let session = self.session.blocking_lock();
-        if let Some(core) = session.as_deref() {
+        if let Some(core) = session.as_ref() {
             let provider = model.provider.clone();
             let model_id = model.id.clone();
             let _ = self
@@ -1488,7 +1423,7 @@ impl SessionEngine for AgentSessionEngine {
         // agent follows it on the next turn.
         let effective = self.effective_thinking();
         let session = self.session.blocking_lock();
-        if let Some(core) = session.as_deref() {
+        if let Some(core) = session.as_ref() {
             let _ = self.runtime.block_on(
                 core.session
                     .set_thinking_level(map_thinking_level(effective)),
@@ -1507,7 +1442,7 @@ impl SessionEngine for AgentSessionEngine {
     /// unbuilt or busy session omits the section.
     fn export_system_prompt(&self) -> Option<String> {
         let session = self.session.try_lock().ok()?;
-        session.as_deref().map(|core| core.system_prompt.clone())
+        session.as_ref().map(|core| core.system_prompt.clone())
     }
 
     /// The built session's live tool registry mapped to the export's tools
@@ -1521,7 +1456,7 @@ impl SessionEngine for AgentSessionEngine {
             let model = self.resolve_model().ok()?;
             self.ensure_core_session_async(&model).await.ok()?;
             let session = self.session.try_lock().ok()?;
-            let state = session.as_deref()?.session.agent().state().await;
+            let state = session.as_ref()?.session.agent().state().await;
             Some(pa_core::export_html::tools_section(&state.tools))
         })
     }
@@ -1538,7 +1473,7 @@ impl SessionEngine for AgentSessionEngine {
             let model = self.resolve_model().ok()?;
             self.ensure_core_session_async(&model).await.ok()?;
             let session = self.session.try_lock().ok()?;
-            let state = session.as_deref()?.session.agent().state().await;
+            let state = session.as_ref()?.session.agent().state().await;
             let renderer = crate::session_export::ExportToolRenderer {
                 tools: &state.tools,
             };
@@ -1597,12 +1532,8 @@ impl SessionEngine for AgentSessionEngine {
         let custom_instructions = request.custom_instructions.clone();
         let api_key = self.config.api_key.clone();
         let run = async {
-            // The lock covers the clone only (see `run_turn_once`): the
-            // compaction below runs a summarizer model call, and holding
-            // the mutex across it serialized every client read seam
-            // behind the compaction.
-            let session = self.session.lock().await.clone();
-            let Some(engine) = session else {
+            let guard = self.session.lock().await;
+            let Some(engine) = guard.as_ref() else {
                 anyhow::bail!("session not built");
             };
             engine
@@ -1647,9 +1578,8 @@ impl SessionEngine for AgentSessionEngine {
                 // manual wire run counts like the `/compact` command).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(telemetry) = guard
-                        .as_deref()
-                        .and_then(|engine| engine.telemetry.as_ref())
+                    if let Some(telemetry) =
+                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
                     {
                         telemetry.note_compaction();
                     }
@@ -1782,7 +1712,7 @@ impl SessionEngine for AgentSessionEngine {
         }
         self.runtime.block_on(async move {
             let guard = self.session.lock().await;
-            let Some(engine) = guard.as_deref() else {
+            let Some(engine) = guard.as_ref() else {
                 return Ok(());
             };
             // TS `_invalidatePendingAutoRefineForBranchChange`: the moved
@@ -2015,7 +1945,7 @@ impl SessionEngine for AgentSessionEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
         Box::pin(async move {
             let guard = self.session.lock().await;
-            let Some(engine) = guard.as_deref() else {
+            let Some(engine) = guard.as_ref() else {
                 return Vec::new();
             };
             // TS `createAgentConnectionCommands` order: extension
@@ -2073,7 +2003,7 @@ impl SessionEngine for AgentSessionEngine {
         Box::pin(async move {
             let session_id = {
                 let guard = self.session.lock().await;
-                match guard.as_deref() {
+                match guard.as_ref() {
                     Some(engine) => engine.session.session_id().await,
                     None => {
                         // The session builds lazily (first prompt); the
@@ -2085,7 +2015,7 @@ impl SessionEngine for AgentSessionEngine {
                 }
             };
             let guard = self.session.lock().await;
-            let Some(engine) = guard.as_deref() else {
+            let Some(engine) = guard.as_ref() else {
                 return crate::engine::empty_resource_snapshot();
             };
             let cwd = self.cwd().display().to_string();
@@ -2175,7 +2105,7 @@ impl SessionEngine for AgentSessionEngine {
             let model = self.resolve_model()?;
             self.ensure_core_session_async(&model).await?;
             let guard = self.session.lock().await;
-            let engine = guard.as_deref().expect("session built above");
+            let engine = guard.as_ref().expect("session built above");
             Ok(engine.system_prompt.clone())
         })
     }
@@ -2187,7 +2117,7 @@ impl SessionEngine for AgentSessionEngine {
         let name = name.to_string();
         Box::pin(async move {
             let guard = self.session.lock().await;
-            let engine = guard.as_deref()?;
+            let engine = guard.as_ref()?;
             let state = engine.session.agent().state().await;
             let tool = state.tools.iter().find(|tool| tool.name() == name)?;
             Some(json!({
@@ -2207,13 +2137,9 @@ impl SessionEngine for AgentSessionEngine {
         self.ensure_core_session(&model)?;
         let api_key = self.resolve_request_api_key(&model);
         let global_harness_dir = self.config.agent_dir.clone();
-        // The lock covers the clone only (see `run_turn_once`): the
-        // refinement below runs a model call, and holding the mutex
-        // across it serialized every client read seam behind it.
-        let core = self
-            .session
-            .blocking_lock()
-            .clone()
+        let guard = self.session.blocking_lock();
+        let core = guard
+            .as_ref()
             .expect("session built by ensure_core_session");
         let result = self.runtime.block_on(async {
             core.session
@@ -2301,7 +2227,7 @@ impl SessionEngine for AgentSessionEngine {
     fn run_prompt(
         &self,
         _prompt_index: usize,
-        mut request: PromptRequest,
+        request: PromptRequest,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
@@ -2309,16 +2235,6 @@ impl SessionEngine for AgentSessionEngine {
         // happen (kernel host requests and session-command mutations), so
         // every emit of this prompt runs through the tracking wrapper.
         let mut emit = self.goal_tracking_emit(emit);
-        // The accepted-turn row carries the skill-expanded text (TS
-        // `_normalizeSubmission` persists the expanded submission as the
-        // user message): a `/skill:<name>` command expands against the
-        // session's skill inventory before the row persists and
-        // broadcasts, so the transcript renders the skill card instead
-        // of the raw command. Everything else skips the expansion (and
-        // its on-demand session build) entirely.
-        if request.message.starts_with("/skill:") {
-            request.message = self.expand_skill_submission(&request.message);
-        }
         // Session commands (compact/refine/goal/autonomous) never admit a
         // model turn and never record a user-message row: the durable echo
         // row replaces it. Execute before admission so the idle-wait loop
@@ -2534,7 +2450,7 @@ impl AgentSessionEngine {
         // retries increment `retry_count`, provider switches `failover_count`.
         let telemetry = {
             let guard = self.session.blocking_lock();
-            guard.as_deref().and_then(|engine| engine.telemetry.clone())
+            guard.as_ref().and_then(|engine| engine.telemetry.clone())
         };
         let primary_state: std::cell::RefCell<
             Option<(
@@ -2756,7 +2672,7 @@ impl AgentSessionEngine {
     /// abort arm clears both the compaction and the refine request).
     fn drop_turn_boundary_requests(&self) {
         let guard = self.session.blocking_lock();
-        if let Some(engine) = guard.as_deref() {
+        if let Some(engine) = guard.as_ref() {
             self.runtime.block_on(engine.turn_boundary.clear_pending());
         }
     }
@@ -2773,7 +2689,7 @@ impl AgentSessionEngine {
         // Fast path: nothing scheduled (the common turn).
         let has_pending = {
             let guard = self.session.blocking_lock();
-            match guard.as_deref() {
+            match guard.as_ref() {
                 Some(engine) => self.runtime.block_on(async {
                     engine.turn_boundary.compaction_scheduled().await
                         || engine.turn_boundary.refine_pending().await
@@ -2798,7 +2714,7 @@ impl AgentSessionEngine {
         // context...` loader swap), carrying the pending instructions.
         let scheduled = {
             let guard = self.session.blocking_lock();
-            match guard.as_deref() {
+            match guard.as_ref() {
                 Some(engine) => self
                     .runtime
                     .block_on(async { engine.turn_boundary.scheduled_compaction().await }),
@@ -2828,7 +2744,7 @@ impl AgentSessionEngine {
         }
         let consumption = {
             let guard = self.session.blocking_lock();
-            let Some(engine) = guard.as_deref() else {
+            let Some(engine) = guard.as_ref() else {
                 self.clear_auto_compaction_abort(&controller);
                 return BoundaryRun::Proceed;
             };
@@ -2864,9 +2780,8 @@ impl AgentSessionEngine {
                 // every completed compaction into the active run).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(telemetry) = guard
-                        .as_deref()
-                        .and_then(|engine| engine.telemetry.as_ref())
+                    if let Some(telemetry) =
+                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
                     {
                         telemetry.note_compaction();
                     }
@@ -3178,7 +3093,7 @@ impl AgentSessionEngine {
             }
         }
         let guard = self.session.blocking_lock();
-        let engine = guard.as_deref().expect("session built");
+        let engine = guard.as_ref().expect("session built");
         Ok(std::sync::Arc::clone(engine.session.agent()))
     }
 
@@ -3510,16 +3425,8 @@ impl AgentSessionEngine {
         let prompt = prompt.clone();
         let mut admitted = std::pin::pin!(async {
             if first_attempt {
-                // The session lock covers the clone only: the turn below
-                // runs for the whole provider stream, and holding the
-                // mutex across it serialized every client read seam
-                // (`get_system_prompt` and its family waited for the turn
-                // to settle and hit the client's 10s bound — the
-                // 2026-09-22 dogfood failure). The Arc clone keeps the
-                // turn on the same built session while the mutex stays
-                // free for reads (the TS event loop interleaves both).
-                let session = self.session.lock().await.clone();
-                let engine = session.expect("session built");
+                let guard = self.session.lock().await;
+                let engine = guard.as_ref().expect("session built");
                 match &prompt {
                     // A plain turn admits a user prompt (text plus
                     // images); an injected turn admits the custom row
@@ -3830,7 +3737,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         // The explicit selection from the session's create config is
@@ -3868,7 +3774,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap()
     }
@@ -3906,7 +3811,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         (engine, dir)
@@ -4009,7 +3913,6 @@ pub(crate) mod tests {
                 supervisor_link: None,
                 telemetry_disabled: None,
                 cron_store: None,
-                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -4151,7 +4054,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         // The recovery turn builds the session; the build adopts the
@@ -4318,7 +4220,6 @@ pub(crate) mod tests {
                 supervisor_link: None,
                 telemetry_disabled: None,
                 cron_store: None,
-                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -4602,7 +4503,6 @@ pub(crate) mod tests {
                 }),
                 telemetry_disabled: None,
                 cron_store: None,
-                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -4676,7 +4576,7 @@ pub(crate) mod tests {
     /// The engine session's entries as their persisted wire shapes.
     fn engine_session_entries(engine: &AgentSessionEngine) -> Vec<pa_types::session::FileEntry> {
         let guard = engine.session.blocking_lock();
-        let core = guard.as_deref().expect("session built");
+        let core = guard.as_ref().expect("session built");
         let persistence = core.session.shared_persistence();
         engine
             .runtime
@@ -5104,7 +5004,7 @@ pub(crate) mod tests {
         );
         {
             let guard = engine.session.blocking_lock();
-            let core = guard.as_deref().expect("session built");
+            let core = guard.as_ref().expect("session built");
             engine
                 .runtime
                 .block_on(async { core.turn_boundary.schedule_compaction(None).await });
@@ -5253,7 +5153,7 @@ pub(crate) mod tests {
     /// The engine session's durable entry chain carries the outcome row.
     pub(crate) fn outcome_row_in_entries(engine: &AgentSessionEngine) -> bool {
         let guard = engine.session.blocking_lock();
-        let Some(core) = guard.as_deref() else {
+        let Some(core) = guard.as_ref() else {
             return false;
         };
         let persistence = core.session.shared_persistence();
@@ -5271,7 +5171,7 @@ pub(crate) mod tests {
     /// the provider request.
     pub(crate) fn outcome_row_in_live_context(engine: &AgentSessionEngine) -> bool {
         let guard = engine.session.blocking_lock();
-        let Some(core) = guard.as_deref() else {
+        let Some(core) = guard.as_ref() else {
             return false;
         };
         engine.runtime.block_on(async {
@@ -5344,7 +5244,7 @@ pub(crate) mod tests {
         assert!(outcome_row_in_entries(&engine));
         assert!(outcome_row_in_live_context(&engine));
         let guard = engine.session.blocking_lock();
-        let core = guard.as_deref().expect("session built");
+        let core = guard.as_ref().expect("session built");
         let persistence = core.session.shared_persistence();
         let has_compaction_entry = engine.runtime.block_on(async {
             persistence
@@ -5385,7 +5285,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5394,7 +5293,7 @@ pub(crate) mod tests {
         // the boundary consumes it after the next turn settles.
         {
             let guard = engine.session.blocking_lock();
-            let core = guard.as_deref().expect("session built");
+            let core = guard.as_ref().expect("session built");
             engine
                 .runtime
                 .block_on(async { core.turn_boundary.schedule_compaction(None).await });
@@ -5420,7 +5319,7 @@ pub(crate) mod tests {
     /// entry (an aborted run must never commit one).
     pub(crate) fn compaction_entry_in_entries(engine: &AgentSessionEngine) -> bool {
         let guard = engine.session.blocking_lock();
-        let Some(core) = guard.as_deref() else {
+        let Some(core) = guard.as_ref() else {
             return false;
         };
         let persistence = core.session.shared_persistence();
@@ -5651,7 +5550,7 @@ pub(crate) mod tests {
         // the boundary consumes it after the next turn settles.
         {
             let guard = engine.session.blocking_lock();
-            let core = guard.as_deref().expect("session built");
+            let core = guard.as_ref().expect("session built");
             engine
                 .runtime
                 .block_on(async { core.turn_boundary.schedule_compaction(None).await });
@@ -5699,7 +5598,7 @@ pub(crate) mod tests {
         // run).
         {
             let guard = engine.session.blocking_lock();
-            let core = guard.as_deref().expect("session built");
+            let core = guard.as_ref().expect("session built");
             assert!(!engine
                 .runtime
                 .block_on(async { core.turn_boundary.compaction_scheduled().await }));
@@ -5736,7 +5635,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5828,7 +5726,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         let model = engine.resolve_registry_model().expect("resolved model");
@@ -5854,7 +5751,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         // A create config with only a model keeps the provider and key.
@@ -5910,7 +5806,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5980,7 +5875,6 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap();
         // Without an explicit flag the TS default applies (medium, clamped).
@@ -6046,7 +5940,6 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
-        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6327,7 +6220,6 @@ fn retried_run_restarts_with_its_own_agent_frames() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
-        queued_steering_probe: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();
@@ -6444,7 +6336,6 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
-        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6558,193 +6449,6 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
     assert_eq!(after["continuationsUsed"], before["continuationsUsed"]);
 }
 
-/// Scoped process-env overrides for the live-kernel tests: applied on
-/// construction, restored on drop. The live-kernel tests are serialized by
-/// the faux lock, so nothing races.
-#[cfg(test)]
-struct KernelEnvOverride {
-    saved: Vec<(String, Option<String>)>,
-}
-
-#[cfg(test)]
-impl KernelEnvOverride {
-    fn apply(pairs: Vec<(&str, Option<String>)>) -> Self {
-        let saved = pairs
-            .iter()
-            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        for (key, value) in &pairs {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-        KernelEnvOverride { saved }
-    }
-}
-
-#[cfg(test)]
-impl Drop for KernelEnvOverride {
-    fn drop(&mut self) {
-        for (key, value) in &self.saved {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
-
-/// The kernel python for the live-kernel abort test (skipped without a live
-/// install).
-#[cfg(test)]
-fn live_kernel_python() -> Option<std::path::PathBuf> {
-    let candidate = std::path::PathBuf::from(
-        std::env::var("HOME")
-            .map(|home| format!("{home}/.prime/agent/kernel-venv/bin/python"))
-            .unwrap_or_else(|_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string()),
-    );
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    eprintln!("kernel python {candidate:?} not found; skipping live kernel test");
-    None
-}
-
-#[cfg(test)]
-fn live_release_dir() -> Option<std::path::PathBuf> {
-    let releases = std::path::PathBuf::from(
-        std::env::var("HOME")
-            .map(|home| format!("{home}/.local/share/prime-agent/releases"))
-            .unwrap_or_else(|_| "/home/ubuntu/.local/share/prime-agent/releases".to_string()),
-    );
-    let Ok(entries) = std::fs::read_dir(&releases) else {
-        eprintln!("no releases dir at {releases:?}; skipping live kernel test");
-        return None;
-    };
-    let mut candidates: Vec<std::path::PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.join("prime-agent-runtime").is_dir())
-        .collect();
-    candidates.sort();
-    candidates.pop()
-}
-
-/// The abort wedge repro (dogfood P0): a turn executing a long kernel cell
-/// must unwind at `abort_in_flight_turn` (the kernel interrupt +
-/// force-abort path settles the tool race) - not keep the turn alive while
-/// the cell runs out. Red: the run thread wedged past the cell's sleep
-/// (the daemon worker's `run_turn_once` awaits the admission forever).
-#[test]
-fn abort_in_flight_turn_cancels_a_running_kernel_cell() {
-    let Some(kernel_python) = live_kernel_python() else {
-        return;
-    };
-    let Some(release) = live_release_dir() else {
-        return;
-    };
-    let _env = KernelEnvOverride::apply(vec![
-        (
-            "PRIME_AGENT_KERNEL_PYTHON",
-            Some(kernel_python.display().to_string()),
-        ),
-        ("PI_PACKAGE_DIR", Some(release.display().to_string())),
-        ("PRIME_AGENT_CODING_AGENT_DIR", None),
-        ("PRIME_API_KEY", None),
-    ]);
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let dir = tempfile::TempDir::new().unwrap();
-    let engine = AgentSessionEngine::new(AgentEngineConfig {
-        cwd: dir.path().to_path_buf(),
-        agent_dir: dir.path().join("agent"),
-        provider: None,
-        model: None,
-        api_key: None,
-        thinking: None,
-        session_dir: None,
-        session_file: None,
-        faux_script: Some(
-            json!({
-                "engine": "faux",
-                "modelId": "faux-1",
-                "modelName": "Faux",
-                "reasoning": false,
-                "contextWindow": 128000,
-                "tokensPerSecond": 30,
-                "responses": [
-                    {"content": [
-                        {"type": "text", "text": "Running the wedge cell."},
-                        {"type": "toolCall", "name": "ipython", "id": "toolu_wedge01",
-                         "arguments": {"code":
-                            "import time\nopen('wedge-started', 'w').write('1')\ntime.sleep(300)\nopen('wedge-finished', 'w').write('1')\nprint('cell completed')"}}
-                    ]},
-                    {"content": [{"type": "text", "text": "The cell completed."}]}
-                ]
-            })
-            .to_string(),
-        ),
-        supervisor_link: None,
-        telemetry_disabled: None,
-        cron_store: None,
-        queued_steering_probe: None,
-    })
-    .unwrap();
-    let engine = std::sync::Arc::new(engine);
-    engine.register_arc();
-    let marker = dir.path().join("wedge-started");
-    let finished = dir.path().join("wedge-finished");
-    let events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let runner = {
-        let engine = std::sync::Arc::clone(&engine);
-        let events = std::sync::Arc::clone(&events);
-        std::thread::spawn(move || {
-            let events = events;
-            engine.run_prompt(
-                0,
-                PromptRequest {
-                    images: Vec::new(),
-                    message: "run the wedge cell".to_string(),
-                    source: "user".to_string(),
-                    agent_message_id: None,
-                    custom_message: None,
-                },
-                &|| false,
-                &mut move |event: EngineEvent| {
-                    events.lock().unwrap().push(event);
-                    true
-                },
-            );
-        })
-    };
-    // The cell started (bounded by the kernel boot).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    while !marker.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if !marker.exists() {
-        let events = events.lock().unwrap();
-        let wire: Vec<String> = events.iter().map(|event| format!("{event:?}")).collect();
-        panic!("the wedge cell never started; events: {wire:?}");
-    }
-    // Abort strictly mid-cell; the run must settle within the budget.
-    engine.abort_in_flight_turn();
-    let settled = runner.join();
-    match settled {
-        Ok(()) => {}
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
-    // The cell died: the finish marker never appears.
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    assert!(
-        !finished.exists(),
-        "the interrupted cell must not run to completion"
-    );
-}
-
 /// A driver loop test harness: faux script + collected events. Holds the
 /// faux lock while the engine runs.
 #[cfg(test)]
@@ -6769,7 +6473,6 @@ fn run_prompts(
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
-        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6872,7 +6575,7 @@ async fn replacement_teardown_retires_the_session_and_the_funnel_adopts_the_bran
         .expect("pending branch lock")
         .is_none());
     let session = engine.session.lock().await;
-    let built = session.as_deref().expect("rebuilt session");
+    let built = session.as_ref().expect("rebuilt session");
     let state = built.session.agent().state().await;
     let texts: Vec<String> = state
         .messages
@@ -7098,7 +6801,6 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
-        queued_steering_probe: None,
     })
     .unwrap();
     let start = std::time::Instant::now();
@@ -7378,7 +7080,6 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap(),
     );
@@ -7483,7 +7184,6 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
-            queued_steering_probe: None,
         })
         .unwrap(),
     );
@@ -7568,7 +7268,6 @@ fn agent_engine_streams_updates_and_final_message() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
-        queued_steering_probe: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();

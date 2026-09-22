@@ -42,15 +42,6 @@ session-scoped queues — a queue is selected per request by markers in the
 request's user-message text, so a parent session and a concurrently running
 spawned child each get their own scripted responses deterministically),
 `perf.py` (f10 perf rows),
-`sustained_cpu.py` (sustained-CPU regression guard, lane cpu-spin: the
-interactive TUI driven through the faux provider — a 30s idle window, a
-paced plain-text stream, a paced markdown/code stream, and a long
-tool-execution turn — with %CPU sampled per process from /proc and
-ASSERTED: idle <5% and streaming <30% of one core, keystroke-to-render
-mid-stream <50ms, the paused viewport stable mid-stream, and a double
-Ctrl+C mid-scroll terminating the process (bug #6's no-escape invariant).
-`perf_wave.py` exposes it as the `sustained_cpu` dimension and
-`perf_gate.py` tracks its medians against the baseline),
 `framediff_first_run.py` (first-run frame diff),
 `streaming_render.py` (live token-stream rendering verifier: pane captures
 must grow progressively mid-turn over a paced faux provider, TS vs Rust

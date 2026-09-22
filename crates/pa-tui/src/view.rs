@@ -5,11 +5,12 @@
 //! owns row geometry and scroll behavior only.
 
 use crate::chat::{
-    render_assistant, render_text_rows, render_user_block, ChatEntry, CompactionState, Detail,
-    WorkingState,
+    render_assistant, render_loader, render_text_rows, render_user_block, ChatEntry,
+    CompactionState, Detail, WorkingState,
 };
 use crate::chrome::{
-    conversation_detail_status, render_prompt_context, render_top_bar, render_tray, ChromeState,
+    conversation_detail_status, render_prompt_context, render_splash, render_top_bar, render_tray,
+    ChromeState,
 };
 use crate::editor::Editor;
 use crate::prompt_highlight::{
@@ -21,10 +22,6 @@ use crate::width::str_width;
 use crate::{Line, Span};
 use pa_types::slash_commands::SlashCommandRegistry;
 use ratatui::style::{Modifier, Style};
-
-mod layout;
-
-use layout::{EntryLayout, TranscriptWindow};
 
 /// Minimum transcript rows when the dock would crowd them out
 /// (TS `FULLSCREEN_MIN_TRANSCRIPT_ROWS`).
@@ -165,26 +162,13 @@ pub struct AgentView {
     /// Plain text of the last frame's rows: OSC zone-marker emission only
     /// re-emits rows whose content changed (mirroring the TS renderer,
     /// which writes a row's marker sequences when it rewrites that row).
-    osc_last_rows: std::collections::HashMap<usize, String>,
+    osc_last_rows: Vec<String>,
     /// Rendered rows per chat entry (incremental layout): a frame re-renders
-    /// only entries invalidated since the last frame; settled entries keep
+    /// only entries invalidated since the last frame; settled entries clone
     /// their cached rows instead of re-running markdown and code previews.
     /// A transcript-scale frame pays full layout cost once per entry, not
-    /// once per draw. Each slot also stores the spacing decision its rows
-    /// were laid out under (TS keeps every component's rendered lines
-    /// resident and recomputes only the dynamic conversation-spacing
-    /// decision per frame): a settled entry survives a live stream — the
-    /// pre-fix render loop re-rendered every agent message in the
-    /// transcript on every streaming delta, the dogfood CPU spin.
-    entry_layout: Vec<Option<EntryLayout>>,
-    /// Per-assistant-entry markdown block caches (TS `Markdown.blockCache`,
-    /// one per component instance): a streaming message re-renders every
-    /// frame, so its settled blocks replay from the cache instead of
-    /// re-running inline styling and wrapping (only the growing final block
-    /// renders fresh). `RefCell` because the layout pass borrows the chat
-    /// immutably while rendering. Cleared wherever `entry_layout` is.
-    md_caches:
-        std::cell::RefCell<std::collections::HashMap<usize, crate::markdown::MarkdownBlockCache>>,
+    /// once per draw.
+    entry_layout: Vec<Option<Vec<Line>>>,
     /// The width the cached rows were laid out for.
     layout_width: usize,
     /// The conversation-detail mode the cached rows were laid out for.
@@ -241,9 +225,8 @@ impl AgentView {
             terminal_rows: 24,
             dock_cursor: None,
             window_rows: 0,
-            osc_last_rows: std::collections::HashMap::new(),
+            osc_last_rows: Vec::new(),
             entry_layout: Vec::new(),
-            md_caches: std::cell::RefCell::new(std::collections::HashMap::new()),
             layout_width: 0,
             layout_detail: Detail::Overview,
             flushed_frame: Vec::new(),
@@ -260,30 +243,26 @@ impl AgentView {
         &mut self,
         frame: &[Line],
     ) -> Vec<(usize, crate::osc133::RowMarkers)> {
-        // Only candidate rows build their text: the zone markers ride on a
-        // handful of boundary rows, so joining the whole frame costs
-        // O(transcript) per render for a comparison only marked rows need.
-        // The stored text carries the zero-width marker sequences, so a
-        // row gaining or keeping its marker is a changed row exactly like
-        // the TS renderer's per-row writes.
-        let mut plan = Vec::new();
-        let mut last_rows = std::collections::HashMap::new();
-        for (row, line) in frame.iter().enumerate() {
-            let markers = crate::osc133::row_markers(line);
-            if !markers.start && !markers.end {
-                continue;
-            }
-            let text: String = line.iter().map(|s| s.content.as_str()).collect();
-            let changed = self
-                .osc_last_rows
-                .get(&row)
-                .is_none_or(|prev| prev != &text);
-            if changed {
-                plan.push((row, markers));
-            }
-            last_rows.insert(row, text);
-        }
-        self.osc_last_rows = last_rows;
+        let rows: Vec<String> = frame
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        let plan = frame
+            .iter()
+            .enumerate()
+            .filter_map(|(row, line)| {
+                let markers = crate::osc133::row_markers(line);
+                if !markers.start && !markers.end {
+                    return None;
+                }
+                let changed = self
+                    .osc_last_rows
+                    .get(row)
+                    .is_none_or(|prev| prev != &rows[row]);
+                changed.then_some((row, markers))
+            })
+            .collect();
+        self.osc_last_rows = rows;
         plan
     }
 
@@ -403,30 +382,14 @@ impl AgentView {
     pub fn clear_chat(&mut self) {
         self.chat.clear();
         self.entry_layout.clear();
-        self.md_caches.borrow_mut().clear();
     }
 
     /// Mark one chat entry's cached rows stale: a mutation changed its
     /// content (streamed blocks, tool-card state, an attached error row),
-    /// so the next frame lays it out again. A mutated entry can also
-    /// change the conversation-leading decision of every LATER
-    /// spacing-driven row (the look-back scans cross it), so those cached
-    /// layouts go stale too — the sweep walks the suffix after the
-    /// mutation point, which is the animating tail in the streaming case,
-    /// not the whole transcript.
+    /// so the next frame lays it out again.
     pub fn mark_entry_stale(&mut self, index: usize) {
         if let Some(slot) = self.entry_layout.get_mut(index) {
             *slot = None;
-        }
-        for (offset, entry) in self.chat.iter().enumerate().skip(index + 1) {
-            if matches!(
-                entry,
-                ChatEntry::AgentMessage(_) | ChatEntry::ShellCompletion(_) | ChatEntry::Tool(_)
-            ) {
-                if let Some(slot) = self.entry_layout.get_mut(offset) {
-                    *slot = None;
-                }
-            }
         }
     }
 
@@ -497,6 +460,38 @@ impl AgentView {
             following: self.following,
             lines_above: self.scroll_top,
             lines_below: self.last_max_scroll.saturating_sub(self.scroll_top),
+        }
+    }
+
+    /// Whether one chat entry's rows are stable: content that later frames
+    /// cannot change (nothing mutates status/user/slash rows once pushed;
+    /// an assistant message stops changing when its stream settles; a tool
+    /// card stops animating once it holds a final result).
+    fn entry_cacheable(&self, entry: &ChatEntry) -> bool {
+        match entry {
+            ChatEntry::Status { .. } | ChatEntry::User { .. } => true,
+            ChatEntry::SlashCommand { .. } | ChatEntry::SlashCommandResult { .. } => true,
+            ChatEntry::CompactionSummary { .. } => true,
+            // Spacing-driven rows (agent messages, shell completions) lean
+            // on the conversation-spacing scan over PRECEDING entries: a
+            // streaming assistant's spacing contribution changes when its
+            // stream settles, so they render fresh until every assistant
+            // message in the transcript has settled (TS computes the
+            // leading blank dynamically on every render).
+            ChatEntry::AgentMessage(_) | ChatEntry::ShellCompletion(_) => !self
+                .chat
+                .iter()
+                .any(|entry| matches!(entry, ChatEntry::Assistant(m) if m.streaming)),
+            ChatEntry::InjectedPrompt(_) | ChatEntry::RefinementOutcome(_) => true,
+            ChatEntry::CustomPanel(_) => true,
+            ChatEntry::ClientMarkdown { .. }
+            | ChatEntry::ClientText { .. }
+            | ChatEntry::ChangelogPanel { .. } => true,
+            ChatEntry::Assistant(message) => !message.streaming,
+            ChatEntry::Tool(card) => !matches!(
+                crate::tool_card::panel_status(card),
+                crate::tool_card::PanelStatus::Queued | crate::tool_card::PanelStatus::Running
+            ),
         }
     }
 
@@ -601,13 +596,7 @@ impl AgentView {
             }
             ChatEntry::User { text } => {
                 let mut rows = Vec::new();
-                // TS `addMessageToChat` separates a user submission from
-                // the components above it with `Spacer(1)` — EXCEPT the
-                // skill invocation's own argument text, which joins the
-                // card below it without a spacer.
-                let follows_skill_card =
-                    index > 0 && matches!(self.chat[index - 1], ChatEntry::SkillInvocation(_));
-                if !first && !follows_skill_card {
+                if !first {
                     rows.push(Vec::new());
                 }
                 rows.extend(render_user_block(
@@ -663,22 +652,14 @@ impl AgentView {
                 ));
                 rows
             }
-            ChatEntry::Assistant(message) => {
-                // The per-entry block cache (TS's per-component
-                // `blockCache`): settled blocks of the streaming message
-                // replay instead of re-rendering on every frame.
-                let mut caches = self.md_caches.borrow_mut();
-                let cache = caches.entry(index).or_default();
-                render_assistant(
-                    message,
-                    self.detail,
-                    &self.theme,
-                    &self.code_block_indent,
-                    width,
-                    preceded_by_tool_activity,
-                    cache,
-                )
-            }
+            ChatEntry::Assistant(message) => render_assistant(
+                message,
+                self.detail,
+                &self.theme,
+                &self.code_block_indent,
+                width,
+                preceded_by_tool_activity,
+            ),
             ChatEntry::Tool(card) => {
                 // TS `ToolExecutionComponent`: the leading spacer rides on
                 // `createConversationSpacing(...).shouldAddLeadingSpace`
@@ -705,21 +686,8 @@ impl AgentView {
                 width,
                 self.conversation_leading(index, self.detail.tool_output_expanded()),
             ),
-            // TS `addMessageToChat`'s user case: `Spacer(1)` when the chat
-            // is non-empty, then the card (the conversation-spacing scan the
-            // agent-message rows use does not apply — the TS user case is
-            // the plain children-count check).
-            ChatEntry::SkillInvocation(row) => {
-                crate::custom_message::skill_invocation::render_skill_invocation(
-                    row,
-                    self.detail,
-                    &self.theme,
-                    width,
-                    !first,
-                )
-            }
             ChatEntry::InjectedPrompt(row) => {
-                crate::custom_message::injected_prompt::render_injected_prompt(
+                crate::custom_message::render::render_injected_prompt(
                     row,
                     self.detail,
                     &self.theme,
@@ -756,12 +724,7 @@ impl AgentView {
                 rows.push(Vec::new());
                 let mut md = crate::markdown::MarkdownStyle::from_theme(&self.theme);
                 md.code_block_indent = self.code_block_indent.clone();
-                rows.extend(crate::chat::render_markdown_block(
-                    text,
-                    &md,
-                    width,
-                    &mut crate::markdown::MarkdownBlockCache::default(),
-                ));
+                rows.extend(crate::chat::render_markdown_block(text, &md, width));
                 rows.push(Vec::new());
                 rows
             }
@@ -783,12 +746,97 @@ impl AgentView {
     }
 
     /// Render the scrollable transcript: splash rows, chat component rows,
-    /// and the working loader when a turn is active (the full compose —
-    /// the inline frame and the headless verifiers; the fullscreen frame
-    /// composes only its scroll window through the layout pass).
+    /// and the working loader when a turn is active.
     pub fn render_transcript(&mut self, width: usize) -> Vec<Line> {
-        let layout = self.layout_pass(width);
-        self.transcript_window(&layout, 0, usize::MAX)
+        if let (Some(working), Some(since)) = (&mut self.working, self.working_since) {
+            working.elapsed_secs = since.elapsed().as_secs();
+        }
+        // A width or detail change re-flows every row: drop the whole
+        // layout cache (the flags below gate every entry's stored rows).
+        if self.layout_width != width || self.layout_detail != self.detail {
+            self.layout_width = width;
+            self.layout_detail = self.detail;
+            self.entry_layout.iter_mut().for_each(|slot| *slot = None);
+        }
+        self.entry_layout.resize(self.chat.len(), None);
+        let mut lines: Vec<Line> = render_splash(&self.chrome, &self.theme, width);
+        let mut first = true;
+        let mut preceded_by_tool_activity = false;
+        for (index, entry) in self.chat.iter().enumerate() {
+            // Incremental layout: settled entries re-use their stored
+            // rows; anything still animating (streaming messages, queued
+            // or running tool cards) renders fresh and stores nothing.
+            let rows = match self.entry_layout[index]
+                .as_ref()
+                .filter(|_| self.entry_cacheable(entry))
+            {
+                Some(rows) => rows.clone(),
+                None => {
+                    let rows =
+                        self.render_entry(index, entry, width, first, preceded_by_tool_activity);
+                    if self.entry_cacheable(entry) {
+                        self.entry_layout[index] = Some(rows.clone());
+                    }
+                    rows
+                }
+            };
+            lines.extend(rows);
+            preceded_by_tool_activity = matches!(entry, ChatEntry::Tool(_));
+            first = false;
+        }
+        // The `?` quick-shortcut guide renders right below the chat rows
+        // (TS mounts `shortcutGuideContainer` between the chat and the
+        // status area, inside the scrollable main view): `Spacer(1)` then
+        // `new Markdown(guide, 1, 1)` — one blank, the markdown paddingY
+        // blank, the content, and the closing paddingY blank.
+        if let Some(guide) = &self.shortcut_guide {
+            lines.push(Vec::new());
+            lines.push(Vec::new());
+            let mut md = crate::markdown::MarkdownStyle::from_theme(&self.theme);
+            md.code_block_indent = self.code_block_indent.clone();
+            lines.extend(crate::chat::render_markdown_block(guide, &md, width));
+            lines.push(Vec::new());
+        }
+        // While the provider retry loop waits, its countdown loader owns
+        // the status area (TS `stopWorkingLoader` + `retryLoader`); a
+        // compaction run owns it next (TS `startCompactionLoader`); the
+        // working loader renders only when neither is active.
+        if let Some(retry) = &self.retry {
+            lines.extend(crate::chat::render_retry(
+                retry,
+                self.pulse_frame,
+                &self.theme,
+                width,
+            ));
+        } else if let Some(compaction) = &self.compaction {
+            let cancel_hint = self
+                .editor
+                .keybindings()
+                .first_key("app.clear")
+                .map(|key| crate::keybindings::format_key_text(&key))
+                .unwrap_or_else(|| "Ctrl+C".to_string());
+            lines.extend(crate::compaction_row::render_compaction_loader(
+                compaction,
+                self.pulse_frame,
+                &cancel_hint,
+                &self.theme,
+                width,
+            ));
+        } else if let Some(working) = &self.working {
+            lines.extend(render_loader(working, self.pulse_frame, &self.theme, width));
+        }
+        // The side-question pane (TS `sideQuestionContainer`): a scroll-area
+        // component under the status area, not a dock row — it hugs the
+        // transcript tail, so the frame's slack (a short transcript against
+        // a bottom-pinned dock) lands between the pane and the editor like
+        // TS, never inside the pane. TS mounts the pane behind a `Spacer(1)`
+        // (`sideQuestionContainer.addChild(new Spacer(1))`), so one blank
+        // row precedes the component's own leading blank.
+        if let Some(pane) = &self.side_pane {
+            lines.push(Vec::new());
+            lines.extend(pane.render(&self.theme, width));
+        }
+        lines
     }
 
     /// Render the dock: prompt-context row(s), the autocomplete overlay
@@ -1104,6 +1152,7 @@ impl AgentView {
             .fullscreen
             .then(|| render_top_bar(&self.chrome, &self.theme, width));
         let top_rows = usize::from(top.is_some());
+        let transcript = self.render_transcript(width);
         let dock = selector_dock.unwrap_or_else(|| self.render_dock(width));
         let dock_height = dock
             .len()
@@ -1116,19 +1165,7 @@ impl AgentView {
         let window_height = height
             .saturating_sub(top_rows + dock.len())
             .max(FULLSCREEN_MIN_TRANSCRIPT_ROWS.min(height.saturating_sub(top_rows + dock.len())));
-        // The transcript layout: the frame composes only its scroll window
-        // (the layout pass counts rows, then the window slice clones
-        // `window_height` rows from the cached layouts — a long settled
-        // transcript costs nothing per frame, the layout-cost cut the
-        // dogfood spin needed); a live transcript selection keeps the
-        // whole compose so the copy buffer's text stays fresh.
-        let transcript: TranscriptWindow = if self.transcript_selection_active() {
-            TranscriptWindow::Full(self.render_transcript(width))
-        } else {
-            TranscriptWindow::Window(self.layout_pass(width))
-        };
-        let transcript_len = transcript.len();
-        let max_scroll = transcript_len.saturating_sub(window_height);
+        let max_scroll = transcript.len().saturating_sub(window_height);
         if self.following {
             self.scroll_top = max_scroll;
         } else {
@@ -1141,16 +1178,11 @@ impl AgentView {
         if let Some(top) = top {
             frame.push(pad_row(top, width));
         }
-        let window_rows: Vec<Line> = match transcript {
-            TranscriptWindow::Full(rows) => {
-                self.note_transcript_text(&rows);
-                rows[start..(start + window_height).min(rows.len())].to_vec()
-            }
-            TranscriptWindow::Window(layout) => {
-                self.transcript_window(&layout, start, window_height)
-            }
-        };
-        for (window_index, line) in window_rows.iter().enumerate() {
+        self.note_transcript_text(&transcript);
+        for (window_index, line) in transcript[start..(start + window_height).min(transcript.len())]
+            .iter()
+            .enumerate()
+        {
             let row = self.highlight_transcript_row(line, start + window_index);
             frame.push(pad_row(row, width));
         }
@@ -1190,11 +1222,8 @@ impl AgentView {
         let mut rows: Vec<Line> = Vec::with_capacity(7);
         rows.push(vec![Span::styled("─".repeat(width.max(1)), border)]);
         let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
-        // TS `BorderedLoader` wraps a `Loader` with the muted spinner and
-        // muted message color fns; the gap between them is the unstyled
-        // plain space (the `Loader` pen reset — see `chat::render_loader`).
-        row.push(Span::styled(spinner.to_string(), muted));
-        row.push(Span::raw(" ".to_string()));
+        row.push(Span::styled(spinner.to_string(), dim));
+        row.push(Span::styled(" ".to_string(), muted));
         row.push(Span::styled(loader.message.clone(), muted));
         rows.push(row);
         rows.push(vec![Span::raw(String::new())]);
@@ -1386,18 +1415,15 @@ fn composite_follow_hint(row: &Line, label: &str, width: usize) -> Line {
     let (markers, rest) = crate::osc133::split_leading_markers(row);
     let col = width.saturating_sub(label_width) / 2;
     let mut out: Line = markers;
-    out.extend(crate::width::slice_line_by_column_strict(
-        &rest, 0, col, true,
-    ));
+    out.extend(crate::width::slice_line_by_column(&rest, 0, col));
     out.push(Span::styled(
         label.to_string(),
         Style::default().add_modifier(Modifier::REVERSED),
     ));
-    out.extend(crate::width::slice_line_by_column_strict(
+    out.extend(crate::width::slice_line_by_column(
         &rest,
         col.saturating_add(label_width),
         width,
-        true,
     ));
     out
 }
@@ -1491,35 +1517,6 @@ mod tests {
 
     fn text_of(line: &Line) -> String {
         line.iter().map(|s| s.content.as_str()).collect::<String>()
-    }
-
-    /// A rendered hint row carries the platform's alt label: the queue
-    /// browse header quotes `app.message.navigateOlder` and friends through
-    /// the shared `format_key_text`, so the row shows `Alt+\u{2191}` on
-    /// Linux/Windows hosts and `Option+\u{2191}` on macOS (TS
-    /// `formatKeyPart`'s darwin branch).
-    #[test]
-    fn hint_rows_carry_the_platform_alt_label() {
-        let mut v = view();
-        v.queue_selected = Some(crate::queued::QueueSelectionItem {
-            lane: crate::queued::QueueLane::Steering,
-            index: 0,
-            text: "turn right".to_string(),
-        });
-        let frame = v.render_frame(80, 24);
-        let joined = frame.iter().map(text_of).collect::<Vec<_>>().join("\n");
-        assert!(
-            joined.contains("browse"),
-            "the queue browse header renders: {joined}"
-        );
-        if std::env::consts::OS == "macos" {
-            assert!(
-                joined.contains("Option+\u{2191}"),
-                "macOS hint row: {joined}"
-            );
-        } else {
-            assert!(joined.contains("Alt+\u{2191}"), "hint row: {joined}");
-        }
     }
 
     #[test]
@@ -1831,7 +1828,6 @@ mod tests {
                 is_error: false,
             }),
             result_partial: false,
-            aborted: false,
         }))
     }
 
@@ -1901,7 +1897,6 @@ mod tests {
             ended_at: None,
             result: None,
             result_partial: false,
-            aborted: false,
         }));
         let mut view = view_with(vec![running, settled_tool_card("call_d")]);
         view.pulse_frame = 0;

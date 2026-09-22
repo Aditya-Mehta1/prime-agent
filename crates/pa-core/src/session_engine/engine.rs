@@ -81,13 +81,6 @@ pub struct SessionEngineConfig {
     /// sites and after a kernel `goal.complete` settles the goal): the
     /// daemon worker's queue purge.
     pub queued_goal_context_purge: Option<super::runtime::QueuedGoalContextPurge>,
-    /// TS `_steeringStopPending` (the session's `shouldStopAfterTurn`/
-    /// `shouldStopBeforeTurn` hooks): `true` while steering-lane session
-    /// actions are queued or mid-selection, so the running turn stops at
-    /// the next turn boundary and the queued steer delivers as the next
-    /// input (TS agent-session.ts's `_steeringStopPending`; the follow-up
-    /// lane never stops the run — `when_run_idle` waits for the settle).
-    pub queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Boot the session's kernel in the background at creation (TS
     /// `prewarmIpythonKernel` from `createDefaultRuntimeFactory`): a main
     /// session (depth 0, the engine's gate like the TS `rlmDepth === 0`
@@ -619,18 +612,6 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // (TS `convertToLlm`): bookkeeping custom rows drop, everything
         // else (the harness digest included) becomes a user turn.
         convert_to_llm: Some(super::messages::engine_convert_to_llm()),
-        // TS `_steeringStopPending`: both the after-turn and the
-        // before-turn hooks consult the same probe (a queued steer stops
-        // the run at the boundary; the pump delivers it next).
-        should_stop_after_turn: config.queued_steering_probe.take().map(|probe| {
-            let probe: pa_agent::agent_loop::ShouldStopAfterTurnFn =
-                std::sync::Arc::new(move |_context| {
-                    let probe = std::sync::Arc::clone(&probe);
-                    Box::pin(async move { Ok(probe()) })
-                });
-            probe
-        }),
-        should_stop_before_turn: config.queued_steering_probe.clone(),
         ..Default::default()
     });
 
@@ -671,10 +652,6 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         std::sync::Arc::downgrade(&provisioner),
     ));
     session.set_kernel_state_probe(Some(kernel_state_probe));
-    // The skill inventory `/skill:<name>` submissions expand against (TS
-    // reads the resource loader at expansion time; the session snapshots
-    // the engine's loaded list).
-    session.set_skills(resources.skills.clone());
     // The restore-notice mailbox becomes the session's next-turn queue:
     // rows parked by a boot that settled mid-build merge in, and later
     // restores (a lazy first-call boot) push straight into the live
@@ -711,12 +688,6 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         _ => None,
     };
 
-    // The `skill used` adoption event reports through the session's
-    // telemetry handle (installed once the telemetry composition decided
-    // whether this session reports at all).
-    if let Some(telemetry) = telemetry.as_ref() {
-        session.set_skill_telemetry(telemetry.clone());
-    }
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
         session,
@@ -737,16 +708,6 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
 }
 
 impl SessionEngine {
-    /// Expand a `/skill:<name>` submission into its `<skill>` block for
-    /// the accepted-turn row (TS `_expandSkillCommand`; the row the daemon
-    /// emits before admission must match the text the model turn
-    /// receives). Non-skill inputs pass through unchanged; the admitted
-    /// turn's own expansion is idempotent over the block. The `skill used`
-    /// adoption event reports from the admission, not here.
-    pub fn expand_skill_submission(&self, text: &str) -> String {
-        crate::skills::expand_skill_command(text, &self.skills).0
-    }
-
     /// Withdraw the queued goal-context turns (TS `_clearQueuedGoalContexts`
     /// at the `_pauseGoal`/`_clearGoal`/`_startGoal` command sites): a
     /// minted continuation waiting in the embedding's queue never runs
@@ -861,7 +822,6 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let engine = create_session(SessionEngineConfig {
             cron_store: None,
-            queued_steering_probe: None,
             cwd: cwd.clone(),
             agent_dir: tmp.path().join("agent"),
             mcp_manager: None,
@@ -968,7 +928,6 @@ mod tests {
         ) -> SessionEngineConfig {
             SessionEngineConfig {
                 cron_store: None,
-                queued_steering_probe: None,
                 cwd: cwd.to_path_buf(),
                 agent_dir: agent_dir.to_path_buf(),
                 mcp_manager: None,

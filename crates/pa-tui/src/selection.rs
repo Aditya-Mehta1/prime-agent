@@ -596,13 +596,6 @@ impl AgentView {
         }
     }
 
-    /// Whether a transcript selection is live: the frame keeps the whole
-    /// transcript compose while one is (its copy buffer needs the plain
-    /// text of every row, TS `lastTranscript`).
-    pub(crate) fn transcript_selection_active(&self) -> bool {
-        self.selection.mode == Some(SelectionMode::Transcript)
-    }
-
     /// Record the transcript's plain rows for the active transcript
     /// selection (TS `lastTranscript`; kept only while one is active).
     pub(crate) fn note_transcript_text(&mut self, transcript: &[Line]) {

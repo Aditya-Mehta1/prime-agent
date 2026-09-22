@@ -130,9 +130,7 @@ fn status_indicator(
     }
     if let Some(credential) = credential {
         let credential_type = match credential {
-            AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => {
-                AuthType::ApiKey
-            }
+            AuthCredential::ApiKey { .. } => AuthType::ApiKey,
             AuthCredential::Oauth { .. } => AuthType::Oauth,
         };
         return Some(if credential_type == auth_type {
@@ -211,8 +209,6 @@ impl ProviderAuth {
     fn mcp_manager(&self) -> pa_core::mcp::McpManager {
         let cwd = self.cwd.clone();
         let agent_dir = self.agent_dir.clone();
-        let catalog_cwd = self.cwd.clone();
-        let catalog_agent_dir = self.agent_dir.clone();
         pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: self.auth_storage_with_oauth(),
             get_user_servers: Box::new(move || {
@@ -233,21 +229,6 @@ impl ProviderAuth {
                 )
             }),
             begin_login: None,
-            agent_dir: Some(self.agent_dir.clone()),
-            get_catalog_sources: Some(Box::new({
-                let cwd = catalog_cwd.clone();
-                let agent_dir = catalog_agent_dir.clone();
-                move || {
-                    let settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
-                    settings
-                        .settings()
-                        .mcp_catalog_sources
-                        .clone()
-                        .unwrap_or_default()
-                }
-            })),
-            remote_source: None,
-            probe_override: None,
         })
     }
 
@@ -307,19 +288,11 @@ impl ProviderAuthCommands for ProviderAuth {
             // The auth-store writes and the MCP manager locks stay off
             // the async workers (the terminal is suspended around the
             // flow).
-            let task_agent_dir = agent_dir.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                login_blocking(provider_row, cwd, task_agent_dir, api_key)
+            tokio::task::spawn_blocking(move || {
+                login_blocking(provider_row, cwd, agent_dir, api_key)
             })
             .await
-            .expect("the login task ran");
-            // The auth-change trigger (TS `authStorage.onChange` →
-            // `scheduleCatalogRefresh`): the catalog refresh fires past the
-            // hourly gate, fire-and-forget.
-            if matches!(outcome, ProviderAuthOutcome::Status(_)) {
-                pa_core::models::spawn_background_catalog_refresh(agent_dir);
-            }
-            outcome
+            .expect("the login task ran")
         })
     }
 
@@ -329,18 +302,9 @@ impl ProviderAuthCommands for ProviderAuth {
         let provider_row = provider.clone();
         let agent_dir = self.agent_dir.clone();
         Box::pin(async move {
-            let task_agent_dir = agent_dir.clone();
-            let (outcome, changed) =
-                tokio::task::spawn_blocking(move || logout_blocking(provider_row, task_agent_dir))
-                    .await
-                    .expect("the logout task ran");
-            // The auth-change trigger (TS `authStorage.onChange` →
-            // `scheduleCatalogRefresh`), same as the login path: only an
-            // actual credential change fires it.
-            if changed {
-                pa_core::models::spawn_background_catalog_refresh(agent_dir);
-            }
-            outcome
+            tokio::task::spawn_blocking(move || logout_blocking(provider_row, agent_dir))
+                .await
+                .expect("the logout task ran")
         })
     }
 }
@@ -470,9 +434,7 @@ impl ProviderAuth {
                 continue;
             };
             let auth_type = match credential {
-                AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => {
-                    AuthType::ApiKey
-                }
+                AuthCredential::ApiKey { .. } => AuthType::ApiKey,
                 AuthCredential::Oauth { .. } => AuthType::Oauth,
             };
             let (is_serper, is_mcp) = (
@@ -574,25 +536,17 @@ fn login_blocking(
 }
 
 /// The logout body (blocking: the auth store lock stays off the async
-/// workers). The flag reports whether a stored credential actually went
-/// away (a no-op logout is not an auth change; TS `authStorage.onChange`
-/// only fires on writes).
-fn logout_blocking(provider_row: ProviderRow, agent_dir: PathBuf) -> (ProviderAuthOutcome, bool) {
+/// workers).
+fn logout_blocking(provider_row: ProviderRow, agent_dir: PathBuf) -> ProviderAuthOutcome {
     let mut auth = pa_core::auth::AuthStorage::create(&agent_dir);
     if auth.get_all().get(&provider_row.id).is_none() {
-        return (
-            ProviderAuthOutcome::Status(format!("{} is not configured.", provider_row.name)),
-            false,
-        );
+        return ProviderAuthOutcome::Status(format!("{} is not configured.", provider_row.name));
     }
     auth.logout(&provider_row.id);
     if let Some(error) = auth.drain_errors().pop() {
-        return (
-            ProviderAuthOutcome::Error(format!("Logout failed: {error}")),
-            false,
-        );
+        return ProviderAuthOutcome::Error(format!("Logout failed: {error}"));
     }
-    let outcome = match provider_row.auth_type {
+    match provider_row.auth_type {
         AuthType::Oauth => ProviderAuthOutcome::Status(format!(
             "Logged out of {}",
             provider_row.name
@@ -601,8 +555,7 @@ fn logout_blocking(provider_row: ProviderRow, agent_dir: PathBuf) -> (ProviderAu
             "Removed stored API key for {}. Environment variables and models.json config are unchanged.",
             provider_row.name
         )),
-    };
-    (outcome, true)
+    }
 }
 
 #[cfg(test)]

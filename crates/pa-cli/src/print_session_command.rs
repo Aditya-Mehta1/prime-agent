@@ -378,7 +378,6 @@ mod tests {
                     extension_tool_allow_list: None,
                     prewarm_ipython_kernel: None,
                     queued_goal_context_purge: None,
-                    queued_steering_probe: None,
                 },
             )
             .await

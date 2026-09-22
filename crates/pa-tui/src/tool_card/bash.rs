@@ -282,7 +282,6 @@ mod tests {
                 is_error: false,
             }),
             result_partial: false,
-            aborted: false,
         }
     }
 

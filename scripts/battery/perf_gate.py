@@ -34,13 +34,6 @@ TRACKED = {
         "prompt_to_first_cell_s_warm_median",
     ],
     "streaming": ["settle_s_median"],
-    "sustained_cpu": [
-        "tui_idle_mean_pct",
-        "tui_plain_mean_pct",
-        "tui_code_mean_pct",
-        "tui_tool_mean_pct",
-        "typing_ms_median",
-    ],
     "compaction": ["compact_s_median"],
     "export": ["export_s_median"],
     "daemon_overhead": ["delta_kb_median", "per_session_kb_median"],

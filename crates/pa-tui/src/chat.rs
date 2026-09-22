@@ -91,11 +91,6 @@ pub enum ChatEntry {
     /// One agent-message summary row (TS `AgentMessageComponent`: the
     /// received transcript rows).
     AgentMessage(Box<crate::custom_message::AgentMessageRow>),
-    /// One skill-invocation card (TS `SkillInvocationMessageComponent`):
-    /// the expandable `<skill>`-block card a user message carrying a
-    /// skill invocation parses into (the trailing arguments render as the
-    /// user block that follows it).
-    SkillInvocation(Box<crate::custom_message::SkillInvocationRow>),
     /// One injected prompt row (TS `InjectedPromptMessageComponent`).
     InjectedPrompt(Box<crate::custom_message::InjectedPromptRow>),
     /// One background-shell completion row (TS `ShellCompletionComponent`).
@@ -359,7 +354,6 @@ pub fn render_assistant(
     code_block_indent: &str,
     width: usize,
     preceded_by_tool_activity: bool,
-    cache: &mut crate::markdown::MarkdownBlockCache,
 ) -> Vec<Line> {
     let show_thinking = detail.show_thinking();
     let visible_blocks: Vec<&MessageBlock> = message
@@ -380,10 +374,10 @@ pub fn render_assistant(
     for (index, block) in visible_blocks.iter().enumerate() {
         match block {
             MessageBlock::Text(text) => {
-                out.extend(render_markdown_block(text, &md, width, cache));
+                out.extend(render_markdown_block(text, &md, width));
             }
             MessageBlock::Thinking(text) => {
-                out.extend(render_thinking_block(text, theme, &md, width, cache));
+                out.extend(render_thinking_block(text, theme, &md, width));
                 // Thinking adds spacing only when another visible block follows.
                 if index + 1 < visible_blocks.len() {
                     out.push(spacer());
@@ -430,11 +424,9 @@ pub(crate) fn render_markdown_block(
     text: &str,
     md: &crate::markdown::MarkdownStyle,
     width: usize,
-    cache: &mut crate::markdown::MarkdownBlockCache,
 ) -> Vec<Line> {
     let content_width = width.saturating_sub(2).max(1);
-    let rendered =
-        crate::markdown::render_markdown_tagged(text.trim(), content_width, md, "", cache);
+    let rendered = crate::markdown::render_markdown(text.trim(), content_width, md);
     let mut out = Vec::new();
     for line in rendered.into_iter() {
         let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
@@ -455,13 +447,9 @@ fn render_thinking_block(
     theme: &Theme,
     md: &crate::markdown::MarkdownStyle,
     width: usize,
-    cache: &mut crate::markdown::MarkdownBlockCache,
 ) -> Vec<Line> {
     let mut md = md.clone();
     let dim = theme.fg_style(ThemeColor::Dim);
-    // TS `getThinkingMarkdownTheme` replaces `highlightCode` with uniform
-    // dim lines: the thinking code blocks never highlight.
-    md.syntax = None;
     md.body = dim;
     md.heading = dim;
     md.link = dim;
@@ -474,8 +462,7 @@ fn render_thinking_block(
     md.hr = dim;
     md.list_bullet = dim;
     let content_width = width.saturating_sub(2).max(1);
-    let rendered =
-        crate::markdown::render_markdown_tagged(text.trim(), content_width, &md, "dim", cache);
+    let rendered = crate::markdown::render_markdown(text.trim(), content_width, &md);
     let mut out = Vec::new();
     for line in rendered.into_iter() {
         // The markdown margin sits outside the styled content (default fg).
@@ -502,12 +489,7 @@ pub fn render_loader(
     let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
     row.push(Span::styled(spinner.to_string(), accent));
     if !message.is_empty() {
-        // The gap between the spinner and the label is unstyled (TS's
-        // `Loader` builds `${renderedFrame} ${messageColorFn(message)}`:
-        // the plain space sits between chalk's two colored runs, so the
-        // emitted row resets to default fg there instead of carrying the
-        // label color over the gap).
-        row.push(Span::raw(" ".to_string()));
+        row.push(Span::styled(" ".to_string(), muted));
         row.push(Span::styled(message, muted));
     }
     vec![spacer(), pad_to(row, width, Style::default())]
@@ -555,14 +537,13 @@ impl RetryState {
 /// The retry loader rows (TS auto_retry_start rendering: muted spinner +
 /// the retry message).
 pub fn render_retry(retry: &RetryState, frame: usize, theme: &Theme, width: usize) -> Vec<Line> {
+    let accent = theme.fg_style(ThemeColor::Accent);
     let muted = theme.fg_style(ThemeColor::Muted);
     let spinner = LOADER_FRAMES[frame % LOADER_FRAMES.len()];
     let message = retry.message();
     let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
-    row.push(Span::styled(spinner.to_string(), muted));
-    // The gap between the spinner and the label is unstyled (the TS
-    // `Loader` pen reset — see `render_loader`).
-    row.push(Span::raw(" ".to_string()));
+    row.push(Span::styled(spinner.to_string(), accent));
+    row.push(Span::styled(" ".to_string(), muted));
     row.push(Span::styled(message, muted));
     vec![spacer(), pad_to(row, width, Style::default())]
 }
@@ -617,32 +598,6 @@ mod tests {
             .map(|s| s.content.as_str())
             .collect::<String>();
         assert!(text.contains("Retrying (1/2) in 1s..."), "got: {text}");
-    }
-
-    /// TS `retryLoader` wraps the same `Loader` with muted spinner and
-    /// message color fns: the muted pen colors the spinner, and the gap
-    /// to the label resets to default fg.
-    #[test]
-    fn retry_loader_spans_carry_the_ts_sgr_boundaries() {
-        let retry = RetryState {
-            attempt: 1,
-            max_attempts: 2,
-            ends_at: std::time::Instant::now() + std::time::Duration::from_millis(1500),
-            error_message: "provider down".to_string(),
-            reason: RetryStartReason::Quick,
-        };
-        let t = theme();
-        let muted = t.fg_style(ThemeColor::Muted);
-        let rows = render_retry(&retry, 0, &t, 60);
-        assert_eq!(
-            rows[1][..4],
-            [
-                Span::styled(" ", Style::default()),
-                Span::styled(LOADER_FRAMES[0], muted),
-                Span::raw(" "),
-                Span::styled("Retrying (1/2) in 1s...", muted),
-            ]
-        );
     }
 
     #[test]
@@ -848,15 +803,7 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(
-            &plain,
-            Detail::Overview,
-            &theme(),
-            "  ",
-            60,
-            false,
-            &mut crate::markdown::MarkdownBlockCache::default(),
-        );
+        let rows = render_assistant(&plain, Detail::Overview, &theme(), "  ", 60, false);
         assert!(crate::osc133::row_markers(&rows[0]).start);
         assert!(crate::osc133::row_markers(rows.last().unwrap()).end);
 
@@ -867,15 +814,7 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(
-            &with_tools,
-            Detail::Overview,
-            &theme(),
-            "  ",
-            60,
-            false,
-            &mut crate::markdown::MarkdownBlockCache::default(),
-        );
+        let rows = render_assistant(&with_tools, Detail::Overview, &theme(), "  ", 60, false);
         assert_eq!(crate::osc133::row_markers(&rows[0]), Default::default());
     }
 
@@ -899,15 +838,7 @@ mod tests {
                 .trim_end()
                 .to_string()
         };
-        let rows = render_assistant(
-            &message,
-            Detail::Overview,
-            &theme(),
-            "    ",
-            60,
-            false,
-            &mut crate::markdown::MarkdownBlockCache::default(),
-        );
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "    ", 60, false);
         let flat: Vec<String> = rows
             .iter()
             .map(|line| line.iter().map(|s| s.content.as_str()).collect::<String>())
@@ -918,15 +849,7 @@ mod tests {
             "non-default indent applied: {flat:?}"
         );
         // The default (no setting) stays two spaces.
-        let rows = render_assistant(
-            &message,
-            Detail::Overview,
-            &theme(),
-            "  ",
-            60,
-            false,
-            &mut crate::markdown::MarkdownBlockCache::default(),
-        );
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, false);
         let flat: Vec<String> = rows
             .iter()
             .map(|line| line.iter().map(|s| s.content.as_str()).collect::<String>())
@@ -973,15 +896,7 @@ mod tests {
             error: Some("Error: request failed after retries".into()),
             aborted: false,
         };
-        let rows = render_assistant(
-            &message,
-            Detail::Overview,
-            &theme(),
-            "  ",
-            60,
-            false,
-            &mut crate::markdown::MarkdownBlockCache::default(),
-        );
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, false);
         let flat: Vec<String> = rows
             .iter()
             .map(|line| line.iter().map(|s| s.content.as_str()).collect())
@@ -1002,15 +917,7 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(
-            &message,
-            Detail::Overview,
-            &theme(),
-            "  ",
-            60,
-            true,
-            &mut crate::markdown::MarkdownBlockCache::default(),
-        );
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, true);
         assert_eq!(rows.last().unwrap().len(), 0, "trailing spacer");
         // A tool-only message after tool activity renders no spacers.
         let message = AssistantMessage {
@@ -1020,15 +927,7 @@ mod tests {
             error: None,
             aborted: false,
         };
-        let rows = render_assistant(
-            &message,
-            Detail::Overview,
-            &theme(),
-            "  ",
-            60,
-            true,
-            &mut crate::markdown::MarkdownBlockCache::default(),
-        );
+        let rows = render_assistant(&message, Detail::Overview, &theme(), "  ", 60, true);
         assert!(rows.is_empty(), "got: {rows:?}");
     }
 
@@ -1048,34 +947,6 @@ mod tests {
             .map(|s| s.content.as_str())
             .collect::<String>();
         assert!(text.contains("\u{283c} Writing \u{00b7} 1s \u{00b7} \u{2193} 72 tokens"));
-    }
-
-    /// TS `Loader`: `${spinnerColorFn(frame)} ${messageColorFn(msg)}` —
-    /// the gap between the spinner and the label sits between chalk's two
-    /// colored runs, so the emitted row resets to default fg there instead
-    /// of carrying the label color over the gap.
-    #[test]
-    fn loader_gap_between_spinner_and_label_is_unstyled() {
-        let working = WorkingState {
-            activity: "Writing",
-            message: None,
-            download: true,
-            tokens: 72,
-            elapsed_secs: 1,
-        };
-        let t = theme();
-        let accent = t.fg_style(ThemeColor::Accent);
-        let muted = t.fg_style(ThemeColor::Muted);
-        let rows = render_loader(&working, 0, &t, 100);
-        assert_eq!(
-            rows[1][..4],
-            [
-                Span::styled(" ", Style::default()),
-                Span::styled(LOADER_FRAMES[0], accent),
-                Span::raw(" "),
-                Span::styled("Writing \u{00b7} 1s \u{00b7} \u{2193} 72 tokens", muted),
-            ]
-        );
     }
 
     /// While a tool owns the working message (python-kernel bootstrap), the

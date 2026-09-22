@@ -11,25 +11,6 @@ use pa_types::session::FileEntry;
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// PR #277 made the loader tolerant of foreign spellings: the raw OpenAI
-/// wire value `tool_calls` deserializes through `StopReason`'s serde alias
-/// to the canonical `toolUse`, so a captured foreign line reserializes with
-/// the canonical spelling. The corpus keeps the foreign line as captured
-/// (it is the record of what the loader must accept), so the comparison
-/// canonicalizes that one known alias instead of asserting identity on it.
-fn canonicalize_foreign_spelling(mut value: Value) -> Value {
-    if let Some(stop_reason) = value
-        .get_mut("message")
-        .and_then(Value::as_object_mut)
-        .and_then(|message| message.get_mut("stopReason"))
-    {
-        if stop_reason == "tool_calls" {
-            *stop_reason = Value::String("toolUse".to_string());
-        }
-    }
-    value
-}
-
 fn roundtrip_file(path: &std::path::Path) -> usize {
     let data = std::fs::read_to_string(path).expect("read session file");
     let mut lines = 0usize;
@@ -44,7 +25,7 @@ fn roundtrip_file(path: &std::path::Path) -> usize {
         let original: Value = serde_json::from_str(line).unwrap();
         let roundtripped: Value = serde_json::from_str(&reserialized).unwrap();
         assert_eq!(
-            canonicalize_foreign_spelling(original),
+            original,
             roundtripped,
             "{}:{}: round trip changed the value\n  {}\n  {}",
             path.display(),

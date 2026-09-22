@@ -450,7 +450,6 @@ mod tests {
                 admission_id: None,
                 images: Vec::new(),
                 done: Some(done_tx),
-                queue_visible: true,
             });
         }
         let response = worker

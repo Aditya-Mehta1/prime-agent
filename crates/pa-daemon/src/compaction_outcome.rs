@@ -40,7 +40,7 @@ impl AgentSessionEngine {
         // against a built session, so the guard is structural.
         let row = {
             let guard = self.session.blocking_lock();
-            guard.as_deref().map(|engine| {
+            guard.as_ref().map(|engine| {
                 self.runtime.block_on(async {
                     engine
                         .session

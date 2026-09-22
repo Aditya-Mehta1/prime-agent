@@ -19,7 +19,6 @@ pub mod extension_rpc;
 pub mod goal;
 pub mod platform;
 pub mod session;
-pub mod skill_blocks;
 pub mod slash_commands;
 pub mod themes;
 pub mod usage;

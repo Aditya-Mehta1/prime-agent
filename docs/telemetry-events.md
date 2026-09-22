@@ -114,19 +114,6 @@ commands (`model`, `effort`, `tree`, `fork`, `clone`, `export`, `share`,
 |---|---|---|
 | `command_name` | string | canonical builtin command name |
 
-### `skill used`
-
-A `/skill:<name>` submission expanded into its skill block (the
-skill-command execution seam, TS `_expandSkillCommand`). Emitted once per
-expanded invocation from the session's prompt admission; never carries
-prompt or skill content.
-
-| property | type | notes |
-|---|---|---|
-| `skill_name` | string | the invoked skill's name |
-| `skill_kind` | string | `markdown` / `python` |
-| `source` | string | `prompt` (admitted fresh) / `steer` / `follow_up` (queued during a run) |
-
 ### `onboarding completed`
 
 | property | type | notes |
@@ -165,19 +152,19 @@ never session payload.
 
 | property | type | notes |
 |---|---|---|
-| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `worker_gave_up`, `attach`, `reattach`, `detach`, `sessions_archived`, `worker_children_closed` |
+| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach`, `sessions_archived`, `worker_children_closed` |
 | `exit_reason` | string | only for `worker_exited`: `normal` / `crash` |
 | `count` | number | only for `sessions_archived` and `worker_children_closed`: how many sessions the sweep moved to the archive / how many resident RLM children the supervisor closed with a hard-killed parent worker |
 
 ### `mcp connector used`
 
-`mcp.*` host-request activity and the connector install flows. Server name
-ONLY — never tool names, arguments, results, or pasted credential material.
+`mcp.*` host-request activity. Server name ONLY — never tool names,
+arguments, or results.
 
 | property | type | notes |
 |---|---|---|
-| `action` | string | `config` / `refresh` / `paste-install` |
-| `server_name` | string | server id from settings / ACP admission / the resolved service catalog |
+| `action` | string | `config` / `refresh` |
+| `server_name` | string | server id from settings / ACP admission |
 
 ### `tool executed`
 
@@ -229,17 +216,6 @@ client run (adoption; later copies in the same run are not reported).
 | property | type | notes |
 |---|---|---|
 | `lines` | number | the copied text's line count |
-
-### `tui enhanced keys`
-
-The terminal enhanced-key modes settled for an interactive run (adoption:
-emitted once per client run when the kitty keyboard protocol answer lands).
-
-| property | type | notes |
-|---|---|---|
-| `kitty` | boolean | the kitty keyboard protocol is active (flags `1\|2\|4`) |
-| `modify_other_keys` | boolean | always `false` in this port: the xterm modifyOtherKeys mode-2 fallback is never armed (crossterm cannot parse the resulting `CSI 27;mods;key~` sequences — the whole input buffer drops on the parse error, the shift-modified-printable bug class); every surface start instead resets the mode. The property keeps the TS event shape. |
-| `mode` | string | the detected protocol: `kitty` / `modify_other_keys` / `none` (the term-enhanced-keys-2 detection shape; `modify_other_keys` never settles in this port, the value keeps the TS shape) |
 
 ### `tui image pasted`
 
@@ -294,7 +270,7 @@ How one interactive client run ended.
 
 | property | type | notes |
 |---|---|---|
-| `exit_reason` | string | `ctrl_c_twice` (second press of the exit-hint window), `ctrl_d`, `session_request` (`/exit`, `/quit`, `/resume`, agents-back), `daemon_closed`, `sigterm` (the SIGTERM handler's graceful shutdown) |
+| `exit_reason` | string | `ctrl_c_twice` (second press of the exit-hint window), `ctrl_d`, `session_request` (`/exit`, `/quit`, `/resume`, agents-back), `daemon_closed` |
 | `turn_active` | boolean | a turn was still running at exit |
 
 ### `tui input queued`
@@ -338,43 +314,14 @@ transition; never carries prompt content.
 | `action` | string | `agents_view` / `session_switch` (a draft stashed on the way out) / `restored` (a stashed draft returned to the editor) |
 | `had_images` | boolean | the draft carried pasted images |
 
-### `tui bash shortcut used`
-
-The `!`/`!!` bash-from-chat shortcut ran a command from the input editor
-(adoption of the bash-mode surface; emitted once per dispatched run, never
-carrying the command or its output).
-
-| property | type | notes |
-|---|---|---|
-| `excluded` | boolean | the `!!` variant: the run stays out of the session context |
-| `side_conversation` | boolean | the run executed inside a side-question pane (transient, pane-rendered) |
-
-### `tui interrupt issued`
-
-One interrupt key (Escape or Ctrl+C) fired an abort at a live target
-(adoption of the interrupt surface; one event per fired target, because a
-single press fires the interrupt ladder and can hit more than one target).
-Never carries any command, prompt, or content.
-
-| property | type | notes |
-|---|---|---|
-| `target` | string | `stream` (a running turn), `side_question`, `retry` (a live retry countdown), `compaction`, `branch_summary`, `bash` (a user-bash run) |
-
-### `tui signal shutdown`
-
-A shutdown signal ended the interactive client run through the registered
-signal handlers (adoption of the signal-shutdown surface).
-
-| property | type | notes |
-|---|---|---|
-| `signal` | string | `sigterm` (SIGHUP exits through the emergency path, which skips the telemetry flush by design — its exit carries no event) |
-
 ## Planned events (seams not yet in the product)
 
-Planned events stay in this catalog as schema v1 placeholders until
-their product seam lands (each in the same PR as the seam, per the
-adoption convention below). None are pending right now: the former
-`skill used` placeholder shipped with its seam (the `/skill:` expansion).
+These stay in the catalog as planned schema v1 additions; they are NOT
+emitted yet. Each lands in the same PR as its product seam (see the
+adoption convention below):
+
+- `skill used` (`skill_name`, `skill_kind`, `source`): the product has no
+  skill-command execution seam yet.
 
 ## Cohorts and breakdowns
 

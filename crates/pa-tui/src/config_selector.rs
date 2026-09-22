@@ -520,10 +520,6 @@ pub fn run_config_selector(
     crossterm::style::force_color_output(true);
     terminal::enable_raw_mode()?;
     crossterm::execute!(stdout(), EnterAlternateScreen)?;
-    // The selector surface owns the same enhanced-key modes as the session
-    // (TS `ProcessTerminal.start`): a pasted filter query arrives as one
-    // chunk instead of per-line keystrokes.
-    crate::enhanced_keys::enable(&mut std::io::stdout())?;
     let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
     let theme = options.theme;
     let kb = options.keybindings;
@@ -555,8 +551,6 @@ pub fn run_config_selector(
             match action {
                 Some(SelectorAction::Close) => break,
                 Some(SelectorAction::Exit) => {
-                    let mut out = stdout();
-                    let _ = crate::enhanced_keys::disable(&mut out);
                     terminal::disable_raw_mode()?;
                     crossterm::execute!(stdout(), LeaveAlternateScreen)?;
                     std::process::exit(0);
@@ -573,8 +567,6 @@ pub fn run_config_selector(
             }
         }
     }
-    let mut out = stdout();
-    let _ = crate::enhanced_keys::disable(&mut out);
     terminal::disable_raw_mode()?;
     crossterm::execute!(stdout(), LeaveAlternateScreen)?;
     Ok(())

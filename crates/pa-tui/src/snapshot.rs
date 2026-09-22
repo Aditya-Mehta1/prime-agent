@@ -8,7 +8,6 @@
 //! the scripted harness and the real engine both emit.
 
 use crate::chat::{AssistantMessage, ChatEntry, MessageBlock, ToolCallCard};
-use crate::tool_card::ToolResultView;
 use pa_types::daemon::{DaemonEventCursor, DaemonReplayInfo};
 use serde::Deserialize;
 use serde_json::Value;
@@ -47,10 +46,6 @@ pub struct Reconstructed {
     pub chat: Vec<ChatEntry>,
     /// Current model id (`state.model.id`), when the session reports one.
     pub model_id: Option<String>,
-    /// The current model's provider (`state.model.provider`), when the
-    /// snapshot reports it: live-catalog ids repeat across providers, so
-    /// the provider disambiguates the picker's `current` row.
-    pub model_provider: Option<String>,
     /// Session display name.
     pub session_name: Option<String>,
     /// Session id of the persisted session file.
@@ -232,9 +227,6 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
     let model_id = state
         .and_then(|state| state.get("model"))
         .and_then(model_id_value);
-    let model_provider = state
-        .and_then(|state| state.get("model"))
-        .and_then(model_provider_value);
     let session_name = state
         .and_then(|state| state.get("sessionName"))
         .and_then(Value::as_str)
@@ -271,7 +263,6 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
     Reconstructed {
         chat: messages,
         model_id,
-        model_provider,
         session_name,
         session_id,
         goal,
@@ -302,18 +293,6 @@ fn model_id_value(model: &Value) -> Option<String> {
     match model {
         Value::String(label) => Some(label.clone()),
         Value::Object(map) => map.get("id").and_then(Value::as_str).map(str::to_string),
-        _ => None,
-    }
-}
-
-/// The provider from a `state.model` wire value (present on the structured
-/// form; a display-string model reports none).
-fn model_provider_value(model: &Value) -> Option<String> {
-    match model {
-        Value::Object(map) => map
-            .get("provider")
-            .and_then(Value::as_str)
-            .map(str::to_string),
         _ => None,
     }
 }
@@ -422,27 +401,6 @@ pub enum TurnUpdate {
     QueueUpdated {
         steering: Vec<String>,
         follow_ups: Vec<String>,
-    },
-    /// `bash_start` (the user-bash slot, TS `!command`): a command run
-    /// outside the model loop; `transient` marks a side-conversation run
-    /// that renders only in the owning client's pane.
-    BashStart {
-        command: String,
-        exclude_from_context: bool,
-        transient: bool,
-        run_id: Option<String>,
-    },
-    /// `bash_output` (the user-bash slot): one streamed output chunk.
-    BashOutput { chunk: String },
-    /// `bash_end` (the user-bash slot): the settled run.
-    BashEnd {
-        exit_code: Option<i64>,
-        cancelled: bool,
-        truncated: bool,
-        full_output_path: Option<String>,
-        error_message: Option<String>,
-        transient: bool,
-        run_id: Option<String>,
     },
     /// Other state churn: the footer status only.
     StatusUpdate,
@@ -650,62 +608,6 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 follow_ups: queue_lane(&actions, "followUps"),
             })
         }
-        // `bash_start` (TS `runUserBash` emits before the process runs):
-        // the identity fields ride the same frame (`transient` marks a
-        // side-conversation run, `runId` matches the owning client).
-        "bash_start" => Some(TurnUpdate::BashStart {
-            command: event
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            exclude_from_context: event
-                .get("excludeFromContext")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            transient: event
-                .get("transient")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            run_id: event
-                .get("runId")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        }),
-        "bash_output" => Some(TurnUpdate::BashOutput {
-            chunk: event
-                .get("chunk")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        }),
-        "bash_end" => Some(TurnUpdate::BashEnd {
-            exit_code: event.get("exitCode").and_then(Value::as_i64),
-            cancelled: event
-                .get("cancelled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            truncated: event
-                .get("truncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            full_output_path: event
-                .get("fullOutputPath")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            error_message: event
-                .get("errorMessage")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            transient: event
-                .get("transient")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            run_id: event
-                .get("runId")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        }),
 
         // Queue churn and unknown events only affect the status line.
         _ => Some(TurnUpdate::StatusUpdate),
@@ -812,14 +714,8 @@ pub fn message_value_to_entries(message: &Value) -> Vec<ChatEntry> {
         .and_then(Value::as_str)
         .unwrap_or_default();
     match role {
-        // TS `addMessageToChat`'s user case: a text that IS a skill block
-        // renders the skill-invocation card (+ the trailing argument text
-        // as its own user block); every other text renders the user block.
         "user" => user_display_text(message)
-            .map(|text| {
-                crate::custom_message::skill_invocation_entries(&text)
-                    .unwrap_or_else(|| vec![ChatEntry::User { text }])
-            })
+            .map(|text| vec![ChatEntry::User { text }])
             .unwrap_or_default(),
         "assistant" => assistant_value_to_entries(message),
         "custom" => custom_message_entries(message),
@@ -942,11 +838,6 @@ pub fn apply_tool_execution_start(
 pub struct AssistantErrorRow {
     /// The rendered row text (provider errors carry the `Error: ` prefix).
     pub text: String,
-    /// The pending-tool-card result text (TS `errorMessage`, the raw
-    /// message with no prefix; `Error` fallback): every pending card
-    /// settles with this as its error result on the aborted/error
-    /// `message_end`.
-    pub error_text: String,
     /// `stopReason: "aborted"` (drives the tool-call trailing spacer).
     pub aborted: bool,
 }
@@ -959,23 +850,15 @@ pub fn assistant_error_row(
 ) -> Option<AssistantErrorRow> {
     let stop_reason = message.get("stopReason").and_then(Value::as_str);
     match stop_reason {
-        Some("aborted") => {
-            // TS renders `Aborted after N retry attempts`/`Operation
-            // aborted` (the elapsed suffix is client-side TS state this
-            // port's row does not track yet); the cards share the row's
-            // text.
-            let text = message
+        Some("aborted") => Some(AssistantErrorRow {
+            text: message
                 .get("errorMessage")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty() && *text != "Request was aborted")
                 .unwrap_or("Operation aborted")
-                .to_string();
-            Some(AssistantErrorRow {
-                error_text: text.clone(),
-                text,
-                aborted: true,
-            })
-        }
+                .to_string(),
+            aborted: true,
+        }),
         Some("error") if tool_calls.is_empty() => Some(AssistantErrorRow {
             text: format!(
                 "Error: {}",
@@ -985,41 +868,9 @@ pub fn assistant_error_row(
                     .filter(|text| !text.is_empty())
                     .unwrap_or("Unknown error")
             ),
-            error_text: message
-                .get("errorMessage")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .unwrap_or("Error")
-                .to_string(),
             aborted: false,
         }),
         _ => None,
-    }
-}
-
-/// TS `message_end`'s aborted/error arm (`interactive-mode.ts`: every
-/// pending tool card gets the error result, then the pending state resets):
-/// every tool card still waiting for its result (none yet, or a partial
-/// one) settles with the run's error text as its error result — no card
-/// keeps its spinner after the run died. The card's `aborted` flag drops
-/// the tool's late result frames, exactly like the TS pending-map reset.
-pub fn settle_pending_tool_cards(error_text: &str, view: &mut crate::view::AgentView) {
-    for index in 0..view.chat.len() {
-        let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) else {
-            continue;
-        };
-        if card.result.is_some() && !card.result_partial {
-            continue;
-        }
-        card.result = Some(ToolResultView {
-            content: vec![serde_json::json!({ "type": "text", "text": error_text })],
-            details: serde_json::Value::Null,
-            is_error: true,
-        });
-        card.result_partial = false;
-        card.aborted = true;
-        card.ended_at = Some(std::time::Instant::now());
-        view.mark_entry_stale(index);
     }
 }
 
@@ -1169,30 +1020,6 @@ mod tests {
             vec![ChatEntry::User {
                 text: "[image]".to_string()
             }]
-        );
-    }
-
-    #[test]
-    fn a_skill_block_user_message_decodes_to_the_card() {
-        // TS `addMessageToChat`'s user case: the persisted user message
-        // that carried a skill invocation parses into the card + the
-        // trailing argument text, never the raw block.
-        let message = json!({
-            "role": "user",
-            "content": "<skill name=\"websearch\" location=\"/s/SKILL.md\">\nRun one query.\n</skill>\n\nfind parity tuis"
-        });
-        let entries = message_value_to_entries(&message);
-        assert!(
-            matches!(
-                entries.as_slice(),
-                [
-                    ChatEntry::SkillInvocation(card),
-                    ChatEntry::User { text }
-                ] if card.name == "websearch"
-                    && card.content == "Run one query."
-                    && text == "find parity tuis"
-            ),
-            "entries: {entries:?}"
         );
     }
 
@@ -1422,68 +1249,6 @@ mod tests {
                 follow_ups: vec!["then summarize".to_string()],
             },
             "an attach re-syncs the queue strip from the snapshot"
-        );
-    }
-
-    #[test]
-    fn decodes_the_user_bash_event_triple() {
-        // The `!command` lane (TS `runUserBash`): bash_start carries the
-        // command and identity, bash_output one chunk, bash_end the
-        // settled outcome — all decoded whole-object.
-        let start = event_to_update(&json!({
-            "type": "bash_start",
-            "command": "echo hi",
-            "excludeFromContext": false,
-        }))
-        .expect("a bash start");
-        assert_eq!(
-            start,
-            TurnUpdate::BashStart {
-                command: "echo hi".to_string(),
-                exclude_from_context: false,
-                transient: false,
-                run_id: None,
-            }
-        );
-        let side_start = event_to_update(&json!({
-            "type": "bash_start",
-            "command": "echo pane",
-            "excludeFromContext": true,
-            "transient": true,
-            "runId": "run-1",
-        }))
-        .expect("a transient bash start");
-        assert_eq!(
-            side_start,
-            TurnUpdate::BashStart {
-                command: "echo pane".to_string(),
-                exclude_from_context: true,
-                transient: true,
-                run_id: Some("run-1".to_string()),
-            }
-        );
-        assert_eq!(
-            event_to_update(&json!({ "type": "bash_output", "chunk": "hi\n" })),
-            Some(TurnUpdate::BashOutput {
-                chunk: "hi\n".to_string()
-            })
-        );
-        assert_eq!(
-            event_to_update(&json!({
-                "type": "bash_end",
-                "exitCode": 0,
-                "cancelled": false,
-                "truncated": false,
-            })),
-            Some(TurnUpdate::BashEnd {
-                exit_code: Some(0),
-                cancelled: false,
-                truncated: false,
-                full_output_path: None,
-                error_message: None,
-                transient: false,
-                run_id: None,
-            })
         );
     }
 
@@ -2238,100 +2003,5 @@ mod tests {
         let goal = reconstructed.goal.expect("snapshot goal");
         assert_eq!(goal.status, pa_types::goal::GoalStatus::Active);
         assert_eq!(goal.objective.as_deref(), Some("keep shipping"));
-    }
-
-    #[test]
-    fn an_aborted_run_settles_every_pending_tool_card_with_the_error_text() {
-        let mut view = test_view();
-        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
-            id: "toolu_pending".to_string(),
-            name: "bash".to_string(),
-            args: json!({ "command": "sleep 30" }),
-            started: true,
-            started_at: Some(std::time::Instant::now()),
-            ..Default::default()
-        })));
-        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
-            id: "toolu_partial".to_string(),
-            name: "bash".to_string(),
-            args: json!({ "command": "echo partial" }),
-            started: true,
-            started_at: Some(std::time::Instant::now()),
-            result: Some(ToolResultView {
-                content: vec![json!({ "type": "text", "text": "partial output" })],
-                details: serde_json::Value::Null,
-                is_error: false,
-            }),
-            result_partial: true,
-            ..Default::default()
-        })));
-        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
-            id: "toolu_done".to_string(),
-            name: "bash".to_string(),
-            args: json!({ "command": "echo done" }),
-            started: true,
-            started_at: Some(std::time::Instant::now()),
-            ended_at: Some(std::time::Instant::now()),
-            result: Some(ToolResultView {
-                content: vec![json!({ "type": "text", "text": "done output" })],
-                details: serde_json::Value::Null,
-                is_error: false,
-            }),
-            ..Default::default()
-        })));
-        settle_pending_tool_cards("Operation aborted", &mut view);
-        let cards: Vec<&ToolCallCard> = view
-            .chat
-            .iter()
-            .filter_map(|entry| match entry {
-                ChatEntry::Tool(card) => Some(card.as_ref()),
-                _ => None,
-            })
-            .collect();
-        // The pending and the partial card both settle with the error
-        // text (TS settles every entry of the pending map, partial or
-        // not); the settled card keeps its result untouched.
-        for card in &cards[..2] {
-            let result = card.result.as_ref().expect("settled result");
-            assert!(result.is_error, "the settled result is an error");
-            assert_eq!(result.text_output(false), "Operation aborted");
-            assert!(card.aborted);
-            assert!(!card.result_partial);
-        }
-        let done = cards[2];
-        assert!(!done.aborted);
-        let kept = done.result.as_ref().expect("kept result");
-        assert!(!kept.is_error);
-        assert_eq!(kept.text_output(false), "done output");
-    }
-
-    #[test]
-    fn aborted_error_rows_carry_the_card_result_text() {
-        let aborted = assistant_error_row(
-            &json!({ "stopReason": "aborted" }),
-            &[("c1".to_string(), "bash".to_string(), json!({}))],
-        )
-        .expect("an aborted message renders");
-        assert_eq!(aborted.text, "Operation aborted");
-        assert_eq!(aborted.error_text, "Operation aborted");
-        assert!(aborted.aborted);
-        let error = assistant_error_row(
-            &json!({ "stopReason": "error", "errorMessage": "provider exploded" }),
-            &[],
-        )
-        .expect("a failed message without tool calls renders");
-        assert_eq!(error.text, "Error: provider exploded");
-        assert_eq!(error.error_text, "provider exploded");
-        let fallback =
-            assistant_error_row(&json!({ "stopReason": "error" }), &[]).expect("fallback renders");
-        assert_eq!(fallback.text, "Error: Unknown error");
-        assert_eq!(fallback.error_text, "Error");
-        // The request-aborted wire message never surfaces its raw text.
-        let request_aborted = assistant_error_row(
-            &json!({ "stopReason": "aborted", "errorMessage": "Request was aborted" }),
-            &[],
-        )
-        .expect("renders");
-        assert_eq!(request_aborted.text, "Operation aborted");
     }
 }

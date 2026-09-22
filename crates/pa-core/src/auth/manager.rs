@@ -370,9 +370,6 @@ impl AuthStorage {
                     refresh.clone().unwrap_or_default()
                 ))
             }
-            AuthCredential::McpStaticToken { bearer, .. } => {
-                Some(format!("mcp_static_token:{bearer}"))
-            }
         }
     }
 
@@ -775,16 +772,6 @@ impl AuthStorage {
                                 api_key: self.oauth.api_key_for(provider_id, &credential),
                                 source_token: self.token_for(provider_id, &candidate),
                                 credential_type: Some("oauth"),
-                            };
-                        }
-                        // A pasted MCP static token IS the api key for its
-                        // `mcp:<server>` provider: the bearer value, used
-                        // verbatim (no resolution, no expiry).
-                        AuthCredential::McpStaticToken { bearer, .. } => {
-                            return AuthApiKeyResult {
-                                api_key: Some(bearer.clone()),
-                                source_token: self.token_for(provider_id, &candidate),
-                                credential_type: Some("mcp_static_token"),
                             };
                         }
                     }

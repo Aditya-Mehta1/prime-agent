@@ -157,26 +157,6 @@ impl CliInteractionTelemetry {
 }
 
 impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
-    fn bash_shortcut_used(
-        &self,
-        excluded: bool,
-        side_conversation: bool,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let Some(client) = self.client() else {
-                return;
-            };
-            let mut properties = pa_telemetry::base_properties("interactive");
-            properties.set("excluded", serde_json::Value::from(excluded));
-            properties.set(
-                "side_conversation",
-                serde_json::Value::from(side_conversation),
-            );
-            client.track("tui bash shortcut used", properties);
-            let _ = client.shutdown().await;
-        })
-    }
-
     fn prompt_stash(
         &self,
         action: &'static str,
@@ -299,28 +279,6 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         })
     }
 
-    fn enhanced_keys(
-        &self,
-        kitty: bool,
-        modify_other_keys: bool,
-        mode: &'static str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let Some(client) = self.client() else {
-                return;
-            };
-            let mut properties = pa_telemetry::base_properties("interactive");
-            properties.set("kitty", serde_json::Value::from(kitty));
-            properties.set(
-                "modify_other_keys",
-                serde_json::Value::from(modify_other_keys),
-            );
-            properties.set("mode", serde_json::Value::from(mode));
-            client.track("tui enhanced keys", properties);
-            let _ = client.shutdown().await;
-        })
-    }
-
     fn suspend_used(&self, outcome: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let Some(client) = self.client() else {
@@ -329,36 +287,6 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
             let mut properties = pa_telemetry::base_properties("interactive");
             properties.set("outcome", serde_json::Value::from(outcome));
             client.track("tui suspend used", properties);
-            let _ = client.shutdown().await;
-        })
-    }
-
-    fn interrupt_issued(
-        &self,
-        target: &'static str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let Some(client) = self.client() else {
-                return;
-            };
-            let mut properties = pa_telemetry::base_properties("interactive");
-            properties.set("target", serde_json::Value::from(target));
-            client.track("tui interrupt issued", properties);
-            let _ = client.shutdown().await;
-        })
-    }
-
-    fn signal_shutdown(
-        &self,
-        signal: &'static str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let Some(client) = self.client() else {
-                return;
-            };
-            let mut properties = pa_telemetry::base_properties("interactive");
-            properties.set("signal", serde_json::Value::from(signal));
-            client.track("tui signal shutdown", properties);
             let _ = client.shutdown().await;
         })
     }
@@ -474,10 +402,6 @@ fn print_resume_hint(hint: &Option<String>) {
 /// `/resume <selector>` chain runs its target before the loop decides again.
 async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) -> Result<()> {
     let mut anchor = anchor;
-    // The flow's roster connection (TS `AgentsViewPersistentState.rosterClient`):
-    // every view run in this loop reuses it, and a chat run hands it back,
-    // so a switch back from a chat skips the connect + hello handshake.
-    let mut roster_link: Option<pa_tui::agents_view::AgentsViewLink> = None;
     // The view/session loop's carried state (TS `AgentsViewPersistentState`):
     // a stack of scope frames (the scope plus the return chat each was
     // opened from), the typed query, the drilled-in row's ancestors to
@@ -510,16 +434,11 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             // `AgentsViewMode.keybindings`).
             keybindings: base.keybindings.clone(),
         };
-        let view_run = pa_tui::agents_view::run_agents_view(
+        let view = pa_tui::agents_view::run_agents_view(
             view_options,
             pa_tui::agents_view::AgentsViewUiMode::Terminal,
-            roster_link.take(),
         )
         .await?;
-        let view = view_run.outcome;
-        // A handoff to a chat parked the connection for this loop's next
-        // view run; a selection-less exit closed it already.
-        roster_link = view_run.link;
         // A dropped scope root or the view's parent key pops the frame (TS
         // `resolveAgentsViewScopeFrames` / the `scope_back` arm), so a later
         // agents-back lands in the parent scope; both clear the query.
@@ -547,9 +466,6 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
         anchor = Some(outcome.session_id.clone());
         if !outcome.return_to_agents_view {
             print_resume_hint(&outcome.resume_hint);
-            if let Some(link) = roster_link.take() {
-                link.close();
-            }
             return Ok(());
         }
         if let Some(scope) = outcome.agents_view_scope {
@@ -575,9 +491,6 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             anchor = Some(outcome.session_id.clone());
             if !outcome.return_to_agents_view {
                 print_resume_hint(&outcome.resume_hint);
-                if let Some(link) = roster_link.take() {
-                    link.close();
-                }
                 return Ok(());
             }
             if let Some(scope) = outcome.agents_view_scope {

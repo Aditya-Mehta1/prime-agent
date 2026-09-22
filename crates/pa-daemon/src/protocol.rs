@@ -142,8 +142,6 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "commit_update_restart",
     "update_restore_status",
     "get_mcp_connections",
-    "set_mcp_static_token",
-    "remove_mcp_connection",
 ];
 
 /// Parsed client command envelope.
@@ -606,12 +604,6 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::GetMcpConnections {
             active_session_id, ..
         }
-        | DaemonCommand::SetMcpStaticToken {
-            active_session_id, ..
-        }
-        | DaemonCommand::RemoveMcpConnection {
-            active_session_id, ..
-        }
         | DaemonCommand::ReplaceAcpMcpServers {
             active_session_id, ..
         }
@@ -867,8 +859,6 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::GetCommands { .. } => "get_commands",
         DaemonCommand::GetResourceSnapshot { .. } => "get_resource_snapshot",
         DaemonCommand::GetMcpConnections { .. } => "get_mcp_connections",
-        DaemonCommand::SetMcpStaticToken { .. } => "set_mcp_static_token",
-        DaemonCommand::RemoveMcpConnection { .. } => "remove_mcp_connection",
         DaemonCommand::ReplaceAcpMcpServers { .. } => "replace_acp_mcp_servers",
         DaemonCommand::GetModelCatalog { .. } => "get_model_catalog",
         DaemonCommand::GetAvailableModels { .. } => "get_available_models",

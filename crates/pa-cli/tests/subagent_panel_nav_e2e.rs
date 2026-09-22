@@ -338,14 +338,10 @@ async fn down_arrow_focuses_the_panel_and_enter_drills_into_the_child() {
         width: 120,
         height: 36,
     };
-    let view = pa_tui::agents_view::run_agents_view(
-        view_options,
-        AgentsViewUiMode::Headless(view_plan),
-        None,
-    )
-    .await
-    .expect("scoped agents view run")
-    .outcome;
+    let view =
+        pa_tui::agents_view::run_agents_view(view_options, AgentsViewUiMode::Headless(view_plan))
+            .await
+            .expect("scoped agents view run");
     let scoped = frame_of(&view.frames, "panel nav worker");
     assert!(
         scoped.contains("panel nav parent") || scoped.contains("subagent"),

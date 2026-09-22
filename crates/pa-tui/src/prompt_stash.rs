@@ -11,21 +11,15 @@
 
 use std::collections::HashMap;
 
-use crate::editor::EditorPasteSnapshot;
 use crate::image_load::LoadedImage;
 
-/// One stashed editor draft: the marker text plus the collapsed-paste and
-/// image registries its markers reference (TS `PromptStash`).
+/// One stashed editor draft: the marker text and the pasted images its
+/// markers reference (TS `PromptStash`; the paste-marker snapshot of the
+/// TS editor is not part of this editor).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PromptStash {
-    /// The editor text, `[paste #N ...]` and `[image #N]` markers
-    /// included.
+    /// The editor text, `[image #N]` markers included.
     pub text: String,
-    /// The collapsed pastes the text's markers reference (TS
-    /// `pasteSnapshot`, captured by `snapshotPromptStashFrom`): without
-    /// it a restored draft's paste markers would stay literal instead of
-    /// expanding on submit.
-    pub paste_snapshot: Option<EditorPasteSnapshot>,
     /// The referenced images, in marker order, keyed by marker id.
     pub images: Vec<(u64, LoadedImage)>,
     /// The auto-stash of a session switch: restored into the editor the
@@ -140,7 +134,6 @@ mod tests {
     fn draft(text: &str, restore_on_open: bool) -> PromptStash {
         PromptStash {
             text: text.to_string(),
-            paste_snapshot: None,
             images: Vec::new(),
             restore_on_open,
         }
@@ -225,41 +218,14 @@ mod tests {
         let state = store.for_session("a");
         let stash = PromptStash {
             text: "look at [image #7]".to_string(),
-            paste_snapshot: None,
             images: vec![(7, image("bytes"))],
             restore_on_open: true,
         };
         state.stash = Some(stash.clone());
 
         let restored = state.take_head_restore_on_open().expect("head restores");
-        assert_eq!(restored, stash, "the whole draft round-trips");
+        assert_eq!(restored.text, "look at [image #7]");
+        assert_eq!(restored.images, vec![(7, image("bytes"))]);
         assert!(state.is_empty(), "the popped draft leaves nothing behind");
-    }
-
-    #[test]
-    fn stashed_paste_snapshot_round_trips_with_the_text() {
-        // TS `PromptStash.pasteSnapshot`: a collapsed draft keeps its
-        // id/content registry through the stash, so the restored marker
-        // still expands on submit.
-        let mut store = PromptStashStore::default();
-        let state = store.for_session("a");
-        let content = (0..20)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        state.stash = Some(PromptStash {
-            text: "[paste #1 +20 lines]".to_string(),
-            paste_snapshot: Some(EditorPasteSnapshot {
-                pastes: vec![(1, content.clone())],
-                paste_counter: 1,
-            }),
-            images: Vec::new(),
-            restore_on_open: true,
-        });
-
-        let restored = state.take_head_restore_on_open().expect("head restores");
-        let snapshot = restored.paste_snapshot.expect("the registry travels");
-        assert_eq!(snapshot.pastes, vec![(1, content)]);
-        assert_eq!(snapshot.paste_counter, 1);
     }
 }

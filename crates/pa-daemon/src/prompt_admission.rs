@@ -29,7 +29,7 @@ use crate::worker::Worker;
 
 /// The admission status vocabulary (TS `SupervisorPromptAdmission.status`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdmissionStatus {
+enum AdmissionStatus {
     Waiting,
     Owned,
     Cancelled,
@@ -459,7 +459,7 @@ impl WorkerAdmissions {
     /// Cancel one admission: a waiting one marks cancelled (its queued
     /// prompt never runs), any other status reports as-is, an unknown id
     /// answers `None` (the wire `unknown`).
-    pub(crate) fn cancel(&self, admission_id: &str) -> Option<AdmissionStatus> {
+    fn cancel(&self, admission_id: &str) -> Option<AdmissionStatus> {
         let mut admissions = self
             .admissions
             .lock()

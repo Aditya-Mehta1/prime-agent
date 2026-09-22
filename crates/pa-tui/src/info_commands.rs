@@ -794,12 +794,7 @@ pub fn render_changelog_panel(
     rows.push(Vec::new());
     let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
     md.code_block_indent = code_block_indent.to_string();
-    rows.extend(crate::chat::render_markdown_block(
-        markdown,
-        &md,
-        width,
-        &mut crate::markdown::MarkdownBlockCache::default(),
-    ));
+    rows.extend(crate::chat::render_markdown_block(markdown, &md, width));
     rows.push(Vec::new());
     rows.push(vec![
         theme.fg(ThemeColor::Border, "\u{2500}".repeat(width.max(1)))

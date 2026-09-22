@@ -123,11 +123,6 @@ struct ChildRecord {
     settled_status: Option<&'static str>,
     answer_preview: Option<String>,
     answer_captured: bool,
-    /// Live tool-call count read from the child worker's session stats
-    /// (TS `run.toolUseCount`; the worker-process port reads the count
-    /// the child worker publishes through `get_session_stats`). The
-    /// last known count survives an unreachable worker.
-    tool_use_count: Option<u64>,
     /// An agent message from this child reached the parent since its task
     /// was admitted (TS `_parentReplyCount`): the no-reply terminal notice
     /// is withheld once set.
@@ -323,11 +318,6 @@ impl SupervisorChildSessions {
             if let Some(answer) = &record.answer_preview {
                 snapshot["answerPreview"] = json!(answer);
             }
-            // TS `RlmChildAgentSnapshot.toolUseCount`: serialized only
-            // when above zero.
-            if let Some(tool_use_count) = record.tool_use_count.filter(|count| *count > 0) {
-                snapshot["toolUseCount"] = json!(tool_use_count);
-            }
             snapshots.push(snapshot);
         }
         snapshots
@@ -386,7 +376,6 @@ impl SupervisorChildSessions {
                 settled_status: None,
                 answer_preview: None,
                 answer_captured: false,
-                tool_use_count: None,
                 replied_since_task: false,
                 notice_delivered: false,
                 prompt_admitted: true,
@@ -446,8 +435,7 @@ impl SupervisorChildSessions {
                 kind: "executing",
                 tool_name: None,
             }),
-            // TS serializes `toolUseCount` only when above zero.
-            tool_use_count: record.tool_use_count.filter(|count| *count > 0),
+            tool_use_count: None,
             duration_ms: Some(now_ms().saturating_sub(record.started_at_ms)),
             answer_preview: record.answer_preview.clone(),
             replied_since_task: None,
@@ -468,7 +456,7 @@ impl SupervisorChildSessions {
             answer_preview: record.answer_preview.clone(),
             error: record.error.clone(),
             duration_ms: Some(now_ms().saturating_sub(record.started_at_ms)),
-            tool_use_count: record.tool_use_count.filter(|count| *count > 0),
+            tool_use_count: None,
             replied_since_task: None,
         }
     }
@@ -753,27 +741,6 @@ impl SupervisorChildSessionsInner {
                 > 0)
     }
 
-    /// The child's live tool-call count (TS `run.toolUseCount`, kept live
-    /// by the parent's in-process event subscription; the worker-process
-    /// port reads the count the child worker publishes through
-    /// `get_session_stats`). Zero counts answer `None`, matching the TS
-    /// `toolUseCount > 0` serialization convention.
-    async fn child_tool_use_count(&self, active_session_id: &str) -> Result<Option<u64>> {
-        let command = DaemonCommand::GetSessionStats {
-            id: None,
-            active_session_id: active_session_id.to_string(),
-            rest: Default::default(),
-        };
-        let stats = self
-            .command(&command, STATE_TIMEOUT_MS)
-            .await
-            .with_context(|| format!("read RLM child session stats {active_session_id}"))?;
-        Ok(stats
-            .get("toolCalls")
-            .and_then(Value::as_u64)
-            .filter(|count| *count > 0))
-    }
-
     /// The child's final answer text, compacted for the roster preview.
     async fn child_answer(&self, active_session_id: &str) -> Result<Option<String>> {
         let command = DaemonCommand::GetLastAssistantText {
@@ -818,14 +785,6 @@ impl SupervisorChildSessionsInner {
             }
         }
         let active_session_id = record.lock().await.active_session_id.clone();
-        // Live telemetry first: a busy child early-returns below, so the
-        // record's tool-call count is refreshed here for every caller (the
-        // settle watcher, the roster reads). A failed read keeps the last
-        // known count (the supervisor may be restarting the child's
-        // worker).
-        if let Ok(tool_use_count) = self.child_tool_use_count(&active_session_id).await {
-            record.lock().await.tool_use_count = tool_use_count;
-        }
         let busy = self.child_busy(&active_session_id).await;
         if !matches!(busy, Ok(false)) {
             return;
@@ -1246,7 +1205,6 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 settled_status: None,
                 answer_preview: None,
                 answer_captured: false,
-                tool_use_count: None,
                 replied_since_task: false,
                 notice_delivered: false,
                 prompt_admitted: false,
@@ -1507,31 +1465,12 @@ mod watch_tests {
         Failure,
     }
 
-    /// The scripted child state the fake supervisor reports: the live
-    /// tool-call count (`get_session_stats`) and the busy flag
-    /// (`get_state`).
-    #[derive(Clone)]
-    struct FakeChildState {
-        tool_calls: std::sync::Arc<std::sync::Mutex<u64>>,
-        busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    impl FakeChildState {
-        fn idle() -> Self {
-            Self {
-                tool_calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
-                busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            }
-        }
-    }
-
     async fn spawn_fake_supervisor(
         socket: std::path::PathBuf,
         follow_up_tx: mpsc::UnboundedSender<Value>,
         idle_delay_ms: u64,
         kill_tx: mpsc::UnboundedSender<Value>,
         kill_behavior: FakeKill,
-        child_state: FakeChildState,
     ) {
         let kill_behavior = std::sync::Arc::new(kill_behavior);
         let listener = bind_transport(&socket).await.unwrap();
@@ -1543,7 +1482,6 @@ mod watch_tests {
                 let follow_up_tx = follow_up_tx.clone();
                 let kill_tx = kill_tx.clone();
                 let kill_behavior = std::sync::Arc::clone(&kill_behavior);
-                let child_state = child_state.clone();
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.split();
                     let mut reader = BufReader::new(reader);
@@ -1583,17 +1521,8 @@ mod watch_tests {
                                 Some(&id),
                                 command_type,
                                 Some(json!({
-                                    "isStreaming": child_state
-                                        .busy
-                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                    "isStreaming": false,
                                     "sessionActions": { "queuedCount": 0 },
-                                })),
-                            ),
-                            "get_session_stats" => response_success(
-                                Some(&id),
-                                command_type,
-                                Some(json!({
-                                    "toolCalls": *child_state.tool_calls.lock().unwrap(),
                                 })),
                             ),
                             "get_last_assistant_text" => response_success(
@@ -1646,24 +1575,18 @@ mod watch_tests {
         follow_up_tx: mpsc::UnboundedSender<Value>,
         idle_delay_ms: u64,
         kill_behavior: FakeKill,
-    ) -> (
-        SupervisorChildSessions,
-        mpsc::UnboundedReceiver<Value>,
-        FakeChildState,
-    ) {
+    ) -> (SupervisorChildSessions, mpsc::UnboundedReceiver<Value>) {
         let socket = std::env::temp_dir().join(format!(
             "pa-rlm-watch-{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
         let (kill_tx, kill_rx) = mpsc::unbounded_channel();
-        let child_state = FakeChildState::idle();
         spawn_fake_supervisor(
             socket.clone(),
             follow_up_tx,
             idle_delay_ms,
             kill_tx,
             kill_behavior,
-            child_state.clone(),
         )
         .await;
         let link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
@@ -1676,7 +1599,7 @@ mod watch_tests {
             cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
             ..ParentIdentity::with_default_depth()
         });
-        (sessions, kill_rx, child_state)
+        (sessions, kill_rx)
     }
 
     async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
@@ -1697,7 +1620,7 @@ mod watch_tests {
     #[tokio::test]
     async fn a_settled_child_without_a_reply_delivers_the_terminal_notice() {
         let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
-        let (sessions, _kill_rx, _child_state) =
+        let (sessions, _kill_rx) =
             sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success).await;
         let handle = spawn_child(&sessions).await;
         // The worker releases the detached prompt at its turn boundary.
@@ -1749,7 +1672,7 @@ mod watch_tests {
         let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
         // A long idle keeps the child mid-run while the close fires, so the
         // settle watcher is parked instead of raced.
-        let (sessions, mut kill_rx, _child_state) =
+        let (sessions, mut kill_rx) =
             sessions_with_fake_supervisor(follow_up_tx, 10_000, FakeKill::Success).await;
         spawn_child(&sessions).await;
         sessions.notify_turn_done();
@@ -1786,7 +1709,7 @@ mod watch_tests {
     #[tokio::test]
     async fn close_children_treats_an_already_gone_child_as_a_no_op() {
         let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
-        let (sessions, _kill_rx, _child_state) =
+        let (sessions, _kill_rx) =
             sessions_with_fake_supervisor(follow_up_tx, 10_000, FakeKill::UnknownSession).await;
         spawn_child(&sessions).await;
         sessions.notify_turn_done();
@@ -1810,7 +1733,7 @@ mod watch_tests {
     #[tokio::test]
     async fn close_children_keeps_a_failed_child_tracked() {
         let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
-        let (sessions, _kill_rx, _child_state) =
+        let (sessions, _kill_rx) =
             sessions_with_fake_supervisor(follow_up_tx, 10_000, FakeKill::Failure).await;
         spawn_child(&sessions).await;
         sessions.notify_turn_done();
@@ -1829,91 +1752,6 @@ mod watch_tests {
         assert_eq!(entries.len(), 1, "the failed child stays tracked for retry");
     }
 
-    /// A running child's tool-call count reaches the roster rows (TS
-    /// `run.toolUseCount`): every roster read refreshes the count from the
-    /// child worker's session stats, so a child that keeps calling tools
-    /// counts up while it runs, and the wire snapshots carry the same
-    /// count (TS `RlmChildAgentSnapshot.toolUseCount`, serialized only
-    /// when above zero).
-    #[tokio::test]
-    async fn a_running_childs_tool_count_increments_in_the_roster() {
-        let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
-        let (sessions, _kill_rx, child_state) =
-            sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success).await;
-        // The child runs (busy) while its tool count climbs.
-        child_state
-            .busy
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        spawn_child(&sessions).await;
-        sessions.notify_turn_done();
-
-        // Two tools ran: the roster row counts them.
-        *child_state.tool_calls.lock().unwrap() = 2;
-        let row = await_tool_count(&sessions, 2).await;
-        assert_eq!(row.status, "running");
-
-        // The child keeps working: the next read counts the new total.
-        *child_state.tool_calls.lock().unwrap() = 5;
-        await_tool_count(&sessions, 5).await;
-
-        // The `get_rlm_children` snapshots carry the same count (TS
-        // `RlmChildAgentSnapshot.toolUseCount`).
-        let snapshots = sessions.child_snapshots().await;
-        assert_eq!(snapshots[0]["toolUseCount"], json!(5));
-
-        // `collect` snapshots the same telemetry.
-        let results = sessions.collect(Vec::new(), 0).await.expect("collect");
-        assert_eq!(results[0].tool_use_count, Some(5));
-
-        // The child finishes: the settled row keeps its final count (TS
-        // settled runs retain `run.toolUseCount`).
-        child_state
-            .busy
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let row = sessions
-                .list_subagents()
-                .await
-                .expect("child roster")
-                .into_iter()
-                .next()
-                .expect("one child row");
-            if row.status == "completed" {
-                assert_eq!(row.tool_use_count, Some(5));
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the child never settled: {row:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    /// The roster row once it counts `count` tool calls (bounded wait: the
-    /// detached prompt admission is asynchronous).
-    async fn await_tool_count(sessions: &SupervisorChildSessions, count: u64) -> RlmSubagentEntry {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let row = sessions
-                .list_subagents()
-                .await
-                .expect("child roster")
-                .into_iter()
-                .next()
-                .expect("one child row");
-            if row.tool_use_count == Some(count) {
-                return row;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the roster row never counted {count} tools: {row:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
     /// A child that sent an agent message back gets no terminal notice: the
     /// reply is the parent's report (TS `_parentReplyCount`).
     #[tokio::test]
@@ -1921,7 +1759,7 @@ mod watch_tests {
         let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
         // A slow idle wait keeps the child "running" while the test marks
         // the reply.
-        let (sessions, _kill_rx, _child_state) =
+        let (sessions, _kill_rx) =
             sessions_with_fake_supervisor(follow_up_tx, 250, FakeKill::Success).await;
         let handle = spawn_child(&sessions).await;
         assert!(!handle.rlm_child_id.is_empty());

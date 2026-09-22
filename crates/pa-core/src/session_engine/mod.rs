@@ -141,13 +141,6 @@ pub struct AgentSession {
     /// continuation context, pushed at construction; taken by the next
     /// prompt or injected turn, exactly like the TS prepared-messages take).
     pending_next_turn_rows: std::sync::Arc<std::sync::Mutex<Vec<pa_types::session::CustomMessage>>>,
-    /// The skill inventory `/skill:<name>` submissions expand against (TS
-    /// reads `resourceLoader.getSkills()` at expansion time; the engine
-    /// wiring installs the loaded list once the session is assembled).
-    skills: Vec<crate::skills::Skill>,
-    /// The telemetry handle for the `skill used` adoption event the
-    /// prompt path owns (`None` in sessions without telemetry).
-    skill_telemetry: Option<std::sync::Arc<telemetry::SessionTelemetry>>,
 }
 
 impl AgentSession {
@@ -198,8 +191,6 @@ impl AgentSession {
             compact_auto_refine: std::sync::Mutex::default(),
             kernel_state: None,
             pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            skills: Vec::new(),
-            skill_telemetry: None,
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -211,20 +202,6 @@ impl AgentSession {
     /// like the TS product instead of the defaults.
     pub fn set_compaction_settings(&mut self, settings: compaction::CompactionSettings) {
         self.compaction = settings;
-    }
-
-    /// Install the skill inventory `/skill:<name>` submissions expand
-    /// against (TS reads the resource loader at expansion time; the Rust
-    /// session snapshots the engine's loaded list here).
-    pub fn set_skills(&mut self, skills: Vec<crate::skills::Skill>) {
-        self.skills = skills;
-    }
-
-    /// Bind the telemetry handle the `skill used` adoption event reports
-    /// through (the engine wiring owns the telemetry lifetime and
-    /// installs it once the session telemetry is assembled).
-    pub fn set_skill_telemetry(&mut self, telemetry: std::sync::Arc<telemetry::SessionTelemetry>) {
-        self.skill_telemetry = Some(telemetry);
     }
 
     /// Bind the auto-refine surface for this session (the engine wiring
@@ -621,17 +598,10 @@ impl AgentSession {
         options: PromptOptions,
     ) -> anyhow::Result<PromptOutcome> {
         let expand = options.expand_prompt_templates.unwrap_or(true);
-        // TS `_finishSubmissionNormalization` order: skill commands expand
-        // first (`/skill:<name>` into its `<skill>` block), prompt templates
-        // second; both are gated by the same policy flag.
-        let (normalized, used_skill) = if expand {
-            let (skill_expanded, used_skill) =
-                crate::skills::expand_skill_command(text, &self.skills);
-            let normalized =
-                crate::skills::expand_prompt_template(&skill_expanded, &self.prompt_templates);
-            (normalized, used_skill)
+        let normalized = if expand {
+            crate::skills::expand_prompt_template(text, &self.prompt_templates)
         } else {
-            (text.to_string(), None)
+            text.to_string()
         };
 
         if let Some(command) = parse_session_command(&self.slash_commands, &normalized) {
@@ -640,31 +610,6 @@ impl AgentSession {
 
         let state = self.agent.state().await;
         let busy = state.is_streaming;
-        // The `skill used` adoption event reports from the admission seam:
-        // an admitted user turn whose text IS a skill block reports once,
-        // with how the invocation arrived (a fresh admission, or a queued
-        // steering/follow-up submission). A pre-expanded block (the daemon
-        // emits the accepted row before admission) reports here too — the
-        // block parse carries the skill identity.
-        if let Some(skill) = used_skill.or_else(|| {
-            pa_types::skill_blocks::parse_skill_block(&normalized)
-                .and_then(|block| self.skills.iter().find(|skill| skill.name == block.name))
-        }) {
-            if let Some(telemetry) = &self.skill_telemetry {
-                let source = if busy {
-                    match options.streaming_behavior {
-                        Some(StreamingBehavior::Steer) => "steer",
-                        Some(StreamingBehavior::FollowUp) => "follow_up",
-                        // The busy-without-behavior case errors below; the
-                        // queued label is the honest fallback.
-                        None => "follow_up",
-                    }
-                } else {
-                    "prompt"
-                };
-                telemetry.note_skill_used(&skill.name, skill.kind_label(), source);
-            }
-        }
         if busy && options.streaming_behavior.is_none() {
             anyhow::bail!(
                 "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
@@ -932,79 +877,6 @@ mod tests {
             roles,
             vec!["user:hi there".to_string(), "assistant:m".to_string()]
         );
-    }
-
-    #[tokio::test]
-    async fn a_skill_command_prompt_expands_into_the_skill_block() {
-        // TS `_expandSkillCommand`: a `/skill:<name> [args]` submission
-        // persists as the `<skill>` block plus the argument text; the
-        // renderer parses that block back out (TS `parseSkillBlock`).
-        let mut session = scripted_session().await;
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("SKILL.md");
-        std::fs::write(&file_path, "---\nname: web-search\n---\nRun a web search.").unwrap();
-        session.set_skills(vec![crate::skills::Skill {
-            name: "web-search".to_string(),
-            description: "search the web".to_string(),
-            file_path: file_path.clone(),
-            base_dir: dir.path().to_path_buf(),
-            source_info: crate::skills::create_synthetic_source_info(
-                &file_path.display().to_string(),
-                "user",
-                crate::skills::SourceScope::User,
-                None,
-            ),
-            disable_model_invocation: false,
-            kind: crate::skills::SkillKind::Markdown,
-            python: None,
-        }]);
-        session
-            .prompt("/skill:web-search find rust tuis", PromptOptions::default())
-            .await
-            .unwrap();
-        session.agent().wait_for_idle().await;
-        let entries = session.entries().await;
-        let user_text = entries
-            .iter()
-            .find_map(|entry| match entry {
-                FileEntry::Message {
-                    message: SessionAgentMessage::User(user),
-                    ..
-                } => Some(user.content.text()),
-                _ => None,
-            })
-            .expect("user message persisted");
-        let parsed = pa_types::skill_blocks::parse_skill_block(&user_text)
-            .expect("the persisted user message is a skill block");
-        assert_eq!(parsed.name, "web-search");
-        assert_eq!(
-            parsed.user_message.as_deref(),
-            Some("find rust tuis"),
-            "args persist as the trailing user message"
-        );
-        assert!(parsed.content.contains("Run a web search."));
-    }
-
-    #[tokio::test]
-    async fn an_unknown_skill_command_passes_through() {
-        let session = scripted_session().await;
-        session
-            .prompt("/skill:missing do a thing", PromptOptions::default())
-            .await
-            .unwrap();
-        session.agent().wait_for_idle().await;
-        let entries = session.entries().await;
-        let user_text = entries
-            .iter()
-            .find_map(|entry| match entry {
-                FileEntry::Message {
-                    message: SessionAgentMessage::User(user),
-                    ..
-                } => Some(user.content.text()),
-                _ => None,
-            })
-            .expect("user message persisted");
-        assert_eq!(user_text, "/skill:missing do a thing");
     }
 
     /// A scripted session wired like the engine wires production sessions:

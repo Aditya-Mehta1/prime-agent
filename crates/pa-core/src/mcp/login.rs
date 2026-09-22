@@ -191,7 +191,7 @@ impl OAuthIntegration for McpOAuth {
     fn api_key_for(&self, _provider: &str, credential: &AuthCredential) -> Option<String> {
         match credential {
             AuthCredential::Oauth { access, .. } => Some(access.clone()),
-            AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => None,
+            AuthCredential::ApiKey { .. } => None,
         }
     }
 
@@ -303,10 +303,6 @@ mod tests {
             ),
             get_user_servers: Box::new(move || user_servers.clone()),
             begin_login: None,
-            agent_dir: None,
-            get_catalog_sources: None,
-            remote_source: None,
-            probe_override: None,
         });
         Arc::new(Mutex::new(manager))
     }

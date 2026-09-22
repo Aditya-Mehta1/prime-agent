@@ -3,31 +3,13 @@
 //! host requests. Port of core/mcp/mcp-manager.ts plus the TS MCP catalog
 //! (the OAuth flow lives in the `oauth*` submodules).
 
-mod catalog_plugin_views;
-mod catalog_schema;
-mod catalog_status_views;
-mod catalog_views;
-mod connection_store;
-mod local_catalog;
 mod login;
-mod manager_catalog;
 mod oauth;
 mod oauth_callback;
 mod oauth_discovery;
 mod oauth_http;
-mod probe;
-mod remote_source;
-mod service_catalog;
-mod url_checks;
 
-pub use catalog_views::{
-    mcp_credential_field_prompt_label, mcp_paste_credential, McpPasteCredential,
-};
 pub use login::{wire_begin_login, McpLoginContext, McpOAuth};
-pub use manager_catalog::{
-    install_static_token, remove_mcp_connection, McpConnectionHandles, PasteInstallInputs,
-    StaticTokenInstall,
-};
 pub use oauth::{mcp_login, mcp_refresh_token, McpLoginUi, McpOAuthConfig};
 pub use oauth_http::{OAuthHttp, OAuthHttpRequest, OAuthHttpResponse, ReqwestOAuthHttp};
 
@@ -218,18 +200,6 @@ pub(crate) struct ResolvedIntegration {
     pub(crate) uses_oauth: bool,
     /// True when this came from the `mcpServers` setting.
     pub(crate) user_declared: bool,
-    /// Catalog entries only: the parent service id (records keep it).
-    pub(crate) catalog_service_id: Option<String>,
-    /// Catalog token services only: the entry collects exactly ONE
-    /// credential (alternative field names collapse to one prompt), so a
-    /// stored `mcp_static_token` credential under this exact id is a valid
-    /// credential source — bound to this endpoint.
-    pub(crate) static_token_eligible: bool,
-    /// Catalog entries only: explicitly public no-auth AND setup-ready, so
-    /// credential-free dispatch is honest.
-    pub(crate) credential_free_eligible: bool,
-    /// Ownership conflict / disabled hint for reserved names.
-    pub(crate) blocked_reason: Option<String>,
 }
 
 /// Options for constructing an [`McpManager`].
@@ -242,20 +212,6 @@ pub struct McpManagerOptions {
     pub get_user_servers: Box<dyn Fn() -> Option<HashMap<String, McpServerConfig>> + Send + Sync>,
     /// Start an interactive host-side login for a server (UI mode supplies it).
     pub begin_login: Option<BeginLoginFn>,
-    /// The agent dir: connection records (`mcp-connections.json`) and the
-    /// default local source (`mcp-services.json`) live here. `None` in
-    /// embedded hosts (in-memory records, no local source).
-    pub agent_dir: Option<std::path::PathBuf>,
-    /// Declared local service-catalog sources (settings
-    /// `mcpCatalogSources`, ~-relative allowed); re-read on refresh.
-    pub get_catalog_sources: Option<Box<dyn Fn() -> Vec<String> + Send + Sync>>,
-    /// The remote plugins-catalog snapshot source; defaults to the disk
-    /// cache then the packaged bundled snapshot. Never fetches — the
-    /// fetch/cadence layer owns writing the cache.
-    pub remote_source: Option<manager_catalog::RemoteCatalogSourceFn>,
-    /// Injectable verification probe (tests); the real streamable-HTTP
-    /// handshake by default.
-    pub probe_override: Option<probe::McpEndpointProbe>,
 }
 
 /// Telemetry usage reporter for MCP connector activity: called with
@@ -270,16 +226,8 @@ pub struct McpManager {
     auth_storage: Arc<tokio::sync::Mutex<AuthStorage>>,
     get_user_servers: Box<dyn Fn() -> Option<HashMap<String, McpServerConfig>> + Send + Sync>,
     begin_login: Option<BeginLoginFn>,
-    agent_dir: Option<std::path::PathBuf>,
-    get_catalog_sources: Option<Box<dyn Fn() -> Vec<String> + Send + Sync>>,
-    remote_source: Option<manager_catalog::RemoteCatalogSourceFn>,
-    probe_override: Option<probe::McpEndpointProbe>,
     usage_report: Option<McpUsageReporter>,
     integrations: HashMap<String, ResolvedIntegration>,
-    /// The resolved service catalog (the SAME resolution feeds integrations
-    /// and the `/mcp` view).
-    service_catalog: service_catalog::McpCatalogResolution,
-    connection_store: std::sync::Arc<std::sync::Mutex<connection_store::McpConnectionStore>>,
     acp_servers: std::sync::Arc<std::sync::Mutex<HashMap<String, AcpMcpServerConfig>>>,
     acp_owner_id: std::sync::Mutex<Option<String>>,
 }
@@ -309,32 +257,12 @@ fn uses_oauth(config: &McpServerConfig) -> bool {
 
 impl McpManager {
     pub fn new(options: McpManagerOptions) -> Self {
-        let agent_dir = options.agent_dir;
-        let connection_store = std::sync::Arc::new(std::sync::Mutex::new(match &agent_dir {
-            Some(dir) => {
-                connection_store::McpConnectionStore::open(dir.join("mcp-connections.json"))
-            }
-            None => connection_store::McpConnectionStore::in_memory(),
-        }));
-        let remote_source = options.remote_source.or_else(|| {
-            agent_dir.as_ref().map(|dir| {
-                let dir = dir.clone();
-                Box::new(move || remote_source::remote_plugins_snapshot(&dir))
-                    as manager_catalog::RemoteCatalogSourceFn
-            })
-        });
         let mut manager = Self {
             auth_storage: Arc::new(tokio::sync::Mutex::new(options.auth_storage)),
             get_user_servers: options.get_user_servers,
             begin_login: options.begin_login,
-            agent_dir,
-            get_catalog_sources: options.get_catalog_sources,
-            remote_source,
-            probe_override: options.probe_override,
             usage_report: None,
             integrations: HashMap::new(),
-            service_catalog: Default::default(),
-            connection_store,
             acp_servers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             acp_owner_id: std::sync::Mutex::new(None),
         };
@@ -365,7 +293,44 @@ impl McpManager {
     }
 
     fn resolve_integrations(&mut self) {
-        self.resolve_integrations_over_catalog();
+        let mut integrations = HashMap::new();
+        for (server, label, url) in BUILTIN_MCP_CATALOG {
+            integrations.insert(
+                server.to_string(),
+                ResolvedIntegration {
+                    server: server.to_string(),
+                    label: label.to_string(),
+                    config: McpServerConfig::Http {
+                        url: url.to_string(),
+                        headers: None,
+                        bearer_token_env_var: None,
+                        oauth: Some(true),
+                        enabled: None,
+                        enabled_tools: None,
+                        disabled_tools: None,
+                        startup_timeout_ms: None,
+                        call_timeout_ms: None,
+                    },
+                    uses_oauth: true,
+                    user_declared: false,
+                },
+            );
+        }
+        if let Some(user_servers) = (self.get_user_servers)() {
+            for (server, config) in user_servers {
+                integrations.insert(
+                    server.clone(),
+                    ResolvedIntegration {
+                        server: server.clone(),
+                        label: server,
+                        uses_oauth: uses_oauth(&config),
+                        user_declared: true,
+                        config,
+                    },
+                );
+            }
+        }
+        self.integrations = integrations;
     }
 
     pub fn can_release_acp_servers(&self, owner_id: &str) -> bool {
@@ -417,71 +382,48 @@ impl McpManager {
         Ok(true)
     }
 
-    /// True when valid credentials exist for the integration (drives
-    /// enablement; TS `isAuthed` over the resolved catalog).
+    /// True when valid credentials exist for the integration (drives enablement).
     fn is_authed(&self, integration: &ResolvedIntegration) -> bool {
-        if integration.blocked_reason.is_some() {
-            return false;
-        }
         if !integration.config.is_enabled() {
             return false;
         }
-        // A bundled catalog service owns its name; a shadowing user entry
-        // is dead by design so its token can never replay against the
-        // official endpoint.
-        if integration.user_declared && self.is_reserved_server_name(&integration.server) {
+        // A user override of a catalog server is not enableable.
+        if integration.user_declared && get_catalog_entry(&integration.server).is_some() {
             return false;
         }
         if matches!(integration.config, McpServerConfig::Stdio { .. }) {
             return true;
         }
         let McpServerConfig::Http {
-            url,
             bearer_token_env_var,
             ..
         } = &integration.config
         else {
-            unreachable!("stdio handled above");
+            return true;
         };
-        let all = self.auth_storage_blocking_snapshot();
-        let credential = all
-            .get(&provider_id(&integration.server))
-            .and_then(|value| {
-                serde_json::from_value::<crate::auth::types::AuthCredential>(value.clone()).ok()
-            });
-        if !integration.user_declared && !integration.uses_oauth {
-            // Catalog entry without OAuth: credential-free dispatch ONLY
-            // for an explicitly public no-auth, setup-ready descriptor. A
-            // token service additionally accepts its STORED pasted static
-            // token — bound to this exact id and endpoint. Everything else
-            // (no stored token, unbound token, or a non-token service with
-            // a stray credential) fails closed. Credential binding is never
-            // inferred from setup field ids: the env vars the fields NAME
-            // are never read as credential sources.
-            if integration.credential_free_eligible {
-                return true;
-            }
-            if integration.static_token_eligible {
-                return super::mcp::catalog_views::mcp_static_token_usable(
-                    credential.as_ref(),
-                    url,
-                )
-                .is_ok();
-            }
-            return false;
+        if !integration.uses_oauth && bearer_token_env_var.is_none() {
+            return true;
         }
         if let Some(env_var) = bearer_token_env_var {
-            // The configured env var is the ONLY credential source for this
-            // server: when it is unset, a stale OAuth credential stored
-            // under the same id must never authorize dispatch.
-            return std::env::var(env_var)
+            if std::env::var(env_var)
                 .map(|value| !value.trim().is_empty())
-                .unwrap_or(false);
+                .unwrap_or(false)
+            {
+                return true;
+            }
         }
-        // ONE shared grant-usability rule (with the view states): typed
-        // oauth, non-empty access, endpoint binding, and no
-        // expired-without-refresh state.
-        super::mcp::catalog_views::oauth_grant_usable(credential.as_ref(), url).is_ok()
+        let all = self.auth_storage_blocking_snapshot();
+        let Some(cred) = all.get(&provider_id(&integration.server)) else {
+            return false;
+        };
+        // Builtin URLs are code-constant; only user-declared endpoints can be
+        // retargeted, so only their tokens must prove where they belong.
+        if !integration.user_declared {
+            return true;
+        }
+        // Only user-declared endpoints can be retargeted, so their tokens
+        // must prove where they belong.
+        cred.get("endpoint").and_then(Value::as_str) == integration.config_url()
     }
 
     fn auth_storage_blocking_snapshot(&self) -> serde_json::Map<String, Value> {
@@ -511,10 +453,6 @@ impl McpManager {
             ),
             get_user_servers: Box::new(move || Some(user_servers.clone())),
             begin_login: None,
-            agent_dir: Some(agent_dir.to_path_buf()),
-            get_catalog_sources: None,
-            remote_source: None,
-            probe_override: None,
         });
         (
             manager.get_disabled_builtin_skill_overrides(),
@@ -615,28 +553,7 @@ impl McpManager {
                     let Some(integration) = integrations.get(&server) else {
                         return Ok(json!({}));
                     };
-                    if !integration.user_declared {
-                        // A catalog service: the kernel dispatches it through
-                        // the same generic API once the host resolves it.
-                        // The static-token marker tells the kernel which
-                        // credential store the bearer comes from; a
-                        // disabled/blocked entry never dispatches.
-                        if integration.blocked_reason.is_some() {
-                            return Ok(json!({}));
-                        }
-                        let mut config = serde_json::to_value(&integration.config)
-                            .map_err(anyhow::Error::new)?;
-                        if integration.static_token_eligible {
-                            if let Value::Object(map) = &mut config {
-                                map.insert("credentialSource".to_string(), json!("static-token"));
-                            }
-                        }
-                        if let Some(report) = &usage_config {
-                            report("config", &server);
-                        }
-                        return Ok(config);
-                    }
-                    if get_catalog_entry(&server).is_some() {
+                    if !integration.user_declared || get_catalog_entry(&server).is_some() {
                         return Ok(json!({}));
                     }
                     serde_json::to_value(&integration.config).map_err(anyhow::Error::new)
@@ -673,29 +590,15 @@ impl McpManager {
         self.acp_servers.lock().unwrap().values().cloned().collect()
     }
 
-    /// Enabled servers available through the generic kernel API: user-
-    /// declared servers plus connected catalog services (a pasted-token
-    /// install or an OAuth login) — legacy builtins surface through
-    /// integration skills instead.
+    /// Enabled user-declared servers available through the generic kernel API.
     pub fn get_enabled_persistent_generic_servers(&self) -> Vec<String> {
         let mut servers: Vec<String> = self
             .integrations
             .values()
             .filter(|integration| {
-                // Ownership/id checks first: `is_authed` reads the auth
-                // store and must not run for integrations that are filtered
-                // out anyway (async callers).
-                is_generic_server_name(&integration.server)
-                    && if integration.user_declared {
-                        get_catalog_entry(&integration.server).is_none()
-                    } else {
-                        // Catalog services: connected and not legacy
-                        // builtins (their ids resolve through skills).
-                        integration.catalog_service_id.is_some()
-                            && self
-                                .service_descriptor(&integration.server)
-                                .is_some_and(|service| !service.legacy_builtin)
-                    }
+                integration.user_declared
+                    && is_generic_server_name(&integration.server)
+                    && get_catalog_entry(&integration.server).is_none()
                     && self.is_authed(integration)
             })
             .map(|integration| integration.server.clone())
@@ -833,10 +736,6 @@ mod tests {
             auth_storage: test_auth_storage(),
             get_user_servers: Box::new(move || user_servers.clone()),
             begin_login: None,
-            agent_dir: None,
-            get_catalog_sources: None,
-            remote_source: None,
-            probe_override: None,
         })
     }
 

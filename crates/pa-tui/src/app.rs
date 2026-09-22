@@ -53,9 +53,6 @@ pub fn run_app(
     crossterm::style::force_color_output(true);
     terminal::enable_raw_mode()?;
     crossterm::execute!(stdout(), EnterAlternateScreen)?;
-    // The replay surface owns the same enhanced-key modes as the session
-    // (TS `ProcessTerminal.start`): bracketed pastes arrive as one chunk.
-    crate::enhanced_keys::enable(&mut std::io::stdout())?;
     let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
 
     let theme = load_theme(&options.theme);
@@ -69,11 +66,8 @@ pub fn run_app(
         if !stream_ended {
             match stream.poll()? {
                 SessionEvent::Item(item) => {
-                    if let crate::session::TranscriptItem::ModelChange { provider, model_id } =
-                        &item
-                    {
+                    if let crate::session::TranscriptItem::ModelChange { model_id, .. } = &item {
                         view.chrome.model_id = Some(model_id.clone());
-                        view.chrome.model_provider = Some(provider.clone());
                     }
                     view.push(item);
                     if options.replay_delay_ms > 0 {
@@ -125,8 +119,6 @@ pub fn run_app(
         }
     }
 
-    let mut out = stdout();
-    let _ = crate::enhanced_keys::disable(&mut out);
     terminal::disable_raw_mode()?;
     crossterm::execute!(stdout(), LeaveAlternateScreen)?;
     Ok(())
