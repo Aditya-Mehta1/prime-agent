@@ -442,6 +442,12 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 					deadline,
 				);
 			} catch (error) {
+				// A disposal abort fails the in-flight request (the close fails
+				// all pending responses); the abort result outranks the adapter
+				// failure report.
+				if (options.signal?.aborted) {
+					return finish("failed", "aborted", "Router aborted during the current step.");
+				}
 				// The dispatch may have reached the adapter before the rejection
 				// (e.g. a request timeout after the write): count the execution and
 				// record the unknown outcome like the deadline branch, instead of
@@ -464,6 +470,11 @@ export async function runSystemRouterLoop(options: SystemRouterLoopOptions): Pro
 					...(decision.usage ? { usage: decision.usage } : {}),
 				});
 				return finish("failed", "environment_error", message);
+			}
+			// A disposal abort that fired mid-execute outranks the recorded
+			// outcome: the run ends failed("aborted") per the signal contract.
+			if (options.signal?.aborted) {
+				return finish("failed", "aborted", "Router aborted during the current step.");
 			}
 			if (executionResult === "deadline") {
 				// The dispatch already reached the adapter and the request is

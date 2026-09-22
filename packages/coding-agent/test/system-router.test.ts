@@ -687,15 +687,20 @@ describe("runSystemRouterLoop", () => {
 		expect(result.reason).toBe("aborted");
 	});
 
-	it("reports aborted instead of done when the signal fires during observe", async () => {
+	it.each([
+		["observe", () => Promise.resolve({ text: "x", terminal: true })],
+		["execute", () => Promise.resolve({ text: "x", terminal: true })],
+		["a failed execute", () => Promise.reject(new Error("adapter closed"))],
+	])("reports aborted when the signal fires during %s", async (phase, settle) => {
 		const controller = new AbortController();
 		const env = new FakeEnvironment(["x"]);
-		env.observe = async () => {
+		const during = async () => {
 			controller.abort();
-			return { text: "x", terminal: true };
+			return settle();
 		};
-		const result = await runLoop(env, { signal: controller.signal });
-		expect(result.reason).toBe("aborted");
+		if (phase === "observe") env.observe = during;
+		else env.execute = during;
+		expect((await runLoop(env, { signal: controller.signal })).reason).toBe("aborted");
 	});
 
 	it("reports the timeout instead of done when the deadline passes during observe", async () => {
