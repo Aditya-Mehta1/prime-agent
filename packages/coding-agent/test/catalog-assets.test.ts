@@ -118,14 +118,24 @@ describe("catalog asset generation", () => {
 	it("sends GitHub tokens to the trusted contents API fallback", async () => {
 		process.env.GITHUB_TOKEN = "secret-token";
 		const seen: Array<{ url: string; authorization?: string }> = [];
+		const rawModelUrl =
+			"https://raw.githubusercontent.com/PrimeIntellect-ai/prime-agent-catalog/main/models/catalog.v1.json";
+		const rawMcpUrl =
+			"https://raw.githubusercontent.com/PrimeIntellect-ai/prime-agent-catalog/main/plugins/catalog.v2.json";
+		const apiModelUrl =
+			"https://api.github.com/repos/PrimeIntellect-ai/prime-agent-catalog/contents/models/catalog.v1.json?ref=main";
+		const apiMcpUrl =
+			"https://api.github.com/repos/PrimeIntellect-ai/prime-agent-catalog/contents/plugins/catalog.v2.json?ref=main";
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 				const url = String(input);
 				const headers = new Headers(init?.headers);
 				seen.push({ url, authorization: headers.get("authorization") ?? undefined });
-				if (url.includes("raw.githubusercontent.com")) return new Response("not found", { status: 404 });
-				return new Response(url.includes("models") ? modelCatalog() : mcpCatalog());
+				if (url === rawModelUrl || url === rawMcpUrl) return new Response("not found", { status: 404 });
+				if (url === apiModelUrl) return new Response(modelCatalog());
+				if (url === apiMcpUrl) return new Response(mcpCatalog());
+				return new Response("unexpected url", { status: 500 });
 			}),
 		);
 
@@ -133,8 +143,8 @@ describe("catalog asset generation", () => {
 
 		expect(seen).toHaveLength(4);
 		expect(seen.every((entry) => entry.authorization === "Bearer secret-token")).toBe(true);
-		expect(seen.filter((entry) => entry.url.includes("raw.githubusercontent.com"))).toHaveLength(2);
-		expect(seen.filter((entry) => entry.url.includes("api.github.com"))).toHaveLength(2);
+		expect(seen.filter((entry) => entry.url === rawModelUrl || entry.url === rawMcpUrl)).toHaveLength(2);
+		expect(seen.filter((entry) => entry.url === apiModelUrl || entry.url === apiMcpUrl)).toHaveLength(2);
 	});
 
 	it("copies generated flat source assets into dist", async () => {
