@@ -862,12 +862,31 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         result = await self._run('f() { chmod 755 sub; }; f')
         self.assertEqual(result.exit_code, 0)
 
+    async def test_env_split_string_underscore_is_a_separator(self):
+        # GNU env splits the -S string at `\_` like whitespace, not `_`.
+        with mock.patch.dict(os.environ, {"HOME": self.test_dir}):
+            message = await self._refused("env -S 'chmod\\_-R\\_755\\_~'")
+        self.assertIn("Refusing to run", message)
+
     async def test_pipe_fed_wrapper_option_value_is_not_a_script_arg(self):
-        # `-o vi` consumes `vi` as an option value, so the pipe stays the
-        # wrapper's input and the fed script is refused.
+        # `-o vi` consumes `vi` as an option value, so the pipe stays input.
         self._make_tree()
         message = await self._refused("printf 'chmod -R 755 sub' | bash -o vi")
         self.assertIn("Refusing to run", message)
+
+    async def test_refuses_xargs_fed_script_names(self):
+        # xargs supplies the script operand at runtime; the fed run is refused.
+        message = await self._refused("printf '%s\n' /tmp/evil.sh | xargs bash")
+        self.assertIn("script", message)
+
+    async def test_refuses_grouped_pipe_fed_wrappers(self):
+        # A group opener between the pipe and the wrapper still feeds it.
+        for command in [
+            "printf 'chmod -R 755 sub\n' | { bash; }",
+            "printf 'chmod -R 755 sub\n' | ( bash )",
+        ]:
+            with self.subTest(command=command):
+                self.assertIn("Refusing to run", await self._refused(command))
 
     async def test_refuses_flagged_procsub_and_pipe_fed_wrappers(self):
         self._make_tree()
@@ -1283,7 +1302,9 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         for command in [
             "FOO=1 hash -p /bin/chmod safe; safe -R 755 ~",
             "command hash -p /bin/chmod safe; safe -R 755 ~",
-            "builtin hash -p /bin/chmod safe; safe -R 755 ~",
+            "command -p hash -p /bin/chmod safe; safe -R 755 ~",
+            "if hash -p /bin/chmod safe; then safe -R 755 ~; fi",
+            "while hash -p /bin/chmod safe; do safe -R 755 ~; break; done",
         ]:
             self.assertIn("Refusing to run", await self._refused(command, home=home.name))
         # Real bash runs `safe` and finds no such command: the argument
@@ -1529,6 +1550,13 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
                 message = await self._refused(command, home=home.name)
                 self.assertIn("Refusing to run this recursive chmod/chown command", message)
                 self.assertTrue(Path(home.name, "keep.txt").exists())
+
+    async def test_deep_heredoc_nesting_refuses_cleanly(self):
+        # Heredoc bodies rescanned as shell code recurse; nesting must refuse.
+        command = "chmod -R 755 ~"
+        for level in range(800):
+            command = "bash <<EOF%d\n%s\nEOF%d" % (level, command, level)
+        self.assertIn("nests more than", await self._refused(command))
 
     async def test_deep_substitution_nesting_refuses_cleanly(self):
         # Hostile nesting must refuse with the guard's own error instead of

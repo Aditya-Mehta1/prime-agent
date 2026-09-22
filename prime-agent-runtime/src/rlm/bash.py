@@ -1118,6 +1118,11 @@ def _locate_heredoc(command: str, operator: re.Match) -> tuple[str | None, int, 
 # hostile input must refuse, not crash.
 _MAX_SUBSTITUTION_NESTING = 100
 
+# Heredoc bodies scanned as shell code recurse one guard pass per wrapper
+# level; deeper hostile nesting refuses with the guard's own error instead
+# of exhausting the Python stack (same bound class as substitutions).
+_MAX_HEREDOC_NESTING = 25
+
 
 def _format_chmod_nesting_refusal() -> str:
     return "\n".join(
@@ -1837,6 +1842,8 @@ def _chmod_hash_registered_command_names(
                     if before.starts_command:
                         break  # an assignment/grouping run head passes the slot
                     continue
+                if before.value.startswith("-") and before.value != "-":
+                    continue  # a dispatcher or command option word: the head still decides
                 slot = False  # an argument or command word takes the slot
                 break
             if not slot:
@@ -2477,9 +2484,14 @@ _UNRESOLVABLE_COMMAND_EXECUTORS = (
 # Words that hold a run's command slot without being the command itself:
 # grouping tokens and the keywords that introduce the simple command inside a
 # group. A wrapper behind one of them still runs (`{ bash -l -c ...; }`).
-# `command` and `builtin` dispatch the word behind them, so they hold the
-# command slot without being the command.
-_COMMAND_SLOT_NOISE = ("{", "}", "(", ")", "then", "do", "else", "elif", "!", "command", "builtin")
+# `command` and `builtin` dispatch the word behind them, and the compound
+# introducers (`if`, `while`, `until`, `time`, `coproc`) run the word after
+# them as the condition command, so all of them hold the command slot
+# without being the command.
+_COMMAND_SLOT_NOISE = (
+    "{", "}", "(", ")", "then", "do", "else", "elif", "!",
+    "command", "builtin", "if", "while", "until", "time", "coproc",
+)
 # Heads whose operand arming BASH_ENV executes before the command runs.
 _ENV_ARMING_HEADS = ("env", "export", "declare", "typeset", "sudo", "nohup")
 # Wrappers that execute a process substitution's output as shell code.
@@ -2712,7 +2724,7 @@ def _substitution_spans(command: str) -> list[tuple[int, int]]:
 
 
 def _heredoc_bodies_hide_shell_code(
-    raw: str, allow_destructive_chmod: bool, command_prefix: str | None
+    raw: str, allow_destructive_chmod: bool, command_prefix: str | None, heredoc_depth: int = 0
 ) -> None:
     """Refuse here-document bodies that execute as shell code: a shell
     wrapper directly fed by the heredoc (`bash <<EOF ... EOF`) runs the
@@ -2747,6 +2759,7 @@ def _heredoc_bodies_hide_shell_code(
                 _prefix_command(body.strip("\n"), command_prefix),
                 allow_destructive_chmod,
                 command_prefix,
+                heredoc_depth + 1,
             )
 
 
@@ -3055,7 +3068,14 @@ def _unscanned_wrapper_script_reason(
         region = re.split(r"[;&|\n]", raw[raw_end:], 1)[0]
         for match in re.finditer(r"<>?\s*([^\s;&|<>()]+)", region):
             candidates.append(match.group(1))
-        if not candidates:
+        if not candidates and os.path.basename(word.value) in _SHELL_C_INTERPRETERS:
+            # An executor chain (xargs, env, nohup, ...) supplies a bare
+            # interpreter's script operand at runtime from data the guard
+            # never sees (`printf %s | xargs bash`), so that input cannot
+            # be scanned: the run is refused like the other unreadable
+            # inputs. An operand-position dot or `source` stays data here.
+            if head is not None and os.path.basename(head.value) in _UNRESOLVABLE_COMMAND_EXECUTORS:
+                return "unscanned_script"
             continue
         # Replay cd relocations so relative scripts resolve where the
         # wrapper will actually read them.
@@ -3121,12 +3141,22 @@ def _shell_wrapper_reads_pipe(normalized: str, words: list[_ChmodShellWord]) -> 
     statically, so the wrapper form is refused. Wrappers governed by a
     `-c` payload or a script argument read that instead and stay fine."""
     for index, word in enumerate(words):
-        if not word.starts_command:
+        # A group opener introduces the wrapper the way a command position
+        # does (`{ bash; }` runs bash), so the wrapper word itself needs no
+        # command position when it directly follows `{` or `(`.
+        introduced_by_opener = normalized[: word.start].rstrip()[-1:] in ("{", "(")
+        if not word.starts_command and not introduced_by_opener:
             continue
         if os.path.basename(word.value) not in _SHELL_C_INTERPRETERS:
             continue
         before = normalized[: word.start].rstrip()
-        if not before.endswith("|"):
+        if "|" in before:
+            # A group opener between the pipe and the wrapper still feeds it
+            # (`printf ... | { bash; }` runs bash on the piped text).
+            between = before[before.rfind("|") + 1 :].replace(" ", "")
+            if between and any(ch not in "{(" for ch in between):
+                continue
+        else:
             continue
         c_payload = False
         script_arg = False
@@ -3489,7 +3519,15 @@ def _chmod_split_env_string(value: str) -> str | None:
     while i < len(value):
         ch = value[i]
         if ch == "\\" and i + 1 < len(value):
-            current.append(value[i + 1])
+            if value[i + 1] == "_":
+                # GNU env splits argv at `\_` in the string: it is a space,
+                # not a literal underscore (`chmod\_-R\_755\_/` runs the
+                # recursive chmod as argv).
+                if current:
+                    parts.append("".join(current))
+                    current = []
+            else:
+                current.append(value[i + 1])
             i += 2
             continue
         if quote is None and ch in "'\"":
@@ -3613,6 +3651,12 @@ def _wrapper_chain_groups(run_words: list[str]) -> list[tuple[str, list[str]]]:
             # is the one that runs (`FOO=1 env -C / chmod ...`, `{ env -C / ... }`).
             index += 1
             continue
+        if run_words[index].startswith("-") and run_words[index] != "-":
+            # An option word reached here follows only slot holders (noise or
+            # assignments: `command -p env ...`), so it is consumed by the
+            # dispatcher, not a command that breaks the chain.
+            index += 1
+            continue
         name = os.path.basename(run_words[index])
         if name not in _UNRESOLVABLE_COMMAND_EXECUTORS:
             break
@@ -3627,7 +3671,12 @@ def _wrapper_chain_groups(run_words: list[str]) -> list[tuple[str, list[str]]]:
     return groups
 
 
-def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command_prefix: str | None) -> None:
+def _guard_destructive_chmod(
+    script: str,
+    allow_destructive_chmod: bool,
+    command_prefix: str | None,
+    heredoc_depth: int = 0,
+) -> None:
     """Refuse recursive chmod/chown commands whose operands could escape the
     kernel workspace or hit the home directory, dot-directories, dotfiles, or
     the filesystem root, and fail closed on what the scanner cannot resolve:
@@ -3645,6 +3694,11 @@ def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command
     caller from one env read, so the scan never diverges from the spawn."""
     if allow_destructive_chmod or _DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START:
         return
+    if heredoc_depth > _MAX_HEREDOC_NESTING:
+        # A heredoc body scanned as shell code can itself carry a heredoc
+        # wrapper, and hostile nesting would exhaust the Python stack; refuse
+        # past the bound like the substitution scanner does.
+        raise DestructiveChmodRefusalError(_format_chmod_nesting_refusal())
     raw = _chmod_normalize_line_continuations(script)
     resolved = _chmod_mask_shell_redirections(raw)
     normalized, index_map = _chmod_strip_shell_escapes(resolved)
@@ -3680,7 +3734,7 @@ def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command
     # heredoc, or a heredoc flowing out of a substitution) are scanned with
     # the full guard; data bodies stay masked and inert.
     if "<<" in raw:
-        _heredoc_bodies_hide_shell_code(raw, allow_destructive_chmod, command_prefix)
+        _heredoc_bodies_hide_shell_code(raw, allow_destructive_chmod, command_prefix, heredoc_depth)
     # The cheap gates are word-driven, not raw-text-driven: quote- and
     # ANSI-C-encoded wrapper names (`e"val"`, `$'bash'`) fold to the
     # wrapper word in the scan even though no contiguous `eval`/`bash` text
