@@ -1,0 +1,1 @@
+- Added an optional hook for one bounded tool-intent recovery per run on OpenAI Chat Completions.

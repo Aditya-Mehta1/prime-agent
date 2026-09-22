@@ -243,6 +243,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getContinuationMessages?: (context: GetContinuationMessagesContext, signal?: AbortSignal) => Promise<AgentMessage[]>;
 
 	/**
+	 * One-shot recovery for a stop-without-tool-call turn.
+	 *
+	 * Called after normal continuations decline, for OpenAI Chat Completions only.
+	 * Return a model-facing message to retry with required tool choice for one turn.
+	 * At most one recovery is accepted per run. Errors, length limits, tool calls,
+	 * and tool-free runs are ineligible. Undefined leaves the turn unchanged.
+	 *
+	 * Contract: synchronous and must not throw. Return undefined instead.
+	 */
+	getToolIntentRecovery?: (context: GetContinuationMessagesContext) => AgentMessage | undefined;
+
+	/**
 	 * Tool execution mode. Defaults to `"parallel"`.
 	 * Parallel mode preflights calls sequentially, executes allowed calls concurrently, emits
 	 * `tool_execution_end` in completion order, then emits tool-result messages in assistant source order.

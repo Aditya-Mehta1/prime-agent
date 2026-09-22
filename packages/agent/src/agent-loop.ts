@@ -174,6 +174,14 @@ async function pollMessagesUnlessAborted(
 	return (await maybePromiseWithAbort(poll(), signal)) || [];
 }
 
+function isStoppedWithoutToolCall(message: AssistantMessage, context: AgentContext): boolean {
+	return (
+		message.stopReason === "stop" &&
+		!message.content.some((part) => part.type === "toolCall") &&
+		(context.tools?.length ?? 0) > 0
+	);
+}
+
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -312,6 +320,8 @@ async function runLoop(
 	let firstTurn = true;
 	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
 	let pendingMessages: AgentMessage[] = await pollMessagesUnlessAborted(config.getSteeringMessages, signal);
+	let toolIntentRecoveryUsed = false;
+	let recoveryToolChoice: "required" | undefined;
 
 	const shouldStopBeforeTurn = (): boolean => !firstTurn && (config.shouldStopBeforeTurn?.() ?? false);
 
@@ -337,7 +347,15 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			const message = await streamAssistantResponse(
+				currentContext,
+				config,
+				signal,
+				emit,
+				streamFn,
+				recoveryToolChoice,
+			);
+			recoveryToolChoice = undefined;
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -442,6 +460,23 @@ async function runLoop(
 			continue;
 		}
 
+		if (shouldStopBeforeTurn() || signal?.aborted) break;
+		if (
+			!toolIntentRecoveryUsed &&
+			config.model.api === "openai-completions" &&
+			(config.toolChoice === undefined || config.toolChoice === "auto") &&
+			lastTurn &&
+			isStoppedWithoutToolCall(lastTurn.message, currentContext)
+		) {
+			const recovery = config.getToolIntentRecovery?.(lastTurn);
+			if (recovery) {
+				toolIntentRecoveryUsed = true;
+				recoveryToolChoice = "required";
+				pendingMessages = [recovery];
+				continue;
+			}
+		}
+
 		break;
 	}
 
@@ -454,6 +489,7 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
+	perTurnToolChoice?: "required",
 ): Promise<AssistantMessage> {
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
@@ -494,6 +530,7 @@ async function streamAssistantResponse(
 		const response = await maybePromiseWithAbort(
 			streamFunction(config.model, llmContext, {
 				...config,
+				toolChoice: perTurnToolChoice ?? config.toolChoice,
 				apiKey: resolvedApiKey,
 				signal,
 			}),

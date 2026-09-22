@@ -509,7 +509,7 @@ export const streamSimpleOpenAICompletions: StreamFunction<"openai-completions",
 	const reasoningSpecified = requestedReasoning !== undefined;
 	const clampedReasoning = reasoningSpecified ? clampThinkingLevel(model, requestedReasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
-	const toolChoice = (options as OpenAICompletionsOptions | undefined)?.toolChoice;
+	const toolChoice = options?.toolChoice;
 
 	return streamOpenAICompletions(model, context, {
 		...base,

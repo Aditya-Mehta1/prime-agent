@@ -1,0 +1,1 @@
+- Added a typed simple-stream tool-choice option for OpenAI Chat Completions.

@@ -1,0 +1,1 @@
+- Added one recovery attempt for Prime Inference GLM-5.3 turns that stop after announcing an immediate action without calling a tool.
