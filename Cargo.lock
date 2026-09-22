@@ -1339,6 +1339,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pa-models"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "pa-ai",
+ "pa-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pa-telemetry"
 version = "0.1.0"
 dependencies = [

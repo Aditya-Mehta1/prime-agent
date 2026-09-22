@@ -25,6 +25,7 @@ Parity contract = user experience + model-facing surface, not internal mechanism
 | `pa-types` | shared wire & domain types, protocol messages | coding-agent core types, daemon protocol |
 | `pa-telemetry` | event schema, queueing/batching, sinks (PostHog/file/noop/mock), install id | core/telemetry.ts |
 | `pa-ai` | providers, model registry, streaming | packages/ai |
+| `pa-models` | live model catalog: fetch, no-cold-start chain, transport pinning, Prime Inference | packages/ai catalog client + coding-agent core catalog layers |
 | `pa-agent` | agent loop | packages/agent |
 | `pa-core` | session engine: tools, skills, prompts, compaction, refinement, kernel/RLM manager, subagents, session manager, settings | packages/coding-agent core/ |
 | `pa-daemon` | supervision redesign: supervisor + per-session worker processes, wire protocol, cloud sandbox attach | modes/daemon, session-worker |
@@ -57,6 +58,9 @@ pa-telemetry <-- telemetry library (schema/queue/sinks); depends on no workspace
             consumers: pa-core, pa-daemon, pa-cli (pa-tui stays pa-types-only)
    ^
    |        pa-ai (providers/registry)
+   |           ^
+   |           |     pa-models (live catalog over the compiled transports;
+   |           |        depends on pa-ai + pa-types only)
    |           ^
    |           |     pa-agent (loop)
    |           |        ^
