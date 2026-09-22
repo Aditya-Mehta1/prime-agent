@@ -232,14 +232,24 @@ class BashHandle:
     handle; later awaits only wait and cancelling them leaves it running.
     """
 
-    def __init__(self, command: str) -> None:
+    def __init__(self, command: str, script: str | None = None) -> None:
         # Every asyncio use in this module runs on a handle path (bash() is the
         # only constructor), so bind the module global here, before
         # _schedule_background_completion_notice or any await can run.
         global asyncio
         import asyncio
 
+        # `command` is the text the caller wrote and stays the display value
+        # (the completion notice and repr use it). `script` is the text the
+        # shell runs, computed once by `bash()` and validated by the guard
+        # before it reached this handle; without one they are the same text,
+        # so a handle built directly is guarded here instead -- the class must
+        # not be a way around the guard, and the `bash()` path, whose script
+        # was already validated, pays no second scan.
+        if script is None:
+            _guard_force_push(command, False)
         self.command = command
+        self._script = script if script is not None else command
         completion_context = _current_cell_completion_context()
         self._creating_cell_finished = completion_context[0] if completion_context else None
         self._creating_cell_task = completion_context[1] if completion_context else None
@@ -298,13 +308,13 @@ class BashHandle:
                 _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
             )
             script = _status_script(
-                command,
+                self._script,
                 completion_token[:token_midpoint],
                 completion_token[token_midpoint:],
             )
         else:
             # Windows lacks a foreground-status channel, so its exit drain stays best-effort.
-            script = command
+            script = self._script
             self._job = _winjob.create_job()
             if self._job is None:
                 # Nothing spawned yet, so nothing can leak: refuse to start.
@@ -1075,8 +1085,12 @@ _FORCE_PUSH_BYPASS_AT_KERNEL_START = os.environ.get(BASH_FORCE_PUSH_BYPASS_ENV) 
 _force_push_late_bypass_warned = False
 
 # Every guarded push spawns at most one upstream probe; keep it bounded so a
-# wedged git (huge repo, hung filesystem) cannot hang the guard with it.
-_FORCE_PUSH_PROBE_TIMEOUT_SECONDS = 10.0
+# wedged git (huge repo, hung filesystem) cannot hang the guard with it. The
+# probe runs inside bash() -- synchronously, on the kernel's event loop -- so
+# this budget is also the whole session's worst-case freeze: a local rev-parse
+# finishes in tens of milliseconds, and a probe that cannot answer inside the
+# budget fails closed instead of letting the push through.
+_FORCE_PUSH_PROBE_TIMEOUT_SECONDS = 2.0
 
 
 class ForcePushRefusalError(RuntimeError):
@@ -3775,6 +3789,12 @@ def _fp_probe_upstream(
             stderr=subprocess.DEVNULL,
             timeout=_FORCE_PUSH_PROBE_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        # Fail closed: a probe that cannot answer means the guard cannot see
+        # the branch an implicit refspec or HEAD would rewrite, and the
+        # process it already froze the event loop waiting for must not also
+        # buy the push a pass.
+        raise ForcePushRefusalError(_fp_format_probe_timeout_refusal()) from None
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         info = None
     else:
@@ -4088,6 +4108,21 @@ def _fp_format_env_refusal() -> str:
     )
 
 
+def _fp_format_probe_timeout_refusal() -> str:
+    return "\n".join(
+        [
+            "Refusing to run this force-push command: resolving the branch it"
+            " would rewrite timed out (a `git rev-parse` probe the guard runs"
+            " before spawning anything), so the target cannot be determined"
+            " safely.",
+            "",
+            "Retry the command, or retry with"
+            " bash(command, allow_force_push=True), or start the kernel with"
+            f" {BASH_FORCE_PUSH_BYPASS_ENV}=1.",
+        ]
+    )
+
+
 def _fp_warn_once_about_late_force_push_bypass() -> None:
     """Warn (once) when the bypass env var appears mid-session.
 
@@ -4294,7 +4329,10 @@ def bash(command: str, *, allow_force_push: bool = False) -> BashHandle:
     refspecs) are refused while their target is protected: a refspec naming
     main/master or `@{u}`, every branch under `--all`/`--mirror`, or, when
     the refspec is implicit, the current upstream (probed with `git rev-parse
-    @{u}`), including a branch that has no upstream at all. A push the scan
+    @{u}`), including a branch that has no upstream at all. The probe is
+    bounded and synchronous -- it runs on the kernel's event loop inside
+    bash() -- and a probe that does not answer inside its budget is refused
+    like any other unresolvable target. A push the scan
     cannot resolve is refused too: an argument carrying a variable, glob, or
     substitution; an ANSI-C-quoted command word; a git alias the command line
     defines for itself; `env -S`/`xargs` wrappers; a command that changes
@@ -4316,7 +4354,10 @@ def bash(command: str, *, allow_force_push: bool = False) -> BashHandle:
     # set prefix is joined here: the pinned read above is the only one.
     command_text = _with_prefix(command, prefix) if prefix else command
     _guard_force_push(command_text, allow_force_push, prefix or "")
-    return BashHandle(command_text)
+    # The handle displays the caller's text and runs the guarded script: the
+    # prefix is plumbing, so it must not leak into handle.command, repr, or
+    # the completion notice.
+    return BashHandle(command, script=command_text)
 
 
 def _shell() -> str:
@@ -4396,7 +4437,7 @@ def _child_env() -> dict[str, str]:
     per-command inline assignment (`GIT_EDITOR=vim git commit`) still wins
     because it replaces the exported value for that command.
     """
-    return {
+    env = {
         **os.environ,
         "NO_COLOR": "1",
         "TERM": "dumb",
@@ -4413,6 +4454,22 @@ def _child_env() -> dict[str, str]:
         "GIT_PAGER": "cat",
         "DEBIAN_FRONTEND": "noninteractive",
     }
+    if not _FORCE_PUSH_BYPASS_AT_KERNEL_START:
+        # A mid-session os.environ write must not arm a child kernel's frozen
+        # launch snapshot: only the launch-time copy authorizes the bypass.
+        env.pop(BASH_FORCE_PUSH_BYPASS_ENV, None)
+    # Non-interactive bash sources $BASH_ENV (and some shells $ENV) before
+    # the command; the env is model-writable mid-session, so never let it
+    # smuggle an unscanned startup file past the guards.
+    env.pop("BASH_ENV", None)
+    env.pop("ENV", None)
+    # Bash also imports exported shell functions from `BASH_FUNC_name%%`
+    # entries in its environment, which would run under a command name the
+    # guards read literally (`BASH_FUNC_git%%=() { git push -f origin main; }`
+    # shadows git).
+    for name in [name for name in env if name.startswith("BASH_FUNC_")]:
+        env.pop(name, None)
+    return env
 
 
 def _signal_group(pid: int, sig: int) -> bool:

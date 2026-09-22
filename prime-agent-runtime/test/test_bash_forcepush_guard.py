@@ -1763,6 +1763,32 @@ read as the command. A long option is resolved by prefix, the way getopt_long do
         )
         self.assertNotIn("defines a git alias", message)
 
+    def test_direct_handle_construction_is_guarded(self):
+        """BashHandle is importable, so building one without a pre-validated script must pay the scan."""
+        with self.assertRaises(ForcePushRefusalError):
+            bash_module.BashHandle("git push -f origin main")
+
+    def test_probe_timeout_fails_closed_and_is_event_loop_bounded(self):
+        """The probe runs on the event loop inside sync bash(); a probe that cannot answer in budget is refused."""
+        self.assertLessEqual(bash_module._FORCE_PUSH_PROBE_TIMEOUT_SECONDS, 2.0)
+        with mock.patch.object(
+            bash_module.subprocess, "run", side_effect=subprocess.TimeoutExpired("probe", 2.0)
+        ):
+            verdict = self._guard_verdict("git push -f")
+        self.assertIn("timed out", verdict)
+
+    def test_child_env_strips_late_bypass_and_smuggled_shell_startup(self):
+        """A late bypass write must not arm a nested kernel; $BASH_ENV/$ENV/BASH_FUNC_* smuggle code (#2429/#2373)."""
+        os.environ[BASH_FORCE_PUSH_BYPASS_ENV] = "1"
+        os.environ["BASH_ENV"] = os.environ["ENV"] = "evil.sh"
+        os.environ["BASH_FUNC_git%%"] = "() { git push -f origin main; }"
+        env = bash_module._child_env()
+        for name in (BASH_FORCE_PUSH_BYPASS_ENV, "BASH_ENV", "ENV", "BASH_FUNC_git%%"):
+            self.assertNotIn(name, env)
+        with mock.patch.object(bash_module, "_FORCE_PUSH_BYPASS_AT_KERNEL_START", True):
+            self.assertIn(BASH_FORCE_PUSH_BYPASS_ENV, bash_module._child_env())
+
+
 class ForcePushGitCommandNameTest(unittest.TestCase):
     """A git subcommand git does not resolve itself is refused.
 
@@ -1931,6 +1957,25 @@ class ForcePushFrozenBypassTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("Refusing to run", completed.stderr)
         self.assertIn("appeared after kernel start", completed.stderr)
+
+    def test_late_write_cannot_arm_a_nested_kernel_spawned_via_bash(self):
+        """A late os.environ write must stay inert in a kernel this kernel launches through bash(): the strip
+keeps the nested kernel's frozen launch snapshot clean, so its own guard refuses the push."""
+        child = "import asyncio\nfrom rlm import bash\nasync def main():\n    r = await bash('git push -f origin main')\nasyncio.run(main())\n"
+        parent = (
+            "import asyncio, os, shlex, sys\nfrom rlm import bash\n"
+            f"os.environ[{BASH_FORCE_PUSH_BYPASS_ENV!r}] = '1'\n"
+            "async def main():\n    r = await asyncio.wait_for(bash(sys.executable + ' -c ' + shlex.quote("
+            + repr(child)
+            + ")), 60)\n    print(r.output, end='')\n    raise SystemExit(r.exit_code)\nasyncio.run(main())\n"
+        )
+        env = {k: v for k, v in os.environ.items() if k != BASH_FORCE_PUSH_BYPASS_ENV}
+        completed = subprocess.run(
+            [sys.executable, "-c", parent], cwd=str(self.workspace), env=env,
+            capture_output=True, text=True, timeout=KERNEL_LAUNCH_TIMEOUT,
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Refusing to run this force-push command", completed.stdout)
 
 
 if __name__ == "__main__":
