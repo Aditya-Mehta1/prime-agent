@@ -22,6 +22,7 @@ describe("ModelRegistry", () => {
 	});
 
 	afterEach(() => {
+		vi.useRealTimers();
 		vi.unstubAllGlobals();
 		vi.unstubAllEnvs();
 		if (tempDir && existsSync(tempDir)) {
@@ -605,6 +606,33 @@ describe("ModelRegistry", () => {
 			expect(getOAuthProvider("anthropic")).toBe(builtInOAuthProvider);
 		});
 
+		test("scheduled catalog refresh preserves other sessions' OAuth providers", async () => {
+			vi.useFakeTimers();
+			vi.stubEnv("PI_OFFLINE", "1");
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			await registry.refreshModelCatalog();
+			const providerId = `sentinel-oauth-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			registerOAuthProvider({
+				id: providerId,
+				name: "Sentinel OAuth",
+				async login() {
+					throw new Error("Not used in this test");
+				},
+				async refreshToken(credentials: { access: string; refresh: string; expires: number }) {
+					return credentials;
+				},
+				getApiKey(credentials: { access: string }) {
+					return credentials.access;
+				},
+			});
+			expect(getOAuthProvider(providerId)?.name).toBe("Sentinel OAuth");
+
+			await vi.advanceTimersByTimeAsync(60 * 60_000);
+			await Promise.resolve();
+
+			expect(getOAuthProvider(providerId)?.name).toBe("Sentinel OAuth");
+		});
+
 		test("unregisterProvider restores the built-in API stream handler", () => {
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 			const builtInApiProvider = getApiProvider("openai-completions");
@@ -713,6 +741,27 @@ describe("ModelRegistry", () => {
 	});
 
 	describe("auth refresh across processes", () => {
+		test("refreshAvailableModels returns while provider catalog refresh is still pending", async () => {
+			const registry = ModelRegistry.inMemory(authStorage);
+			let providerCatalogRequested = false;
+			vi.stubGlobal(
+				"fetch",
+				vi.fn((input: string | URL | Request) => {
+					if (String(input).includes("prime-agent-catalog/main/models/catalog.v1.json"))
+						providerCatalogRequested = true;
+					return new Promise<Response>(() => {});
+				}),
+			);
+
+			// Deterministic non-blocking proof: refreshAvailableModels resolves before the
+			// pending fetch settles, and the fetch was started. A deferred promise stands in
+			// for the network; no wall-clock timer is involved.
+			const models = await registry.refreshAvailableModels();
+			expect(models.length).toBeGreaterThan(0);
+			expect(providerCatalogRequested).toBe(true);
+			await registry.waitForPendingModelRefreshes(1_000).catch(() => undefined);
+		});
+
 		test("model catalog includes unauthenticated public models and hides private Prime routes", async () => {
 			const savedPrimeApiKey = process.env.PRIME_API_KEY;
 			const savedOpenAiApiKey = process.env.OPENAI_API_KEY;

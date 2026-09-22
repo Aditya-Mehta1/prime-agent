@@ -32,7 +32,7 @@ import { getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { getBundledModels } from "./bundled-model-catalog.js";
-import { CATALOG_REFRESH_INTERVAL_MS, CatalogCache } from "./model-catalog-cache.js";
+import { CATALOG_REFRESH_INTERVAL_MS, CatalogCache, isCatalogOffline } from "./model-catalog-cache.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
 	buildPrimeInferenceModels,
@@ -441,9 +441,7 @@ function privatePrimeAuthorizationFingerprint(apiKey: string, teamId: string): s
 }
 
 function isOfflineModeEnabled(): boolean {
-	const value = process.env.PI_OFFLINE;
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+	return isCatalogOffline();
 }
 
 /**
@@ -466,6 +464,7 @@ export class ModelRegistry {
 	private backgroundPrivatePrimeAuthorization: { fingerprint: string; promise: Promise<void> } | undefined;
 	private livePrimeInferenceModels: Model<"openai-completions">[] | undefined;
 	private pendingPrimeInferenceCatalogRefresh: Promise<void> | undefined;
+	private pendingProviderCatalogRefresh: Promise<void> | undefined;
 	private readonly providerCatalog: CatalogCache<Model<Api>[]>;
 	private catalogRefreshTimer?: ReturnType<typeof setInterval>;
 	private scheduledCatalogRefresh?: Promise<void>;
@@ -508,7 +507,7 @@ export class ModelRegistry {
 	/**
 	 * Reload models from disk (built-in + custom from models.json).
 	 */
-	refresh(options: { refreshCatalogs?: boolean } = {}): void {
+	refresh(): void {
 		this.providerRequestConfigs.clear();
 		this.modelRequestHeaders.clear();
 		this.lastProviderAuthSourceTokens.clear();
@@ -542,8 +541,6 @@ export class ModelRegistry {
 		this.onOAuthProvidersReset?.();
 
 		this.reloadModelsAfterCatalogChange();
-		if (options.refreshCatalogs !== false && this.catalogRefreshTimer)
-			void this.scheduleCatalogRefresh().catch(() => {});
 	}
 
 	private reloadModelsAfterCatalogChange(): void {
@@ -906,7 +903,8 @@ export class ModelRegistry {
 				previousTeamId,
 				previousPrivateModels,
 			);
-			await this.refreshProviderCatalog(false);
+			this.pendingProviderCatalogRefresh = this.refreshProviderCatalog(false).catch(() => undefined);
+			void this.pendingProviderCatalogRefresh;
 			return this.getAvailable();
 		});
 	}
@@ -930,7 +928,7 @@ export class ModelRegistry {
 		const reference = new WeakRef(this);
 		const timer = setInterval(() => {
 			const registry = reference.deref();
-			if (registry) void registry.refreshAvailableModels().catch(() => {});
+			if (registry) void registry.scheduleCatalogRefresh().catch(() => {});
 			else clearInterval(timer);
 		}, CATALOG_REFRESH_INTERVAL_MS);
 		timer.unref();
@@ -951,6 +949,7 @@ export class ModelRegistry {
 	async waitForPendingModelRefreshes(timeoutMs: number): Promise<void> {
 		const pending: Promise<unknown>[] = [];
 		if (this.pendingPrimeInferenceCatalogRefresh) pending.push(this.pendingPrimeInferenceCatalogRefresh);
+		if (this.pendingProviderCatalogRefresh) pending.push(this.pendingProviderCatalogRefresh);
 		if (this.backgroundPrivatePrimeAuthorization?.promise) {
 			pending.push(this.backgroundPrivatePrimeAuthorization.promise);
 		}

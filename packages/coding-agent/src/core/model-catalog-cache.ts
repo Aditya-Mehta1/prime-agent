@@ -4,7 +4,6 @@ import { dirname } from "node:path";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 
 export const CATALOG_REFRESH_INTERVAL_MS = 60 * 60_000;
-export const MODEL_CATALOG_REFRESH_INTERVAL_MS = CATALOG_REFRESH_INTERVAL_MS;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 export function isCatalogOffline(): boolean {
@@ -120,7 +119,7 @@ export class CatalogCache<T> {
 			!options.force &&
 			checkedAt !== undefined &&
 			Date.now() >= checkedAt &&
-			Date.now() - checkedAt < MODEL_CATALOG_REFRESH_INTERVAL_MS
+			Date.now() - checkedAt < CATALOG_REFRESH_INTERVAL_MS
 		)
 			return Promise.resolve(cached);
 		this.lastAttempt = Date.now();
@@ -179,7 +178,3 @@ export class CatalogCache<T> {
 		return promise;
 	}
 }
-
-export const isModelCatalogOffline = isCatalogOffline;
-export const ModelCatalogRequestError = CatalogRequestError;
-export const ModelCatalogCache = CatalogCache;

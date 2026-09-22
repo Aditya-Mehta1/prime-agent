@@ -95,7 +95,7 @@ async function fetchCatalogViaContentsApi(rawUrl, label, options = {}) {
 	let response;
 	try {
 		response = await fetch(apiUrl, {
-			headers: { ...authHeaders(apiUrl, options), accept: "application/vnd.github.raw+json" },
+			headers: { ...authHeaders(rawUrl, options), accept: "application/vnd.github.raw+json" },
 			signal: AbortSignal.timeout(5_000),
 			redirect: "error",
 		});

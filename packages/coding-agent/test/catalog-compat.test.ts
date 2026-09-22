@@ -263,6 +263,7 @@ describe("remote catalog compatibility", () => {
 
 		try {
 			await modelRegistry.refreshAvailableModels();
+			await modelRegistry.waitForPendingModelRefreshes(2_000);
 			expect(modelRegistry.find("anthropic", "claude-fable-5")?.name).toBe("Changed catalog name");
 			const modelAfterChangedCatalog = session.model;
 			expect(modelAfterChangedCatalog).toBe(activeModel);

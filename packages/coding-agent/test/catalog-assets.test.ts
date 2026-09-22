@@ -115,6 +115,28 @@ describe("catalog asset generation", () => {
 		expect(cancelled).toBe(true);
 	});
 
+	it("sends GitHub tokens to the trusted contents API fallback", async () => {
+		process.env.GITHUB_TOKEN = "secret-token";
+		const seen: Array<{ url: string; authorization?: string }> = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				const url = String(input);
+				const headers = new Headers(init?.headers);
+				seen.push({ url, authorization: headers.get("authorization") ?? undefined });
+				if (url.includes("raw.githubusercontent.com")) return new Response("not found", { status: 404 });
+				return new Response(url.includes("models") ? modelCatalog() : mcpCatalog());
+			}),
+		);
+
+		await generateBundledCatalogAssets({ outDir: tempDir(), allowSmallFixture: true });
+
+		expect(seen).toHaveLength(4);
+		expect(seen.every((entry) => entry.authorization === "Bearer secret-token")).toBe(true);
+		expect(seen.filter((entry) => entry.url.includes("raw.githubusercontent.com"))).toHaveLength(2);
+		expect(seen.filter((entry) => entry.url.includes("api.github.com"))).toHaveLength(2);
+	});
+
 	it("copies generated flat source assets into dist", async () => {
 		const outDir = tempDir();
 		const catalogDir = join(process.cwd(), "catalog");
