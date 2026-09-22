@@ -248,7 +248,12 @@ export function runTailscaleStatus(json = false): number {
 		};
 		const rows: string[] = [];
 		for (const [listen, entry] of Object.entries(parsed.TCP ?? {})) {
-			rows.push(`  ${listen} -> ${entry.TCPForward ?? "tcp"}`);
+			// An HTTPS/HTTP listener lands here with no TCPForward (upstream keeps them
+			// mutually exclusive) and its target is the Web entry printed below; only a
+			// real TCPForward is a raw TCP forward, so never invent a "tcp" target.
+			if (entry.TCPForward) {
+				rows.push(`  ${listen} -> ${entry.TCPForward}`);
+			}
 		}
 		for (const [listen, server] of Object.entries(parsed.Web ?? {})) {
 			for (const [path, handler] of Object.entries(server.Handlers ?? {})) {

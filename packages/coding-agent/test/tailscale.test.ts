@@ -145,7 +145,7 @@ describe("runTailscaleStatus", () => {
 	});
 	it("exits 0 when online and prints listen->target pairs incl. TCP forwards", () => {
 		const serveStatus = JSON.stringify({
-			TCP: { "10000": { TCPForward: "127.0.0.1:9000" } },
+			TCP: { "10000": { TCPForward: "127.0.0.1:9000" }, "443": { HTTPS: true } },
 			Web: { "milk.tailnet.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:3000" } } } },
 			AllowFunnel: {},
 		});
@@ -157,6 +157,7 @@ describe("runTailscaleStatus", () => {
 		spy.mockRestore();
 		expect(logged).toContain("127.0.0.1:9000");
 		expect(logged).toContain("milk.tailnet.ts.net:443/ -> http://127.0.0.1:3000");
+		expect(logged).not.toContain("-> tcp"); // the HTTPS listener must not read as a TCP forward
 	});
 });
 
