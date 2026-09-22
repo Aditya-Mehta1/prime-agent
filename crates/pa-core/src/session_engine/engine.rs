@@ -81,6 +81,13 @@ pub struct SessionEngineConfig {
     /// sites and after a kernel `goal.complete` settles the goal): the
     /// daemon worker's queue purge.
     pub queued_goal_context_purge: Option<super::runtime::QueuedGoalContextPurge>,
+    /// TS `_steeringStopPending` (the session's `shouldStopAfterTurn`/
+    /// `shouldStopBeforeTurn` hooks): `true` while steering-lane session
+    /// actions are queued or mid-selection, so the running turn stops at
+    /// the next turn boundary and the queued steer delivers as the next
+    /// input (TS agent-session.ts's `_steeringStopPending`; the follow-up
+    /// lane never stops the run — `when_run_idle` waits for the settle).
+    pub queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Boot the session's kernel in the background at creation (TS
     /// `prewarmIpythonKernel` from `createDefaultRuntimeFactory`): a main
     /// session (depth 0, the engine's gate like the TS `rlmDepth === 0`
@@ -612,6 +619,18 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // (TS `convertToLlm`): bookkeeping custom rows drop, everything
         // else (the harness digest included) becomes a user turn.
         convert_to_llm: Some(super::messages::engine_convert_to_llm()),
+        // TS `_steeringStopPending`: both the after-turn and the
+        // before-turn hooks consult the same probe (a queued steer stops
+        // the run at the boundary; the pump delivers it next).
+        should_stop_after_turn: config.queued_steering_probe.take().map(|probe| {
+            let probe: pa_agent::agent_loop::ShouldStopAfterTurnFn =
+                std::sync::Arc::new(move |_context| {
+                    let probe = std::sync::Arc::clone(&probe);
+                    Box::pin(async move { Ok(probe()) })
+                });
+            probe
+        }),
+        should_stop_before_turn: config.queued_steering_probe.clone(),
         ..Default::default()
     });
 
@@ -842,6 +861,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let engine = create_session(SessionEngineConfig {
             cron_store: None,
+            queued_steering_probe: None,
             cwd: cwd.clone(),
             agent_dir: tmp.path().join("agent"),
             mcp_manager: None,
@@ -948,6 +968,7 @@ mod tests {
         ) -> SessionEngineConfig {
             SessionEngineConfig {
                 cron_store: None,
+                queued_steering_probe: None,
                 cwd: cwd.to_path_buf(),
                 agent_dir: agent_dir.to_path_buf(),
                 mcp_manager: None,

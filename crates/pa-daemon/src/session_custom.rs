@@ -164,6 +164,13 @@ impl Worker {
                     admission_id: None,
                     images: crate::worker::parse_prompt_images(payload),
                     done: None,
+                    // TS restores the action's own visibility flag
+                    // (`queueVisible: action.payload.queueVisible`);
+                    // the stored default is visible.
+                    queue_visible: payload
+                        .get("queueVisible")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
                 };
                 if lane_follow_up {
                     core.follow_up.push_back(item);

@@ -292,6 +292,7 @@ async fn build_headless_engine_parts(options: &RunOptions) -> Result<HeadlessEng
             // the engine's depth-0 gate matches the TS session's.
             prewarm_ipython_kernel: Some(true),
             queued_goal_context_purge: None,
+            queued_steering_probe: None,
         },
     )
     .await
@@ -1162,6 +1163,7 @@ async fn build_faux_engine_parts(
             // product surface: no background kernel boot in tests.
             prewarm_ipython_kernel: None,
             queued_goal_context_purge: None,
+            queued_steering_probe: None,
         },
     )
     .await

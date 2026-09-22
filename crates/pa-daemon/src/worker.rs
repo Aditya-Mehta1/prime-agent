@@ -178,6 +178,14 @@ pub(crate) struct QueuedItem {
     /// mime type), admitted with the message as multimodal content.
     pub(crate) images: Vec<pa_agent::types::ImageContent>,
     pub(crate) done: Option<oneshot::Sender<Result<(), String>>>,
+    /// TS `payload.queueVisible`: the item shows in the queue projection
+    /// and its delivery projects the active-action phase transitions
+    /// (steer/follow-up lanes, agent-message deliveries, prompt-behind-work,
+    /// heartbeat fires, restored rows). Injected continuations (goal,
+    /// autonomous, post-compaction) and an idle session's direct prompt
+    /// admission stay invisible: the TS wire shows no queue rows or
+    /// active phases for them.
+    pub(crate) queue_visible: bool,
 }
 
 /// Parse the wire `images` array of a prompt-family command (each entry
@@ -278,6 +286,13 @@ pub(crate) struct SessionCore {
     /// Restored next-turn rows (TS `_pendingNextTurnMessages`,
     /// `restore_next_turn`): delivered as prefix rows with the next turn.
     pub(crate) pending_next_turn: Vec<Value>,
+    /// The queue projection's active action (TS `getSessionActionSnapshot`
+    /// reads the store's first active action): the runner sets the phase
+    /// transitions of a queue-visible delivery (`preparing` at pickup,
+    /// `committing` before the turn dispatch, `running` at the turn's
+    /// `agent_start`) and clears it once the delivered turn settles. The
+    /// label rides the snapshot (TS `compactRlmText(active.payload.text)`).
+    pub(crate) active_action: Option<crate::types::SessionActionActive>,
 }
 
 impl SessionCore {
@@ -325,6 +340,7 @@ impl SessionCore {
             retry_abort_requested: false,
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
+            active_action: None,
         }
     }
 }
@@ -702,10 +718,26 @@ impl Worker {
             retry_abort_requested: false,
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
+            active_action: None,
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
         let core = Arc::new(Mutex::new(core));
+        // TS `_steeringStopPending` (the session's stop hooks): the
+        // steering lane owning the probe makes a queued steer stop the
+        // running turn at its next turn boundary — the runner delivers
+        // the steer as the next turn (the follow-up lane never stops the
+        // run; it waits for the settle, TS `when_run_idle`).
+        let queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>> = Some({
+            let core = Arc::clone(&core);
+            std::sync::Arc::new(move || {
+                !core
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .steering
+                    .is_empty()
+            })
+        });
         // Shared worker recovery journal: the turn runner persists queue
         // snapshots into it, `serve` opens the file, and command handlers
         // record busy/operation state.
@@ -775,6 +807,7 @@ impl Worker {
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
                         cron_store: Some(kernel_cron_wiring(&scheduled)),
+                        queued_steering_probe: queued_steering_probe.clone(),
                     }) {
                         Ok(engine) => {
                             let concrete = std::sync::Arc::new(engine);
@@ -804,6 +837,7 @@ impl Worker {
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
                         cron_store: Some(kernel_cron_wiring(&scheduled)),
+                        queued_steering_probe: queued_steering_probe.clone(),
                     }) {
                         Ok(engine) => {
                             let concrete = std::sync::Arc::new(engine);
@@ -2320,6 +2354,7 @@ impl Worker {
                 admission_id: admission_id.clone(),
                 images: images.clone(),
                 done,
+                queue_visible: queued_behind_work,
             };
             match lane {
                 Lane::Steering => core.steering.push_back(item),
@@ -2376,6 +2411,7 @@ impl Worker {
             admission_id: None,
             images,
             done: None,
+            queue_visible: true,
         });
         let snapshot = self.snapshot_locked(&core);
         let lanes = queue_lanes(&core);
@@ -2492,6 +2528,7 @@ impl Worker {
                 admission_id: None,
                 images: Vec::new(),
                 done: None,
+                queue_visible: true,
             });
             let queued = core.busy;
             let summary = self.summary_locked(&core);
@@ -2878,6 +2915,37 @@ impl Worker {
             // site fires.
             core.queued_input_suspended = true;
         }
+        // TS `requestAbort()`'s `_cancelSessionActions`: queue-INVISIBLE
+        // turn actions cancel with "Prompt aborted before delivery." - a
+        // direct prompt admitted on an idle session never became a queue
+        // row, so the abort must resolve its waiting response instead of
+        // parking it behind the suspension forever (the ACP cancel wedge:
+        // the prompt item sat in the lane with no resume site, the
+        // `prompt_and_wait` response hung). The queue-visible lanes
+        // (steer/follow-up, agent-message deliveries, prompt-behind-work,
+        // heartbeat fires) survive parked - the suspension defers the
+        // pump, it never drops the queue (the abort-ownership probe).
+        {
+            let mut core = self.core.lock().unwrap();
+            let cancel = |lane: &mut VecDeque<QueuedItem>| {
+                let mut kept = VecDeque::new();
+                while let Some(item) = lane.pop_front() {
+                    if item.queue_visible {
+                        kept.push_back(item);
+                    } else {
+                        if let Some(id) = &item.admission_id {
+                            let _ = self.prompt_admissions.cancel(id);
+                        }
+                        if let Some(done) = item.done {
+                            let _ = done.send(Err("Prompt aborted before delivery.".to_string()));
+                        }
+                    }
+                }
+                *lane = kept;
+            };
+            cancel(&mut core.steering);
+            cancel(&mut core.follow_up);
+        };
         // TS `requestAbort()` also aborts the compaction in flight (manual
         // and automatic): the interrupt key cancels a compacting session.
         self.compaction.abort();
@@ -2995,6 +3063,7 @@ impl Worker {
                                 admission_id: None,
                                 images: continuation.request.images,
                                 done: None,
+                                queue_visible: false,
                             });
                         }
                     }
@@ -3769,6 +3838,7 @@ fn restore_queue_snapshot(
                 admission_id: None,
                 images: Vec::new(),
                 done: None,
+                queue_visible: true,
             })
             .collect()
     }
@@ -3840,6 +3910,7 @@ pub(crate) fn admit_autonomous_follow_up(
             admission_id: None,
             images: Vec::new(),
             done: None,
+            queue_visible: false,
         });
     }
     work_notify.notify_waiters();
@@ -3880,6 +3951,7 @@ pub(crate) fn admit_goal_follow_up(
             admission_id: None,
             images: follow_up.request.images,
             done: None,
+            queue_visible: false,
         };
         match lane {
             Lane::Steering => core.steering.push_back(item),
@@ -3964,6 +4036,45 @@ impl TurnRunner {
                 }
             };
             if let Some(item) = item {
+                // The pickup projection (TS `_pumpSessionInputs` emits the
+                // queue update at the action's `preparing` transition): the
+                // delivered item leaves the queue projection BEFORE its
+                // turn starts, so a client's queue strip drops the row at
+                // delivery time. Without it the strip keeps the delivered
+                // message for the whole turn (dogfood P0: the steered
+                // message sends but still shows in the queue) and a browse
+                // edit addressed at the stale row is rejected as changed.
+                // A queue-visible delivery carries the active action through
+                // its TS phase transitions (`selected`/`preparing` projects
+                // first, then the `committing` transition before the turn
+                // dispatch, `running` once the turn's `agent_start` lands,
+                // cleared at the settle); an invisible item (an idle
+                // session's direct prompt admission, injected goal and
+                // autonomous continuations) projects the plain pickup like
+                // TS's `queueVisible` filter.
+                let queue_visible = item.queue_visible;
+                {
+                    let mut core = self.core.lock().unwrap();
+                    if queue_visible {
+                        core.active_action = Some(crate::types::SessionActionActive {
+                            kind: "turn".to_string(),
+                            phase: "preparing".to_string(),
+                            label: Some(compact_action_label(&item.message)),
+                        });
+                    }
+                    let snapshot = self.snapshot_from(&core);
+                    drop(core);
+                    let _ = self.emit_action_update(&snapshot);
+                }
+                if queue_visible {
+                    let mut core = self.core.lock().unwrap();
+                    if let Some(active) = core.active_action.as_mut() {
+                        active.phase = "committing".to_string();
+                    }
+                    let snapshot = self.snapshot_from(&core);
+                    drop(core);
+                    let _ = self.emit_action_update(&snapshot);
+                }
                 // The busy flip reaches the supervisor's roster before the
                 // turn runs (TS pushes the same transition).
                 self.push_roster_delta();
@@ -4020,6 +4131,19 @@ impl TurnRunner {
             self.prompt_admissions.commit(admission_id);
         }
         self.emit_turn_event(json!({ "type": "agent_start" }));
+        // The active action's `running` phase lands right after the turn's
+        // `agent_start` (TS marks the action running once the primary
+        // message starts the run): a queue-visible delivery projects it,
+        // and every later queue snapshot mid-turn carries it too.
+        if item.queue_visible {
+            let mut core = self.core.lock().unwrap();
+            if let Some(active) = core.active_action.as_mut() {
+                active.phase = "running".to_string();
+            }
+            let snapshot = self.snapshot_from(&core);
+            drop(core);
+            let _ = self.emit_action_update(&snapshot);
+        }
         self.emit_turn_event(json!({ "type": "turn_start" }));
 
         let prompt_index = {
@@ -4099,16 +4223,31 @@ impl TurnRunner {
                 // Sequence + persist under the core lock, then broadcast.
                 // The abort flag lives on the session core (`abort`
                 // command): a cancelled turn stops consuming its own
-                // events — except the aborted assistant row, its
-                // `turn_end` frame, and the run's `agent_end` carrying
-                // that row. TS `createAbortedAssistantMessage`'s
-                // message_start/message_end pair reaches the listeners and
-                // `appendMessage` persists it, the loop's trailing
-                // `turn_end` carries that row as the terminal payload, and
-                // the run's `agent_end` carries it in the messages, so the
-                // row's frames pass the gate (persist + broadcast) while
-                // the turn still unwinds; every other post-abort event
-                // stays dropped.
+                // events — except the frames TS still broadcasts for an
+                // interrupted turn. TS applies no post-abort gate at all:
+                // the agent abort cancels the provider fetch and turns the
+                // in-flight tool into an error result, and the frames that
+                // settle the cancelled run reach the listeners and the
+                // session store (the tool-phase probe: `abort` mid-kernel
+                // cell broadcasts tool_execution_end + the aborted
+                // toolResult row pair + turn_end + agent_end, exactly like
+                // a settled turn). The only post-abort noise TS never
+                // shows is the cancelled fetch's stream stragglers (the
+                // provider stream stops at the cancel, and TS tool
+                // updates stop at `acceptingUpdates = false`), so the gate
+                // drops the stream-update family and forwards:
+                // - the aborted assistant row (`createAbortedAssistantMessage`:
+                //   the pair broadcasts, `appendMessage` persists, the
+                //   trailing `turn_end` and `agent_end` carry the row),
+                //   closed by `suppress_aborted_row` for the detached-run
+                //   paths (TS `compact`/branch navigation);
+                // - the aborted tool's settle frames (the error
+                //   tool_execution_end, the toolResult row pair, the
+                //   cancelled run's own turn_end/agent_end);
+                // - the engine's trailing `Done` outcome, which parks the
+                //   turn result so a waiting `prompt_and_wait` resolves at
+                //   the settle (a dropped Done hung the response forever —
+                //   the abort UX probe).
                 if matches!(event, EngineEvent::TurnEnd { .. }) {
                     engine_turn_ended = true;
                 }
@@ -4128,8 +4267,18 @@ impl TurnRunner {
                             message.get("stopReason").and_then(Value::as_str) == Some("aborted")
                         })
                 );
+                let abort_settle = matches!(
+                    &event,
+                    EngineEvent::ToolExecutionEnd { .. }
+                        | EngineEvent::ToolResultMessage(_)
+                        | EngineEvent::TurnEnd { .. }
+                        | EngineEvent::AgentEnd { .. }
+                        | EngineEvent::Done(_)
+                );
                 let mut core = core.lock().unwrap();
-                if core.abort_requested && !(aborted_row && !core.suppress_aborted_row) {
+                if core.abort_requested
+                    && (core.suppress_aborted_row || !(abort_settle || aborted_row))
+                {
                     return false;
                 }
                 // The engine cuts its in-memory entries; its
@@ -4503,6 +4652,7 @@ impl TurnRunner {
         {
             let mut core = self.core.lock().unwrap();
             core.busy = false;
+            core.active_action = None;
         }
         self.push_roster_delta();
         // The fallback `agent_end` for runs that ended without a model
@@ -4596,7 +4746,7 @@ impl TurnRunner {
                 .iter()
                 .map(|item| item.message.clone())
                 .collect(),
-            active: None,
+            active: core.active_action.clone(),
         }
     }
 
@@ -4783,16 +4933,20 @@ fn session_snapshot(core: &SessionCore) -> SessionActionSnapshot {
             .iter()
             .map(|item| item.message.clone())
             .collect(),
-        active: if core.busy {
-            Some(crate::types::SessionActionActive {
-                kind: "turn".to_string(),
-                phase: "running".to_string(),
-                label: None,
-            })
-        } else {
-            None
-        },
+        active: core.active_action.clone(),
     }
+}
+
+/// The active action's queue label (TS `compactRlmText(text, 160)`):
+/// collapse whitespace and cap at 160 chars with an ellipsis.
+fn compact_action_label(text: &str) -> String {
+    let compact: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_CHARS: usize = 160;
+    if compact.chars().count() <= MAX_CHARS {
+        return compact;
+    }
+    let kept: String = compact.chars().take(MAX_CHARS - 3).collect();
+    format!("{}...", kept.trim_end())
 }
 
 #[cfg(test)]
@@ -5042,6 +5196,7 @@ mod agent_message_tests {
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
+                    queue_visible: true,
                 });
             }
         }
@@ -5457,6 +5612,7 @@ mod tests {
                 admission_id: None,
                 images: Vec::new(),
                 done: None,
+                queue_visible: true,
             });
         }
         let compact = worker
@@ -6614,6 +6770,7 @@ mod turn_stream_tests {
             retry_abort_requested: false,
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
+            active_action: None,
         }));
         let (status_notify, _status_rx) = tokio::sync::mpsc::unbounded_channel();
         TurnRunner {
@@ -6653,6 +6810,7 @@ mod turn_stream_tests {
                 admission_id: None,
                 images: Vec::new(),
                 done: Some(done_tx),
+                queue_visible: true,
             });
         }
         let parked = std::sync::Arc::clone(&runner.core);
@@ -6710,6 +6868,7 @@ mod turn_stream_tests {
                         admission_id: None,
                         images: Vec::new(),
                         done: Some(done_tx),
+                        queue_visible: true,
                     },
                 )
                 .await;
@@ -6742,6 +6901,7 @@ mod turn_stream_tests {
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
+                    queue_visible: true,
                 },
             )
             .await;
@@ -6775,6 +6935,7 @@ mod turn_stream_tests {
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
+                    queue_visible: true,
                 },
             )
             .await;

@@ -197,6 +197,7 @@ mod tests {
             let engine = std::sync::Arc::new(
                 create_session(SessionEngineConfig {
                     cron_store: None,
+                    queued_steering_probe: None,
                     telemetry: None,
                     cwd: dir.path().to_path_buf(),
                     agent_dir: agent_dir.clone(),

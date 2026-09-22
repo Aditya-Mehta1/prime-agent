@@ -39,7 +39,7 @@ use crate::goal_continuation::GoalBoundary;
 use crate::rlm_children::{ParentIdentity, SupervisorChildSessions, DEFAULT_RLM_MAX_DEPTH};
 
 /// Configuration for the real engine.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentEngineConfig {
     pub cwd: std::path::PathBuf,
     pub agent_dir: std::path::PathBuf,
@@ -74,6 +74,11 @@ pub struct AgentEngineConfig {
     /// The binding is enriched per build from the worker's live/durable
     /// session identity.
     pub cron_store: Option<pa_core::session_engine::runtime_wiring::KernelCronWiring>,
+    /// TS `_steeringStopPending` (the session's stop hooks): `true` while
+    /// the worker's steering lane holds a queued item, so the running turn
+    /// stops at the next turn boundary and the steer delivers as the next
+    /// input (the follow-up lane never stops the run).
+    pub queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Supervisor-link coordinates for a daemon worker.
@@ -976,6 +981,10 @@ impl AgentSessionEngine {
             // purge, so the session engine's surfaces withdraw queued
             // minted continuations.
             queued_goal_context_purge,
+            // TS `_steeringStopPending`: the worker's steering lane owns
+            // the stop hooks (a queued steer cuts the run at the next
+            // turn boundary; the runner delivers it as the next turn).
+            queued_steering_probe: self.config.queued_steering_probe.clone(),
             // The worker's shared scheduled-jobs store with the session
             // identity the kernel binding needs: the live active session
             // id the supervisor routes commands by, and the durable session
@@ -3821,6 +3830,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         // The explicit selection from the session's create config is
@@ -3858,6 +3868,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap()
     }
@@ -3895,6 +3906,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         (engine, dir)
@@ -3997,6 +4009,7 @@ pub(crate) mod tests {
                 supervisor_link: None,
                 telemetry_disabled: None,
                 cron_store: None,
+                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -4138,6 +4151,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         // The recovery turn builds the session; the build adopts the
@@ -4304,6 +4318,7 @@ pub(crate) mod tests {
                 supervisor_link: None,
                 telemetry_disabled: None,
                 cron_store: None,
+                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -4587,6 +4602,7 @@ pub(crate) mod tests {
                 }),
                 telemetry_disabled: None,
                 cron_store: None,
+                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -5369,6 +5385,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5719,6 +5736,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5810,6 +5828,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         let model = engine.resolve_registry_model().expect("resolved model");
@@ -5835,6 +5854,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         // A create config with only a model keeps the provider and key.
@@ -5890,6 +5910,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5959,6 +5980,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         // Without an explicit flag the TS default applies (medium, clamped).
@@ -6024,6 +6046,7 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6304,6 +6327,7 @@ fn retried_run_restarts_with_its_own_agent_frames() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();
@@ -6420,6 +6444,7 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6533,6 +6558,193 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
     assert_eq!(after["continuationsUsed"], before["continuationsUsed"]);
 }
 
+/// Scoped process-env overrides for the live-kernel tests: applied on
+/// construction, restored on drop. The live-kernel tests are serialized by
+/// the faux lock, so nothing races.
+#[cfg(test)]
+struct KernelEnvOverride {
+    saved: Vec<(String, Option<String>)>,
+}
+
+#[cfg(test)]
+impl KernelEnvOverride {
+    fn apply(pairs: Vec<(&str, Option<String>)>) -> Self {
+        let saved = pairs
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        for (key, value) in &pairs {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        KernelEnvOverride { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for KernelEnvOverride {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// The kernel python for the live-kernel abort test (skipped without a live
+/// install).
+#[cfg(test)]
+fn live_kernel_python() -> Option<std::path::PathBuf> {
+    let candidate = std::path::PathBuf::from(
+        std::env::var("HOME")
+            .map(|home| format!("{home}/.prime/agent/kernel-venv/bin/python"))
+            .unwrap_or_else(|_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string()),
+    );
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    eprintln!("kernel python {candidate:?} not found; skipping live kernel test");
+    None
+}
+
+#[cfg(test)]
+fn live_release_dir() -> Option<std::path::PathBuf> {
+    let releases = std::path::PathBuf::from(
+        std::env::var("HOME")
+            .map(|home| format!("{home}/.local/share/prime-agent/releases"))
+            .unwrap_or_else(|_| "/home/ubuntu/.local/share/prime-agent/releases".to_string()),
+    );
+    let Ok(entries) = std::fs::read_dir(&releases) else {
+        eprintln!("no releases dir at {releases:?}; skipping live kernel test");
+        return None;
+    };
+    let mut candidates: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.join("prime-agent-runtime").is_dir())
+        .collect();
+    candidates.sort();
+    candidates.pop()
+}
+
+/// The abort wedge repro (dogfood P0): a turn executing a long kernel cell
+/// must unwind at `abort_in_flight_turn` (the kernel interrupt +
+/// force-abort path settles the tool race) - not keep the turn alive while
+/// the cell runs out. Red: the run thread wedged past the cell's sleep
+/// (the daemon worker's `run_turn_once` awaits the admission forever).
+#[test]
+fn abort_in_flight_turn_cancels_a_running_kernel_cell() {
+    let Some(kernel_python) = live_kernel_python() else {
+        return;
+    };
+    let Some(release) = live_release_dir() else {
+        return;
+    };
+    let _env = KernelEnvOverride::apply(vec![
+        (
+            "PRIME_AGENT_KERNEL_PYTHON",
+            Some(kernel_python.display().to_string()),
+        ),
+        ("PI_PACKAGE_DIR", Some(release.display().to_string())),
+        ("PRIME_AGENT_CODING_AGENT_DIR", None),
+        ("PRIME_API_KEY", None),
+    ]);
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(
+            json!({
+                "engine": "faux",
+                "modelId": "faux-1",
+                "modelName": "Faux",
+                "reasoning": false,
+                "contextWindow": 128000,
+                "tokensPerSecond": 30,
+                "responses": [
+                    {"content": [
+                        {"type": "text", "text": "Running the wedge cell."},
+                        {"type": "toolCall", "name": "ipython", "id": "toolu_wedge01",
+                         "arguments": {"code":
+                            "import time\nopen('wedge-started', 'w').write('1')\ntime.sleep(300)\nopen('wedge-finished', 'w').write('1')\nprint('cell completed')"}}
+                    ]},
+                    {"content": [{"type": "text", "text": "The cell completed."}]}
+                ]
+            })
+            .to_string(),
+        ),
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let engine = std::sync::Arc::new(engine);
+    engine.register_arc();
+    let marker = dir.path().join("wedge-started");
+    let finished = dir.path().join("wedge-finished");
+    let events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runner = {
+        let engine = std::sync::Arc::clone(&engine);
+        let events = std::sync::Arc::clone(&events);
+        std::thread::spawn(move || {
+            let events = events;
+            engine.run_prompt(
+                0,
+                PromptRequest {
+                    images: Vec::new(),
+                    message: "run the wedge cell".to_string(),
+                    source: "user".to_string(),
+                    agent_message_id: None,
+                    custom_message: None,
+                },
+                &|| false,
+                &mut move |event: EngineEvent| {
+                    events.lock().unwrap().push(event);
+                    true
+                },
+            );
+        })
+    };
+    // The cell started (bounded by the kernel boot).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !marker.exists() {
+        let events = events.lock().unwrap();
+        let wire: Vec<String> = events.iter().map(|event| format!("{event:?}")).collect();
+        panic!("the wedge cell never started; events: {wire:?}");
+    }
+    // Abort strictly mid-cell; the run must settle within the budget.
+    engine.abort_in_flight_turn();
+    let settled = runner.join();
+    match settled {
+        Ok(()) => {}
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+    // The cell died: the finish marker never appears.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        !finished.exists(),
+        "the interrupted cell must not run to completion"
+    );
+}
+
 /// A driver loop test harness: faux script + collected events. Holds the
 /// faux lock while the engine runs.
 #[cfg(test)]
@@ -6557,6 +6769,7 @@ fn run_prompts(
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6885,6 +7098,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let start = std::time::Instant::now();
@@ -7164,6 +7378,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap(),
     );
@@ -7268,6 +7483,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap(),
     );
@@ -7352,6 +7568,7 @@ fn agent_engine_streams_updates_and_final_message() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();
