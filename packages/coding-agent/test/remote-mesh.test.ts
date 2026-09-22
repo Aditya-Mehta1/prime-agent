@@ -45,7 +45,6 @@ describe("RemoteAgentMeshState", () => {
 						remoteSession({
 							id: "worker-active",
 							sessionId: "worker-session",
-							activeSessionId: "worker-active",
 							sessionName: "worker",
 							activity: "working",
 							isStreaming: true,

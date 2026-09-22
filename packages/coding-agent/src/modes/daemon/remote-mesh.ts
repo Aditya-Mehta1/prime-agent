@@ -162,7 +162,9 @@ function remoteSessionSummary(
 		rosterStatus: offline
 			? "inactive"
 			: classifySessionRosterStatus({
-					activeSessionId: session.activeSessionId,
+					activeSessionId:
+						session.activeSessionId ??
+						(isStreaming || session.activity === "working" ? session.sessionId : undefined),
 					activity: session.activity,
 					isSessionActive: isStreaming || session.activity === "working",
 				}),
