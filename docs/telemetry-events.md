@@ -294,7 +294,7 @@ How one interactive client run ended.
 
 | property | type | notes |
 |---|---|---|
-| `exit_reason` | string | `ctrl_c_twice` (second press of the exit-hint window), `ctrl_d`, `session_request` (`/exit`, `/quit`, `/resume`, agents-back), `daemon_closed` |
+| `exit_reason` | string | `ctrl_c_twice` (second press of the exit-hint window), `ctrl_d`, `session_request` (`/exit`, `/quit`, `/resume`, agents-back), `daemon_closed`, `sigterm` (the SIGTERM handler's graceful shutdown) |
 | `turn_active` | boolean | a turn was still running at exit |
 
 ### `tui input queued`
@@ -348,6 +348,26 @@ carrying the command or its output).
 |---|---|---|
 | `excluded` | boolean | the `!!` variant: the run stays out of the session context |
 | `side_conversation` | boolean | the run executed inside a side-question pane (transient, pane-rendered) |
+
+### `tui interrupt issued`
+
+One interrupt key (Escape or Ctrl+C) fired an abort at a live target
+(adoption of the interrupt surface; one event per fired target, because a
+single press fires the interrupt ladder and can hit more than one target).
+Never carries any command, prompt, or content.
+
+| property | type | notes |
+|---|---|---|
+| `target` | string | `stream` (a running turn), `side_question`, `retry` (a live retry countdown), `compaction`, `branch_summary`, `bash` (a user-bash run) |
+
+### `tui signal shutdown`
+
+A shutdown signal ended the interactive client run through the registered
+signal handlers (adoption of the signal-shutdown surface).
+
+| property | type | notes |
+|---|---|---|
+| `signal` | string | `sigterm` (SIGHUP exits through the emergency path, which skips the telemetry flush by design — its exit carries no event) |
 
 ## Planned events (seams not yet in the product)
 

@@ -8,6 +8,7 @@
 //! the scripted harness and the real engine both emit.
 
 use crate::chat::{AssistantMessage, ChatEntry, MessageBlock, ToolCallCard};
+use crate::tool_card::ToolResultView;
 use pa_types::daemon::{DaemonEventCursor, DaemonReplayInfo};
 use serde::Deserialize;
 use serde_json::Value;
@@ -941,6 +942,11 @@ pub fn apply_tool_execution_start(
 pub struct AssistantErrorRow {
     /// The rendered row text (provider errors carry the `Error: ` prefix).
     pub text: String,
+    /// The pending-tool-card result text (TS `errorMessage`, the raw
+    /// message with no prefix; `Error` fallback): every pending card
+    /// settles with this as its error result on the aborted/error
+    /// `message_end`.
+    pub error_text: String,
     /// `stopReason: "aborted"` (drives the tool-call trailing spacer).
     pub aborted: bool,
 }
@@ -953,15 +959,23 @@ pub fn assistant_error_row(
 ) -> Option<AssistantErrorRow> {
     let stop_reason = message.get("stopReason").and_then(Value::as_str);
     match stop_reason {
-        Some("aborted") => Some(AssistantErrorRow {
-            text: message
+        Some("aborted") => {
+            // TS renders `Aborted after N retry attempts`/`Operation
+            // aborted` (the elapsed suffix is client-side TS state this
+            // port's row does not track yet); the cards share the row's
+            // text.
+            let text = message
                 .get("errorMessage")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty() && *text != "Request was aborted")
                 .unwrap_or("Operation aborted")
-                .to_string(),
-            aborted: true,
-        }),
+                .to_string();
+            Some(AssistantErrorRow {
+                error_text: text.clone(),
+                text,
+                aborted: true,
+            })
+        }
         Some("error") if tool_calls.is_empty() => Some(AssistantErrorRow {
             text: format!(
                 "Error: {}",
@@ -971,9 +985,41 @@ pub fn assistant_error_row(
                     .filter(|text| !text.is_empty())
                     .unwrap_or("Unknown error")
             ),
+            error_text: message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .unwrap_or("Error")
+                .to_string(),
             aborted: false,
         }),
         _ => None,
+    }
+}
+
+/// TS `message_end`'s aborted/error arm (`interactive-mode.ts`: every
+/// pending tool card gets the error result, then the pending state resets):
+/// every tool card still waiting for its result (none yet, or a partial
+/// one) settles with the run's error text as its error result — no card
+/// keeps its spinner after the run died. The card's `aborted` flag drops
+/// the tool's late result frames, exactly like the TS pending-map reset.
+pub fn settle_pending_tool_cards(error_text: &str, view: &mut crate::view::AgentView) {
+    for index in 0..view.chat.len() {
+        let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) else {
+            continue;
+        };
+        if card.result.is_some() && !card.result_partial {
+            continue;
+        }
+        card.result = Some(ToolResultView {
+            content: vec![serde_json::json!({ "type": "text", "text": error_text })],
+            details: serde_json::Value::Null,
+            is_error: true,
+        });
+        card.result_partial = false;
+        card.aborted = true;
+        card.ended_at = Some(std::time::Instant::now());
+        view.mark_entry_stale(index);
     }
 }
 
@@ -2192,5 +2238,100 @@ mod tests {
         let goal = reconstructed.goal.expect("snapshot goal");
         assert_eq!(goal.status, pa_types::goal::GoalStatus::Active);
         assert_eq!(goal.objective.as_deref(), Some("keep shipping"));
+    }
+
+    #[test]
+    fn an_aborted_run_settles_every_pending_tool_card_with_the_error_text() {
+        let mut view = test_view();
+        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "toolu_pending".to_string(),
+            name: "bash".to_string(),
+            args: json!({ "command": "sleep 30" }),
+            started: true,
+            started_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        })));
+        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "toolu_partial".to_string(),
+            name: "bash".to_string(),
+            args: json!({ "command": "echo partial" }),
+            started: true,
+            started_at: Some(std::time::Instant::now()),
+            result: Some(ToolResultView {
+                content: vec![json!({ "type": "text", "text": "partial output" })],
+                details: serde_json::Value::Null,
+                is_error: false,
+            }),
+            result_partial: true,
+            ..Default::default()
+        })));
+        view.push_entry(ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "toolu_done".to_string(),
+            name: "bash".to_string(),
+            args: json!({ "command": "echo done" }),
+            started: true,
+            started_at: Some(std::time::Instant::now()),
+            ended_at: Some(std::time::Instant::now()),
+            result: Some(ToolResultView {
+                content: vec![json!({ "type": "text", "text": "done output" })],
+                details: serde_json::Value::Null,
+                is_error: false,
+            }),
+            ..Default::default()
+        })));
+        settle_pending_tool_cards("Operation aborted", &mut view);
+        let cards: Vec<&ToolCallCard> = view
+            .chat
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Tool(card) => Some(card.as_ref()),
+                _ => None,
+            })
+            .collect();
+        // The pending and the partial card both settle with the error
+        // text (TS settles every entry of the pending map, partial or
+        // not); the settled card keeps its result untouched.
+        for card in &cards[..2] {
+            let result = card.result.as_ref().expect("settled result");
+            assert!(result.is_error, "the settled result is an error");
+            assert_eq!(result.text_output(false), "Operation aborted");
+            assert!(card.aborted);
+            assert!(!card.result_partial);
+        }
+        let done = cards[2];
+        assert!(!done.aborted);
+        let kept = done.result.as_ref().expect("kept result");
+        assert!(!kept.is_error);
+        assert_eq!(kept.text_output(false), "done output");
+    }
+
+    #[test]
+    fn aborted_error_rows_carry_the_card_result_text() {
+        let aborted = assistant_error_row(
+            &json!({ "stopReason": "aborted" }),
+            &[("c1".to_string(), "bash".to_string(), json!({}))],
+        )
+        .expect("an aborted message renders");
+        assert_eq!(aborted.text, "Operation aborted");
+        assert_eq!(aborted.error_text, "Operation aborted");
+        assert!(aborted.aborted);
+        let error = assistant_error_row(
+            &json!({ "stopReason": "error", "errorMessage": "provider exploded" }),
+            &[],
+        )
+        .expect("a failed message without tool calls renders");
+        assert_eq!(error.text, "Error: provider exploded");
+        assert_eq!(error.error_text, "provider exploded");
+        let fallback =
+            assistant_error_row(&json!({ "stopReason": "error" }), &[]).expect("fallback renders");
+        assert_eq!(fallback.text, "Error: Unknown error");
+        assert_eq!(fallback.error_text, "Error");
+        // The request-aborted wire message never surfaces its raw text.
+        let request_aborted = assistant_error_row(
+            &json!({ "stopReason": "aborted", "errorMessage": "Request was aborted" }),
+            &[],
+        )
+        .expect("renders");
+        assert_eq!(request_aborted.text, "Operation aborted");
     }
 }

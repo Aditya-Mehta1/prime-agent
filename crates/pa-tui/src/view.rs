@@ -1831,6 +1831,7 @@ mod tests {
                 is_error: false,
             }),
             result_partial: false,
+            aborted: false,
         }))
     }
 
@@ -1900,6 +1901,7 @@ mod tests {
             ended_at: None,
             result: None,
             result_partial: false,
+            aborted: false,
         }));
         let mut view = view_with(vec![running, settled_tool_card("call_d")]);
         view.pulse_frame = 0;

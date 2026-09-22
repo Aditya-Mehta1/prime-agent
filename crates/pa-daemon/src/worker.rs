@@ -2650,6 +2650,14 @@ impl Worker {
     /// The session's telemetry finalizes first (TS dispose callback:
     /// `agent session ended` + one flush), bounded by the sink timeouts.
     async fn handle_shutdown(&self) -> DaemonResponse {
+        self.shutdown_sequence().await;
+        response_success(None, "shutdown", None)
+    }
+
+    /// The shared graceful-shutdown sequence (the `shutdown` command and
+    /// the shutdown signals both run it, TS `closeSession` over every
+    /// session before the runtime dispose).
+    pub(crate) async fn shutdown_sequence(&self) {
         {
             let mut core = self.core.lock().unwrap();
             core.shutdown_requested = true;
@@ -2681,7 +2689,6 @@ impl Worker {
             agent_engine.dispose_kernel().await;
         }
         self.engine.end_telemetry().await;
-        response_success(None, "shutdown", None)
     }
 
     /// Wait until no turn or compaction run is in flight (the awaited
@@ -4783,6 +4790,11 @@ pub async fn run_worker() -> Result<()> {
     // because workers re-present their identity (liveness watch + backoff).
     let registration = crate::registration::start(&config);
     let worker = Arc::new(Worker::new(config, registration));
+    // TS daemon-mode registers its shutdown-signal handlers after the
+    // listener binds; the worker registers before serving so a `prime
+    // kill` mid-run kills the tracked bash children with the same
+    // graceful sequence the `shutdown` command runs.
+    crate::worker_signals::register(Arc::clone(&worker));
     worker.serve().await
 }
 

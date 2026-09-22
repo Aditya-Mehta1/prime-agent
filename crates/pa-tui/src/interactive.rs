@@ -137,6 +137,21 @@ pub trait InteractionTelemetry: Send + Sync {
         action: &'static str,
         had_images: bool,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// One interrupt key (Escape or Ctrl+C) fired an abort at `target`
+    /// (`tui interrupt issued`): `stream` / `side_question` / `retry` /
+    /// `compaction` / `branch_summary` / `bash` — a primitive enum only,
+    /// never any command or content.
+    fn interrupt_issued(
+        &self,
+        target: &'static str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// A shutdown signal ended the run (`tui signal shutdown`): `signal`
+    /// is `sigterm` (SIGHUP exits too fast to report — the emergency exit
+    /// skips the telemetry flush by design).
+    fn signal_shutdown(
+        &self,
+        signal: &'static str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Persistence for the first-run onboarding answers. The TUI crate owns
@@ -446,7 +461,7 @@ async fn run_onboarding_phase(
         }
         view.onboarding = Some(screen.clone());
         if let Some(renderer) = renderer.is_terminal_mut() {
-            crate::app::draw(renderer, view)?;
+            draw_frame(renderer, view)?;
         }
         view.onboarding = None;
     }
@@ -593,6 +608,24 @@ impl ReconnectLoop {
     }
 }
 
+/// Paint one frame, taking the emergency exit when the terminal device
+/// is gone (TS `process.stdout.on("error")` over the dead-terminal
+/// classes): a dead pty makes every further paint fail the same way, so
+/// the run exits 129 without writing restore sequences back onto the dead
+/// device.
+fn draw_frame(
+    renderer: &mut Terminal<crate::hyperlinks::LinkBackend>,
+    view: &mut AgentView,
+) -> Result<()> {
+    match crate::app::draw(renderer, view) {
+        Ok(()) => Ok(()),
+        Err(error) if crate::exit_guard::is_dead_terminal_error(&error) => {
+            crate::exit_guard::emergency_terminal_exit()
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Run the interactive UI until the user exits (terminal) or the plan
 /// completes (headless).
 pub async fn run_interactive(
@@ -627,6 +660,12 @@ pub async fn run_interactive(
     // pair even while this loop is wedged in a daemon request, and a plain
     // std-thread watchdog enforces the exit deadline without the runtime.
     let exit_guard = ExitGuard::new();
+    // The shutdown-signal handlers (TS `registerSignalHandlers` in `init`):
+    // SIGTERM asks this loop for a graceful leave, SIGHUP takes the
+    // emergency exit. The task outlives the loop (see `signals`), so a
+    // signal during teardown or a later view still terminates the process.
+    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<crate::signals::SignalExit>();
+    crate::signals::register(signal_tx);
 
     // The view and the terminal surface come up BEFORE the session attach
     // (TS `init`: `ui.start()` paints the header + editor first, then
@@ -664,7 +703,7 @@ pub async fn run_interactive(
         // and session labels are placeholders until the attach's
         // `rebuild_view` repaints with the snapshot.
         if let Some(renderer) = renderer.is_terminal_mut() {
-            crate::app::draw(renderer, &mut view)?;
+            draw_frame(renderer, &mut view)?;
         }
     }
     let mut session = match SessionUi::open(
@@ -987,7 +1026,7 @@ pub async fn run_interactive(
                 // delays the switch.
                 if let Some(renderer) = renderer.is_terminal_mut() {
                     if !session.open_agents_view && session.pending_selection.is_none() {
-                        crate::app::draw(renderer, &mut view)?;
+                        draw_frame(renderer, &mut view)?;
                         // The frame scheduler's bookkeeping follows the
                         // inline paint: the 16ms gate below now measures its
                         // interval from this frame, and a paint satisfied
@@ -1140,6 +1179,15 @@ pub async fn run_interactive(
             maybe_input = ui_rx.recv() => {
                 if let Some(input) = maybe_input {
                     pending.push_back(input);
+                }
+            }
+            maybe_signal = signal_rx.recv() => {
+                if let Some(crate::signals::SignalExit::Sigterm) = maybe_signal {
+                    // TS's SIGTERM handler kills the tracked detached
+                    // children (done in the signal task) and runs the
+                    // same shutdown as the exit keys.
+                    session.exit_reason = "sigterm";
+                    running = false;
                 }
             }
             maybe_note = notes_rx.recv() => {
@@ -1382,7 +1430,7 @@ pub async fn run_interactive(
                     .map(|at| at.elapsed() >= MIN_RENDER_INTERVAL)
                     .unwrap_or(true);
                 if interval_elapsed {
-                    crate::app::draw(renderer, &mut view)?;
+                    draw_frame(renderer, &mut view)?;
                     session.dirty = false;
                     last_render_at = Some(Instant::now());
                     last_pulse_phase = view.pulse_frame;
@@ -1459,6 +1507,23 @@ pub async fn run_interactive(
     let exit_reason = session.exit_reason();
     let turn_active_at_exit = session.turn_active;
     if let Some(telemetry) = session.telemetry.clone() {
+        // A signal-ended run reports the shutdown signal itself (TS has no
+        // such event; the Rust port's adoption catalog covers the signal
+        // path). SIGHUP exits too fast to report — the emergency exit skips
+        // the telemetry flush by design.
+        let signal_event = (exit_reason == "sigterm").then(|| {
+            let telemetry = telemetry.clone();
+            async move {
+                telemetry.signal_shutdown("sigterm").await;
+            }
+        });
+        if let Some(signal_event) = signal_event {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(TELEMETRY_EXIT_TIMEOUT_MS),
+                signal_event,
+            )
+            .await;
+        }
         let exit_event = async move {
             let _ = telemetry
                 .client_exit(exit_reason, turn_active_at_exit)
