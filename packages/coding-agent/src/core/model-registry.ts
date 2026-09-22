@@ -906,7 +906,7 @@ export class ModelRegistry {
 				previousTeamId,
 				previousPrivateModels,
 			);
-			if (this.modelsJsonPath) await this.refreshProviderCatalog(false);
+			await this.refreshProviderCatalog(false);
 			return this.getAvailable();
 		});
 	}
@@ -1225,7 +1225,7 @@ export class ModelRegistry {
 
 	async getExecutableModels(): Promise<Model<Api>[]> {
 		this.startCatalogRefreshTimer();
-		if (this.modelsJsonPath) await this.refreshProviderCatalog(false);
+		await this.refreshProviderCatalog(false);
 		await this.runSerializedEntitlementRefresh(() => this.refreshPrivatePrimeInferenceAuthorization());
 		const availableModels = this.getAvailable();
 		const codexModels = availableModels.filter((model) => model.provider === "openai-codex");

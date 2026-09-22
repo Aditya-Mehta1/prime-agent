@@ -201,7 +201,7 @@ def prepare(request: Request, side: Side) -> None:
         raise RuntimeError("Checkout did not resolve to the requested commit")
     run_as(
         "builder",
-        ["npm", "run", "catalog:assets"],
+        ["npm", "run", "--if-present", "catalog:assets"],
         SOURCE,
         timeout=120,
         log=log,

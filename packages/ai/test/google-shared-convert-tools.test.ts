@@ -376,7 +376,7 @@ describe("google-shared image tool result routing", () => {
 });
 
 describe("Google Vertex thinking budget payload", () => {
-	const stableFlashLite = getModel("google-vertex", "gemini-2.5-flash-lite");
+	const stableFlashLite = getModel("google-vertex", "gemini-2.5-flash-lite")!;
 
 	it.each([stableFlashLite, { ...stableFlashLite, id: "gemini-2.5-flash-lite-preview" }])(
 		"uses the supported minimal budget for $id",

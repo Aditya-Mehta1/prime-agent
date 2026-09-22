@@ -28,19 +28,67 @@ function bundledTargets(outDir) {
 	};
 }
 
-function authHeaders() {
+function isTrustedCatalogUrl(url) {
+	try {
+		const parsed = new URL(url);
+		return (
+			parsed.origin === "https://raw.githubusercontent.com" &&
+			parsed.pathname.startsWith("/PrimeIntellect-ai/prime-agent-catalog/")
+		);
+	} catch {
+		return false;
+	}
+}
+
+function authHeaders(url, options = {}) {
 	const token = process.env.GITHUB_TOKEN || process.env.PRIME_CATALOG_REPO_TOKEN;
 	return {
 		accept: "application/json",
-		...(token ? { authorization: `Bearer ${token}` } : {}),
+		...(token && (options.allowTokenForUrl === true || isTrustedCatalogUrl(url))
+			? { authorization: `Bearer ${token}` }
+			: {}),
 	};
 }
 
-async function fetchCatalog(url, label) {
+async function readBoundedResponseText(response, label) {
+	const contentLength = Number(response.headers.get("content-length") ?? "0");
+	if (contentLength > MAX_REMOTE_CATALOG_BYTES) {
+		throw new Error(`${label} catalog is too large: ${contentLength} bytes exceeds ${MAX_REMOTE_CATALOG_BYTES}`);
+	}
+	if (!response.body) {
+		const body = await response.text();
+		const bytes = Buffer.byteLength(body, "utf8");
+		if (bytes > MAX_REMOTE_CATALOG_BYTES) {
+			throw new Error(`${label} catalog is too large: ${bytes} bytes exceeds ${MAX_REMOTE_CATALOG_BYTES}`);
+		}
+		return body;
+	}
+	const reader = response.body.getReader();
+	const chunks = [];
+	let bytes = 0;
+	try {
+		for (;;) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			bytes += value.byteLength;
+			if (bytes > MAX_REMOTE_CATALOG_BYTES) {
+				await reader.cancel().catch(() => undefined);
+				throw new Error(`${label} catalog is too large: ${bytes} bytes exceeds ${MAX_REMOTE_CATALOG_BYTES}`);
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+async function fetchCatalog(url, label, options = {}) {
 	let response;
 	try {
 		response = await fetch(url, {
-			headers: authHeaders(),
+			headers: authHeaders(url, options),
 			signal: AbortSignal.timeout(5_000),
 			redirect: "error",
 		});
@@ -55,15 +103,7 @@ async function fetchCatalog(url, label) {
 				: "";
 		throw new Error(`Failed to fetch ${label} catalog from ${url}: HTTP ${response.status}.${privateRepoHint}`);
 	}
-	const contentLength = Number(response.headers.get("content-length") ?? "0");
-	if (contentLength > MAX_REMOTE_CATALOG_BYTES) {
-		throw new Error(`${label} catalog is too large: ${contentLength} bytes exceeds ${MAX_REMOTE_CATALOG_BYTES}`);
-	}
-	const body = await response.text();
-	const bytes = Buffer.byteLength(body, "utf8");
-	if (bytes > MAX_REMOTE_CATALOG_BYTES) {
-		throw new Error(`${label} catalog is too large: ${bytes} bytes exceeds ${MAX_REMOTE_CATALOG_BYTES}`);
-	}
+	const body = await readBoundedResponseText(response, label);
 	return body.endsWith("\n") ? body : `${body}\n`;
 }
 
@@ -241,8 +281,8 @@ export async function generateBundledCatalogAssets(options = {}) {
 		copyCatalogSourcesToTargets(options.catalogDir, outDir);
 	} else {
 		const [modelBody, mcpServiceBody] = await Promise.all([
-			fetchCatalog(options.modelsUrl ?? DEFAULT_MODEL_CATALOG_URL, "model"),
-			fetchCatalog(options.mcpServicesUrl ?? DEFAULT_MCP_SERVICE_CATALOG_URL, "MCP service"),
+			fetchCatalog(options.modelsUrl ?? DEFAULT_MODEL_CATALOG_URL, "model", options),
+			fetchCatalog(options.mcpServicesUrl ?? DEFAULT_MCP_SERVICE_CATALOG_URL, "MCP service", options),
 		]);
 		writeFileSync(targets.models, modelBody);
 		writeFileSync(targets.mcpServices, mcpServiceBody);
@@ -250,7 +290,7 @@ export async function generateBundledCatalogAssets(options = {}) {
 	return validateBundledCatalogDir(outDir, { allowSmallFixture: options.allowSmallFixture === true || options.fixture === true });
 }
 
-export function copySourceCatalogAssets(options = {}) {
+export async function copySourceCatalogAssets(options = {}) {
 	const outDir = resolve(options.outDir ?? join(packageDir, "dist"));
 	mkdirSync(outDir, { recursive: true });
 	const targets = bundledTargets(outDir);
@@ -259,17 +299,30 @@ export function copySourceCatalogAssets(options = {}) {
 
 	const sourceDir = join(packageDir, "catalog");
 	const allSourcesPresent = bundledCatalogFiles.every((file) => existsSync(join(sourceDir, file)));
-	if (!allSourcesPresent) {
+	if (allSourcesPresent) {
+		cpSync(join(sourceDir, "models.bundled.json"), targets.models);
+		cpSync(join(sourceDir, "mcp-services.bundled.json"), targets.mcpServices);
+		return validateBundledCatalogDir(outDir, options);
+	}
+
+	try {
+		const [modelBody, mcpServiceBody] = await Promise.all([
+			fetchCatalog(options.modelsUrl ?? DEFAULT_MODEL_CATALOG_URL, "model", options),
+			fetchCatalog(options.mcpServicesUrl ?? DEFAULT_MCP_SERVICE_CATALOG_URL, "MCP service", options),
+		]);
+		writeFileSync(targets.models, modelBody);
+		writeFileSync(targets.mcpServices, mcpServiceBody);
+		return validateBundledCatalogDir(outDir, options);
+	} catch (error) {
 		const message =
-			"Missing generated catalog assets. Run `npm run catalog:assets -- --catalog-dir /path/to/prime-agent-catalog` or set PRIME_CATALOG_REPO_TOKEN and run `npm run catalog:assets`.";
+			"Missing generated catalog assets and failed to fetch public catalog assets. Run `npm run catalog:assets -- --catalog-dir /path/to/prime-agent-catalog` or set PRIME_CATALOG_REPO_TOKEN and run `npm run catalog:assets`.";
 		if (options.optional) {
-			console.warn(`${message} Continuing without bundled catalog assets; source runs will use the compiled fallback and runtime cache refresh.`);
+			const reason = error instanceof Error ? error.message : String(error);
+			console.warn(`${message} ${reason} Continuing without bundled catalog assets; source runs will use the compiled fallback and runtime cache refresh.`);
 			return { skipped: true, reason: "missing-source-catalog" };
 		}
-		throw new Error(message);
+		throw new Error(message, { cause: error });
 	}
-	copyCatalogSourcesToTargets(sourceDir, outDir);
-	return validateBundledCatalogDir(outDir, options);
 }
 
 function parseArgs(argv) {
@@ -287,6 +340,7 @@ function parseArgs(argv) {
 		else if (arg === "--mcp-services-url") options.mcpServicesUrl = rest[++i];
 		else if (arg === "--fixture") options.fixture = true;
 		else if (arg === "--allow-small-fixture") options.allowSmallFixture = true;
+		else if (arg === "--allow-token-for-url") options.allowTokenForUrl = true;
 		else if (arg === "--optional") options.optional = true;
 		else throw new Error(`Unknown catalog-assets argument: ${arg}`);
 	}
@@ -299,7 +353,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
 		command === "generate"
 			? await generateBundledCatalogAssets(options)
 			: command === "copy-source"
-				? copySourceCatalogAssets(options)
+				? await copySourceCatalogAssets(options)
 				: command === "verify"
 					? validateBundledCatalogDir(resolve(options.outDir ?? join(packageDir, "dist")), options)
 					: undefined;

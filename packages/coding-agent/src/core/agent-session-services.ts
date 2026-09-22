@@ -285,6 +285,7 @@ export async function createAgentSessionFromServices(
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,
 	});
+	result.session.registerDisposeCallback(() => options.services.mcpManager.dispose());
 	if (result.session.rlmDepth === 0 && !options.telemetryDisabled) {
 		installAgentTelemetry(result.session, {
 			agentDir: options.services.agentDir,

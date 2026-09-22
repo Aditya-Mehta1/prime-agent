@@ -57,7 +57,7 @@ afterEach(() => {
 });
 
 async function streamOnce() {
-	return streamAzureOpenAIResponses(getModel("azure-openai-responses", "gpt-4o-mini"), context, {
+	return streamAzureOpenAIResponses(getModel("azure-openai-responses", "gpt-4o-mini")!, context, {
 		apiKey: "test-api-key",
 	}).result();
 }

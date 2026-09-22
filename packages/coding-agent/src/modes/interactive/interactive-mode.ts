@@ -9755,6 +9755,7 @@ export class InteractiveMode {
 		const resolution = resolveServiceCatalogWithDiagnostics(
 			this.settingsManager.getMcpCatalogSources(),
 			this.getMcpConnectionStore().records(),
+			path.join(getAgentDir(), "mcp-service-catalog.v2.json"),
 		);
 		const views = buildPluginViews({
 			services: resolution.descriptors,
@@ -9776,6 +9777,7 @@ export class InteractiveMode {
 		return resolveServiceCatalogWithDiagnostics(
 			this.settingsManager.getMcpCatalogSources(),
 			this.getMcpConnectionStore().records(),
+			path.join(getAgentDir(), "mcp-service-catalog.v2.json"),
 		).descriptors;
 	}
 

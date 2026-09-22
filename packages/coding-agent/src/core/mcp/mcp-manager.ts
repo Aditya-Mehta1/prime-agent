@@ -111,6 +111,7 @@ export class McpManager {
 	private readonly connectionStore: McpConnectionStore;
 	private readonly probeConnection: typeof probeMcpEndpoint | undefined;
 	private readonly noBackgroundVerification: boolean;
+	private readonly unsubscribeRemoteMcpServiceCatalogChange: () => void;
 	private integrations = new Map<string, ResolvedIntegration>();
 	private services: readonly McpServiceDescriptor[] = [];
 	private acpServers = new Map<string, AcpMcpServerConfig>();
@@ -136,7 +137,7 @@ export class McpManager {
 			options.connectionStore ?? McpConnectionStore.open(join(getAgentDir(), "mcp-connections.json"));
 		this.probeConnection = options.probeConnection;
 		this.noBackgroundVerification = options.noBackgroundVerification ?? false;
-		onRemoteMcpServiceCatalogChange(() => this.refresh());
+		this.unsubscribeRemoteMcpServiceCatalogChange = onRemoteMcpServiceCatalogChange(() => this.refresh());
 		void refreshRemoteMcpServiceCatalog(join(getAgentDir(), "mcp-service-catalog.v2.json"), false).catch(() => {});
 		this.refresh();
 	}
@@ -150,6 +151,10 @@ export class McpManager {
 		this.connectionStore.load();
 		this.resolveIntegrations();
 		this.registerProviders();
+	}
+
+	dispose(): void {
+		this.unsubscribeRemoteMcpServiceCatalogChange();
 	}
 
 	canReleaseAcpServers(ownerId: string): boolean {

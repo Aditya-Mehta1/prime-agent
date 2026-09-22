@@ -349,7 +349,24 @@ describe("model catalog exporter policy", () => {
 		);
 		writeFileSync(
 			join(root, "models", "manual", "openai-codex.yml"),
-			'models:\n  - id: "gpt-5.1"\n    name: "GPT-5.1"\n    provider: "openai-codex"\n',
+			[
+				"models:",
+				'  - id: "gpt-5.1"',
+				'    name: "GPT-5.1"',
+				'    api: "openai-codex-responses"',
+				'    provider: "openai-codex"',
+				'    baseUrl: "https://chatgpt.com/backend-api"',
+				"    reasoning: true",
+				'    input: ["text"]',
+				"    cost:",
+				"      input: 1",
+				"      output: 2",
+				"      cacheRead: 0",
+				"      cacheWrite: 0",
+				"    contextWindow: 128000",
+				"    maxTokens: 8192",
+				"",
+			].join("\n"),
 		);
 
 		const policy = readCatalogPolicy(root);

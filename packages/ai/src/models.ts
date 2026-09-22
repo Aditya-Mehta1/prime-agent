@@ -31,13 +31,13 @@ export function getModel<TProvider extends KnownProvider, TModelId extends keyof
 export function getModel<TProvider extends KnownProvider>(
 	provider: TProvider,
 	modelId: string,
-): Model<ModelApi<TProvider>>;
+): Model<ModelApi<TProvider>> | undefined;
 export function getModel<TProvider extends KnownProvider>(
 	provider: TProvider,
 	modelId: string,
-): Model<ModelApi<TProvider>> {
+): Model<ModelApi<TProvider>> | undefined {
 	const providerModels = modelRegistry.get(provider);
-	return providerModels?.get(modelId) as Model<ModelApi<TProvider>>;
+	return providerModels?.get(modelId) as Model<ModelApi<TProvider>> | undefined;
 }
 
 export function getProviders(): KnownProvider[] {

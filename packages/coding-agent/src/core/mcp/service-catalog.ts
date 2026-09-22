@@ -167,7 +167,7 @@ export const REMOTE_MCP_SERVICE_CATALOG_URL =
 	"https://raw.githubusercontent.com/PrimeIntellect-ai/prime-agent-catalog/main/plugins/catalog.v2.json";
 const PACKAGED_MCP_SERVICE_CATALOG_FILE = "mcp-services.bundled.json";
 const remoteMcpListeners = new Set<() => void>();
-let remoteMcpCache: CatalogCache<readonly McpServiceEntry[]> | undefined;
+const remoteMcpCaches = new Map<string, CatalogCache<readonly McpServiceEntry[]>>();
 let remoteMcpLoadedFromBundle: readonly McpServiceEntry[] | undefined;
 
 function packagedMcpCatalogPath(): string {
@@ -197,10 +197,14 @@ function loadBundledRemoteMcpCatalog(): readonly McpServiceEntry[] {
 
 function getRemoteMcpCache(cachePath?: string): CatalogCache<readonly McpServiceEntry[]> | undefined {
 	if (!cachePath) return undefined;
-	remoteMcpCache ??= new CatalogCache(REMOTE_MCP_SERVICE_CATALOG_URL, cachePath, (payload) =>
-		Object.freeze(parseMcpServiceCatalogFile(payload).entries),
-	);
-	return remoteMcpCache;
+	let cache = remoteMcpCaches.get(cachePath);
+	if (!cache) {
+		cache = new CatalogCache(REMOTE_MCP_SERVICE_CATALOG_URL, cachePath, (payload) =>
+			Object.freeze(parseMcpServiceCatalogFile(payload).entries),
+		);
+		remoteMcpCaches.set(cachePath, cache);
+	}
+	return cache;
 }
 
 export function onRemoteMcpServiceCatalogChange(listener: () => void): () => void {

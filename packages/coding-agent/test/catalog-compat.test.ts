@@ -6,6 +6,10 @@ import { parseMcpServiceCatalogFile } from "@earendil-works/pi-ai/mcp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { getBundledModels } from "../src/core/bundled-model-catalog.js";
+import {
+	refreshRemoteMcpServiceCatalog,
+	resolveServiceCatalogWithDiagnostics,
+} from "../src/core/mcp/service-catalog.js";
 import { CatalogCache } from "../src/core/model-catalog-cache.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { PRIME_INFERENCE_BASE_URL } from "../src/core/prime-inference-model-catalog.js";
@@ -154,6 +158,39 @@ describe("remote catalog compatibility", () => {
 			fetchFn: fetchSequence([() => new Response(JSON.stringify(mcpPayload([mcpEntry("gamma")])))]),
 		});
 		expect(recovered?.map((entry) => entry.server)).toEqual(["gamma"]);
+	});
+
+	it("resolves entries from each remote MCP cache path independently", async () => {
+		const firstDir = makeTempDir();
+		const secondDir = makeTempDir();
+		const firstPath = join(firstDir, "mcp-service-catalog.v2.json");
+		const secondPath = join(secondDir, "mcp-service-catalog.v2.json");
+		vi.stubGlobal(
+			"fetch",
+			fetchSequence([
+				() => new Response(JSON.stringify(mcpPayload([mcpEntry("remote-alpha")]))),
+				() => new Response(JSON.stringify(mcpPayload([mcpEntry("remote-beta")]))),
+			]),
+		);
+
+		await refreshRemoteMcpServiceCatalog(firstPath, true);
+		await refreshRemoteMcpServiceCatalog(secondPath, true);
+
+		expect(
+			resolveServiceCatalogWithDiagnostics([], [], firstPath).descriptors.some(
+				(entry) => entry.serviceId === "remote-alpha",
+			),
+		).toBe(true);
+		expect(
+			resolveServiceCatalogWithDiagnostics([], [], firstPath).descriptors.some(
+				(entry) => entry.serviceId === "remote-beta",
+			),
+		).toBe(false);
+		expect(
+			resolveServiceCatalogWithDiagnostics([], [], secondPath).descriptors.some(
+				(entry) => entry.serviceId === "remote-beta",
+			),
+		).toBe(true);
 	});
 
 	it("keeps last-good MCP data on unsupported versions, network failures, and oversized payloads", async () => {

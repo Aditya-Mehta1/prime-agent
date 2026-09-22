@@ -2030,9 +2030,6 @@ async function collectCatalogModelsWithStatus(): Promise<CatalogCollection> {
 	return { providers, skippedProviders, skippedModels };
 }
 
-export async function collectCatalogModels(): Promise<Record<string, Model<Api>[]>> {
-	return (await collectCatalogModelsWithStatus()).providers;
-}
 
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -2167,6 +2164,19 @@ export function mergeProviderModelsForCatalog(
 		globAdmitted.push({ id: collected.id, glob });
 	}
 
+	let skipped = 0;
+	for (const existing of existingModels) {
+		if (admittedSet.has(existing.id)) {
+			continue;
+		}
+		if (!admission.globs.some((glob) => matchesGlob(existing.id, glob))) {
+			continue;
+		}
+		admittedIds.push(existing.id);
+		admittedSet.add(existing.id);
+		skipped += 1;
+	}
+
 	const nextModels: CatalogModelRecord[] = [];
 	const notInUpstreamIds: string[] = [];
 	let updated = 0;
@@ -2201,7 +2211,7 @@ export function mergeProviderModelsForCatalog(
 			added,
 			delisted: delistedIds.length,
 			notInUpstream: notInUpstreamIds.length,
-			skipped: 0,
+			skipped,
 			globAdmitted,
 			delistedIds,
 			notInUpstreamIds,
@@ -2346,12 +2356,17 @@ export function readCatalogPolicy(catalogDir: string): CatalogPolicy {
 		if (!Array.isArray(parsed.models) || !parsed.models.every(isCatalogModelRecord)) {
 			throw new Error(`${path}.models must be an array of model objects with string ids`);
 		}
-		for (const model of parsed.models) {
+		const manualModels = parsed.models.map((model) => stripCatalogHeaders(model as unknown as Model<Api>) as unknown as CatalogModelRecord);
+		for (const model of manualModels) {
 			if (model.provider !== provider) {
 				throw new Error(`${path}: model ${model.id} provider must match ${provider}`);
 			}
+			const invalidReason = getInvalidModelReason(model as unknown as Model<Api>);
+			if (invalidReason) {
+				throw new Error(`${path}: model ${model.id} is invalid: ${invalidReason}`);
+			}
 		}
-		manuals.set(provider, parsed.models);
+		manuals.set(provider, manualModels);
 	}
 
 	return { whitelists, manuals };
@@ -2511,10 +2526,6 @@ export async function syncCatalog(catalogDir: string): Promise<number> {
 	console.log(`Wrote ${manifestPath}`);
 
 	return Object.keys(collection.skippedProviders).length > 0 ? 1 : 0;
-}
-
-function readdirSorted(path: string): string[] {
-	return readdirSync(path).sort();
 }
 
 async function main(): Promise<void> {
