@@ -54,18 +54,28 @@ impl TreeNavigation {
     }
 
     /// `get_session_tree`: every entry in file order with its label plus the
-    /// current leaf id (TS `getFlatTree` + `getLeafId`).
+    /// current leaf id (TS `getFlatTree` + `getLeafId`). A windowed store
+    /// lists the held window and says so: `window` carries the boundary the
+    /// history backfill pager pages from (the structure above the floor
+    /// loads by paged backfill, never a full parse).
     pub(crate) fn get_session_tree(&self) -> DaemonResponse {
         let core = self.core.lock().unwrap();
         match core.store.as_ref() {
-            Some(store) => response_success(
-                None,
-                "get_session_tree",
-                Some(json!({
+            Some(store) => {
+                let mut data = json!({
                     "flatNodes": session_tree::flat_tree(store),
                     "leafId": store.leaf_id(),
-                })),
-            ),
+                });
+                if let Some(window) = store.window_info() {
+                    data["window"] = json!({
+                        "held": window.window_entries,
+                        "bytes": window.window_bytes,
+                        "oldestEntryId": window.oldest_entry_id,
+                        "boundaryEntryId": window.boundary_entry_id,
+                    });
+                }
+                response_success(None, "get_session_tree", Some(data))
+            }
             None => response_failure(
                 None,
                 "get_session_tree",
@@ -76,8 +86,12 @@ impl TreeNavigation {
     }
 
     /// `get_user_messages_for_forking`: the user messages with text (TS
-    /// `getUserMessagesForForking`).
-    pub(crate) fn get_user_messages_for_forking(&self) -> DaemonResponse {
+    /// `getUserMessagesForForking`). Every fork point is listed, so the
+    /// store upgrades to the full chain first (async; off the command loop).
+    pub(crate) async fn get_user_messages_for_forking(&self) -> DaemonResponse {
+        if let Err(error) = crate::session_window::ensure_store_full_history(&self.core).await {
+            return response_failure(None, "get_user_messages_for_forking", &error, None);
+        }
         let core = self.core.lock().unwrap();
         match core.store.as_ref() {
             Some(store) => response_success(
@@ -148,8 +162,10 @@ impl TreeNavigation {
             .map(str::to_string);
 
         // Snapshot the tree state under one lock pass; the model call below
-        // runs without holding it.
-        let (target, old_leaf, entries) = {
+        // runs without holding it. A target outside the open window is
+        // tree navigation into pre-window regions: the store upgrades to
+        // the full chain (async, off the command loop) before the lookup.
+        let snapshot = {
             let core = self.core.lock().unwrap();
             let Some(store) = core.store.as_ref() else {
                 return response_failure(
@@ -159,17 +175,38 @@ impl TreeNavigation {
                     None,
                 );
             };
-            let Some(target) = store.entry(target_id).cloned() else {
-                return response_failure(
-                    None,
-                    "navigate_tree",
-                    &format!("Entry {target_id} not found"),
-                    None,
-                );
-            };
-            let old_leaf = store.leaf_id().map(str::to_string);
-            let entries = store.entries().to_vec();
-            (target, old_leaf, entries)
+            store
+                .entry(target_id)
+                .cloned()
+                .map(|target| (target, store.leaf_id().map(str::to_string), store.entries().to_vec()))
+        };
+        let (target, old_leaf, entries) = match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                if let Err(error) =
+                    crate::session_window::ensure_store_full_history(&self.core).await
+                {
+                    return response_failure(None, "navigate_tree", &error, None);
+                }
+                let core = self.core.lock().unwrap();
+                let Some(store) = core.store.as_ref() else {
+                    return response_failure(
+                        None,
+                        "navigate_tree",
+                        "Session is still initializing",
+                        None,
+                    );
+                };
+                let Some(target) = store.entry(target_id).cloned() else {
+                    return response_failure(
+                        None,
+                        "navigate_tree",
+                        &format!("Entry {target_id} not found"),
+                        None,
+                    );
+                };
+                (target, store.leaf_id().map(str::to_string), store.entries().to_vec())
+            }
         };
         // No-op when already at the target (TS checks before pausing work).
         if Some(target_id) == old_leaf.as_deref() {
@@ -571,6 +608,11 @@ impl Worker {
     /// rebuilds the branch context in place on the live session and never
     /// runs this teardown, so the kernel stays warm there.
     pub(crate) async fn handle_fork(&self, payload: &Value) -> DaemonResponse {
+        // A fork copies the whole branch path, so it needs the full chain
+        // even when the fork point sits before the open window.
+        if let Err(error) = crate::session_window::ensure_store_full_history(&self.core).await {
+            return response_failure(None, "fork", &error, None);
+        }
         let (forked, selected_text) = match self.tree_navigation.prepare_fork(payload).await {
             Ok(prepared) => prepared,
             Err(response) => return response,

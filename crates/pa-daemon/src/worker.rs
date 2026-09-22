@@ -1531,7 +1531,7 @@ impl Worker {
             "set_auto_retry" => self.handle_set_auto_retry(payload),
             "abort_retry" => self.handle_abort_retry(),
             "get_session_tree" => self.tree_navigation.get_session_tree(),
-            "get_user_messages_for_forking" => self.tree_navigation.get_user_messages_for_forking(),
+            "get_user_messages_for_forking" => self.tree_navigation.get_user_messages_for_forking().await,
             "set_session_entry_label" => self.tree_navigation.set_session_entry_label(payload),
             "navigate_tree" => self.handle_navigate_tree(payload).await,
             "fork" => self.handle_fork(payload).await,
@@ -1540,7 +1540,7 @@ impl Worker {
                 response_success(None, "abort_branch_summary", None)
             }
             "export_html" => self.exports.export_html(payload).await,
-            "export_jsonl" => self.exports.export_jsonl(payload),
+            "export_jsonl" => self.exports.export_jsonl(payload).await,
             "mutate_queued_message" => self.handle_mutate_queued_message(payload),
             "resume_queue" => self.handle_resume_queue(),
             "execute_bash" => self.handle_execute_bash(payload),
@@ -3406,7 +3406,10 @@ impl Worker {
             let mut core = self.core.lock().unwrap();
             if let Some(store) = core.store.as_mut() {
                 let _ = store.append_session_state("archived");
-                let _ = store.rewrite();
+                // Append-only on purpose: the kill path must never pay a
+                // full-history upgrade, and the `archived` row is a pure
+                // append (flushed + synced before the aborted row lands).
+                let _ = store.persist_appended();
             }
             core.created = false;
         }

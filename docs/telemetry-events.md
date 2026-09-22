@@ -211,6 +211,23 @@ Emitted on the daemon `kill` path, before the session-ended finalization.
 |---|---|---|
 | `duration_ms` | number | session lifetime at archive time |
 
+### `session_open`
+
+Emitted by the daemon worker when it opens a session file (resume, recovery
+rebuild, session switch). The fast-session-open perf event: the open path
+seeds the store from the window loader (the compaction-bounded context plus
+a display floor), falling back to a full parse when the window
+preconditions do not hold. Underscore name per the agreed fast-session-open
+design — a Rust-only perf series with no TS counterpart.
+
+| property | type | notes |
+|---|---|---|
+| `duration_ms` | number | open elapsed: loader scan/parse through store seed |
+| `entries` | number | entries the opened store holds (window or full) |
+| `window_bytes` | number | byte span the window covers; 0 on a full-parse fallback |
+| `file_bytes` | number | session file size on disk |
+| `from_window` | boolean | true when the store was seeded from the window |
+
 ### `tui scroll used`
 
 The interactive transcript viewport's first scroll action per client run

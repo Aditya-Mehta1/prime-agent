@@ -50,6 +50,11 @@ impl ExportCommands {
     }
 
     async fn export_html_impl(&self, output_path: Option<&str>) -> Result<String> {
+        // The export carries the whole session, so a windowed store
+        // upgrades to the full chain first (async, off the command loop).
+        crate::session_window::ensure_store_full_history(&self.core)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         // The store snapshot under the core lock: the std guard is not
         // `Send`, so the engine reads below await outside the lock (the
         // TS exporter reads its state without holding anything either).
@@ -124,18 +129,23 @@ impl ExportCommands {
 
     /// `export_jsonl`: the current branch re-chained linearly into a JSONL
     /// file; the response carries the resolved path (TS `{ path }`).
-    pub(crate) fn export_jsonl(&self, payload: &Value) -> DaemonResponse {
+    pub(crate) async fn export_jsonl(&self, payload: &Value) -> DaemonResponse {
         let output_path = payload
             .get("outputPath")
             .and_then(Value::as_str)
             .map(str::to_string);
-        match self.export_jsonl_impl(output_path.as_deref()) {
+        match self.export_jsonl_impl(output_path.as_deref()).await {
             Ok(path) => response_success(None, "export_jsonl", Some(json!({ "path": path }))),
             Err(error) => response_failure(None, "export_jsonl", &format!("{error:#}"), None),
         }
     }
 
-    fn export_jsonl_impl(&self, output_path: Option<&str>) -> Result<String> {
+    async fn export_jsonl_impl(&self, output_path: Option<&str>) -> Result<String> {
+        // The export re-chains the whole branch, so a windowed store
+        // upgrades to the full chain first (async, off the command loop).
+        crate::session_window::ensure_store_full_history(&self.core)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         let core = self.core.lock().unwrap();
         let store = core
             .store
@@ -286,7 +296,7 @@ mod tests {
         let core = Arc::new(Mutex::new(core_with_session(dir.path())));
         let engine: Arc<dyn SessionEngine> = Arc::new(crate::engine::ScriptedEngine::default());
         let exports = ExportCommands::new(engine, core, dir.path().join("agent"));
-        let response = exports.export_jsonl(&json!({}));
+        let response = exports.export_jsonl(&json!({})).await;
         assert!(response.success, "export failed: {:?}", response.error);
         let path = response
             .data

@@ -6,6 +6,7 @@
 //! with the TS product is load-bearing: TUI reattach, checkpoint/resume, and
 //! external tooling read the same files.
 
+use crate::session_window::WindowInfo;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -77,7 +78,12 @@ impl SessionEntry {
     }
 }
 
-/// A loaded session: header plus the full entry chain, indexed by id.
+/// A loaded session: header plus the entry chain, indexed by id.
+///
+/// A store opened through the window loader (`session_window`) holds only
+/// the context window; `window` carries that state and
+/// [`SessionFile::ensure_full_history`] upgrades the store to the full
+/// chain. A `window` of `None` means every entry is held.
 #[derive(Debug, Clone)]
 pub struct SessionFile {
     pub path: PathBuf,
@@ -85,6 +91,10 @@ pub struct SessionFile {
     pub(crate) entries: Vec<SessionEntry>,
     pub(crate) by_id: HashMap<String, usize>,
     pub(crate) leaf_id: Option<String>,
+    pub(crate) window: Option<WindowInfo>,
+    /// `entries[..persisted_entries]` are on disk; the tail is memory-only
+    /// until [`SessionFile::persist_appended`] or a rewrite flushes it.
+    pub(crate) persisted_entries: usize,
 }
 
 pub fn session_file_name(session_id: &str) -> String {
@@ -144,6 +154,8 @@ impl SessionFile {
             entries: Vec::new(),
             by_id: HashMap::new(),
             leaf_id: None,
+            window: None,
+            persisted_entries: 0,
         };
         for line in lines {
             let trimmed = line.trim();
@@ -156,6 +168,7 @@ impl SessionFile {
                 Err(_) => continue,
             }
         }
+        file.persisted_entries = file.entries.len();
         Ok(file)
     }
 
@@ -177,10 +190,12 @@ impl SessionFile {
             entries: Vec::new(),
             by_id: HashMap::new(),
             leaf_id: None,
+            window: None,
+            persisted_entries: 0,
         }
     }
 
-    fn push_index(&mut self, entry: SessionEntry) {
+    pub(crate) fn push_index(&mut self, entry: SessionEntry) {
         self.by_id.insert(entry.id.clone(), self.entries.len());
         self.leaf_id = Some(entry.id.clone());
         self.entries.push(entry);
@@ -427,7 +442,14 @@ impl SessionFile {
     }
 
     /// Write the full file atomically (header + every entry), like `_rewriteFile`.
-    pub fn rewrite(&self) -> Result<()> {
+    ///
+    /// A windowed store never rewrote the file directly: its in-memory
+    /// entries are a suffix view, so a full rewrite from them would truncate
+    /// the durable history. The upgrade to the full chain happens first.
+    pub fn rewrite(&mut self) -> Result<()> {
+        if self.window.is_some() {
+            self.ensure_full_history()?;
+        }
         let path = self.path.as_path();
         let Some(path) = (if path.as_os_str().is_empty() {
             None
@@ -460,21 +482,39 @@ impl SessionFile {
     /// Append one entry line to the file, rewriting first when the file is missing.
     pub fn persist_entry(&mut self, entry_type: &str, fields: Value) -> Result<String> {
         let id = self.append_entry(entry_type, fields);
-        if !self.path.as_os_str().is_empty() && self.path.exists() {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .with_context(|| format!("append to {}", self.path.display()))?;
-            let mut writer = std::io::BufWriter::new(file);
-            let entry = self.entries.last().expect("entry just appended");
-            write_line(&mut writer, entry)?;
-            writer.flush()?;
-            writer.get_ref().sync_data()?;
-        } else {
-            self.rewrite()?;
-        }
+        self.persist_appended()?;
         Ok(id)
+    }
+
+    /// Flush the entries appended since the last persist to the file
+    /// (append-only; the durable history before them is never touched).
+    /// Rewrites first when the file is missing, like `persist_entry`.
+    pub fn persist_appended(&mut self) -> Result<()> {
+        if self.persisted_entries >= self.entries.len() {
+            return Ok(());
+        }
+        if self.path.as_os_str().is_empty() {
+            // In-memory store (created before `set_path`): nothing durable
+            // to append onto, matching `rewrite`'s early return.
+            return Ok(());
+        }
+        if !self.path.exists() {
+            self.rewrite()?;
+            return Ok(());
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("append to {}", self.path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        for entry in &self.entries[self.persisted_entries..] {
+            write_line(&mut writer, entry)?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+        self.persisted_entries = self.entries.len();
+        Ok(())
     }
 
     /// Point the session at a concrete file path (after `create`), preserving entries.
