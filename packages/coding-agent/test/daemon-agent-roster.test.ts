@@ -125,6 +125,7 @@ function makeState(options: {
 				getCurrentRecap: () => undefined,
 				_contextTokensForCurrentMessages: () => undefined,
 				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				getContextUsage: () => undefined,
 				state: { streamingMessage: undefined, pendingToolCalls: new Set() },
 			},
 		},

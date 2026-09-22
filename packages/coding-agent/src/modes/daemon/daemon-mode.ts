@@ -7960,6 +7960,7 @@ const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
 	"session_action_update",
 	"session_info_changed",
 	"thinking_level_changed",
+	"rlm_progress_note",
 ]);
 
 /**

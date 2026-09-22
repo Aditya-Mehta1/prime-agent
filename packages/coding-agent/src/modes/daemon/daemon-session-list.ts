@@ -81,6 +81,10 @@ export interface SessionSummary {
 	diagnostics?: AgentSessionRuntimeDiagnostic[];
 	/** One-line background summary of what the agent is doing or just did. */
 	summary?: string;
+	/** Latest rlm.progress_note from the agent itself; shown in place of the recap while present. */
+	progressNote?: string;
+	/** Context window fill in percent; absent for passive rows or right after a compaction. */
+	contextPercent?: number;
 	/** Completion verdict for an idle session; absent while working or unjudged. */
 	taskState?: AgentTaskState;
 	rosterStatus?: AgentRosterStatus;
@@ -263,6 +267,7 @@ interface SummaryComposeFingerprint {
 	thinkingLevel: ThinkingLevel | undefined;
 	streamingMessage: AgentMessage | undefined;
 	summaryState: AgentStatus | undefined;
+	progressNote: string | undefined;
 	diagnostics: readonly AgentSessionRuntimeDiagnostic[];
 	repliedSinceTask: boolean | undefined;
 	sessionActions: SessionActionSnapshot;
@@ -346,6 +351,7 @@ export function summaryForActiveSession(
 		thinkingLevel: session.thinkingLevel,
 		streamingMessage: session.state.streamingMessage,
 		summaryState: activeSession.summaryState,
+		progressNote: session.rlmProgressNote,
 		diagnostics: activeSession.runtime.diagnostics,
 		repliedSinceTask: metadata.kind === "subagent" ? session.repliedToParentSinceTask : undefined,
 		sessionActions: session.getSessionActionSnapshot(),
@@ -422,6 +428,8 @@ export function summaryForActiveSession(
 		// gate the verdict on currency: a stale "completed" must not show on a turn
 		// that is active again.
 		summary: activeSession.summaryState?.summary,
+		progressNote: session.rlmProgressNote,
+		contextPercent: session.getContextUsage()?.percent ?? undefined,
 		...(isSummaryCurrent(activeSession) ? { taskState: activeSession.summaryState?.taskState } : {}),
 	};
 	summaryComposeMemos.set(activeSession, { fingerprint, summary });
@@ -449,6 +457,7 @@ function summaryComposeFingerprintsEqual(left: SummaryComposeFingerprint, right:
 		left.thinkingLevel === right.thinkingLevel &&
 		left.streamingMessage === right.streamingMessage &&
 		left.summaryState === right.summaryState &&
+		left.progressNote === right.progressNote &&
 		left.repliedSinceTask === right.repliedSinceTask &&
 		left.metadataKind === right.metadataKind &&
 		left.metadataParentActiveSessionId === right.metadataParentActiveSessionId &&
