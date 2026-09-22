@@ -276,7 +276,7 @@ pub(crate) fn worker_model_registry(agent_dir: &std::path::Path) -> ModelRegistr
     registry
 }
 
-/// The TS `Usage` wire shape (pi-ai `emptyUsage`).
+/// The TS `Usage` wire shape (the TS `emptyUsage`).
 pub(crate) fn empty_usage() -> Value {
     json!({
         "input": 0,

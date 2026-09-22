@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Development rules for prime-agent-rs. Adapted from the codex-rs and prime-agent (TS) repo rules.
+Development rules for prime-agent-rs. Adapted from the Prime Agent (TS) repo rules.
 Every contributor (human or agent) must read this before working on this repo.
 
 ## Style and structure

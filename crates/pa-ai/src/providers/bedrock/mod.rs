@@ -903,7 +903,7 @@ mod tests {
     }
 
     /// Connection failures surface undici's raw `TypeError` message, like the
-    /// codex raw-`fetch` path (the AWS SDK does not wrap them).
+    /// TS raw-`fetch` path (the AWS SDK does not wrap them).
     /// The in-stream exception message composition (`{prefix}: {message}`).
     #[test]
     fn bedrock_exception_message_shape() {

@@ -1,7 +1,7 @@
 //! The composition root's provider auth flows behind the TUI's `/login`
 //! and `/logout` (TS `ProviderAuthFlows`): the provider catalog rows with
 //! their auth status, the API-key store, the MCP device flow, and the
-//! credential removal. The provider OAuth flows (TS `pi-ai/oauth`:
+//! credential removal. The provider OAuth flows (TS `the TS AI library/oauth`:
 //! Anthropic, GitHub Copilot, OpenAI Codex, xAI subscriptions) and the
 //! Prime browser logins are not ported yet; their rows render (TS shape)
 //! and their flows report the unavailability.
@@ -15,7 +15,7 @@ use pa_tui::provider_auth::{
     ProviderAuthFuture, ProviderAuthOutcome, ProviderRow, ProviderRowsFuture,
 };
 
-/// The TS OAuth provider rows (`pi-ai/oauth` registry): subscription
+/// The TS OAuth provider rows (`the TS AI library/oauth` registry): subscription
 /// logins whose flows this build does not port yet.
 const SUBSCRIPTION_PROVIDERS: [(&str, &str); 4] = [
     ("anthropic", "Anthropic (Claude Pro/Max)"),

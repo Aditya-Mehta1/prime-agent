@@ -35,8 +35,8 @@ const RUNTIME_FILES: &[BundleFile] = &[
         bytes: include_bytes!("typebox.mjs"),
     },
     BundleFile {
-        name: "pi-ai.mjs",
-        bytes: include_bytes!("pi-ai.mjs"),
+        name: "the TS AI library.mjs",
+        bytes: include_bytes!("the TS AI library.mjs"),
     },
     BundleFile {
         name: "pi-coding-agent.mjs",
