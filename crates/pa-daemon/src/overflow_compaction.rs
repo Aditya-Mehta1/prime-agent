@@ -125,7 +125,7 @@ impl AgentSessionEngine {
     /// shape (TS `_findLastAssistantMessage`).
     fn last_loop_assistant_message(&self) -> Option<pa_agent::types::AssistantMessage> {
         let guard = self.session.blocking_lock();
-        let engine = guard.as_ref()?;
+        let engine = guard.as_deref()?;
         let wire = self
             .runtime
             .block_on(async { engine.session.last_assistant_message().await })?;
@@ -161,23 +161,32 @@ impl AgentSessionEngine {
         // Skip the check when the message predates the latest compaction
         // boundary (TS `assistantIsFromBeforeCompaction`): a stale
         // pre-compaction overflow must not retrigger.
-        if self.session.blocking_lock().as_ref().is_some_and(|engine| {
-            self.runtime
-                .block_on(engine.session.latest_compaction_timestamp())
-                .is_some_and(|timestamp| wire.timestamp <= timestamp)
-        }) {
+        if self
+            .session
+            .blocking_lock()
+            .as_deref()
+            .is_some_and(|engine| {
+                self.runtime
+                    .block_on(engine.session.latest_compaction_timestamp())
+                    .is_some_and(|timestamp| wire.timestamp <= timestamp)
+            })
+        {
             return OverflowAttempt::None;
         }
         // Enablement: the compaction settings gate, or a pending model
         // request (the run below consumes it and honors its instructions).
-        let pending_scheduled = self.session.blocking_lock().as_ref().is_some_and(|engine| {
-            self.runtime
-                .block_on(async { engine.turn_boundary.compaction_scheduled().await })
-        });
+        let pending_scheduled = self
+            .session
+            .blocking_lock()
+            .as_deref()
+            .is_some_and(|engine| {
+                self.runtime
+                    .block_on(async { engine.turn_boundary.compaction_scheduled().await })
+            });
         let enabled = self
             .session
             .blocking_lock()
-            .as_ref()
+            .as_deref()
             .is_some_and(|engine| engine.session.auto_compaction_enabled());
         if !enabled && !pending_scheduled {
             return OverflowAttempt::None;
@@ -217,7 +226,7 @@ impl AgentSessionEngine {
         // the session history, but the retry must not re-send it).
         {
             let guard = self.session.blocking_lock();
-            if let Some(engine) = guard.as_ref() {
+            if let Some(engine) = guard.as_deref() {
                 self.runtime.block_on(async {
                     engine
                         .session
@@ -231,7 +240,7 @@ impl AgentSessionEngine {
         let custom_instructions = self
             .session
             .blocking_lock()
-            .as_ref()
+            .as_deref()
             .and_then(|engine| {
                 self.runtime
                     .block_on(async { engine.turn_boundary.take_compaction().await })
@@ -259,7 +268,7 @@ impl AgentSessionEngine {
         let api_key = self.resolve_request_api_key(&model);
         let outcome = {
             let guard = self.session.blocking_lock();
-            let Some(engine) = guard.as_ref() else {
+            let Some(engine) = guard.as_deref() else {
                 self.clear_auto_compaction_abort(&controller);
                 return OverflowAttempt::None;
             };
@@ -286,8 +295,9 @@ impl AgentSessionEngine {
                 // every completed compaction into the active run).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(telemetry) =
-                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
+                    if let Some(telemetry) = guard
+                        .as_deref()
+                        .and_then(|engine| engine.telemetry.as_ref())
                     {
                         telemetry.note_compaction();
                     }
@@ -327,7 +337,7 @@ impl AgentSessionEngine {
                 // of it (TS will-retry branch).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(engine) = guard.as_ref() {
+                    if let Some(engine) = guard.as_deref() {
                         self.runtime.block_on(async {
                             engine
                                 .session

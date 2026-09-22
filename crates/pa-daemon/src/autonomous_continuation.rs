@@ -278,7 +278,7 @@ impl AgentSessionEngine {
     /// The latest settled assistant message of the built session, if any.
     async fn latest_settled_assistant(&self) -> Option<pa_agent::types::AssistantMessage> {
         let guard = self.session.lock().await;
-        let engine = guard.as_ref()?;
+        let engine = guard.as_deref()?;
         let state = engine.session.agent().state().await;
         state
             .messages

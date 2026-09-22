@@ -36,7 +36,7 @@ impl AgentSessionEngine {
     /// session (TS `_compactAutoRefinePending`).
     pub(crate) fn compact_auto_refine_pending(&self) -> bool {
         let guard = self.session.blocking_lock();
-        match guard.as_ref() {
+        match guard.as_deref() {
             Some(engine) => self
                 .runtime
                 .block_on(async { engine.session.compact_auto_refine_pending() }),
@@ -49,7 +49,7 @@ impl AgentSessionEngine {
     /// the refine surface.
     pub(crate) fn mark_compact_auto_refine_pending(&self) {
         let guard = self.session.blocking_lock();
-        if let Some(engine) = guard.as_ref() {
+        if let Some(engine) = guard.as_deref() {
             self.runtime
                 .block_on(async { engine.session.mark_compact_auto_refine_pending() });
         }
@@ -60,7 +60,7 @@ impl AgentSessionEngine {
     /// message_end increment).
     pub(crate) fn note_settled_turn_since_auto_refine_review(&self) {
         let guard = self.session.blocking_lock();
-        if let Some(engine) = guard.as_ref() {
+        if let Some(engine) = guard.as_deref() {
             self.runtime
                 .block_on(async { engine.session.note_settled_turn_since_auto_refine_review() });
         }
@@ -136,7 +136,7 @@ impl AgentSessionEngine {
         // quiescent, so only the queued-work check remains live here.
         let busy = {
             let guard = self.session.blocking_lock();
-            match guard.as_ref() {
+            match guard.as_deref() {
                 Some(engine) => self
                     .runtime
                     .block_on(async { engine.session.agent().has_queued_messages() }),
@@ -154,7 +154,7 @@ impl AgentSessionEngine {
         let api_key = self.resolve_request_api_key(&model);
         let global_harness_dir = self.config.agent_dir.clone();
         let guard = self.session.blocking_lock();
-        let Some(engine) = guard.as_ref() else {
+        let Some(engine) = guard.as_deref() else {
             return Ok(None);
         };
         self.runtime.block_on(async {
