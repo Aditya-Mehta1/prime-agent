@@ -236,14 +236,19 @@ export class RemoteAgentMeshState {
 	 * roster push when it completes. The wait never starts a second scan.
 	 */
 	async refreshAwaiting(waitMs: number): Promise<void> {
-		// Clear the timer when the refresh wins the race, so frequent polling does
-		// not retain a timeout closure per request.
-		const timer = setTimeout(() => undefined, waitMs);
-		timer.unref?.();
+		// A single timer participates in the race and is cleared when the refresh
+		// settles first, so frequent polling retains no timer per request.
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
-			await Promise.race([this.refreshIfStale(), new Promise<void>((resolve) => setTimeout(resolve, waitMs))]);
+			await Promise.race([
+				this.refreshIfStale(),
+				new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, waitMs);
+					timer.unref?.();
+				}),
+			]);
 		} finally {
-			clearTimeout(timer);
+			if (timer !== undefined) clearTimeout(timer);
 		}
 	}
 
@@ -316,7 +321,10 @@ export class RemoteAgentMeshState {
 		const changed: string[] = [];
 		const removed: string[] = [];
 		for (const [agentId, entry] of entries) {
-			if (this.entries.get(agentId) !== entry) changed.push(agentId);
+			const previous = this.entries.get(agentId);
+			// Entry objects are rebuilt each scan; compare structurally so an
+			// identical roster row is not marked changed on every scan.
+			if (previous === undefined || JSON.stringify(previous) !== JSON.stringify(entry)) changed.push(agentId);
 		}
 		for (const agentId of this.entries.keys()) {
 			if (!entries.has(agentId)) removed.push(agentId);
