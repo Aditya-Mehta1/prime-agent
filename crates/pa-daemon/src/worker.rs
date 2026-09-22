@@ -1533,7 +1533,9 @@ impl Worker {
             "set_auto_retry" => self.handle_set_auto_retry(payload),
             "abort_retry" => self.handle_abort_retry(),
             "get_session_tree" => self.tree_navigation.get_session_tree(),
-            "get_user_messages_for_forking" => self.tree_navigation.get_user_messages_for_forking().await,
+            "get_user_messages_for_forking" => {
+                self.tree_navigation.get_user_messages_for_forking().await
+            }
             "set_session_entry_label" => self.tree_navigation.set_session_entry_label(payload),
             "navigate_tree" => self.handle_navigate_tree(payload).await,
             "fork" => self.handle_fork(payload).await,
@@ -1842,7 +1844,9 @@ impl Worker {
                         );
                         opened
                     }
-                    Err(error) => return response_failure(None, "create", &error.to_string(), None),
+                    Err(error) => {
+                        return response_failure(None, "create", &error.to_string(), None)
+                    }
                 }
             }
             (Some(path), false) => {

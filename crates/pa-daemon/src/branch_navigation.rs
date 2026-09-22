@@ -182,10 +182,13 @@ impl TreeNavigation {
                     None,
                 );
             };
-            store
-                .entry(target_id)
-                .cloned()
-                .map(|target| (target, store.leaf_id().map(str::to_string), store.entries().to_vec()))
+            store.entry(target_id).cloned().map(|target| {
+                (
+                    target,
+                    store.leaf_id().map(str::to_string),
+                    store.entries().to_vec(),
+                )
+            })
         };
         let (target, old_leaf, entries) = match snapshot {
             Some(snapshot) => snapshot,
@@ -212,7 +215,11 @@ impl TreeNavigation {
                         None,
                     );
                 };
-                (target, store.leaf_id().map(str::to_string), store.entries().to_vec())
+                (
+                    target,
+                    store.leaf_id().map(str::to_string),
+                    store.entries().to_vec(),
+                )
             }
         };
         // No-op when already at the target (TS checks before pausing work).

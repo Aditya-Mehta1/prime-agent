@@ -135,7 +135,10 @@ impl SessionFile {
     /// replay's compaction-branch leaf; production always passes `None`).
     pub(crate) fn open_windowed_at(path: &Path, leaf_id: Option<&str>) -> Result<Self> {
         let window = pa_core::session::window_loader::load_session_window(path, leaf_id);
-        if matches!(window.source, pa_core::session::window_loader::WindowSource::FullRead) {
+        if matches!(
+            window.source,
+            pa_core::session::window_loader::WindowSource::FullRead
+        ) {
             return SessionFile::open(path);
         }
         let checkpoint = matches!(
@@ -158,9 +161,8 @@ impl SessionFile {
     /// `firstKeptEntryId`.
     pub(crate) fn seed_from_window(path: &Path, seed: WindowSeed) -> Result<Self> {
         let header = read_session_header_bounded(path)?;
-        let mut entries: Vec<SessionEntry> = Vec::with_capacity(
-            seed.display_floor_records.len() + seed.retained_records.len(),
-        );
+        let mut entries: Vec<SessionEntry> =
+            Vec::with_capacity(seed.display_floor_records.len() + seed.retained_records.len());
         for record in seed
             .display_floor_records
             .iter()
@@ -225,7 +227,11 @@ impl SessionFile {
     /// seed the parse was started for (same generation); anything the live
     /// store appended while the parse ran — flush-through entries the parse
     /// predates — is re-appended by id. Returns whether the install ran.
-    pub(crate) fn finish_full_history_upgrade(&mut self, full: SessionFile, generation: u64) -> bool {
+    pub(crate) fn finish_full_history_upgrade(
+        &mut self,
+        full: SessionFile,
+        generation: u64,
+    ) -> bool {
         let Some(window) = self.window.as_ref() else {
             return false;
         };
@@ -272,8 +278,7 @@ fn session_open_client(
         .get_or_init(|| {
             let settings = pa_core::settings::SettingsManager::create(cwd, agent_dir);
             Some(pa_core::session_engine::telemetry::build_client(
-                &settings,
-                agent_dir,
+                &settings, agent_dir,
             ))
         })
         .as_ref()
@@ -301,7 +306,10 @@ pub(crate) fn emit_session_open(
         .unwrap_or((0, false));
     let mut properties = pa_telemetry::Properties::new();
     properties.set("duration_ms", serde_json::Value::from(open_ms));
-    properties.set("entries", serde_json::Value::from(store.entries().len() as u64));
+    properties.set(
+        "entries",
+        serde_json::Value::from(store.entries().len() as u64),
+    );
     properties.set("window_bytes", serde_json::Value::from(window_bytes));
     properties.set("file_bytes", serde_json::Value::from(file_bytes));
     properties.set("from_window", serde_json::Value::from(from_window));
@@ -374,10 +382,7 @@ mod tests {
     fn windowed_seed(path: &std::path::Path, held: usize) -> SessionFile {
         let full = SessionFile::open(path).unwrap();
         let header = full.header.clone();
-        let entries: Vec<SessionEntry> = full
-            .entries()
-            [full.entries().len() - held..]
-            .to_vec();
+        let entries: Vec<SessionEntry> = full.entries()[full.entries().len() - held..].to_vec();
         let window = WindowInfo {
             window_entries: entries.len(),
             window_bytes: 0,
@@ -395,7 +400,8 @@ mod tests {
         let before = fs::read_to_string(&path).unwrap();
 
         let mut store = windowed_seed(&path, 2);
-        let new_id = store.append_message(json!({"role": "user", "content": "m6", "timestamp": 6u64}));
+        let new_id =
+            store.append_message(json!({"role": "user", "content": "m6", "timestamp": 6u64}));
         store.persist_appended().unwrap();
 
         // The durable file grew by exactly the appended line.
@@ -539,7 +545,8 @@ mod tests {
             oldest_entry_id: entries.first().map(|entry| entry.id.clone()),
             generation: WINDOW_GENERATION.fetch_add(1, Ordering::Relaxed),
         };
-        let store = SessionFile::from_window_parts(path.clone(), full.header.clone(), entries, window);
+        let store =
+            SessionFile::from_window_parts(path.clone(), full.header.clone(), entries, window);
 
         assert_eq!(
             serde_json::to_vec(&store.messages()).unwrap(),
@@ -558,11 +565,7 @@ mod tests {
 
         // Records as the loader hands them over: raw bytes, no newline.
         let record_of = |id: &str| -> Vec<u8> {
-            let entry = full
-                .entries()
-                .iter()
-                .find(|entry| entry.id == id)
-                .unwrap();
+            let entry = full.entries().iter().find(|entry| entry.id == id).unwrap();
             let mut line = serde_json::to_vec(entry).unwrap();
             line.push(b'\n');
             line[..line.len() - 1].to_vec()
@@ -626,7 +629,10 @@ mod tests {
             full_messages,
             "window-open context diverged from the full parse"
         );
-        assert!(open_ms < 200, "windowed open took {open_ms}ms (gate: <200ms)");
+        assert!(
+            open_ms < 200,
+            "windowed open took {open_ms}ms (gate: <200ms)"
+        );
     }
 
     /// The compaction-checkpoint window on the golden corpus: a leaf on the
