@@ -24,6 +24,9 @@ pub(crate) struct TreeNavigation {
     /// The live branch-summary run's abort slot; each run replaces it, like
     /// the TS `_branchSummaryAbortController`.
     abort: Mutex<Option<Arc<AbortController>>>,
+    /// Telemetry seam for the `session_open` event the switch path emits.
+    agent_dir: std::path::PathBuf,
+    telemetry_disabled: Option<bool>,
 }
 
 impl TreeNavigation {
@@ -31,12 +34,16 @@ impl TreeNavigation {
         engine: Arc<dyn SessionEngine>,
         core: Arc<Mutex<SessionCore>>,
         idle_notify: Arc<Notify>,
+        agent_dir: std::path::PathBuf,
+        telemetry_disabled: Option<bool>,
     ) -> Self {
         TreeNavigation {
             engine,
             core,
             idle_notify,
             abort: Mutex::new(None),
+            agent_dir,
+            telemetry_disabled,
         }
     }
 

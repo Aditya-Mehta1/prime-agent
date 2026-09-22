@@ -3,17 +3,18 @@
 //!
 //! The open path seeds the store from the window loader
 //! (`pa_core::session::window_loader`): the compaction-bounded context
-//! region plus a display floor, instead of the whole file. The window is a
-//! READ optimization only — the durable file is never truncated — so every
-//! windowed mutation is append-only (`persist_appended`) and a full rewrite
-//! upgrades the store first. [`SessionFile::ensure_full_history`] is the
-//! explicit upgrade the full-history consumers run (export, archive, branch
-//! summarization, forking into pre-window regions); it re-reads the file and
-//! absorbs anything the live store appended while the parse ran.
+//! region plus a display floor, or the whole leaf chain by closure,
+//! instead of the whole file. The window is a READ optimization only — the
+//! durable file is never truncated — so every windowed mutation is
+//! append-only (`persist_appended`) and a full rewrite upgrades the store
+//! first. [`SessionFile::ensure_full_history`] is the explicit async
+//! upgrade the full-history consumers run (export, fork, fork-point
+//! listing, pre-window tree navigation); it re-reads the file and absorbs
+//! anything the live store appended while the parse ran.
 
-use anyhow::Result;
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use anyhow::{anyhow, Context, Result};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::session_store::{SessionEntry, SessionFile, SessionHeader};
@@ -23,6 +24,23 @@ use crate::worker::SessionCore;
 /// upgrade compares it before installing its parse, so a store replaced
 /// underneath the parse (session switch) drops the stale result.
 static WINDOW_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// The window byte span the `session_open` event reports: the seeded
+/// records' on-disk size (the loader's scan span minus the records it
+/// rejected), newline included.
+fn window_bytes_of(records: &[Vec<u8>]) -> u64 {
+    records.iter().map(|record| record.len() as u64 + 1).sum()
+}
+
+/// The loader output the store seeds from: the raw session-file records
+/// (newline excluded), oldest first, plus whether the cut is a compaction
+/// checkpoint (its boundary rides the retained records).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WindowSeed {
+    pub display_floor_records: Vec<Vec<u8>>,
+    pub retained_records: Vec<Vec<u8>>,
+    pub checkpoint: bool,
+}
 
 /// The window state of a store opened through the window loader.
 #[derive(Debug, Clone)]
@@ -42,6 +60,33 @@ pub(crate) struct WindowInfo {
     /// cursor the history backfill pager starts from.
     pub oldest_entry_id: Option<String>,
     pub generation: u64,
+}
+
+/// The session header for a windowed open: a bounded first-line read, so
+/// the open never pays the full-file read the plain loader spends on the
+/// header alone. The header line is small in practice; the cap only guards
+/// a corrupt first line.
+fn read_session_header_bounded(path: &std::path::Path) -> Result<SessionHeader> {
+    use std::io::Read;
+    const HEADER_READ_CAP: u64 = 64 * 1024;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    let mut head = Vec::new();
+    (&mut file)
+        .take(HEADER_READ_CAP)
+        .read_to_end(&mut head)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    let first_line_end = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| anyhow!("empty session file {}", path.display()))?;
+    let header_value: serde_json::Value = serde_json::from_slice(&head[..first_line_end])
+        .with_context(|| format!("invalid session header in {}", path.display()))?;
+    if header_value.get("type").and_then(serde_json::Value::as_str) != Some("session") {
+        return Err(anyhow!("missing session header in {}", path.display()));
+    }
+    serde_json::from_value(header_value)
+        .with_context(|| format!("invalid session header in {}", path.display()))
 }
 
 impl SessionFile {
@@ -74,6 +119,83 @@ impl SessionFile {
     /// loader; `None` means the store holds the full chain.
     pub(crate) fn window_info(&self) -> Option<&WindowInfo> {
         self.window.as_ref()
+    }
+
+    /// Open a session file through the window loader: the store holds the
+    /// context region (a compaction checkpoint, or the whole leaf chain by
+    /// closure) instead of the whole file. The leaf is the file's last
+    /// record — the daemon's resume leaf. A `FullRead` outcome (header
+    /// below v3, non-canonical record heads, duplicate-id divergence) falls
+    /// back to the plain full parse.
+    pub(crate) fn open_windowed(path: &Path) -> Result<Self> {
+        Self::open_windowed_at(path, None)
+    }
+
+    /// [`SessionFile::open_windowed`] at an explicit leaf (the golden
+    /// replay's compaction-branch leaf; production always passes `None`).
+    pub(crate) fn open_windowed_at(path: &Path, leaf_id: Option<&str>) -> Result<Self> {
+        let window = pa_core::session::window_loader::load_session_window(path, leaf_id);
+        if matches!(window.source, pa_core::session::window_loader::WindowSource::FullRead) {
+            return SessionFile::open(path);
+        }
+        let checkpoint = matches!(
+            window.source,
+            pa_core::session::window_loader::WindowSource::CompactionCheckpoint
+        );
+        Self::seed_from_window(
+            path,
+            WindowSeed {
+                display_floor_records: window.display_floor_records,
+                retained_records: window.retained_records,
+                checkpoint,
+            },
+        )
+    }
+
+    /// Seed the store from the loader's window records: display floor then
+    /// retained suffix, both oldest first — the store's entry order. The
+    /// boundary is inclusive, so the first retained record is the cut's
+    /// `firstKeptEntryId`.
+    pub(crate) fn seed_from_window(path: &Path, seed: WindowSeed) -> Result<Self> {
+        let header = read_session_header_bounded(path)?;
+        let mut entries: Vec<SessionEntry> = Vec::with_capacity(
+            seed.display_floor_records.len() + seed.retained_records.len(),
+        );
+        for record in seed
+            .display_floor_records
+            .iter()
+            .chain(seed.retained_records.iter())
+        {
+            match serde_json::from_slice::<SessionEntry>(record) {
+                Ok(entry) => entries.push(entry),
+                // The loader only emits canonical records; a store-side
+                // decode miss is skipped like the plain loader skips a
+                // malformed line.
+                Err(_) => continue,
+            }
+        }
+        let boundary_entry_id = if seed.checkpoint {
+            seed.retained_records
+                .first()
+                .and_then(|record| serde_json::from_slice::<SessionEntry>(record).ok())
+                .map(|entry| entry.id)
+        } else {
+            None
+        };
+        let info = WindowInfo {
+            window_entries: entries.len(),
+            window_bytes: window_bytes_of(&seed.display_floor_records)
+                + window_bytes_of(&seed.retained_records),
+            boundary_entry_id,
+            oldest_entry_id: entries.first().map(|entry| entry.id.clone()),
+            generation: WINDOW_GENERATION.fetch_add(1, Ordering::Relaxed),
+        };
+        Ok(Self::from_window_parts(
+            path.to_path_buf(),
+            header,
+            entries,
+            info,
+        ))
     }
 
     /// Upgrade the store to the full entry chain (synchronous). A no-op on a
@@ -131,6 +253,61 @@ impl SessionFile {
     }
 }
 
+/// The process-wide `session_open` telemetry client (one per worker
+/// process — workers are one-process-per-session). Built on first use from
+/// the creating session's settings; `None` when telemetry is disabled or
+/// the install identity is unavailable.
+static SESSION_OPEN_CLIENT: std::sync::OnceLock<Option<pa_telemetry::TelemetryClient>> =
+    std::sync::OnceLock::new();
+
+fn session_open_client(
+    agent_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    telemetry_disabled: bool,
+) -> Option<&'static pa_telemetry::TelemetryClient> {
+    if telemetry_disabled {
+        return None;
+    }
+    SESSION_OPEN_CLIENT
+        .get_or_init(|| {
+            let settings = pa_core::settings::SettingsManager::create(cwd, agent_dir);
+            Some(pa_core::session_engine::telemetry::build_client(
+                &settings,
+                agent_dir,
+            ))
+        })
+        .as_ref()
+}
+
+/// The `session_open` adoption event (`docs/telemetry-events.md`,
+/// fast-session-open PR 2): the open path's cost and window shape, emitted
+/// at the daemon's open seams. Best-effort — telemetry never fails the open.
+pub(crate) fn emit_session_open(
+    agent_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    telemetry_disabled: bool,
+    open_ms: u64,
+    store: &SessionFile,
+) {
+    let Some(client) = session_open_client(agent_dir, cwd, telemetry_disabled) else {
+        return;
+    };
+    let file_bytes = std::fs::metadata(&store.path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let (window_bytes, from_window) = store
+        .window_info()
+        .map(|window| (window.window_bytes, true))
+        .unwrap_or((0, false));
+    let mut properties = pa_telemetry::Properties::new();
+    properties.set("duration_ms", serde_json::Value::from(open_ms));
+    properties.set("entries", serde_json::Value::from(store.entries().len() as u64));
+    properties.set("window_bytes", serde_json::Value::from(window_bytes));
+    properties.set("file_bytes", serde_json::Value::from(file_bytes));
+    properties.set("from_window", serde_json::Value::from(from_window));
+    client.track("session_open", properties);
+}
+
 /// The async full-history upgrade the full-history consumers run before
 /// reading the whole chain (export, fork, pre-window tree navigation): the
 /// live tail flushes, the file parses on a blocking thread — never the
@@ -169,7 +346,6 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pa-daemon-window-{}", uuid::Uuid::new_v4()));
@@ -368,6 +544,121 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&store.messages()).unwrap(),
             serde_json::to_vec(&full_messages).unwrap()
+        );
+    }
+
+    /// The window seed decodes raw file records in order: display floor
+    /// first, then the retained suffix, with the checkpoint boundary taken
+    /// from the first retained record.
+    #[test]
+    fn the_window_seed_decodes_records_in_order_with_the_boundary() {
+        let dir = temp_dir();
+        let (path, ids) = persisted_session(&dir, 6);
+        let full = SessionFile::open(&path).unwrap();
+
+        // Records as the loader hands them over: raw bytes, no newline.
+        let record_of = |id: &str| -> Vec<u8> {
+            let entry = full
+                .entries()
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap();
+            let mut line = serde_json::to_vec(entry).unwrap();
+            line.push(b'\n');
+            line[..line.len() - 1].to_vec()
+        };
+        let seed = WindowSeed {
+            display_floor_records: vec![record_of(&ids[0]), record_of(&ids[1])],
+            retained_records: vec![record_of(&ids[2]), record_of(&ids[3])],
+            checkpoint: true,
+        };
+        let mut store = SessionFile::seed_from_window(&path, seed).unwrap();
+
+        let window = store.window_info().unwrap();
+        assert_eq!(window.window_entries, 4);
+        assert_eq!(
+            window.boundary_entry_id.as_deref(),
+            Some(ids[2].as_str()),
+            "the inclusive boundary is the first retained record"
+        );
+        assert_eq!(
+            window.oldest_entry_id.as_deref(),
+            Some(ids[0].as_str()),
+            "the floor's oldest record leads the store"
+        );
+        assert_eq!(store.leaf_id().map(str::to_string), Some(ids[3].clone()));
+        assert_eq!(
+            window.window_bytes as usize,
+            serde_json::to_vec(&full.entries()[0]).unwrap().len()
+                + serde_json::to_vec(&full.entries()[1]).unwrap().len()
+                + serde_json::to_vec(&full.entries()[2]).unwrap().len()
+                + serde_json::to_vec(&full.entries()[3]).unwrap().len()
+                + 4,
+            "the reported span is the records' on-disk size"
+        );
+        assert!(store.persist_appended().is_ok());
+        let on_disk = SessionFile::open(&path).unwrap();
+        assert_eq!(on_disk.message_count(), 6, "the durable file is intact");
+    }
+
+    /// The golden-session replay gate (fast-session-open PR 2): on a real
+    /// captured session, the windowed open's context is byte-equal to the
+    /// full parse's, and the open is fast. The corpus is the 42MB driver
+    /// session; run in the sandbox with the read-only copy uploaded.
+    #[test]
+    #[ignore = "golden corpus replay: PA_FAST_OPEN_CORPUS must name the file"]
+    fn golden_window_open_context_is_byte_equal_to_the_full_parse() {
+        let Some(path) = std::env::var_os("PA_FAST_OPEN_CORPUS").map(PathBuf::from) else {
+            panic!("PA_FAST_OPEN_CORPUS must name the golden session file");
+        };
+        let full = SessionFile::open(&path).unwrap();
+        let full_messages = serde_json::to_vec(&full.messages()).unwrap();
+
+        let open_started = std::time::Instant::now();
+        let windowed = SessionFile::open_windowed(&path).unwrap();
+        let open_ms = open_started.elapsed().as_millis() as u64;
+        assert!(
+            windowed.window_info().is_some(),
+            "the window must apply to the golden corpus"
+        );
+        assert_eq!(
+            serde_json::to_vec(&windowed.messages()).unwrap(),
+            full_messages,
+            "window-open context diverged from the full parse"
+        );
+        assert!(open_ms < 200, "windowed open took {open_ms}ms (gate: <200ms)");
+    }
+
+    /// The compaction-checkpoint window on the golden corpus: a leaf on the
+    /// last-compaction branch seeds a CompactionCheckpoint window whose
+    /// context is byte-equal to the full parse at the same leaf. Leaf
+    /// `a3186289` (line 37265 of the captured corpus) is the tip of the
+    /// branch carrying the last compaction; the append-only file keeps both
+    /// facts frozen.
+    #[test]
+    #[ignore = "golden corpus replay: PA_FAST_OPEN_CORPUS must name the file"]
+    fn golden_compaction_checkpoint_window_is_byte_equal_at_its_leaf() {
+        let Some(path) = std::env::var_os("PA_FAST_OPEN_CORPUS").map(PathBuf::from) else {
+            panic!("PA_FAST_OPEN_CORPUS must name the golden session file");
+        };
+        let leaf_id = "a3186289";
+        let windowed = SessionFile::open_windowed_at(&path, Some(leaf_id)).unwrap();
+        let window = windowed.window_info().expect("the window applies");
+        assert_eq!(window.window_entries, 145, "the retained window size");
+        assert_eq!(
+            window.boundary_entry_id.as_deref(),
+            Some("4f4cc0e3"),
+            "the window cut is the compaction's firstKeptEntryId"
+        );
+
+        // The full-parse reference at the same leaf: the store's leaf drives
+        // the same fold the windowed seed must reproduce.
+        let mut full = SessionFile::open(&path).unwrap();
+        full.leaf_id = Some(leaf_id.to_string());
+        assert_eq!(
+            serde_json::to_vec(&windowed.messages()).unwrap(),
+            serde_json::to_vec(&full.messages()).unwrap(),
+            "compaction-checkpoint window diverged from the full parse"
         );
     }
 }

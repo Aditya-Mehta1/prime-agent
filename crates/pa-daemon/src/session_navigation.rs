@@ -260,7 +260,9 @@ impl SessionNavigation {
         cwd_override: Option<String>,
         command: &'static str,
     ) -> Result<PreparedReplacement, DaemonResponse> {
-        let file = SessionFile::open(std::path::Path::new(path))
+        // The switch is an open (fast-session-open PR 2): the store seeds
+        // from the window loader, the same as the resume path.
+        let file = SessionFile::open_windowed(std::path::Path::new(path))
             .map_err(|error| response_failure(None, command, &error.to_string(), None))?;
         let cwd = cwd_override
             .clone()

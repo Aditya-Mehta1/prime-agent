@@ -947,6 +947,8 @@ impl Worker {
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
             idle_notify.clone(),
+            config.agent_dir.clone(),
+            config.telemetry_disabled,
         );
         let exports = crate::session_export::ExportCommands::new(
             std::sync::Arc::clone(&engine),
@@ -1807,23 +1809,42 @@ impl Worker {
             .map(str::to_string);
 
         let mut store = match (&session_path, no_session) {
-            (Some(path), false) if path.exists() => match SessionFile::open(path) {
-                Ok(mut opened) => {
-                    append_creation_prefix(
-                        &mut opened,
-                        self.engine.as_ref(),
-                        &self.config.agent_dir,
-                        &cwd,
-                        false,
-                    );
-                    let _ = opened.append_session_state("active");
-                    if let Err(error) = opened.rewrite() {
-                        return response_failure(None, "create", &error.to_string(), None);
+            (Some(path), false) if path.exists() => {
+                let open_started = std::time::Instant::now();
+                match crate::session_store::SessionFile::open_windowed(path) {
+                    Ok(mut opened) => {
+                        let open_ms = open_started.elapsed().as_millis() as u64;
+                        append_creation_prefix(
+                            &mut opened,
+                            self.engine.as_ref(),
+                            &self.config.agent_dir,
+                            &cwd,
+                            false,
+                        );
+                        let _ = opened.append_session_state("active");
+                        // A windowed store never rewrites: the durable file
+                        // holds the pre-window history, so the creation
+                        // prefix persists append-only.
+                        let persisted = if opened.window_info().is_some() {
+                            opened.persist_appended()
+                        } else {
+                            opened.rewrite()
+                        };
+                        if let Err(error) = persisted {
+                            return response_failure(None, "create", &error.to_string(), None);
+                        }
+                        crate::session_window::emit_session_open(
+                            &self.config.agent_dir,
+                            std::path::Path::new(&cwd),
+                            self.config.telemetry_disabled == Some(true),
+                            open_ms,
+                            &opened,
+                        );
+                        opened
                     }
-                    opened
+                    Err(error) => return response_failure(None, "create", &error.to_string(), None),
                 }
-                Err(error) => return response_failure(None, "create", &error.to_string(), None),
-            },
+            }
             (Some(path), false) => {
                 let mut created = SessionFile::create(
                     &cwd,

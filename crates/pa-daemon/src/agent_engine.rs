@@ -602,7 +602,7 @@ impl AgentSessionEngine {
             .clone();
         let durable_branch = session_file
             .as_deref()
-            .and_then(|path| crate::session_store::SessionFile::open(path).ok())
+            .and_then(|path| crate::session_store::SessionFile::open_windowed(path).ok())
             .map(|store| store.branch_file_entries())
             .filter(|entries| !entries.is_empty());
         if let Some(entries) = durable_branch {
