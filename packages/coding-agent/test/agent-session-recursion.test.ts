@@ -1474,8 +1474,6 @@ describe("AgentSession rlm recursion", () => {
 		const stopKernel = vi.spyOn(childProvisioner, "stopKernel");
 		const disposed = vi.spyOn(childProvisioner, "dispose");
 		await waitFor(() => root.getRlmChildSession(daemonChildId)?.getLastAssistantText() !== undefined);
-		// Settle-time retention stopped the kernel with a final snapshot and left
-		// the session itself live for reads, follow-up turns, and collects.
 		await waitFor(() => stopKernel.mock.calls.length === 1);
 		expect(stopKernel).toHaveBeenCalledWith({ snapshot: true });
 		expect(disposed).not.toHaveBeenCalled();

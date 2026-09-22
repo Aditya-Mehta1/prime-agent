@@ -496,10 +496,8 @@ export interface SubagentRuntimeHost {
 		status: "done" | "error" | "cancelled",
 	) => Promise<void>;
 	/**
-	 * Eagerly passivate a settled, retained child runtime: flush its kernel
-	 * snapshot and close its resident runtime while the parent's retained entry
-	 * and any host registry rows stay intact. Hosts that do not implement this
-	 * leave residency to the caller's direct session disposal.
+	 * Eagerly passivate a settled child's runtime (host registry rows stay
+	 * intact); hosts that omit this leave residency to the caller.
 	 */
 	passivateRlmSubagentRuntime?: (childId: string, runtime: RlmSubagentRuntime) => Promise<void>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */

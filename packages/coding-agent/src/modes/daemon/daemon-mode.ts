@@ -3180,14 +3180,9 @@ export class AgentDaemon {
 	}
 
 	/**
-	 * Eagerly passivate a just-settled RLM child: the same graceful close the
-	 * idle sweep performs (shutdown keeps the resume entry, registry row, and
-	 * heartbeats; the kernel snapshot flushes before teardown), without waiting
-	 * out the idle window. Skips leave the child resident for the idle sweep:
-	 * attached clients, in-flight closes or hydration, resident descendants
-	 * (e.g. a rehydrated grandchild), or non-heartbeat cron jobs. The parent's
-	 * retained entry is intentionally kept: listing extras and collects serve
-	 * from it until the child is rehydrated or deleted.
+	 * The idle sweep's graceful close, without the idle window: skips leave the
+	 * child resident for that sweep, and the parent's retained entry is
+	 * intentionally kept for listings and collects.
 	 */
 	private async passivateSettledRlmSubagent(
 		parentState: ActiveSessionState,

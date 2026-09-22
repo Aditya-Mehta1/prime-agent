@@ -257,8 +257,6 @@ describe("daemon mode helpers", () => {
 		await host.deleteRlmSubagentRuntime("missing-child", missingSession);
 		expect(missingSession.disposeAsync).toHaveBeenCalledOnce();
 
-		// Settled-child retention: the hook closes through the daemon exactly like
-		// an idle passivation, while the policy gate and identity guard skip.
 		internals.sessions.set(parentState.activeSessionId, parentState);
 		Reflect.set(childState.runtime, "session", { ...childSession, sessionFile: "/tmp/prime-agent-child.jsonl" });
 		internals.sessionPassivationSnapshot = vi.fn(async () => ({ hasParent: true, attachedClients: 0 }));

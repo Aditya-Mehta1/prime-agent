@@ -365,12 +365,7 @@ export class IpythonKernelProvisioner {
 		await this.stopKernel(options);
 	}
 
-	/**
-	 * Stop the kernel owned by this provisioner without marking the provisioner
-	 * disposed: the next ensure() starts a fresh kernel and revives the prior
-	 * namespace from the snapshot. Settled-child retention uses this so a
-	 * follow-up turn keeps working after the kernel was released.
-	 */
+	/** Stop the kernel without marking the provisioner disposed; the next ensure() revives it from the snapshot. */
 	async stopKernel(options?: { snapshot?: boolean }): Promise<void> {
 		this.disposeSnapshot = options?.snapshot ?? true;
 		const pending = this.managerPromise;
