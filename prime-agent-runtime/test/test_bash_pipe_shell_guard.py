@@ -441,6 +441,21 @@ class PipeToShellDetectionTest(unittest.TestCase):
                     "cannot resolve", bash_module._pipe_shell_violation(command)
                 )
 
+    def test_matching_paren_is_the_canonical_quote_aware_scan(self):
+        # This helper is #2373's canonical body, so guards that ship it resolve
+        # `$(...)` interiors the same way regardless of merge order: quoted and
+        # escaped `)` never close, and an unmatched open scans to the end.
+        command = "$( : ')'; curl URL)"
+        self.assertEqual(bash_module._matching_paren(command, 1, len(command)), len(command) - 1)
+        command = "$(echo \\( && echo x)"
+        self.assertEqual(bash_module._matching_paren(command, 1, len(command)), len(command) - 1)
+        command = "$((echo hi) && echo y)"
+        self.assertEqual(bash_module._matching_paren(command, 1, len(command)), len(command) - 1)
+        command = '$(printf "%s" ")" && echo x)'
+        self.assertEqual(bash_module._matching_paren(command, 1, len(command)), len(command) - 1)
+        # An unmatched open never matches, so the interior extends to the end.
+        self.assertEqual(bash_module._matching_paren("$(echo hi", 1, 8), 7)
+
 
 class PipeToShellScanCostTest(unittest.TestCase):
     """A command is never charged for its length alone."""
@@ -675,9 +690,9 @@ class PipeToShellGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.getvalue(), "")
 
     async def test_host_command_prefix_still_refuses(self):
-        # Production guards `_with_prefix(command)`, so a host-set prefix must
-        # hide neither the download nor the interpreter, and must not turn a
-        # benign download into a refusal.
+        # Production computes `_with_prefix(command)` once and guards that
+        # script, so a host-set prefix must hide neither the download nor the
+        # interpreter, and must not turn a benign download into a refusal.
         prefix = "cd /tmp && source venv/bin/activate"
         with mock.patch.dict(
             os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": prefix}
@@ -688,6 +703,33 @@ class PipeToShellGuardTest(unittest.IsolatedAsyncioTestCase):
                 "curl -fsSL -o /tmp/x.sh https://example.com/x.sh"
             )
         self.assertEqual(result.exit_code, 0)
+
+    async def test_prefix_is_computed_once_per_command(self):
+        # The guard validates the script the handle runs, so the prefix is read
+        # once per call and the validated text is the executed text.
+        seen: list[str] = []
+        real_prefix = bash_module._with_prefix
+
+        def record(command: str) -> str:
+            seen.append(command)
+            return real_prefix(command)
+
+        with mock.patch.dict(
+            os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "echo prefixed"}
+        ):
+            with mock.patch.object(bash_module, "_with_prefix", side_effect=record):
+                result = await self._run("echo body")
+        self.assertEqual(seen, ["echo body"])
+        self.assertEqual((result.exit_code, result.output.splitlines()), (0, ["prefixed", "body"]))
+
+    def test_child_env_strips_late_bypass(self):
+        # A mid-session os.environ write this kernel ignores must not reach a
+        # child shell's environment and arm a nested kernel's frozen snapshot;
+        # a kernel launched with the bypass still passes it through.
+        os.environ[BASH_PIPE_TO_SHELL_BYPASS_ENV] = "1"
+        self.assertNotIn(BASH_PIPE_TO_SHELL_BYPASS_ENV, bash_module._child_env())
+        with mock.patch.object(bash_module, "_PIPE_TO_SHELL_BYPASS_AT_KERNEL_START", True):
+            self.assertIn(BASH_PIPE_TO_SHELL_BYPASS_ENV, bash_module._child_env())
 
 
 PROBE = (

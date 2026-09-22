@@ -232,14 +232,25 @@ class BashHandle:
     handle; later awaits only wait and cancelling them leaves it running.
     """
 
-    def __init__(self, command: str) -> None:
-        # Every asyncio use in this module runs on a handle path (bash() is the
-        # only constructor), so bind the module global here, before
-        # _schedule_background_completion_notice or any await can run.
+    def __init__(self, command: str, script: str | None = None) -> None:
+        # Every asyncio use in this module runs on a handle path (bash() is
+        # the only in-repo constructor), so bind the module global here,
+        # before _schedule_background_completion_notice or any await can run.
         global asyncio
         import asyncio
 
+        # `command` is the text the caller wrote and stays the display value
+        # (the completion notice and repr use it). `script` is the text the
+        # shell runs, computed once by `bash()` and validated by the guard
+        # before it reached this handle; without one they are the same text,
+        # so a handle built directly is guarded here instead -- the class
+        # must not be a way around the guard, and the `bash()` path, whose
+        # script was already validated, pays no second scan.
+        if script is None:
+            _guard_pipe_to_shell(command, False)
+
         self.command = command
+        self._script = script if script is not None else command
         completion_context = _current_cell_completion_context()
         self._creating_cell_finished = completion_context[0] if completion_context else None
         self._creating_cell_task = completion_context[1] if completion_context else None
@@ -298,13 +309,13 @@ class BashHandle:
                 _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
             )
             script = _status_script(
-                _with_prefix(command),
+                self._script,
                 completion_token[:token_midpoint],
                 completion_token[token_midpoint:],
             )
         else:
             # Windows lacks a foreground-status channel, so its exit drain stays best-effort.
-            script = _with_prefix(command)
+            script = self._script
             self._job = _winjob.create_job()
             if self._job is None:
                 # Nothing spawned yet, so nothing can leak: refuse to start.
@@ -1185,50 +1196,53 @@ class _PipeShellRegion:
     unterminated_quote: bool
 
 
-def _command_name(value: str) -> str:
+def _pipe_shell_command_name(value: str) -> str:
     """The command name a word runs: its basename, as the shell resolves it."""
     return value.rsplit("/", 1)[-1]
+
+
+def _quote_span_end(command: str, start: int, end: int) -> int:
+    """Index just past the quoted span starting at `command[start]` (a single
+    or double quote), skipping escaped characters inside double quotes."""
+    quote = command[start]
+    i = start + 1
+    while i < end:
+        ch = command[i]
+        if quote == '"' and ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1
+        i += 1
+    return end
 
 
 def _matching_paren(command: str, open_index: int, end: int) -> int:
     """Index of the `)` matching the `(` at `open_index`, or `end - 1`.
 
-    Quotes and escapes are read because a `)` inside them does not close the
-    substitution (`$( : ')'; curl URL)` must scan the curl, not stop at the
-    quoted paren)."""
+    Quote-aware: a `)` inside a single- or double-quoted span or after a
+    backslash escape never closes the substitution, mirroring how the shell
+    parses it. Unterminated quotes or an unmatched `(` scan to the end, so
+    the whole region stays live-command territory rather than a miss."""
     depth = 0
-    index = open_index
-    quote = ""
-    while index < end:
-        char = command[index]
-        if quote == "'":
-            if char == "'":
-                quote = ""
-            index += 1
-            continue
-        if quote == '"':
-            if char == '"':
-                quote = ""
-            elif char == "\\" and index + 1 < end:
-                index += 2
-                continue
-            index += 1
-            continue
-        if char == "\\":
-            index += 2
-            continue
-        if char in "'\"":
-            quote = char
-            index += 1
-            continue
-        if char == "(":
+    i = open_index
+    while i < end:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+        elif ch in "'\"":
+            i = _quote_span_end(command, i, end)
+        elif ch == "(":
             depth += 1
-        elif char == ")":
+            i += 1
+        elif ch == ")":
             depth -= 1
             if depth == 0:
-                return index
-        index += 1
-    return end - 1
+                return i
+            i += 1
+        else:
+            i += 1
+    return end - 1  # unterminated: scan to the end
 
 
 def _parenthesized_span(command: str, index: int, end: int) -> tuple[int, int]:
@@ -1672,7 +1686,7 @@ def _stage_command_word(
     index = 0
     while index < len(words):
         value = words[index].value
-        name = _command_name(value)
+        name = _pipe_shell_command_name(value)
         if _PIPE_SHELL_ASSIGNMENT_RE.match(value):
             index += 1
             continue
@@ -1714,7 +1728,7 @@ def _region_runs_download(command: str, start: int, end: int, depth: int = 0) ->
     region = _scan_pipe_shell_region(command, start, end)
     for stage in region.stages:
         resolved = _stage_command_word(stage.words)
-        if resolved is not None and _command_name(resolved[0].value) in _DOWNLOAD_COMMANDS:
+        if resolved is not None and _pipe_shell_command_name(resolved[0].value) in _DOWNLOAD_COMMANDS:
             return True
         for body_start, body_end, _quoted in stage.heredoc_bodies:
             # A here-document body inside this region is live text: whatever
@@ -1748,7 +1762,7 @@ def _stage_payload_runs_download(stage: _PipeShellStage, command_index: int) -> 
     (`sh deploy.sh 'curl URL | sh'`) and a script path
     (`. /dev/stdin 'curl URL | sh'`) stay data."""
     words = stage.words
-    name = _command_name(words[command_index].value)
+    name = _pipe_shell_command_name(words[command_index].value)
     if name == "eval":
         # `eval` passes every argument through to the shell as script text
         # (it has no flags of its own), so nothing is filtered before joining.
@@ -1840,7 +1854,7 @@ def _stage_env_s_operand(words: tuple[_PipeShellWord, ...]) -> _PipeShellWord | 
     """The operand a `env -S` prefix hands the shell as argv, or None. GNU env
     runs the string as a command line, so the operand is live text."""
     for index, word in enumerate(words):
-        if _command_name(word.value) == "env":
+        if _pipe_shell_command_name(word.value) == "env":
             cursor = index + 1
             while cursor < len(words):
                 value = words[cursor].value
@@ -1880,7 +1894,7 @@ def _text_runs_download(text: str, depth: int = 0) -> bool:
     region = _scan_pipe_shell_region(text, 0, len(text))
     for stage in region.stages:
         resolved = _stage_command_word(stage.words)
-        if resolved is not None and _command_name(resolved[0].value) in _DOWNLOAD_COMMANDS:
+        if resolved is not None and _pipe_shell_command_name(resolved[0].value) in _DOWNLOAD_COMMANDS:
             return True
         for word in stage.words:
             # Only a word that carries shell separators can hold a nested
@@ -1902,7 +1916,7 @@ def _stage_targets_run_shell(command: str, stage: _PipeShellStage) -> bool:
         region = _scan_pipe_shell_region(command, start, end)
         for inner in region.stages:
             resolved = _stage_command_word(inner.words)
-            if resolved is not None and _command_name(resolved[0].value) in _RUNNERS:
+            if resolved is not None and _pipe_shell_command_name(resolved[0].value) in _RUNNERS:
                 return True
             if resolved is None and _stage_runs_stdin_shell(inner.words):
                 return True
@@ -1914,7 +1928,7 @@ def _stage_runs_stdin_shell(words: tuple[_PipeShellWord, ...]) -> bool:
     and `sudo -i` with no further command run the user's shell with the
     pipeline's output on stdin, exactly like a bare `sh`."""
     for index, word in enumerate(words):
-        if _command_name(word.value) == "sudo":
+        if _pipe_shell_command_name(word.value) == "sudo":
             value_flags = _WRAPPER_VALUE_FLAGS.get("sudo", ())
             cursor = index + 1
             shell_flag = False
@@ -1965,7 +1979,7 @@ def _continuation_runs_shell(region: _PipeShellRegion, position: int) -> bool:
         if stage.words:
             resolved = _stage_command_word(stage.words)
             if resolved is not None:
-                if _command_name(resolved[0].value) in _RUNNERS:
+                if _pipe_shell_command_name(resolved[0].value) in _RUNNERS:
                     return True
             elif _stage_runs_stdin_shell(stage.words):
                 return True
@@ -2065,7 +2079,7 @@ def _pipe_shell_stage_violation(
             return "a download piped into a command the scan cannot resolve"
         if resolved is not None:
             word, command_index = resolved
-            name = _command_name(word.value)
+            name = _pipe_shell_command_name(word.value)
             if piped_download:
                 if name in _RUNNERS:
                     return "a download piped into a shell"
@@ -2116,7 +2130,7 @@ def _pipe_shell_stage_violation(
             )
             for operand_stage in operand_region.stages:
                 operand_resolved = _stage_command_word(operand_stage.words)
-                if operand_resolved is not None and _command_name(
+                if operand_resolved is not None and _pipe_shell_command_name(
                     operand_resolved[0].value
                 ) in _RUNNERS:
                     # The operand names the runner, so the stage's other
@@ -2127,7 +2141,7 @@ def _pipe_shell_stage_violation(
                     ) or _stage_heredoc_body_runs_download(command, stage, depth):
                         return "a download substituted into a shell"
         if stage.heredoc_bodies and not (
-            resolved is not None and _command_name(resolved[0].value) in _RUNNERS
+            resolved is not None and _pipe_shell_command_name(resolved[0].value) in _RUNNERS
         ):
             # A stage that is not itself a runner holds its here-document
             # bodies as data, with the two reads the shell forces anyway: the
@@ -2244,14 +2258,16 @@ def _warn_once_about_late_pipe_to_shell_bypass() -> None:
     )
 
 
-def _guard_pipe_to_shell(command: str, allow_pipe_to_shell: bool) -> None:
+def _guard_pipe_to_shell(script: str, allow_pipe_to_shell: bool) -> None:
     """Refuse a curl/wget download that a shell interpreter would run: piped
-    into one, or substituted into its argv. The scan is string-only and runs
+    into one, or substituted into its argv. The caller passes the script the
+    shell will run, prefix included, so the text this scan reads and the text
+    the handle executes are one string. The scan is string-only and runs
     before any spawn, so a refused command never starts a process, and a
     command the patterns do not name pays for one linear pass."""
     if allow_pipe_to_shell or _PIPE_TO_SHELL_BYPASS_AT_KERNEL_START:
         return
-    violation = _pipe_shell_violation(_with_prefix(command))
+    violation = _pipe_shell_violation(script)
     if violation is None:
         return
     _warn_once_about_late_pipe_to_shell_bypass()
@@ -2296,8 +2312,12 @@ def bash(command: str, *, allow_pipe_to_shell: bool = False) -> BashHandle:
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
-    _guard_pipe_to_shell(command, allow_pipe_to_shell)
-    return BashHandle(command)
+    # One computation, read once per call: the guard validates exactly the
+    # script the handle runs, so a mid-call change to the prefix cannot make
+    # the validated text differ from the executed text.
+    script = _with_prefix(command)
+    _guard_pipe_to_shell(script, allow_pipe_to_shell)
+    return BashHandle(command, script=script)
 
 
 def _shell() -> str:
@@ -2373,7 +2393,7 @@ def _child_env() -> dict[str, str]:
     per-command inline assignment (`GIT_EDITOR=vim git commit`) still wins
     because it replaces the exported value for that command.
     """
-    return {
+    env = {
         **os.environ,
         "NO_COLOR": "1",
         "TERM": "dumb",
@@ -2390,6 +2410,11 @@ def _child_env() -> dict[str, str]:
         "GIT_PAGER": "cat",
         "DEBIAN_FRONTEND": "noninteractive",
     }
+    if not _PIPE_TO_SHELL_BYPASS_AT_KERNEL_START:
+        # A mid-session os.environ write must not arm a child kernel's frozen
+        # snapshot: the pipe-to-shell bypass is honored only at kernel start.
+        env.pop(BASH_PIPE_TO_SHELL_BYPASS_ENV, None)
+    return env
 
 
 def _signal_group(pid: int, sig: int) -> bool:
