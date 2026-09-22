@@ -137,6 +137,43 @@ describe("Anthropic thinking disable payload", () => {
 		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.output_config).toEqual({ effort: "max" });
 	});
+
+	it("omits the thinking param for Claude Opus 5.5 when reasoning is off (explicit disabled is a 400)", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-opus-5-5"));
+
+		expect(payload.thinking).toBeUndefined();
+		expect(payload.output_config).toBeUndefined();
+	});
+
+	it("drops temperature for Claude Opus 5.5 (sampling params are rejected)", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-opus-5-5"), { temperature: 0.5 });
+
+		expect(payload.temperature).toBeUndefined();
+		expect(payload.thinking).toBeUndefined();
+	});
+
+	it("uses adaptive thinking with effort=medium default metadata for Claude Opus 5.5", async () => {
+		const model = getModel("anthropic", "claude-opus-5-5");
+
+		const payload = await capturePayload(model, { reasoning: "medium" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "medium" });
+	});
+
+	it("maps xhigh reasoning to effort=xhigh for Claude Opus 5.5", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-opus-5-5"), { reasoning: "xhigh" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "xhigh" });
+	});
+
+	it("maps max reasoning to effort=max for Claude Opus 5.5", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-opus-5-5"), { reasoning: "max" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "max" });
+	});
 });
 
 interface CapturedRequest {

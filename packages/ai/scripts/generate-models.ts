@@ -229,6 +229,8 @@ const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
+	"gpt-6-sol",
+	"gpt-6-luna",
 ]);
 
 function mergeThinkingLevelMap(model: Model<any>, map: NonNullable<Model<any>["thinkingLevelMap"]>): void {
@@ -281,7 +283,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.id.includes("gpt-5.6")) {
 		mergeThinkingLevelMap(model, { minimal: null, max: "max" });
 	}
-	// gpt-6 reasoning is mandatory with no minimal effort; xhigh/max are supported (OpenRouter capability data).
+	// gpt-6: no minimal effort; xhigh/max are supported (OpenAI model pages).
+	// Astra's reasoning is mandatory (off is rejected); Sol and Luna accept
+	// reasoning.effort "none", like the gpt-5.6 family.
 	if (model.id.includes("gpt-6")) {
 		mergeThinkingLevelMap(model, { minimal: null, xhigh: "xhigh", max: "max" });
 	}
@@ -289,7 +293,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		(model.api === "openai-responses" ||
 			model.api === "azure-openai-responses" ||
 			model.api === "openai-codex-responses") &&
-		model.id.startsWith("gpt-6")
+		model.id.includes("gpt-6-astra")
 	) {
 		mergeThinkingLevelMap(model, { off: null });
 	}
@@ -315,6 +319,11 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	if (model.id.includes("fable-5") || model.id.includes("mythos-5")) {
 		mergeThinkingLevelMap(model, { off: null, xhigh: "xhigh", max: "max" });
+	}
+	// Claude Opus 5.5 is always-on adaptive like the Fable/Mythos models: it rejects
+	// `thinking: {type: "disabled"}` and non-default sampling params with a 400.
+	if (model.id.includes("opus-5-5") || model.id.includes("opus-5.5")) {
+		mergeThinkingLevelMap(model, { off: null });
 	}
 	if (model.id.includes("mythos-preview")) {
 		mergeThinkingLevelMap(model, { off: null, max: "max" });
@@ -1775,6 +1784,49 @@ async function generateModels() {
 		});
 	}
 
+	// Add missing GPT-6 Sol / Luna until models.dev includes them. Specs verified
+	// against the OpenAI model pages: 1,050,000-token context, 128,000 max output,
+	// reasoning.effort none/low/medium (default)/high/xhigh/max, text+image input.
+	if (!allModels.some((m) => m.provider === "openai" && m.id === "gpt-6-sol")) {
+		allModels.push({
+			id: "gpt-6-sol",
+			name: "GPT-6 Sol",
+			api: "openai-responses",
+			baseUrl: "https://api.openai.com/v1",
+			provider: "openai",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 2,
+				output: 10,
+				cacheRead: 0.2,
+				cacheWrite: 2.5,
+			},
+			contextWindow: 1050000,
+			maxTokens: 128000,
+		});
+	}
+
+	if (!allModels.some((m) => m.provider === "openai" && m.id === "gpt-6-luna")) {
+		allModels.push({
+			id: "gpt-6-luna",
+			name: "GPT-6 Luna",
+			api: "openai-responses",
+			baseUrl: "https://api.openai.com/v1",
+			provider: "openai",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 0.1,
+				output: 0.5,
+				cacheRead: 0.01,
+				cacheWrite: 0.125,
+			},
+			contextWindow: 1050000,
+			maxTokens: 128000,
+		});
+	}
+
 	const deepseekV4Models: Model<"openai-completions">[] = [
 		{
 			id: "deepseek-v4-flash",
@@ -2001,6 +2053,32 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		// GPT-6 Sol / Luna rolled out to Codex for Plus, Pro, Business, Enterprise,
+		// and Edu users on 2026-09-22; same API pricing as the direct API routes.
+		{
+			id: "gpt-6-sol",
+			name: "GPT-6 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-6-luna",
+			name: "GPT-6 Luna",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},

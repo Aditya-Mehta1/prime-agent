@@ -1,0 +1,3 @@
+- Added Claude Opus 5.5 (models.dev lists it; it rejects `thinking: {type: "disabled"}` and non-default sampling params, so off is hidden and the provider stops sending them) to the compiled model catalog, alongside the Bedrock regional rows.
+- Added GPT-6 Sol and GPT-6 Luna to the OpenAI, Azure, and Codex subscription catalogs. Unlike GPT-6 Astra, reasoning is optional: `off` maps to `reasoning.effort: "none"` like the GPT-5.6 family.
+- Refreshed the generated model catalog from live provider catalogs, picking up upstream model additions (grok 4.7 on GitHub Copilot, mimo v2.6, opus 5.5 routes on OpenRouter and the Vercel AI Gateway) and repricing.
