@@ -571,6 +571,28 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// The inline paste flow: install a pasted static token for one
+    /// pasteable catalog service (`server`), binding it to the service
+    /// endpoint and verifying with a real MCP handshake.
+    SetMcpStaticToken {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        server: String,
+        token: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Remove one MCP connection: its credential and its connection record
+    /// (the durable endpoint pin), in one step.
+    RemoveMcpConnection {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        server: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     ReplaceAcpMcpServers {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

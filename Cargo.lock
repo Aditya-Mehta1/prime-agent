@@ -1297,6 +1297,7 @@ dependencies = [
  "nix",
  "pa-agent",
  "pa-ai",
+ "pa-models",
  "pa-telemetry",
  "pa-types",
  "reqwest",

@@ -171,13 +171,13 @@ never session payload.
 
 ### `mcp connector used`
 
-`mcp.*` host-request activity. Server name ONLY — never tool names,
-arguments, or results.
+`mcp.*` host-request activity and the connector install flows. Server name
+ONLY — never tool names, arguments, results, or pasted credential material.
 
 | property | type | notes |
 |---|---|---|
-| `action` | string | `config` / `refresh` |
-| `server_name` | string | server id from settings / ACP admission |
+| `action` | string | `config` / `refresh` / `paste-install` |
+| `server_name` | string | server id from settings / ACP admission / the resolved service catalog |
 
 ### `tool executed`
 

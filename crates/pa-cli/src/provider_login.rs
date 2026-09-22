@@ -130,7 +130,9 @@ fn status_indicator(
     }
     if let Some(credential) = credential {
         let credential_type = match credential {
-            AuthCredential::ApiKey { .. } => AuthType::ApiKey,
+            AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => {
+                AuthType::ApiKey
+            }
             AuthCredential::Oauth { .. } => AuthType::Oauth,
         };
         return Some(if credential_type == auth_type {
@@ -209,6 +211,8 @@ impl ProviderAuth {
     fn mcp_manager(&self) -> pa_core::mcp::McpManager {
         let cwd = self.cwd.clone();
         let agent_dir = self.agent_dir.clone();
+        let catalog_cwd = self.cwd.clone();
+        let catalog_agent_dir = self.agent_dir.clone();
         pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: self.auth_storage_with_oauth(),
             get_user_servers: Box::new(move || {
@@ -229,6 +233,21 @@ impl ProviderAuth {
                 )
             }),
             begin_login: None,
+            agent_dir: Some(self.agent_dir.clone()),
+            get_catalog_sources: Some(Box::new({
+                let cwd = catalog_cwd.clone();
+                let agent_dir = catalog_agent_dir.clone();
+                move || {
+                    let settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+                    settings
+                        .settings()
+                        .mcp_catalog_sources
+                        .clone()
+                        .unwrap_or_default()
+                }
+            })),
+            remote_source: None,
+            probe_override: None,
         })
     }
 
@@ -434,7 +453,9 @@ impl ProviderAuth {
                 continue;
             };
             let auth_type = match credential {
-                AuthCredential::ApiKey { .. } => AuthType::ApiKey,
+                AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => {
+                    AuthType::ApiKey
+                }
                 AuthCredential::Oauth { .. } => AuthType::Oauth,
             };
             let (is_serper, is_mcp) = (

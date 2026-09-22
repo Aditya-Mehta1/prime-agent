@@ -927,6 +927,10 @@ impl Worker {
             auth_storage: pa_core::auth::AuthStorage::create(&agent_dir),
             get_user_servers: Box::new(|| None),
             begin_login: None,
+            agent_dir: Some(agent_dir.clone()),
+            get_catalog_sources: None,
+            remote_source: None,
+            probe_override: None,
         });
         let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
         let navigation = crate::session_navigation::SessionNavigation::new(
@@ -1461,6 +1465,8 @@ impl Worker {
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
             "get_connection_state" => self.handle_get_connection_state(),
             "get_mcp_connections" => self.handle_get_mcp_connections().await,
+            "set_mcp_static_token" => self.handle_set_mcp_static_token(payload).await,
+            "remove_mcp_connection" => self.handle_remove_mcp_connection(payload).await,
             "get_rlm_children" => self.handle_get_rlm_children().await,
             "get_context_tree" => self.handle_get_context_tree().await,
             "get_commands" => self.handle_get_commands().await,

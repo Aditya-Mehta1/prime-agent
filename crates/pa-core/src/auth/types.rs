@@ -23,6 +23,16 @@ pub enum AuthCredential {
         #[serde(rename = "primeTeam", default, skip_serializing_if = "Option::is_none")]
         prime_team: Option<PrimeTeamCredential>,
     },
+    /// A pasted MCP static token (the inline paste flow for
+    /// `requires-setup` token services): the literal bearer value plus the
+    /// endpoint it is bound to. No expiry — usable until removed or replaced.
+    /// Setup field ids are metadata, never environment variables to read.
+    #[serde(rename = "mcp_static_token")]
+    McpStaticToken {
+        bearer: String,
+        #[serde(rename = "endpoint", default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
+    },
     #[serde(rename = "oauth")]
     Oauth {
         access: String,
@@ -57,6 +67,7 @@ impl AuthCredential {
     pub fn credential_type(&self) -> &'static str {
         match self {
             AuthCredential::ApiKey { .. } => "api_key",
+            AuthCredential::McpStaticToken { .. } => "mcp_static_token",
             AuthCredential::Oauth { .. } => "oauth",
         }
     }

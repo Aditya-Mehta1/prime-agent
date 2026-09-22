@@ -4434,6 +4434,13 @@ impl SessionUi {
                 // flow — the same command path as `/mcp login <name>`.
                 self.pending_client_command = Some(format!("/mcp login {server}"));
             }
+            Some(crate::mcp_view::McpViewAction::Paste(server)) => {
+                view.mcp_view = None;
+                self.dirty = true;
+                // The inline paste panel's client surface: prompt for the
+                // token, store it bound to the service endpoint, verify.
+                self.pending_client_command = Some(format!("/mcp paste {server}"));
+            }
             None => {}
         }
         Ok(())
