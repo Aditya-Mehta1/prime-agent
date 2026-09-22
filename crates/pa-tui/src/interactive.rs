@@ -615,18 +615,16 @@ pub async fn run_interactive(
     // pair even while this loop is wedged in a daemon request, and a plain
     // std-thread watchdog enforces the exit deadline without the runtime.
     let exit_guard = ExitGuard::new();
-    let mut session = SessionUi::open(
-        client,
-        &options,
-        notes_tx,
-        share_tx,
-        reload_tx,
-        catalog_tx,
-        heartbeats_tx,
-    )
-    .await?;
-    session.exit_guard = exit_guard.clone();
 
+    // The view and the terminal surface come up BEFORE the session attach
+    // (TS `init`: `ui.start()` paints the header + editor first, then
+    // `rebindCurrentSession` loads the session; the header's model and cwd
+    // lines fill in when the connection state loads). The pane paints the
+    // startup chrome immediately instead of holding the previous surface
+    // (or a blank pane) until the attach snapshot arrives; the transcript
+    // itself renders when the snapshot lands — `rebuild_view`'s dirty flag
+    // schedules the first full repaint, so no resize event is ever needed
+    // to see the attached session.
     let theme = crate::app::load_theme(&options.theme);
     let mut view = AgentView::new(theme);
     view.code_block_indent = options.code_block_indent.clone();
@@ -643,6 +641,47 @@ pub async fn run_interactive(
         view.fullscreen = settings.fullscreen();
     }
     apply_startup_chrome(&mut view, &options);
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
+    // Headless verification runs capture the OSC 52 clipboard channel
+    // instead of writing it to the plain pipes.
+    let headless = matches!(ui, UiMode::Headless(_));
+    let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone(), options.fullscreen_mouse)?;
+    if !headless {
+        // TS `ui.start()` renders once before the session loads: the first
+        // frame is the startup chrome (banner, editor, tray). The model
+        // and session labels are placeholders until the attach's
+        // `rebuild_view` repaints with the snapshot.
+        if let Some(renderer) = renderer.is_terminal_mut() {
+            crate::app::draw(renderer, &mut view)?;
+        }
+    }
+    let mut session = match SessionUi::open(
+        client,
+        &options,
+        notes_tx,
+        share_tx,
+        reload_tx,
+        catalog_tx,
+        heartbeats_tx,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            // The surface is already up: hand the terminal back before the
+            // CLI reports the failure on the plain screen (the same
+            // teardown contract as the onboarding exit below).
+            if renderer.is_terminal() {
+                exit_guard.arm_for_exit();
+            }
+            renderer.finish(&mut view, false);
+            return Err(error);
+        }
+    };
+    session.exit_guard = exit_guard.clone();
+    if headless {
+        session.osc_sink = crate::clipboard::OscSink::Buffer(Vec::new());
+    }
     session.refresh_stats().await;
     // The startup catalog fetch (TS `updateAvailableProviderCount` →
     // `getConnectionAvailableModels`): failures stay silent and the
@@ -663,14 +702,6 @@ pub async fn run_interactive(
     // previous chat view of this session left via the agents view or a
     // switch) returns to the editor when its chat reopens.
     session.restore_prompt_stash_on_open(&mut view);
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
-    // Headless verification runs capture the OSC 52 clipboard channel
-    // instead of writing it to the plain pipes.
-    let headless = matches!(ui, UiMode::Headless(_));
-    let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone(), options.fullscreen_mouse)?;
-    if headless {
-        session.osc_sink = crate::clipboard::OscSink::Buffer(Vec::new());
-    }
     // First-run onboarding owns the pane before the session screen (TS
     // `runStartupOnboarding`, model-ready branch: splash + trace question).
     // Headless harness runs have no terminal to draw it on and skip it.
