@@ -1096,6 +1096,7 @@ interface RlmSubagentModelSelection {
 
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
+const SESSION_CWD_STATE_CUSTOM_TYPE = "session_cwd_state";
 /** Minimum spacing between accepted progress notes from one child session. */
 const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
 /** Bounded ring of progress notes kept per child run; the snapshot exposes the newest. */
@@ -1711,6 +1712,11 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		const persistedCwd = this._loadPersistedCwd();
+		if (persistedCwd && config.cwd === this.sessionManager.getHeader()?.cwd) {
+			this._cwd = persistedCwd;
+			this.sessionManager.setCwd(persistedCwd);
+		}
 		this._agentDir = config.agentDir;
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
@@ -2083,6 +2089,18 @@ export class AgentSession {
 			) {
 				return entry.data;
 			}
+		}
+		return undefined;
+	}
+
+	/** Latest /cwd on the active branch, if that directory still exists. */
+	private _loadPersistedCwd(): string | undefined {
+		const branch = this.sessionManager.getBranch();
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry.type !== "custom" || entry.customType !== SESSION_CWD_STATE_CUSTOM_TYPE) continue;
+			const cwd = (entry.data as { cwd?: unknown } | undefined)?.cwd;
+			return typeof cwd === "string" && statSync(cwd, { throwIfNoEntry: false })?.isDirectory() ? cwd : undefined;
 		}
 		return undefined;
 	}
@@ -14069,31 +14087,34 @@ export class AgentSession {
 		});
 	}
 
-	/** Retarget this live session's working directory. Not persisted: a resume restarts in the header cwd. */
+	/** Retarget this session's working directory; persisted on the branch so a resume restarts there. */
 	async setCwd(input: string): Promise<string> {
-		if (this.isStreaming) {
-			throw new Error("Cannot change the working directory while the agent is running.");
-		}
 		const cwd = resolve(this._cwd, expandTildePath(input.trim()));
-		if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
-			throw new Error(`Not a directory: ${cwd}`);
+		if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Not a directory: ${cwd}`);
+		// Holding the admission fence keeps a concurrent prompt from starting a turn under the kernel chdir.
+		const admissionFence = await this._acquireDirectTurnAdmissionFence();
+		try {
+			if (this.isStreaming) throw new Error("Cannot change the working directory while the agent is running.");
+			if (cwd === this._cwd) return cwd;
+			await this._ipythonKernelProvisioner?.setCwd(cwd);
+			this.sessionManager.appendCustomEntryWithRollback(SESSION_CWD_STATE_CUSTOM_TYPE, { cwd });
+			const previousCwd = this._cwd;
+			this._cwd = cwd;
+			this.sessionManager.setCwd(cwd);
+			await this.sendCustomMessage(
+				{
+					customType: SESSION_CWD_CHANGED_CUSTOM_TYPE,
+					content: cwdChangedNotice(previousCwd, cwd),
+					display: true,
+					details: { cwd, previousCwd },
+				},
+				{ deliverAs: "nextTurn" },
+			);
+			this._emit({ type: "cwd_changed", cwd });
+			return cwd;
+		} finally {
+			admissionFence.release();
 		}
-		if (cwd === this._cwd) return cwd;
-		await this._ipythonKernelProvisioner?.setCwd(cwd);
-		const previousCwd = this._cwd;
-		this._cwd = cwd;
-		this.sessionManager.setCwd(cwd);
-		await this.sendCustomMessage(
-			{
-				customType: SESSION_CWD_CHANGED_CUSTOM_TYPE,
-				content: cwdChangedNotice(previousCwd, cwd),
-				display: true,
-				details: { cwd, previousCwd },
-			},
-			{ deliverAs: "nextTurn" },
-		);
-		this._emit({ type: "cwd_changed", cwd });
-		return cwd;
 	}
 
 	/**
@@ -14701,7 +14722,7 @@ function cwdChangedNotice(previousCwd: string, cwd: string): string {
 	return [
 		"[cwd-changed]",
 		"",
-		`The user ran /cwd. For the rest of this session the working directory is ${cwd} (previously ${previousCwd}).`,
+		`The user ran /cwd. This session's working directory is now ${cwd} (previously ${previousCwd}); it stays so for the rest of the session, including after a resume.`,
 		`The Python kernel's working directory is now ${cwd} (os.getcwd()): bash() and relative paths resolve there, and new subagents start there. The "Working directory" line in the system prompt is from session start and no longer applies. Do not chdir back unless the user asks.`,
 	].join("\n");
 }

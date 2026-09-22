@@ -25,6 +25,20 @@ describe("AgentSession.setCwd", () => {
 		}
 	});
 
+	it("resumes a session in its persisted /cwd directory", async () => {
+		const first = await createHarness({ persistSession: true });
+		const child = join(first.tempDir, "child");
+		mkdirSync(child);
+		await first.session.setCwd("child");
+		const resumed = await createHarness({ existingSessionFile: first.session.sessionFile! });
+		try {
+			expect(resumed.sessionManager.getCwd()).toBe(child);
+		} finally {
+			resumed.cleanup();
+			first.cleanup();
+		}
+	});
+
 	it("rejects a missing or non-directory path without changing state", async () => {
 		const harness = await createHarness();
 		try {
