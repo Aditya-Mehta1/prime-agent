@@ -1,10 +1,10 @@
 //! Session entry parsing, migration, context reconstruction, and tree.
-mod reverse_scanner;
-mod window_loader;
 pub mod discovery;
 pub mod manager;
 pub mod manager_ext;
+mod reverse_scanner;
 pub mod tree;
+mod window_loader;
 
 pub use reverse_scanner::{ReverseJsonlScanner, ScanOutcome};
 pub use window_loader::{load_session_window, SessionWindow, WindowSource};

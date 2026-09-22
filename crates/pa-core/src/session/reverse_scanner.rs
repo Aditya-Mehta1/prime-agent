@@ -137,18 +137,17 @@ where
     where
         T: DeserializeOwned,
     {
-        Ok(self.scan_next_record()?.map(|record| match serde_json::from_slice::<T>(&record) {
-            Ok(value) => ScanOutcome::Parsed(value),
-            Err(error) => ScanOutcome::Rejected(error),
-        }))
+        Ok(self
+            .scan_next_record()?
+            .map(|record| match serde_json::from_slice::<T>(&record) {
+                Ok(value) => ScanOutcome::Parsed(value),
+                Err(error) => ScanOutcome::Rejected(error),
+            }))
     }
 
     fn exceeds_record_limit(&self, incoming_bytes: usize) -> bool {
         self.max_record_bytes.is_some_and(|max_record_bytes| {
-            self.record_reversed
-                .len()
-                .saturating_add(incoming_bytes)
-                > max_record_bytes
+            self.record_reversed.len().saturating_add(incoming_bytes) > max_record_bytes
         })
     }
 
@@ -191,7 +190,10 @@ mod tests {
         record
     }
 
-    fn assert_records<R>(scanner: &mut ReverseJsonlScanner<R>, expected: &[&str]) -> std::io::Result<()>
+    fn assert_records<R>(
+        scanner: &mut ReverseJsonlScanner<R>,
+        expected: &[&str],
+    ) -> std::io::Result<()>
     where
         R: Read + Seek,
     {
@@ -295,11 +297,7 @@ not-json
     #[test]
     fn scans_across_read_chunk_boundaries() -> std::io::Result<()> {
         let empty_record_len = serde_json::to_string(&record(""))?.len();
-        for distance_from_eof in [
-            READ_CHUNK_SIZE - 1,
-            READ_CHUNK_SIZE,
-            READ_CHUNK_SIZE + 1,
-        ] {
+        for distance_from_eof in [READ_CHUNK_SIZE - 1, READ_CHUNK_SIZE, READ_CHUNK_SIZE + 1] {
             let large_value = "x".repeat(distance_from_eof - empty_record_len - 2);
             let input = format!(
                 "{}\n{}\n",
@@ -339,9 +337,18 @@ not-json
 {"b":[1,2,3]}
 "#;
         let mut scanner = ReverseJsonlScanner::new(Cursor::new(input))?;
-        assert_eq!(scanner.scan_next_record()?.as_deref(), Some(&b"{\"b\":[1,2,3]}"[..]));
-        assert_eq!(scanner.scan_next_record()?.as_deref(), Some(&b"not-json"[..]));
-        assert_eq!(scanner.scan_next_record()?.as_deref(), Some(&b"{\"a\":1}"[..]));
+        assert_eq!(
+            scanner.scan_next_record()?.as_deref(),
+            Some(&b"{\"b\":[1,2,3]}"[..])
+        );
+        assert_eq!(
+            scanner.scan_next_record()?.as_deref(),
+            Some(&b"not-json"[..])
+        );
+        assert_eq!(
+            scanner.scan_next_record()?.as_deref(),
+            Some(&b"{\"a\":1}"[..])
+        );
         assert!(scanner.scan_next_record()?.is_none());
         Ok(())
     }
@@ -352,8 +359,8 @@ not-json
             "{{\"value\":\"first\"}}\n{{\"value\":\"{}\"}}\n{{\"value\":\"third\"}}\n",
             "x".repeat(64)
         );
-        let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?
-            .with_max_record_bytes(32);
+        let mut scanner =
+            ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?.with_max_record_bytes(32);
         assert_eq!(
             scanner.scan_next_record()?.as_deref(),
             Some(&b"{\"value\":\"third\"}"[..])
@@ -365,5 +372,4 @@ not-json
         assert!(scanner.scan_next_record()?.is_none());
         Ok(())
     }
-
 }

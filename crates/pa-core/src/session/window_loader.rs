@@ -953,7 +953,10 @@ mod tests {
         // The display floor keeps the pre-boundary rows.
         assert!(!window.display_floor_records.is_empty());
         let leaf_message = window.context.messages.last().expect("messages");
-        assert!(matches!(leaf_message, super::super::super::session::AgentMessage::Assistant(_)));
+        assert!(matches!(
+            leaf_message,
+            super::super::super::session::AgentMessage::Assistant(_)
+        ));
     }
 
     #[test]
