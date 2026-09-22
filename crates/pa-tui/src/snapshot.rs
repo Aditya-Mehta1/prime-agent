@@ -46,6 +46,10 @@ pub struct Reconstructed {
     pub chat: Vec<ChatEntry>,
     /// Current model id (`state.model.id`), when the session reports one.
     pub model_id: Option<String>,
+    /// The current model's provider (`state.model.provider`), when the
+    /// snapshot reports it: live-catalog ids repeat across providers, so
+    /// the provider disambiguates the picker's `current` row.
+    pub model_provider: Option<String>,
     /// Session display name.
     pub session_name: Option<String>,
     /// Session id of the persisted session file.
@@ -227,6 +231,9 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
     let model_id = state
         .and_then(|state| state.get("model"))
         .and_then(model_id_value);
+    let model_provider = state
+        .and_then(|state| state.get("model"))
+        .and_then(model_provider_value);
     let session_name = state
         .and_then(|state| state.get("sessionName"))
         .and_then(Value::as_str)
@@ -263,6 +270,7 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
     Reconstructed {
         chat: messages,
         model_id,
+        model_provider,
         session_name,
         session_id,
         goal,
@@ -293,6 +301,18 @@ fn model_id_value(model: &Value) -> Option<String> {
     match model {
         Value::String(label) => Some(label.clone()),
         Value::Object(map) => map.get("id").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// The provider from a `state.model` wire value (present on the structured
+/// form; a display-string model reports none).
+fn model_provider_value(model: &Value) -> Option<String> {
+    match model {
+        Value::Object(map) => map
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         _ => None,
     }
 }

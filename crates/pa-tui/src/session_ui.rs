@@ -227,6 +227,7 @@ pub(crate) struct SessionUi {
     pending_snapshot: Option<Vec<ChatEntry>>,
     /// Snapshot labels (model) for the next rebuild.
     pending_model: Option<String>,
+    pending_model_provider: Option<String>,
     /// Snapshot queue state for the next rebuild (attach re-sync).
     pending_queue: Option<crate::queued::QueuedMessages>,
     /// The parked-message browse state (TS `QueueSelection`): which queued
@@ -467,6 +468,7 @@ impl SessionUi {
             next_image_marker_id: 1,
             pending_snapshot: None,
             pending_model: None,
+            pending_model_provider: None,
             pending_queue: None,
             queue_selection: crate::queued::QueueSelection::default(),
             context: None,
@@ -666,6 +668,7 @@ impl SessionUi {
         self.heartbeat_catalog.clear();
         self.spawn_heartbeat_refresh();
         self.pending_model = reconstructed.model_id;
+        self.pending_model_provider = reconstructed.model_provider;
         self.last_assistant_text = reconstructed
             .chat
             .iter()
@@ -848,6 +851,7 @@ impl SessionUi {
         }
         if let Some(model) = self.pending_model.take() {
             view.chrome.model_id = Some(model);
+            view.chrome.model_provider = self.pending_model_provider.take();
         }
         view.queued = self.pending_queue.take().unwrap_or_default();
         // A rebuilt view starts from the snapshot's queue: any browse
@@ -1375,13 +1379,12 @@ impl SessionUi {
     /// startup catalog; unknown models are assumed capable (the daemon
     /// re-checks against the resolved model anyway).
     fn model_supports_images(&self, view: &AgentView) -> bool {
-        let Some(model_id) = view.chrome.model_id.as_deref() else {
-            return true;
-        };
-        let Some(model) = self.model_catalog.iter().find(|model| model.id == model_id) else {
-            return true;
-        };
-        model.input.contains(&pa_types::ai::ModelInput::Image)
+        match self.current_catalog_model(view) {
+            Some(model) => model.input.contains(&pa_types::ai::ModelInput::Image),
+            // Unknown models are assumed capable (the daemon re-checks
+            // against the resolved model anyway).
+            None => true,
+        }
     }
 
     /// Submit a prompt (the Enter path). The user message arrives back as a
@@ -3600,8 +3603,7 @@ impl SessionUi {
     /// The catalog entry for the current model (the `/fast` eligibility
     /// check needs the provider and api, not just the id).
     fn current_model_entry(&self, view: &AgentView) -> Option<&pa_types::ai::Model> {
-        let model_id = view.chrome.model_id.as_deref()?;
-        self.model_catalog.iter().find(|model| model.id == model_id)
+        self.current_catalog_model(view)
     }
 
     /// Recompute the `/fast` autocomplete filter (TS
@@ -5173,15 +5175,23 @@ impl SessionUi {
         }
     }
 
-    /// The session's current model, matched against the picker catalog (the
-    /// daemon state reports the id; the catalog entry supplies the
-    /// provider).
-    fn current_model(&self, view: &AgentView) -> Option<CurrentModel> {
+    /// The session's current model's catalog entry: the TS
+    /// `modelsAreEqual` key (provider plus id) — live-catalog ids repeat
+    /// across providers, so a reported provider disambiguates.
+    fn current_catalog_model<'s>(&'s self, view: &AgentView) -> Option<&'s pa_types::ai::Model> {
         let model_id = view.chrome.model_id.as_deref()?;
-        let model = self
-            .model_catalog
-            .iter()
-            .find(|model| model.id == model_id)?;
+        match view.chrome.model_provider.as_deref() {
+            Some(provider) => self
+                .model_catalog
+                .iter()
+                .find(|model| model.provider == provider && model.id == model_id),
+            None => self.model_catalog.iter().find(|model| model.id == model_id),
+        }
+    }
+
+    /// The picker's `current` key ([`Self::current_catalog_model`]).
+    fn current_model(&self, view: &AgentView) -> Option<CurrentModel> {
+        let model = self.current_catalog_model(view)?;
         Some(CurrentModel {
             provider: model.provider.clone(),
             model_id: model.id.clone(),
@@ -5406,13 +5416,18 @@ impl SessionUi {
             )
             .await;
         if let Ok(data) = state {
-            let model_id = data
-                .get("model")
+            let model = data.get("model");
+            let model_id = model
                 .and_then(|model| model.get("id"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| picked_model_id.to_string());
+            let model_provider = model
+                .and_then(|model| model.get("provider"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
             view.chrome.model_id = Some(model_id);
+            view.chrome.model_provider = model_provider;
             self.dirty = true;
         }
     }
