@@ -32,6 +32,7 @@ describe("daemon protocol helpers", () => {
 		["abort_and_send_queued", { minProtocol: 7, minSchemaRevision: 29, capability: "abort_and_send_queued" }, true],
 		["get_rlm_max_depth_status", { minProtocol: 7, minSchemaRevision: 11 }, undefined],
 		["set_rlm_max_depth", { minProtocol: 7, minSchemaRevision: 11 }, undefined],
+		["set_cwd", { minProtocol: 7, minSchemaRevision: 30 }, undefined],
 		[
 			"acquire_session_input_pause",
 			{ minProtocol: 7, minSchemaRevision: 19, capability: "session_input_pause" },

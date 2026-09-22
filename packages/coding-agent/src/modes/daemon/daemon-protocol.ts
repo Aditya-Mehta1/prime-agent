@@ -75,8 +75,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 27 adds structured session_recovering failure info for known-but-unaddressable sessions.
 // Revision 28 publishes the last recorded model on saved-session rows.
 // Revision 29 adds the capability-gated abort_and_send_queued command.
-export const DAEMON_SCHEMA_REVISION = 29;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-a5c9d20f8b13";
+// Revision 30 adds the set_cwd session command.
+export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-86d49b92d2e8";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -665,6 +666,7 @@ export type DaemonCommand =
 	| { id?: string; type: "set_session_name"; activeSessionId: string; name: string; workerToken?: string }
 	| { id?: string; type: "get_rlm_max_depth_status"; activeSessionId: string }
 	| { id?: string; type: "set_rlm_max_depth"; activeSessionId: string; maxDepth: number; global?: boolean }
+	| { id?: string; type: "set_cwd"; activeSessionId: string; cwd: string }
 	| { id?: string; type: "rename_saved_session"; activeSessionId?: string; sessionPath: string; name: string }
 	| { id?: string; type: "delete_saved_session"; activeSessionId?: string; sessionPath: string }
 	| { id?: string; type: "get_session_context"; activeSessionId: string }
@@ -843,6 +845,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	set_session_name: LEGACY_DAEMON_COMMAND,
 	get_rlm_max_depth_status: RLM_MAX_DEPTH_COMMAND,
 	set_rlm_max_depth: RLM_MAX_DEPTH_COMMAND,
+	set_cwd: { minProtocol: 7, minSchemaRevision: 30 },
 	rename_saved_session: LEGACY_DAEMON_COMMAND,
 	delete_saved_session: LEGACY_DAEMON_COMMAND,
 	get_session_context: LEGACY_DAEMON_COMMAND,
@@ -962,6 +965,7 @@ export const DAEMON_COMMAND_PLANE = {
 	set_session_name: "control",
 	get_rlm_max_depth_status: "session",
 	set_rlm_max_depth: "session",
+	set_cwd: "session",
 	rename_saved_session: "control",
 	delete_saved_session: "control",
 	get_session_context: "session",

@@ -1,0 +1,1 @@
+- Added `/cwd <path>`: changes the live session's working directory for the Python kernel (`bash()`, relative paths), new subagents, `!` commands, and `@` path completion, and tells the model with the next turn; the system prompt is not reloaded and the change is not persisted across resume.

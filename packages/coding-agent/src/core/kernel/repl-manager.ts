@@ -1661,6 +1661,17 @@ export class ReplKernelManager {
 		}
 	}
 
+	/** Future spawns/restarts use `cwd`; a running kernel chdirs now. */
+	async setCwd(cwd: string): Promise<void> {
+		if (this.isRunning) {
+			const result = await this.execute(`import os; os.chdir(${JSON.stringify(cwd)})`, { internal: true });
+			if (result.status !== "ok") {
+				throw new Error(`Python kernel could not change directory: ${result.error?.evalue ?? result.stderr}`);
+			}
+		}
+		this.options.cwd = cwd;
+	}
+
 	private scheduleSnapshot(): void {
 		const cfg = this.options.snapshot;
 		if (!cfg) return;

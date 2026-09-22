@@ -373,6 +373,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"set_session_name",
 	"get_rlm_max_depth_status",
 	"set_rlm_max_depth",
+	"set_cwd",
 	"rename_saved_session",
 	"delete_saved_session",
 	"get_session_context",
@@ -5427,6 +5428,12 @@ export class AgentDaemon {
 				return success(command.id, "set_rlm_max_depth", result);
 			}
 
+			case "set_cwd": {
+				const state = this.getSessionState(command.activeSessionId);
+				const cwd = await state.runtime.session.setCwd(command.cwd);
+				return success(command.id, "set_cwd", { cwd });
+			}
+
 			case "get_session_context": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_session_context", {
@@ -7959,6 +7966,7 @@ const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
 	"message_end",
 	"session_action_update",
 	"session_info_changed",
+	"cwd_changed",
 	"thinking_level_changed",
 ]);
 

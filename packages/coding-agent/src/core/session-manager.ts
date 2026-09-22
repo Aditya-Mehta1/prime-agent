@@ -1953,6 +1953,11 @@ export class SessionManager {
 		return this.cwd;
 	}
 
+	/** Live retarget by /cwd; the header keeps the cwd the session was created in. */
+	setCwd(cwd: string): void {
+		this.cwd = cwd;
+	}
+
 	getSessionDir(): string {
 		return this.sessionDir;
 	}
