@@ -85,6 +85,7 @@ import {
 	UPDATE_RESTART_PREPARING_MESSAGE,
 } from "./daemon-errors.js";
 import {
+	AGENT_PEER_LIST_REQUEST_TIMEOUT_MS,
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
 	DAEMON_COMMAND_COMPATIBILITY,
@@ -235,6 +236,12 @@ const REMOTE_MESH_LIST_REFRESH_WAIT_MS = 5_000;
 // The send_message fallback shares the bounded refresh on a tighter budget: the
 // sender is waiting on an error path, so discovery must not hold it for `list`'s span.
 const REMOTE_MESH_MESSAGE_REFRESH_WAIT_MS = 2_000;
+// `list_agent_peers` answers a worker request bounded by
+// AGENT_PEER_LIST_REQUEST_TIMEOUT_MS, and a cold mesh scan pays bounded connect
+// timeouts for every offline peer: the refresh takes half that budget and
+// serves last-known rows, so the local siblings and the response fit in the
+// rest instead of racing the worker's timeout to a silent empty peer list.
+const REMOTE_MESH_PEERS_REFRESH_WAIT_MS = Math.floor(AGENT_PEER_LIST_REQUEST_TIMEOUT_MS / 2);
 /**
  * Upper bound on relay payloads deferred per client and session while a
  * snapshot stream is active. Deferral spans one stream (seconds), so overflow
@@ -2773,12 +2780,10 @@ export class DaemonSupervisor {
 				// lookup misses too; otherwise a tailnet sibling that shares a name
 				// would intercept a message that resumes the saved local session.
 				// Session names are unique per daemon, not per tailnet: two remote
-				// daemons can each own a "worker", so two matches stay ambiguous.
+				// daemons can each own a "worker", but two remote matches only turn
+				// ambiguous once the saved-local lookup has missed as well.
 				await this.refreshRemoteMesh(REMOTE_MESH_MESSAGE_REFRESH_WAIT_MS);
 				const remoteMatches = this.remoteAgentMeshState?.findMessageTargets(command.targetActiveSessionId) ?? [];
-				if (remoteMatches.length > 1) {
-					throw new Error(`Ambiguous active session: ${command.targetActiveSessionId}`);
-				}
 				const remoteTarget = remoteMatches[0];
 				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
 				let sessionPath: string;
@@ -2794,8 +2799,12 @@ export class DaemonSupervisor {
 					if (catalogError instanceof Error && catalogError.message.startsWith("Ambiguous session selector")) {
 						throw catalogError;
 					}
-					// The catalog missed as well: only now may a single remote
-					// sibling claim the message.
+					// The catalog missed as well: only now may remote siblings claim
+					// the message — a single one delivers, two stay ambiguous exactly
+					// like the local path.
+					if (remoteMatches.length > 1) {
+						throw new Error(`Ambiguous active session: ${command.targetActiveSessionId}`);
+					}
 					if (remoteTarget) {
 						return this.deliverRemoteAgentMessage(client, command, source?.summary, remoteTarget);
 					}
@@ -4582,9 +4591,12 @@ export class DaemonSupervisor {
 		await mesh.refreshAwaiting(waitMs);
 	}
 
-	/** Fresh depth-0 peer rows: `list_agent_peers` refreshes the mesh itself. */
+	/**
+	 * Fresh depth-0 peer rows: `list_agent_peers` refreshes the mesh itself on a
+	 * budget that fits the worker's 5s request timeout.
+	 */
 	private async remotePeerSummaries(): Promise<AgentSessionMessageAgentSummary[]> {
-		await this.refreshRemoteMesh();
+		await this.refreshRemoteMesh(REMOTE_MESH_PEERS_REFRESH_WAIT_MS);
 		return this.remoteAgentMeshState?.peerSummaries() ?? [];
 	}
 

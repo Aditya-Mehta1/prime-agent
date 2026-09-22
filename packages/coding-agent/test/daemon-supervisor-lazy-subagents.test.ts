@@ -10,7 +10,7 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
-import { success } from "../src/modes/daemon/daemon-protocol.js";
+import { AGENT_PEER_LIST_REQUEST_TIMEOUT_MS, success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
@@ -848,18 +848,22 @@ describe("daemon supervisor remote mesh routing", () => {
 	// Mesh stub: every read needs a preceding refreshAwaiting, so a cold-cache supervisor refreshes first.
 	function meshStub(deliveries: unknown[]) {
 		let refreshed = false;
+		const waits: Array<number | undefined> = [];
 		const consume = () => {
 			const ready = refreshed;
 			refreshed = false;
 			return ready;
 		};
-		const target = { sessionId: "r-s", activeSessionId: "r-a", summary: { rlmDepth: 0, rosterStatus: "idle" } };
+		const targets = [{ sessionId: "r-s", activeSessionId: "r-a", summary: { rlmDepth: 0, rosterStatus: "idle" } }];
 		return {
 			enabled: () => true,
-			refreshAwaiting: async () => {
+			waits,
+			targets,
+			refreshAwaiting: async (waitMs?: number) => {
+				waits.push(waitMs);
 				refreshed = true;
 			},
-			findMessageTargets: () => (consume() ? [target] : []),
+			findMessageTargets: () => (consume() ? targets : []),
 			peerSummaries: () => (consume() ? [{ sessionName: "remote-agent" }] : []),
 			sendAgentMessage: async (delivery: { message: string }) => {
 				deliveries.push(delivery);
@@ -880,7 +884,8 @@ describe("daemon supervisor remote mesh routing", () => {
 			createOrReuseWorker: (c: string, m: object) => Promise<WorkerFixture>;
 			remoteAgentMeshState?: unknown;
 		};
-		supervisor.remoteAgentMeshState = meshStub(deliveries);
+		const mesh = meshStub(deliveries);
+		supervisor.remoteAgentMeshState = mesh;
 		const resident = worker("local", [summary({ id: "l", sessionId: "l-s", rlmDepth: 0 })]);
 		supervisor.workers.set("local", resident);
 		seedSupervisorRoster(supervisor, resident);
@@ -894,18 +899,20 @@ describe("daemon supervisor remote mesh routing", () => {
 			message,
 		});
 
-		// Cold cache: the sibling list itself refreshes the mesh before reading it.
 		const peers = (await supervisor.handleCommand(client, { type: "list_agent_peers", workerToken: token })) as {
 			data: { peers: { sessionName?: string }[] };
 		};
 		expect(peers.data.peers.map((peer) => peer.sessionName)).toContain("remote-agent");
+		expect(mesh.waits[0]).toBeLessThan(AGENT_PEER_LIST_REQUEST_TIMEOUT_MS);
 
 		// No saved local names "remote-agent": the catalog miss lets the remote sibling claim the send.
 		supervisor.catalog.resolve = vi.fn().mockRejectedValue(new Error("Unknown saved session"));
 		await supervisor.handleCommand(client, send("hi tailnet", true));
 		expect(deliveries[0]).toMatchObject({ message: "hi tailnet", fromRelationship: "sibling" });
 
-		// A saved local session shares the remote sibling's name: it wakes and wins the send.
+		mesh.targets.push({ ...mesh.targets[0], sessionId: "r-s2", activeSessionId: "r-a2" });
+		await expect(supervisor.handleCommand(client, send("hi both"))).rejects.toThrow("Ambiguous active session");
+
 		const saved = summary({ id: "s", sessionId: "s", sessionName: "remote-agent", sessionFile: "/s.jsonl" });
 		const woken = worker("woken", [saved]);
 		woken.client.requestWorker.mockResolvedValue({ success: true, data: { deliveryStatus: "delivered" } });

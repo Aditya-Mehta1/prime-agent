@@ -152,6 +152,7 @@ import {
 } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
+	AGENT_PEER_LIST_REQUEST_TIMEOUT_MS,
 	collectDaemonLaunchEnv,
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
@@ -5900,12 +5901,14 @@ export class AgentDaemon {
 		try {
 			const response = await link.request(
 				{ type: "list_agent_peers", workerToken: this.options.worker.authenticationToken },
-				5000,
+				AGENT_PEER_LIST_REQUEST_TIMEOUT_MS,
 			);
 			if (!response.success) throw deserializeDaemonError(response);
 			// SAFETY: The authenticated supervisor constructs the peer response.
 			return (response.data as { peers: AgentSessionMessageAgentSummary[] }).peers;
-		} catch {
+		} catch (error) {
+			// A timeout or failed sibling listing must be visible, not a silent empty list.
+			this.log(`list_agent_peers failed: ${error instanceof Error ? error.message : String(error)}`);
 			return [];
 		}
 	}
