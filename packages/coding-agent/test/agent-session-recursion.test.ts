@@ -8,7 +8,6 @@ import {
 	type Context,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
-	getModel,
 	type TextContent,
 	type Usage,
 } from "@earendil-works/pi-ai";
@@ -43,10 +42,11 @@ import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { waitForHeadlessCompletion } from "../src/modes/headless-completion.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { createHarness, getAssistantTexts, getMessageText, type Harness } from "./suite/harness.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
-const model = getModel("anthropic", "claude-sonnet-4-5")!;
+const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 function userText(context: Context): string {
 	const lastMessage = context.messages[context.messages.length - 1] as AgentMessage | undefined;
