@@ -11,12 +11,10 @@ import type { AgentRosterEntry, RosterSessionSummary } from "./agent-roster.js";
 import { sessionSummaryFromRosterEntry } from "./agent-roster.js";
 import { classifySessionRosterStatus, type SessionSummary } from "./daemon-session-list.js";
 
-// Tailnet remote-agent mesh composition seam (stacked PRs 2-5).
-// PR 3 (tailnet peer discovery) supplies RemoteAgentHost snapshots on demand;
-// this module converts them into the roster, list, and family shapes PR 4
-// surfaces, marks peers offline between scans, and defines the delivery seam
-// PR 5 (cross-machine messaging/spawn) fills. Nothing here scans the tailnet:
-// the supervisor refreshes this state when a roster consumer queries it.
+// Tailnet remote-agent mesh: converts RemoteAgentHost snapshots into
+// roster, list, and family shapes; marks unreachable peers offline; and
+// defines the cross-machine delivery seam. The supervisor refreshes this
+// state on demand when a roster consumer queries it.
 
 /** Session facts a remote daemon publishes over the mesh (PR 3 discovery output). */
 export interface RemoteAgentSessionSummary {
@@ -104,13 +102,13 @@ export interface RemoteAgentMessageTarget {
 	summary: SessionSummary;
 }
 
-export const DEFAULT_REMOTE_MESH_REFRESH_TTL_MS = 30_000;
+const DEFAULT_REMOTE_MESH_REFRESH_TTL_MS = 30_000;
 /**
  * Offline rows are kept so unreachable peers read "offline" instead of
  * vanishing, but a peer that stays gone is eventually forgotten: mesh state
  * must stay bounded when a tailnet churns through transient devices.
  */
-export const DEFAULT_REMOTE_MESH_OFFLINE_TTL_MS = 24 * 60 * 60_000;
+const DEFAULT_REMOTE_MESH_OFFLINE_TTL_MS = 24 * 60 * 60_000;
 
 /** Roster ids are namespaced so remote rows can never collide with local ones. */
 export function remoteAgentRosterId(tailnetHost: string, sessionId: string): string {
@@ -223,11 +221,7 @@ export class RemoteAgentMeshState {
 		if (!this.source) return false;
 		if (this.scan) return this.scan;
 		if (this.lastScanAt !== undefined && this.now() - this.lastScanAt < this.refreshTtlMs) return false;
-		this.scan = this.runScan(this.source);
-		const result = await this.scan.finally(() => {
-			this.scan = undefined;
-		});
-		return result;
+		return this.refresh();
 	}
 
 	/**
@@ -252,8 +246,7 @@ export class RemoteAgentMeshState {
 		}
 	}
 
-	/** Force a scan ignoring the TTL (tests; PR 3's forced surfaces bypass this state). */
-	async refresh(): Promise<boolean> {
+	private async refresh(): Promise<boolean> {
 		if (!this.source) return false;
 		if (this.scan) return this.scan;
 		this.scan = this.runScan(this.source);
@@ -446,7 +439,7 @@ function mergeRemoteSessions(sessions: readonly RemoteAgentSessionSummary[]): Ma
  * derives exactly as for local rows: a depth-0 remote session is a sibling of
  * depth-0 locals and unrelated to everything else.
  */
-export function remoteAgentFamilyEntry(target: RemoteAgentMessageTarget): AgentFamilyCatalogEntry {
+function remoteAgentFamilyEntry(target: RemoteAgentMessageTarget): AgentFamilyCatalogEntry {
 	return {
 		id: target.sessionId,
 		...(target.summary.sessionName ? { name: target.summary.sessionName } : {}),

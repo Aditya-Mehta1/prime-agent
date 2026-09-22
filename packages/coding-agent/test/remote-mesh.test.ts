@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { agentFamilyRelationship } from "../src/core/agent-messages.js";
 import type {
 	RemoteAgentHost,
 	RemoteAgentMeshSource,
 	RemoteAgentMessageTransport,
 	RemoteAgentSessionSummary,
 } from "../src/modes/daemon/remote-mesh.js";
-import { RemoteAgentMeshState, remoteAgentFamilyEntry, remoteAgentRosterId } from "../src/modes/daemon/remote-mesh.js";
+import {
+	RemoteAgentMeshState,
+	remoteAgentFamilyRelationship,
+	remoteAgentRosterId,
+} from "../src/modes/daemon/remote-mesh.js";
 
 function remoteSession(overrides: Partial<RemoteAgentSessionSummary> = {}): RemoteAgentSessionSummary {
 	return {
@@ -56,7 +59,7 @@ describe("RemoteAgentMeshState", () => {
 				host({ tailnetHost: "locked.tailnet.ts.net", locked: true }),
 			]),
 		});
-		await state.refresh();
+		await state.refreshIfStale();
 		const entries = state.entriesForClients();
 		expect(entries[0]).toMatchObject({
 			agentId: remoteAgentRosterId("milk.tailnet.ts.net", "remote-session"),
@@ -82,24 +85,25 @@ describe("RemoteAgentMeshState", () => {
 		const rosterChanges: { changed: string[]; removed: string[] }[] = [];
 		const state = new RemoteAgentMeshState({
 			source,
+			refreshTtlMs: 0,
 			onRosterChange: (changed, removed) => rosterChanges.push({ changed: [...changed], removed: [...removed] }),
 		});
-		await state.refresh();
+		await state.refreshIfStale();
 		expect(state.sessionSummaries()[0]!.remoteOffline).toBeUndefined();
 
 		source.listRemoteAgents.mockResolvedValueOnce([host()]);
-		await state.refresh();
+		await state.refreshIfStale();
 		expect(state.sessionSummaries().map((summary) => summary.sessionId)).toEqual(["remote-session"]);
 		expect(rosterChanges.at(-1)!.removed).toEqual([remoteAgentRosterId("milk.tailnet.ts.net", "closing-session")]);
 
 		source.listRemoteAgents.mockResolvedValueOnce([]);
-		await state.refresh();
+		await state.refreshIfStale();
 		// Rows survive, marked offline: an exceptional label the view renders.
 		expect(state.sessionSummaries()[0]).toMatchObject({ remoteOffline: true, rosterStatus: "inactive" });
 		expect(state.entriesForClients()[0]).toMatchObject({ status: "inactive", statusLabel: "offline" });
 
 		source.listRemoteAgents.mockResolvedValueOnce([host()]);
-		await state.refresh();
+		await state.refreshIfStale();
 		expect(state.sessionSummaries()[0]!.rosterStatus).toBe("idle");
 		expect(state.sessionSummaries()[0]!.remoteOffline).toBeUndefined();
 	});
@@ -110,19 +114,20 @@ describe("RemoteAgentMeshState", () => {
 		const removedIds: string[][] = [];
 		const state = new RemoteAgentMeshState({
 			source,
+			refreshTtlMs: 0,
 			offlineTtlMs: 60_000,
 			now: () => nowMs,
 			onRosterChange: (_c, removed) => removedIds.push([...removed]),
 		});
-		await state.refresh();
+		await state.refreshIfStale();
 		nowMs = 10_000;
 		source.listRemoteAgents.mockResolvedValueOnce([]);
-		await state.refresh();
+		await state.refreshIfStale();
 		expect(state.sessionSummaries()).toHaveLength(1);
 		// Still inside the TTL the offline row stays; past it, the peer is forgotten.
 		nowMs = 70_001;
 		source.listRemoteAgents.mockResolvedValueOnce([]);
-		await state.refresh();
+		await state.refreshIfStale();
 		expect(state.sessionSummaries()).toHaveLength(0);
 		expect(removedIds.at(-1)).toEqual([remoteAgentRosterId("milk.tailnet.ts.net", "remote-session")]);
 	});
@@ -177,8 +182,8 @@ describe("RemoteAgentMeshState", () => {
 				],
 			}),
 		]);
-		const bare = new RemoteAgentMeshState({ source });
-		await bare.refresh();
+		const bare = new RemoteAgentMeshState({ source, refreshTtlMs: 0 });
+		await bare.refreshIfStale();
 		for (const selector of ["remote-session", "remote-active"]) {
 			expect(bare.findMessageTargets(selector)).toHaveLength(1);
 			expect(bare.findMessageTargets(selector)[0]!.sessionId).toBe("remote-session");
@@ -188,8 +193,8 @@ describe("RemoteAgentMeshState", () => {
 			bare.sendAgentMessage({ target: bare.findMessageTargets("remote-agent")[0]!, message: "hi" }),
 		).rejects.toThrow("remote agent messaging is not available");
 
-		const delivering = new RemoteAgentMeshState({ source, transport });
-		await delivering.refresh();
+		const delivering = new RemoteAgentMeshState({ source, transport, refreshTtlMs: 0 });
+		await delivering.refreshIfStale();
 		const target = delivering.findMessageTargets("remote-agent")[0]!;
 		const sent = await delivering.sendAgentMessage({
 			target,
@@ -203,7 +208,7 @@ describe("RemoteAgentMeshState", () => {
 		]);
 		// The peer drops: its row stays targetable but delivery reports offline.
 		source.listRemoteAgents.mockResolvedValueOnce([]);
-		await delivering.refresh();
+		await delivering.refreshIfStale();
 		await expect(
 			delivering.sendAgentMessage({ target: delivering.findMessageTargets("remote-session")[0]!, message: "hi" }),
 		).rejects.toThrow("Remote agent on milk.tailnet.ts.net is offline");
@@ -211,12 +216,12 @@ describe("RemoteAgentMeshState", () => {
 
 	it("treats a depth-0 remote session as a sibling and nothing else", async () => {
 		const state = new RemoteAgentMeshState({ source: mockSource(async () => [host()]) });
-		await state.refresh();
+		await state.refreshIfStale();
 		// Depth-0 without parent edges: a sibling of local depth-0 rows, nothing else.
-		const entry = remoteAgentFamilyEntry(state.findMessageTargets("remote-agent")[0]!);
-		expect(agentFamilyRelationship({ id: "local", depth: 0, status: "idle" }, entry)).toBe("sibling");
+		const target = state.findMessageTargets("remote-agent")[0]!;
+		expect(remoteAgentFamilyRelationship({ id: "local", depth: 0, status: "idle" }, target)).toBe("sibling");
 		expect(
-			agentFamilyRelationship({ id: "child", depth: 1, status: "running", parentSessionPath: "/p" }, entry),
+			remoteAgentFamilyRelationship({ id: "child", depth: 1, status: "running", parentSessionPath: "/p" }, target),
 		).toBeUndefined();
 	});
 });

@@ -217,6 +217,8 @@ function createUnifiedSearchableText(
 		daemon?.cwd,
 		daemon?.sessionFile,
 		daemon?.summary,
+		daemon?.remoteHost,
+		daemon?.remoteModel ? `${daemon.remoteModel.provider}/${daemon.remoteModel.modelId}` : undefined,
 		saved?.id,
 		saved?.name,
 		saved?.firstMessage,
@@ -1210,6 +1212,7 @@ export function getAgentsViewSessionTitle(summary: SessionSummary): string {
 function getSessionSubtitle(summary: SessionSummary): string {
 	const parts = [
 		summary.model ? `${summary.model.provider}/${summary.model.id}` : undefined,
+		summary.remoteHost ? `on ${summary.remoteHost}` : undefined,
 		summary.cwd,
 		summary.activeSessionId ?? summary.id,
 	].filter((part): part is string => part !== undefined && part.length > 0);

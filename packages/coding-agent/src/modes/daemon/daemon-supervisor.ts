@@ -440,10 +440,7 @@ interface DaemonSupervisorOptions {
 	socketPath?: string;
 	defaultSessionConfig: AgentSessionRuntimeConfig;
 	descriptorDir?: string;
-	/**
-	 * Tailnet remote-agent mesh (stacked PRs 2-5). PR 3 injects the discovery
-	 * source; without it the supervisor serves an entirely local roster.
-	 */
+	/** Tailnet remote-agent mesh. Without a discovery source the supervisor serves a local roster. */
 	remoteAgentMesh?: {
 		source?: RemoteAgentMeshSource;
 		transport?: RemoteAgentMessageTransport;
