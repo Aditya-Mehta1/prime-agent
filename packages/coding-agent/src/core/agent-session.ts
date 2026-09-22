@@ -14503,9 +14503,9 @@ export class AgentSession {
 
 	/**
 	 * Build the agent context overview for /context: this session as the root
-	 * plus one node per RLM sub-agent, recursively. Running children are read
-	 * from their live sessions; completed children from their persisted session
-	 * dirs, so the tree survives child disposal and session resume.
+	 * plus one node per RLM sub-agent, recursively. Running and resident
+	 * finished children come from their live sessions, others from their
+	 * persisted session dirs, so the tree survives child disposal and session resume.
 	 */
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
@@ -14530,7 +14530,35 @@ export class AgentSession {
 				status: run.status,
 			});
 		}
-		children.push(...loadContextTreeChildrenFromDisk(this._rlmSessionDirForReading(), resolveContextWindow, liveIds));
+		// Resident finished children project from their live sessions: usage
+		// reaches their session file only at settle boundaries, so memory is fresher than a re-parse.
+		const residentIds = new Set<string>(liveIds);
+		const rlmSessionDir = this._rlmSessionDirForReading();
+		for (const [childId, retained] of this._rlmChildSessions) {
+			if (
+				residentIds.has(childId) ||
+				this._deletingRlmChildren.has(childId) ||
+				this._deletedRlmChildIds.has(childId)
+			) {
+				continue;
+			}
+			// Only project children the disk walk would enumerate, so visibility stays identical.
+			const childDir = retained.session._rlmSessionDir ?? retained.session.sessionManager.getSessionDir();
+			if (!rlmSessionDir || basename(childDir) !== childId || dirname(childDir) !== rlmSessionDir) {
+				continue;
+			}
+			residentIds.add(childId);
+			children.push({
+				...retained.session.getContextTree(),
+				id: childId,
+				label: retained.run ? rlmChildLabel(retained.run.prompt) : (retained.session.sessionName ?? "child agent"),
+				// Without a run, status stays "done", matching _rlmChildSnapshotForSession.
+				status: retained.run?.status ?? "done",
+			});
+		}
+		children.push(
+			...loadContextTreeChildrenFromDisk(this._rlmSessionDirForReading(), resolveContextWindow, residentIds),
+		);
 
 		const model = this.model;
 		return {
