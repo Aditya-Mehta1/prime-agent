@@ -120,6 +120,12 @@ const PRIME_INFERENCE_ZAI_COMPAT: OpenAICompletionsCompat = {
 	supportsReasoningEffort: false,
 };
 
+// Prime-hosted GLM routes run behind Dynamo, which reports a tool call the model
+// started but ended before its close tag as `length` with no call
+// (ai-dynamo/dynamo#15184). Only routes verified to be Prime-hosted belong here;
+// `z-ai/glm-5.3-flash` is resold from another provider.
+const PRIME_INFERENCE_DYNAMO_GLM_MODELS = new Set(["z-ai/glm-5.3"]);
+
 const PRIME_INFERENCE_BASE_URL = "https://api.pinference.ai/api/v1";
 const PRIME_INFERENCE_COMPAT: OpenAICompletionsCompat = {
 	supportsStore: false,
@@ -471,6 +477,7 @@ function getPrimeInferenceCompat(modelId: string): OpenAICompletionsCompat {
 		return {
 			...PRIME_INFERENCE_COMPAT,
 			...PRIME_INFERENCE_ZAI_COMPAT,
+			...(PRIME_INFERENCE_DYNAMO_GLM_MODELS.has(id) ? { retryOnTruncatedToolCall: true } : {}),
 		};
 	}
 

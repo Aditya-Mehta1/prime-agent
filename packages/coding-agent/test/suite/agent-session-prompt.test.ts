@@ -914,10 +914,14 @@ describe("AgentSession prompt characterization", () => {
 			...overrides,
 		});
 	it.each([
-		{ stopReason: "toolUse" as const, model: "internal/glm-5.3-fast", retryToolChoice: "required" },
-		{ stopReason: "length" as const, model: "z-ai/glm-5.3", retryToolChoice: undefined },
+		{ stopReason: "toolUse" as const, model: { id: "internal/glm-5.3-fast" }, retryToolChoice: "required" },
+		{
+			stopReason: "length" as const,
+			model: { id: "z-ai/glm-5.3", compat: { retryOnTruncatedToolCall: true } },
+			retryToolChoice: undefined,
+		},
 	])("retries once when a reply delivers no tool call: %j", async ({ stopReason, model, retryToolChoice }) => {
-		const harness = await glmHarness({ models: [{ id: model }] });
+		const harness = await glmHarness({ models: [model] });
 		harnesses.push(harness);
 		const toolChoices: Array<string | undefined> = [];
 		harness.setResponses([
@@ -953,9 +957,13 @@ describe("AgentSession prompt characterization", () => {
 		{ text: "Let me actually check the evidence." },
 		{ text: "Would you like me to run a targeted check of the live session state?" },
 		{ text: "Let me check the logs.", stopReason: "error" as const },
-		{ text: "Let me check the logs.", stopReason: "length" as const, models: [{ id: "internal/deepseek-v4-flash" }] },
-		{ text: "Let me check the logs.", stopReason: "length" as const, models: [{ id: "z-ai/glm-5.3-flash" }] },
-		{ text: "Let me check the logs.", stopReason: "length" as const, provider: "other-provider" },
+		{ text: "Let me check the logs.", stopReason: "aborted" as const },
+		{ text: "Let me check the logs.", stopReason: "length" as const },
+		{
+			text: "",
+			stopReason: "length" as const,
+			models: [{ id: "z-ai/glm-5.3", compat: { retryOnTruncatedToolCall: false } }],
+		},
 		{ text: "Let me check the logs.", stopReason: "toolUse" as const, tools: [] },
 	])("does not retry an ineligible terminal reply: %j", async ({ text, stopReason, ...overrides }) => {
 		const harness = await glmHarness({ settings: { retry: { enabled: false } }, ...overrides });

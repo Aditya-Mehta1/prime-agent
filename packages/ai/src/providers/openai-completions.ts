@@ -114,7 +114,11 @@ interface OpenAICompatCacheControl {
 	ttl?: string;
 }
 
-type ResolvedOpenAICompletionsCompat = Omit<Required<OpenAICompletionsCompat>, "cacheControlFormat"> & {
+/** Wire-affecting compat resolved to concrete values; `retryOnTruncatedToolCall` is agent-layer policy left on `model.compat`. */
+type ResolvedOpenAICompletionsCompat = Omit<
+	Required<OpenAICompletionsCompat>,
+	"cacheControlFormat" | "retryOnTruncatedToolCall"
+> & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 };
 

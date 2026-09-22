@@ -1,10 +1,7 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import type { CustomMessage } from "./messages.js";
 
 export const TOOL_INTENT_RECOVERY_CUSTOM_TYPE = "tool_intent_recovery";
-
-/** Dynamo GLM-5.3 routes that report dropped tool calls as length. */
-const DROPS_TOOL_CALLS_AS_LENGTH = /(?:^|\/)glm-5\.3(?:-fast(?:-\w+)?)?$/i;
 
 /** Hidden model-facing retry message. */
 export function createToolIntentRecoveryMessage(timestamp = Date.now()): CustomMessage {
@@ -18,17 +15,29 @@ export function createToolIntentRecoveryMessage(timestamp = Date.now()): CustomM
 	};
 }
 
-/** Match protocol finishes eligible for a retry when no tool call was delivered. */
-export function isDroppedToolCallStop(message: AssistantMessage): boolean {
+/**
+ * Match protocol finishes eligible for a retry when no tool call was delivered.
+ * `toolUse` qualifies on any model; `length` only when the model's catalog entry
+ * sets `compat.retryOnTruncatedToolCall`. A plain `stop` never qualifies.
+ */
+export function isDroppedToolCallStop(message: AssistantMessage, model: Model<string> | undefined): boolean {
 	if (message.content.some((part) => part.type === "toolCall")) {
 		return false;
 	}
-	if (message.stopReason === "toolUse") {
-		return true;
+	switch (message.stopReason) {
+		case "toolUse":
+			return true;
+		case "length":
+			return retriesOnTruncatedToolCall(model);
+		default:
+			return false;
 	}
-	return (
-		message.stopReason === "length" &&
-		message.provider === "prime-inference" &&
-		DROPS_TOOL_CALLS_AS_LENGTH.test(message.model)
-	);
+}
+
+function retriesOnTruncatedToolCall(model: Model<string> | undefined): boolean {
+	if (model?.api !== "openai-completions") {
+		return false;
+	}
+	// `Model<string>` erases the per-API compat type; the api check selects it.
+	return (model as Model<"openai-completions">).compat?.retryOnTruncatedToolCall === true;
 }

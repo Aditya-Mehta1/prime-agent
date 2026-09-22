@@ -314,6 +314,8 @@ export interface OpenAICompletionsCompat {
 	sendSessionAffinityHeaders?: boolean;
 	/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
 	supportsLongCacheRetention?: boolean;
+	/** Whether a `length` finish with no tool call means the serving layer dropped a tool call the model started (Dynamo reports an EOS-truncated GLM call this way), so the agent may retry once. Default: false. */
+	retryOnTruncatedToolCall?: boolean;
 }
 
 /** Compatibility settings for OpenAI Responses APIs. */

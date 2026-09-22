@@ -2008,7 +2008,9 @@ export class AgentSession {
 			) {
 				return undefined;
 			}
-			return isDroppedToolCallStop(context.message) ? createToolIntentRecoveryMessage() : undefined;
+			return isDroppedToolCallStop(context.message, this._runModel())
+				? createToolIntentRecoveryMessage()
+				: undefined;
 		};
 	}
 

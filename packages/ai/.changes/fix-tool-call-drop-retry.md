@@ -1,1 +1,1 @@
-- Added the optional `toolChoice` stream option. The OpenAI Chat Completions adapter sends it as `tool_choice`; other adapters ignore it.
+- Added `compat.retryOnTruncatedToolCall`, set on the Prime Inference GLM-5.3 route Dynamo serves, and the optional `toolChoice` stream option (sent as `tool_choice` by the OpenAI Chat Completions adapter; other adapters ignore it).
