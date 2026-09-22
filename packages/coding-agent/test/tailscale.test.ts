@@ -280,3 +280,14 @@ describe("status failure diagnostics", () => {
 		expect(runTailscaleStatus()).toBe(1);
 	});
 });
+describe("status succeeds when serve-status is unavailable", () => {
+	it("returns 0 when serve status is unavailable after a successful probe", () => {
+		const d = mkdtempSync(join(tmpdir(), "ts-s-"));
+		writeShim(
+			d,
+			`#!/bin/sh\n[ "$1" = version ] && exit 0\n[ "$1" = status ] && { printf '${ONLINE}'; exit 0; }\necho err >&2\nexit 1\n`,
+		);
+		process.env.PATH = `${d}:${process.env.PATH}`;
+		expect(runTailscaleStatus()).toBe(0);
+	});
+});

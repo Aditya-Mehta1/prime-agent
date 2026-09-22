@@ -237,7 +237,9 @@ export function runTailscaleStatus(json = false): number {
 		console.log(
 			chalk.yellow(`tailscale serve status failed (exit ${serve.code}); served-local status is unavailable`),
 		);
-		return 1;
+		// Probe already confirmed this node is on a tailnet; a missing serve
+		// capability is a warning, not a hard failure (matches --json behavior).
+		return 0;
 	}
 	try {
 		const parsed = JSON.parse(serve.stdout) as {
@@ -264,7 +266,9 @@ export function runTailscaleStatus(json = false): number {
 		}
 	} catch {
 		console.log(chalk.yellow(`tailscale serve status output was unparseable; served-local status is unavailable`));
-		return 1;
+		// Probe already confirmed this node is on a tailnet; unparseable serve
+		// output is a warning, not a hard failure (matches --json behavior).
+		return 0;
 	}
 	return 0;
 }
