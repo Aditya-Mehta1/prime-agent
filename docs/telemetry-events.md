@@ -239,6 +239,7 @@ emitted once per client run when the kitty keyboard protocol answer lands).
 |---|---|---|
 | `kitty` | boolean | the kitty keyboard protocol is active (flags `1\|2\|4`) |
 | `modify_other_keys` | boolean | always `false` in this port: the xterm modifyOtherKeys mode-2 fallback is never armed (crossterm cannot parse the resulting `CSI 27;mods;key~` sequences — the whole input buffer drops on the parse error, the shift-modified-printable bug class); every surface start instead resets the mode. The property keeps the TS event shape. |
+| `mode` | string | the detected protocol: `kitty` / `modify_other_keys` / `none` (the term-enhanced-keys-2 detection shape; `modify_other_keys` never settles in this port, the value keeps the TS shape) |
 
 ### `tui image pasted`
 

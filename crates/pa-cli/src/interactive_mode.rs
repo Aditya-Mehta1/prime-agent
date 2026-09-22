@@ -303,6 +303,7 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         &self,
         kitty: bool,
         modify_other_keys: bool,
+        mode: &'static str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let Some(client) = self.client() else {
@@ -314,6 +315,7 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
                 "modify_other_keys",
                 serde_json::Value::from(modify_other_keys),
             );
+            properties.set("mode", serde_json::Value::from(mode));
             client.track("tui enhanced keys", properties);
             let _ = client.shutdown().await;
         })

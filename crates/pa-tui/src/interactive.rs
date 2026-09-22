@@ -111,11 +111,14 @@ pub trait InteractionTelemetry: Send + Sync {
     /// `failed` (the cycle errored).
     fn suspend_used(&self, outcome: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// The terminal enhanced-key modes settled (`tui enhanced keys`):
-    /// `kitty` / `modify_other_keys` report the established combination.
+    /// `kitty` / `modify_other_keys` report the established combination,
+    /// `mode` names the detected protocol (`kitty` / `modify_other_keys` /
+    /// `none`).
     fn enhanced_keys(
         &self,
         kitty: bool,
         modify_other_keys: bool,
+        mode: &'static str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// The `!`/`!!` bash shortcut ran a command from the chat view (event
     /// `tui bash shortcut used`): `excluded` is the `!!` variant, and
@@ -787,8 +790,19 @@ pub async fn run_interactive(
         // event reports the established combination.
         if enhanced_keys_pending {
             if let Some((kitty, modify_other_keys)) = crate::enhanced_keys::settle_state() {
+                // The lane-2 detection shape (enhanced_keys_mode): the
+                // protocol the run settled on, primitives only.
+                let mode = if kitty {
+                    "kitty"
+                } else if modify_other_keys {
+                    "modify_other_keys"
+                } else {
+                    "none"
+                };
                 if let Some(telemetry) = &session.telemetry {
-                    telemetry.enhanced_keys(kitty, modify_other_keys).await;
+                    telemetry
+                        .enhanced_keys(kitty, modify_other_keys, mode)
+                        .await;
                 }
                 enhanced_keys_pending = false;
             }
