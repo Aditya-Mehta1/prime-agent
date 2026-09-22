@@ -1,0 +1,6 @@
+{
+ "command": "wait_for_idle",
+ "id": "gwi1",
+ "success": true,
+ "type": "response"
+}

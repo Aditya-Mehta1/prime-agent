@@ -1,0 +1,33 @@
+{
+ "session": "vbat20260917T134930Z-perf-ts-1",
+ "first_frame_s": 0.822,
+ "ready_s": 0.846,
+ "typing_ms": [
+  30.3,
+  7.2,
+  7.0,
+  6.4,
+  15.3,
+  6.1,
+  6.3,
+  6.2,
+  6.2,
+  6.4,
+  6.4,
+  6.4,
+  6.3,
+  6.3,
+  6.1,
+  6.1,
+  6.2,
+  5.9,
+  12.2,
+  6.1,
+  6.2,
+  6.2,
+  5.7,
+  6.6,
+  5.9
+ ],
+ "ready_frame": "                                                          work  $0.00\n\n                  \u2597\u2584\u2584\u2588\u2580\n    \u2588\u2588\u2588\u2584       \u2597\u2584\u2588\u2588\u2588\u2580\n   \u2597\u2588\u259b\u2590\u2588\u2599   \u2597\u2584\u2588\u2580\u2597\u2588\u2580       prime agent v0.9.5\n  \u2597\u2588\u259b \u259f\u2588\u2588\u2599\u2584\u2588\u2588\u259b \u259f\u259b         model mock-1\n  \u2597\u259f\u258c \u2590\u2588\u2588\u2588\u259b\u2598\u2597\u2584\u2588\u2596          cwd ~/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/ts/work\n \u259f\u2588\u2588\u2588\u2584  \u2584\u2584\u259f\u2588\u2588\u2588\u2580\n \u259c\u2588\u259b\u2580\u2598  \u259c\u2588\u259b\u2580\u2598\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                      Collapsed mode (Ctrl+O to expand)\n\n >\n\n\u2190 manage                                                                                                 mock-1 \u00b7 0 (0%)\n"
+}

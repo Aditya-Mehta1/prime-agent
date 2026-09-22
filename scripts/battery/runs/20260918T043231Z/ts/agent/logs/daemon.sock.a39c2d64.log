@@ -1,0 +1,4 @@
+[2026-09-18T04:32:36.118Z] supervisor: Prime Agent daemon supervisor fe545739-3d18-4e71-901e-a78575de61ea listening on /home/ubuntu/lane-worktrees/roster-wire/scripts/battery/runs/20260918T043231Z/ts/daemon.sock
+[2026-09-18T04:32:38.793Z] supervisor: Session worker 9b1e6f848c51 stderr: Prime Agent daemon listening on /tmp/vbat20260918T043231Z-ts/prime-agent-1000/worker-a39c2d649f54-9b1e6f848c51.sock
+[2026-09-18T04:33:17.929Z] supervisor: Session worker 9b1e6f848c51 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-18T04:33:17.929Z] supervisor: Session worker 9b1e6f848c51 stderr: shutting down (exit 0); closing 1 active session(s)

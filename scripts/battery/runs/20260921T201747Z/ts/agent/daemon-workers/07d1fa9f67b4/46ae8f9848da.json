@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "workerId": "46ae8f9848da",
+  "pid": 2739591,
+  "processStartId": "proc:20334929",
+  "socketPath": "/tmp/util20260921T201747Z-ts/prime-agent-1000/worker-07d1fa9f67b4-46ae8f9848da.sock",
+  "recoveryJournalPath": "/home/ubuntu/lane-worktrees/utility-commands/scripts/battery/runs/20260921T201747Z/ts/agent/daemon-workers/07d1fa9f67b4/46ae8f9848da.recovery.jsonl",
+  "orphanProcessJournalPath": "/home/ubuntu/lane-worktrees/utility-commands/scripts/battery/runs/20260921T201747Z/ts/agent/daemon-workers/07d1fa9f67b4/46ae8f9848da.orphans.jsonl",
+  "supervisorSocketPath": "/home/ubuntu/lane-worktrees/utility-commands/scripts/battery/runs/20260921T201747Z/ts/daemon.sock",
+  "authenticationToken": "W2CaWLHnZXYE7gCnSe1JVDYp6eBH7V9rh65iq837rpc",
+  "workerInstanceId": "a1b80cdc-0025-46da-9686-bf69e7b31011",
+  "rootActiveSessionId": "05b89406e1d6",
+  "rootSessionId": "01a0c59e-1b6b-71db-bbcc-8dbc6e97d8c6",
+  "sessionFile": "/home/ubuntu/lane-worktrees/utility-commands/scripts/battery/runs/20260921T201747Z/ts/agent/sessions/01a0c59e-1b6b-71db-bbcc-8dbc6e97d8c6.jsonl",
+  "telemetryDisabled": true,
+  "createdAt": "2026-09-21T20:17:48.110Z",
+  "updatedAt": "2026-09-21T20:27:48.105Z",
+  "lifecycle": "ready",
+  "createCommand": {
+    "type": "create",
+    "sessionPath": "/home/ubuntu/lane-worktrees/utility-commands/scripts/battery/runs/20260921T201747Z/ts/agent/sessions/01a0c59e-1b6b-71db-bbcc-8dbc6e97d8c6.jsonl"
+  },
+  "consecutiveFailures": 0
+}

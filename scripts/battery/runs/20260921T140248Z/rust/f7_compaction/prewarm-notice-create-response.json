@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "c146bcb9cd98",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-21T14:04:36.332Z",
+  "cwd": "/home/ubuntu/lane-worktrees/agent-end-messages/scripts/battery/runs/20260921T140248Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "c146bcb9cd98",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T14:04:36.355Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T14:04:36.355Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/agent-end-messages/scripts/battery/runs/20260921T140248Z/rust/agent/sessions/01a0c448-6e6c-726e-b6d0-f6ee7d43f5f2.jsonl",
+  "sessionId": "01a0c448-6e6c-726e-b6d0-f6ee7d43f5f2",
+  "sessionName": "battery-ipython-prewarm",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 2146990,
+  "workerState": "ready"
+ },
+ "id": "batt-c1",
+ "success": true,
+ "type": "response"
+}

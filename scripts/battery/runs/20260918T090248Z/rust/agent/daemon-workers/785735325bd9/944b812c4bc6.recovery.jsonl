@@ -1,0 +1,34 @@
+{"activeSessionId":"944b812c4bc6","busy":true,"operation":"create","recordedAt":"2026-09-18T09:03:00.425Z","sessionFile":"/home/ubuntu/lane-worktrees/tui-interaction/scripts/battery/runs/20260918T090248Z/rust/agent/sessions/01a0b3c1-3b41-7253-bee5-6800613acd3e.jsonl","sessionId":"01a0b3c1-3b41-7253-bee5-6800613acd3e"}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 0"],"recorded_at":"2026-09-18T09:03:02.427Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:02.458Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 1"],"recorded_at":"2026-09-18T09:03:02.637Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:02.651Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 2"],"recorded_at":"2026-09-18T09:03:02.843Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:02.856Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 3"],"recorded_at":"2026-09-18T09:03:03.067Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:03.081Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 4"],"recorded_at":"2026-09-18T09:03:03.275Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:03.286Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 5"],"recorded_at":"2026-09-18T09:03:03.481Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:03.491Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 6"],"recorded_at":"2026-09-18T09:03:03.691Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:03.705Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 7"],"recorded_at":"2026-09-18T09:03:03.938Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:03.952Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 8"],"recorded_at":"2026-09-18T09:03:04.154Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:04.171Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 9"],"recorded_at":"2026-09-18T09:03:04.395Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:04.411Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 10"],"recorded_at":"2026-09-18T09:03:04.612Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:04.626Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 11"],"recorded_at":"2026-09-18T09:03:04.836Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:04.850Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 12"],"recorded_at":"2026-09-18T09:03:05.068Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:05.083Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 13"],"recorded_at":"2026-09-18T09:03:05.294Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:05.306Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 14"],"recorded_at":"2026-09-18T09:03:05.539Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:05.553Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":["prompt 15"],"recorded_at":"2026-09-18T09:03:05.756Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"944b812c4bc6","follow_up":[],"recorded_at":"2026-09-18T09:03:05.773Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"944b812c4bc6","busy":false,"operation":"shutdown","recordedAt":"2026-09-18T09:03:18.174Z","sessionFile":"/home/ubuntu/lane-worktrees/tui-interaction/scripts/battery/runs/20260918T090248Z/rust/agent/sessions/01a0b3c1-3b41-7253-bee5-6800613acd3e.jsonl","sessionId":"01a0b3c1-3b41-7253-bee5-6800613acd3e"}

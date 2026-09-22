@@ -1,0 +1,3 @@
+supervisor started pid 3377096
+[2026-09-17T13:53:38.899Z] session worker a390c30a601e registered (epoch 1, pid 3377103)
+[2026-09-17T13:53:38.939Z] session worker a390c30a601e re-registered (epoch 2, pid 3377103)

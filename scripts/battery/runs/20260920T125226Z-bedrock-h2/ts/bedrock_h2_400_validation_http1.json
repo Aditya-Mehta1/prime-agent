@@ -1,0 +1,21 @@
+{
+ "scenario": "bedrock_h2_400_validation_http1",
+ "api": "bedrock-converse-stream",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "read ECONNRESET\n",
+  "duration_s": 2.28,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-4c89-773f-a6d9-c3fdde65ac88.jsonl",
+ "errorMessage": "read ECONNRESET",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "TimeoutError",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": "ECONNRESET",
+  "retryAfterMs": null
+ }
+}

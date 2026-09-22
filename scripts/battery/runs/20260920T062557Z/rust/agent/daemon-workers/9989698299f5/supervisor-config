@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T062557Z/rust/daemon.sock",
+  "defaultSessionDir": "/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T062557Z/rust/agent/sessions"
+}

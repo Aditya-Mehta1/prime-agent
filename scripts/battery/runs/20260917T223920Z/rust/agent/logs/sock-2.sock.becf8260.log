@@ -1,0 +1,3 @@
+supervisor started pid 255112
+[2026-09-17T22:46:19.646Z] session worker b6265e2a6287 registered (epoch 1, pid 255128)
+[2026-09-17T22:46:19.702Z] session worker b6265e2a6287 re-registered (epoch 2, pid 255128)

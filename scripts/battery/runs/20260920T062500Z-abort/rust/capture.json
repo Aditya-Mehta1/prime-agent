@@ -1,0 +1,26 @@
+{
+ "abort_response": {
+  "success": true,
+  "command": "abort_compaction",
+  "has_data": false
+ },
+ "prompt_response": {
+  "success": true
+ },
+ "events": [],
+ "durable": {
+  "outcome_rows": [
+   {
+    "type": "custom_message",
+    "content": "Compaction cancelled",
+    "customType": "compaction_outcome",
+    "details": {
+     "outcome": "cancelled",
+     "reason": "threshold"
+    },
+    "display": true
+   }
+  ],
+  "compaction_entries": 0
+ }
+}

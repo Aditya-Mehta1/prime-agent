@@ -1,0 +1,58 @@
+{
+ "id": "oc1",
+ "type": "response",
+ "command": "create",
+ "success": true,
+ "data": {
+  "id": "7d2bcdae276f",
+  "lifecycle": "draft",
+  "activity": "idle",
+  "isSessionActive": false,
+  "lastActivityAt": "2026-09-20T08:44:55.753Z",
+  "runtimeKind": "top-level",
+  "rlmDepth": 0,
+  "activeSessionId": "7d2bcdae276f",
+  "sessionId": "01a0bdfd-660e-76ec-9c2f-c812f5b0d60f",
+  "sessionFile": "/home/ubuntu/lane-worktrees/harness-digest/scripts/battery/runs/20260920T084452Z/ts/agent/sessions/01a0bdfd-660e-76ec-9c2f-c812f5b0d60f.jsonl",
+  "sessionName": "battery-overflow",
+  "cwd": "/home/ubuntu/lane-worktrees/harness-digest/scripts/battery/runs/20260920T084452Z/ts/work",
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "api": "openai-completions",
+   "provider": "prime-inference",
+   "baseUrl": "http://127.0.0.1:35655/v1",
+   "reasoning": false,
+   "input": [
+    "text"
+   ],
+   "cost": {
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0
+   },
+   "contextWindow": 128000,
+   "maxTokens": 4096
+  },
+  "thinkingLevel": "off",
+  "isStreaming": false,
+  "isCompacting": false,
+  "isBashRunning": false,
+  "hasRunningRlmChildren": false,
+  "isRunningTools": false,
+  "attachedClients": 0,
+  "messageCount": 0,
+  "unfinishedActionCount": 0,
+  "created": "2026-09-20T08:44:55.694Z",
+  "modified": "2026-09-20T08:44:55.753Z",
+  "sessionActions": {
+   "queuedCount": 0,
+   "steering": [],
+   "followUps": []
+  },
+  "rosterStatus": "idle",
+  "workerState": "ready",
+  "workerPid": 890576
+ }
+}

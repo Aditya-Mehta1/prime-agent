@@ -1,0 +1,37 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "50b7bdb5857d",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-16T22:19:14.009Z",
+  "cwd": "/home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221725Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "50b7bdb5857d",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-16T22:19:14.008Z",
+  "lifecycle": "resident",
+  "messageCount": 0,
+  "modified": "2026-09-16T22:19:14.008Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221725Z/rust/agent/sessions/01a0ac4d-7ad9-70e5-9bde-e5f4cc9314b6.jsonl",
+  "sessionId": "01a0ac4d-7ad9-70e5-9bde-e5f4cc9314b6",
+  "sessionName": "battery-compact",
+  "thinkingLevel": "default",
+  "unfinishedActionCount": 0,
+  "workerPid": 1885502,
+  "workerState": "ready"
+ },
+ "id": "c1",
+ "success": true,
+ "type": "response"
+}

@@ -1,0 +1,863 @@
+[
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "agent_start"
+  },
+  "meta": {
+   "id": "4544a91a4d5f:15",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 15,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 15
+   },
+   "emittedAt": "2026-09-20T20:29:57.710Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "turn_start"
+  },
+  "meta": {
+   "id": "4544a91a4d5f:16",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 16,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 16
+   },
+   "emittedAt": "2026-09-20T20:29:57.714Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_start",
+   "message": {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "overflow probe xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+     }
+    ],
+    "timestamp": 1789936197616
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:17",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 17,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 17
+   },
+   "emittedAt": "2026-09-20T20:29:57.715Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_end",
+   "message": {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "overflow probe xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+     }
+    ],
+    "timestamp": 1789936197616
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:18",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 18,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 18
+   },
+   "emittedAt": "2026-09-20T20:29:57.716Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_start",
+   "message": {
+    "role": "assistant",
+    "content": [],
+    "api": "openai-completions",
+    "provider": "prime-inference",
+    "model": "mock-1",
+    "usage": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "totalTokens": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "error",
+    "timestamp": 1789936197717,
+    "errorMessage": "400 prompt is too long: 213462 tokens > 200000 maximum",
+    "diagnostics": [
+     {
+      "type": "provider_stream_failure",
+      "timestamp": 1789936197721,
+      "error": {
+       "name": "Error",
+       "message": "400 prompt is too long: 213462 tokens > 200000 maximum",
+       "stack": "Error: 400 prompt is too long: 213462 tokens > 200000 maximum\n    at generate (/$bunfs/root/prime-agent:61:15767)\n    at makeRequest (/$bunfs/root/prime-agent:91:6207)\n    at processTicksAndRejections (native:7:39)"
+      },
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      }
+     }
+    ]
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:19",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 19,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 19
+   },
+   "emittedAt": "2026-09-20T20:29:57.722Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_end",
+   "message": {
+    "role": "assistant",
+    "content": [],
+    "api": "openai-completions",
+    "provider": "prime-inference",
+    "model": "mock-1",
+    "usage": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "totalTokens": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "error",
+    "timestamp": 1789936197717,
+    "errorMessage": "400 prompt is too long: 213462 tokens > 200000 maximum",
+    "diagnostics": [
+     {
+      "type": "provider_stream_failure",
+      "timestamp": 1789936197721,
+      "error": {
+       "name": "Error",
+       "message": "400 prompt is too long: 213462 tokens > 200000 maximum",
+       "stack": "Error: 400 prompt is too long: 213462 tokens > 200000 maximum\n    at generate (/$bunfs/root/prime-agent:61:15767)\n    at makeRequest (/$bunfs/root/prime-agent:91:6207)\n    at processTicksAndRejections (native:7:39)"
+      },
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      }
+     }
+    ]
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:20",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 20,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 20
+   },
+   "emittedAt": "2026-09-20T20:29:57.724Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "turn_end",
+   "message": {
+    "role": "assistant",
+    "content": [],
+    "api": "openai-completions",
+    "provider": "prime-inference",
+    "model": "mock-1",
+    "usage": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "totalTokens": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "error",
+    "timestamp": 1789936197717,
+    "errorMessage": "400 prompt is too long: 213462 tokens > 200000 maximum",
+    "diagnostics": [
+     {
+      "type": "provider_stream_failure",
+      "timestamp": 1789936197721,
+      "error": {
+       "name": "Error",
+       "message": "400 prompt is too long: 213462 tokens > 200000 maximum",
+       "stack": "Error: 400 prompt is too long: 213462 tokens > 200000 maximum\n    at generate (/$bunfs/root/prime-agent:61:15767)\n    at makeRequest (/$bunfs/root/prime-agent:91:6207)\n    at processTicksAndRejections (native:7:39)"
+      },
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      }
+     }
+    ]
+   },
+   "toolResults": []
+  },
+  "meta": {
+   "id": "4544a91a4d5f:21",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 21,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 21
+   },
+   "emittedAt": "2026-09-20T20:29:57.725Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "agent_end",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "overflow probe xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "timestamp": 1789936197616
+    },
+    {
+     "role": "assistant",
+     "content": [],
+     "api": "openai-completions",
+     "provider": "prime-inference",
+     "model": "mock-1",
+     "usage": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "totalTokens": 0,
+      "cost": {
+       "input": 0,
+       "output": 0,
+       "cacheRead": 0,
+       "cacheWrite": 0,
+       "total": 0
+      }
+     },
+     "stopReason": "error",
+     "timestamp": 1789936197717,
+     "errorMessage": "400 prompt is too long: 213462 tokens > 200000 maximum",
+     "diagnostics": [
+      {
+       "type": "provider_stream_failure",
+       "timestamp": 1789936197721,
+       "error": {
+        "name": "Error",
+        "message": "400 prompt is too long: 213462 tokens > 200000 maximum",
+        "stack": "Error: 400 prompt is too long: 213462 tokens > 200000 maximum\n    at generate (/$bunfs/root/prime-agent:61:15767)\n    at makeRequest (/$bunfs/root/prime-agent:91:6207)\n    at processTicksAndRejections (native:7:39)"
+       },
+       "details": {
+        "kind": "invalid_request",
+        "status": 400
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "meta": {
+   "id": "4544a91a4d5f:22",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 22,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 22
+   },
+   "emittedAt": "2026-09-20T20:29:57.787Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "compaction_start",
+   "reason": "overflow"
+  },
+  "meta": {
+   "id": "4544a91a4d5f:23",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 23,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 23
+   },
+   "emittedAt": "2026-09-20T20:29:57.789Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_start",
+   "message": {
+    "role": "custom",
+    "customType": "ipython_state",
+    "content": "[python-state]\n\nYour Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available. These names are still defined: agent_message, agent_observe, attach_image, compact, edit, goal, refine, rlm_heartbeat, websearch.",
+    "display": false,
+    "timestamp": 1789936197799
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:24",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 24,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 24
+   },
+   "emittedAt": "2026-09-20T20:29:57.800Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_end",
+   "message": {
+    "role": "custom",
+    "customType": "ipython_state",
+    "content": "[python-state]\n\nYour Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available. These names are still defined: agent_message, agent_observe, attach_image, compact, edit, goal, refine, rlm_heartbeat, websearch.",
+    "display": false,
+    "timestamp": 1789936197799
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:25",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 25,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 25
+   },
+   "emittedAt": "2026-09-20T20:29:57.801Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "compaction_end",
+   "reason": "overflow",
+   "result": {
+    "summary": "the overflow summary",
+    "firstKeptEntryId": "3c2aeecc",
+    "tokensBefore": 214,
+    "details": {
+     "readFiles": [],
+     "modifiedFiles": []
+    }
+   },
+   "aborted": false,
+   "willRetry": true
+  },
+  "meta": {
+   "id": "4544a91a4d5f:26",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 26,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 26
+   },
+   "emittedAt": "2026-09-20T20:29:57.803Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "agent_start"
+  },
+  "meta": {
+   "id": "4544a91a4d5f:27",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 27,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 27
+   },
+   "emittedAt": "2026-09-20T20:29:57.864Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "turn_start"
+  },
+  "meta": {
+   "id": "4544a91a4d5f:28",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 28,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 28
+   },
+   "emittedAt": "2026-09-20T20:29:57.865Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_start",
+   "message": {
+    "role": "assistant",
+    "content": [],
+    "api": "openai-completions",
+    "provider": "prime-inference",
+    "model": "mock-1",
+    "usage": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "totalTokens": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "error",
+    "timestamp": 1789936197866,
+    "errorMessage": "400 prompt is too long: 213462 tokens > 200000 maximum",
+    "diagnostics": [
+     {
+      "type": "provider_stream_failure",
+      "timestamp": 1789936197869,
+      "error": {
+       "name": "Error",
+       "message": "400 prompt is too long: 213462 tokens > 200000 maximum",
+       "stack": "Error: 400 prompt is too long: 213462 tokens > 200000 maximum\n    at generate (/$bunfs/root/prime-agent:61:15767)\n    at makeRequest (/$bunfs/root/prime-agent:91:6207)\n    at processTicksAndRejections (native:7:39)"
+      },
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      }
+     }
+    ]
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:29",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 29,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 29
+   },
+   "emittedAt": "2026-09-20T20:29:57.871Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_end",
+   "message": {
+    "role": "assistant",
+    "content": [],
+    "api": "openai-completions",
+    "provider": "prime-inference",
+    "model": "mock-1",
+    "usage": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "totalTokens": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "error",
+    "timestamp": 1789936197866,
+    "errorMessage": "400 prompt is too long: 213462 tokens > 200000 maximum",
+    "diagnostics": [
+     {
+      "type": "provider_stream_failure",
+      "timestamp": 1789936197869,
+      "error": {
+       "name": "Error",
+       "message": "400 prompt is too long: 213462 tokens > 200000 maximum",
+       "stack": "Error: 400 prompt is too long: 213462 tokens > 200000 maximum\n    at generate (/$bunfs/root/prime-agent:61:15767)\n    at makeRequest (/$bunfs/root/prime-agent:91:6207)\n    at processTicksAndRejections (native:7:39)"
+      },
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      }
+     }
+    ]
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:30",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 30,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 30
+   },
+   "emittedAt": "2026-09-20T20:29:57.873Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "turn_end",
+   "message": {
+    "role": "assistant",
+    "content": [],
+    "api": "openai-completions",
+    "provider": "prime-inference",
+    "model": "mock-1",
+    "usage": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "totalTokens": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "error",
+    "timestamp": 1789936197866,
+    "errorMessage": "400 prompt is too long: 213462 tokens > 200000 maximum",
+    "diagnostics": [
+     {
+      "type": "provider_stream_failure",
+      "timestamp": 1789936197869,
+      "error": {
+       "name": "Error",
+       "message": "400 prompt is too long: 213462 tokens > 200000 maximum",
+       "stack": "Error: 400 prompt is too long: 213462 tokens > 200000 maximum\n    at generate (/$bunfs/root/prime-agent:61:15767)\n    at makeRequest (/$bunfs/root/prime-agent:91:6207)\n    at processTicksAndRejections (native:7:39)"
+      },
+      "details": {
+       "kind": "invalid_request",
+       "status": 400
+      }
+     }
+    ]
+   },
+   "toolResults": []
+  },
+  "meta": {
+   "id": "4544a91a4d5f:31",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 31,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 31
+   },
+   "emittedAt": "2026-09-20T20:29:57.874Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "agent_end",
+   "messages": [
+    {
+     "role": "assistant",
+     "content": [],
+     "api": "openai-completions",
+     "provider": "prime-inference",
+     "model": "mock-1",
+     "usage": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "totalTokens": 0,
+      "cost": {
+       "input": 0,
+       "output": 0,
+       "cacheRead": 0,
+       "cacheWrite": 0,
+       "total": 0
+      }
+     },
+     "stopReason": "error",
+     "timestamp": 1789936197866,
+     "errorMessage": "400 prompt is too long: 213462 tokens > 200000 maximum",
+     "diagnostics": [
+      {
+       "type": "provider_stream_failure",
+       "timestamp": 1789936197869,
+       "error": {
+        "name": "Error",
+        "message": "400 prompt is too long: 213462 tokens > 200000 maximum",
+        "stack": "Error: 400 prompt is too long: 213462 tokens > 200000 maximum\n    at generate (/$bunfs/root/prime-agent:61:15767)\n    at makeRequest (/$bunfs/root/prime-agent:91:6207)\n    at processTicksAndRejections (native:7:39)"
+       },
+       "details": {
+        "kind": "invalid_request",
+        "status": 400
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "meta": {
+   "id": "4544a91a4d5f:32",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 32,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 32
+   },
+   "emittedAt": "2026-09-20T20:29:57.949Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_start",
+   "message": {
+    "role": "custom",
+    "customType": "compaction_outcome",
+    "content": "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+    "display": true,
+    "details": {
+     "reason": "overflow",
+     "outcome": "failed"
+    },
+    "timestamp": 1789936197950
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:33",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 33,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 33
+   },
+   "emittedAt": "2026-09-20T20:29:57.951Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "message_end",
+   "message": {
+    "role": "custom",
+    "customType": "compaction_outcome",
+    "content": "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+    "display": true,
+    "details": {
+     "reason": "overflow",
+     "outcome": "failed"
+    },
+    "timestamp": 1789936197950
+   }
+  },
+  "meta": {
+   "id": "4544a91a4d5f:34",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 34,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 34
+   },
+   "emittedAt": "2026-09-20T20:29:57.953Z"
+  }
+ },
+ {
+  "type": "session_event",
+  "activeSessionId": "4544a91a4d5f",
+  "event": {
+   "type": "compaction_end",
+   "reason": "overflow",
+   "aborted": false,
+   "willRetry": false,
+   "errorMessage": "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
+  },
+  "meta": {
+   "id": "4544a91a4d5f:35",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 35,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 35
+   },
+   "emittedAt": "2026-09-20T20:29:57.954Z"
+  }
+ },
+ {
+  "type": "session_status",
+  "activeSessionId": "4544a91a4d5f",
+  "recap": "Model request failed: 400 prompt is too long: 213462 tokens > 200000 maximum",
+  "meta": {
+   "id": "4544a91a4d5f:36",
+   "protocol": {
+    "name": "prime-agent.daemon",
+    "version": 7
+   },
+   "activeSessionId": "4544a91a4d5f",
+   "sequence": 36,
+   "cursor": {
+    "generation": "0f9b5a93242e",
+    "sequence": 36
+   },
+   "emittedAt": "2026-09-20T20:29:59.953Z"
+  }
+ }
+]

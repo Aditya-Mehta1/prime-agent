@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "workerId": "e6f66d4b8996",
+  "pid": 1135026,
+  "processStartId": "proc:9177631",
+  "socketPath": "/tmp/compaction-abort-ts-1134973/prime-agent-1000/worker-7648f18322ed-e6f66d4b8996.sock",
+  "recoveryJournalPath": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/agent/daemon-workers/7648f18322ed/e6f66d4b8996.recovery.jsonl",
+  "orphanProcessJournalPath": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/agent/daemon-workers/7648f18322ed/e6f66d4b8996.orphans.jsonl",
+  "supervisorSocketPath": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/daemon.sock",
+  "authenticationToken": "TFqC2-qZMh7Uqf9DnaJGnV1RnuaksMyBh5QhDqrwhLQ",
+  "workerInstanceId": "34ef54de-b51d-4169-85d5-6a16a323af2b",
+  "rootActiveSessionId": "4a03be7b0557",
+  "rootSessionId": "01a0bef7-a381-7219-939c-dceac8021077",
+  "sessionFile": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/agent/sessions/01a0bef7-a381-7219-939c-dceac8021077.jsonl",
+  "sessionDir": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/agent/sessions",
+  "createdAt": "2026-09-20T13:18:15.127Z",
+  "updatedAt": "2026-09-20T13:20:05.407Z",
+  "lifecycle": "recovering",
+  "createCommand": {
+    "type": "create",
+    "sessionPath": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/agent/sessions/01a0bef7-a381-7219-939c-dceac8021077.jsonl"
+  },
+  "consecutiveFailures": 2,
+  "lastFailureAt": "2026-09-20T13:20:05.407Z"
+}

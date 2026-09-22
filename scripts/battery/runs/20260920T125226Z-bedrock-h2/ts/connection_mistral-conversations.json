@@ -1,0 +1,21 @@
+{
+ "scenario": "connection_mistral-conversations",
+ "api": "mistral-conversations",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?\n",
+  "duration_s": 2.28,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-5d13-761a-8807-dad61f1ec1ad.jsonl",
+ "errorMessage": "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "UnexpectedClientError",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": "UnexpectedClientError",
+  "retryAfterMs": null
+ }
+}

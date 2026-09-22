@@ -1,0 +1,3 @@
+[2026-09-17T04:34:29.365Z] supervisor: Prime Agent daemon supervisor b008a358-0006-4736-b4ab-78d85718bdf5 listening on /home/ubuntu/lane-worktrees/trial-send/scripts/battery/runs/20260917T043428Z/ts/daemon.sock
+[2026-09-17T04:34:29.561Z] supervisor: Session worker aaa43589574f stderr: Prime Agent daemon listening on /tmp/vbat20260917T043428Z-ts/prime-agent-1000/worker-bdea18b643d9-aaa43589574f.sock
+[2026-09-17T04:35:12.317Z] supervisor: Session worker aaa43589574f stderr: shutting down (exit 0); closing 0 active session(s)

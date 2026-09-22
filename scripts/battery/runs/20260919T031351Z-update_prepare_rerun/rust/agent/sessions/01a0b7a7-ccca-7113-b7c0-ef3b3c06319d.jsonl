@@ -1,0 +1,5 @@
+{"cwd":"/tmp/upw-s5/rust/work","id":"01a0b7a7-ccca-7113-b7c0-ef3b3c06319d","rlmDepth":0,"timestamp":"2026-09-19T03:13:42.602Z","type":"session","version":3}
+{"type":"model_change","id":"da154c1c","parentId":null,"timestamp":"2026-09-19T03:13:42.628Z","modelId":"z-ai/glm-5.3","provider":"prime-inference"}
+{"type":"thinking_level_change","id":"49663ca0","parentId":"da154c1c","timestamp":"2026-09-19T03:13:42.628Z","thinkingLevel":"high"}
+{"type":"service_tier_change","id":"11b566d3","parentId":"49663ca0","timestamp":"2026-09-19T03:13:42.628Z","serviceTier":"default"}
+{"type":"session_state","id":"da5feedd","parentId":"11b566d3","timestamp":"2026-09-19T03:13:42.628Z","state":{"status":"active"}}

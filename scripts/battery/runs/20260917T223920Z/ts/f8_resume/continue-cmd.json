@@ -1,0 +1,20 @@
+{
+ "argv": [
+  "prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T223920Z/ts/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "-c",
+  "Continue this session"
+ ],
+ "exit_code": 1,
+ "stdout": "",
+ "stderr": "Error: Session is already active in 2fac1120afcb: /home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T223920Z/ts/agent/sessions/01a0b189-0556-73eb-85e0-df24ad605e2a.jsonl\n",
+ "duration_s": 2.95,
+ "timeout": false
+}

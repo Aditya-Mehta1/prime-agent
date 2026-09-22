@@ -1,0 +1,3 @@
+
+{"version":1,"type":"received","key":"[\"12ad70c18730\",\"sd\"]","clientId":"12ad70c18730","commandId":"sd","commandType":"shutdown","recordedAt":"2026-09-19T00:17:33.798Z"}
+{"version":1,"type":"result","key":"[\"12ad70c18730\",\"sd\"]","response":{"id":"sd","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-19T00:17:33.800Z"}

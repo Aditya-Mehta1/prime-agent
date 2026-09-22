@@ -1,0 +1,11 @@
+Prime Agent daemon supervisor 3fa86f0a-90ce-4420-9c15-13f01b992b83 listening on /home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T202945Z/ts/daemon.sock
+Session worker 49046a6cbb8f stderr: Prime Agent daemon listening on /tmp/vbat20260920T202945Z-ts/prime-agent-1000/worker-9db4c9d2d723-49046a6cbb8f.sock
+Session worker cae7360d45d7 stderr: Prime Agent daemon listening on /tmp/vbat20260920T202945Z-ts/prime-agent-1000/worker-9db4c9d2d723-cae7360d45d7.sock
+Session worker 7b47b70b8707 stderr: Prime Agent daemon listening on /tmp/vbat20260920T202945Z-ts/prime-agent-1000/worker-9db4c9d2d723-7b47b70b8707.sock
+Session worker ac410870d45b stderr: Prime Agent daemon listening on /tmp/vbat20260920T202945Z-ts/prime-agent-1000/worker-9db4c9d2d723-ac410870d45b.sock
+Session worker 32815e57eae3 stderr: Prime Agent daemon listening on /tmp/vbat20260920T202945Z-ts/prime-agent-1000/worker-9db4c9d2d723-32815e57eae3.sock
+Session worker ac410870d45b stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 7b47b70b8707 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker cae7360d45d7 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 49046a6cbb8f stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 32815e57eae3 stderr: shutting down (exit 0); closing 0 active session(s)

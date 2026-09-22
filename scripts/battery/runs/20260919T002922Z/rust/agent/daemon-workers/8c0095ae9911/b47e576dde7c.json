@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "workerId": "b47e576dde7c",
+  "pid": 136340,
+  "socketPath": "/tmp/vbat20260919T002922Z-rust/prime-agent-1000/worker-8c0095ae9911-b47e576dde7c.sock",
+  "recoveryJournalPath": "/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/agent/daemon-workers/8c0095ae9911/b47e576dde7c.recovery.jsonl",
+  "supervisorSocketPath": "/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/daemon.sock",
+  "authenticationToken": "87edce5f-ed40-4268-8bf4-05142d784c3d",
+  "workerInstanceId": "b7f5ca53-6050-4a7f-922b-88b007b0509d",
+  "rootActiveSessionId": "b47e576dde7c",
+  "ownerClientId": "daemon-tui:136329",
+  "rootSessionId": "01a0b711-8d95-76e8-a5ef-fa3bfbee25a1",
+  "sessionFile": "/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/agent/sessions/01a0b711-8d95-76e8-a5ef-fa3bfbee25a1.jsonl",
+  "sessionDir": "/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/agent/sessions",
+  "telemetryDisabled": true,
+  "createdAt": "2026-09-19T00:29:35.956Z",
+  "updatedAt": "2026-09-19T00:29:36.049Z",
+  "lifecycle": "ready",
+  "createCommand": {
+    "sessionPath": "/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/agent/sessions/01a0b711-8d95-76e8-a5ef-fa3bfbee25a1.jsonl",
+    "cwd": "/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/work",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "sessionDir": "/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/agent/sessions"
+  },
+  "consecutiveFailures": 0
+}

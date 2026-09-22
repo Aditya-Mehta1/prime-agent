@@ -1,0 +1,27 @@
+{
+ "cold": {
+  "ensure_kernel_python_ms": 10772,
+  "note": "one-time: uv venv + prime-agent-runtime + skills install",
+  "bootstrap_execute_ms": 216,
+  "kernel_boot_and_bootstrap_ms": 464,
+  "execute_rounds": 50,
+  "execute_total_ms": 30,
+  "per_execute_ms_warm": 0.6
+ },
+ "warm": {
+  "ensure_kernel_python_ms": 100,
+  "bootstrap_execute_ms": 49,
+  "kernel_boot_and_bootstrap_ms": 195,
+  "execute_rounds": 50,
+  "execute_total_ms": 26,
+  "per_execute_ms_warm": 0.52
+ },
+ "snapshot_restore": {
+  "snapshot_ms": 107,
+  "snapshot_bytes": 5250076,
+  "restore_ms": 17,
+  "restore_idempotent_ms": 7,
+  "namespace": "~5 MiB blob + kernel skill modules"
+ },
+ "env": "same sandbox + build as the recorded wave (main @ 57ddb2fe); fresh HOME /tmp/kb-home; PI_PACKAGE_DIR=repo (ships prime-agent-runtime); skills/ from the checkout"
+}

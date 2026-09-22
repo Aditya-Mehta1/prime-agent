@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "98d017fd7c3f",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-20T22:15:33.531Z",
+  "cwd": "/repo/scripts/battery/runs/20260920T221429Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "98d017fd7c3f",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-20T22:15:33.539Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-20T22:15:33.539Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/repo/scripts/battery/runs/20260920T221429Z/rust/agent/sessions/01a0c0e3-8d9b-71ff-b78c-b64fef59b88a.jsonl",
+  "sessionId": "01a0c0e3-8d9b-71ff-b78c-b64fef59b88a",
+  "sessionName": "battery-ipython-prewarm",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 51767,
+  "workerState": "ready"
+ },
+ "id": "batt-c1",
+ "success": true,
+ "type": "response"
+}

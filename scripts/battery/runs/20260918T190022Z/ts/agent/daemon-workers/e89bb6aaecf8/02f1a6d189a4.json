@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "workerId": "02f1a6d189a4",
+  "pid": 709070,
+  "processStartId": "proc:3803237",
+  "socketPath": "/tmp/vbat20260918T190022Z-ts/prime-agent-1000/worker-e89bb6aaecf8-02f1a6d189a4.sock",
+  "recoveryJournalPath": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/agent/daemon-workers/e89bb6aaecf8/02f1a6d189a4.recovery.jsonl",
+  "orphanProcessJournalPath": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/agent/daemon-workers/e89bb6aaecf8/02f1a6d189a4.orphans.jsonl",
+  "supervisorSocketPath": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/daemon.sock",
+  "authenticationToken": "TkiiCb4V5wRIgANnWJRTGk--pNP5Qc0FGMnkZWPG2AE",
+  "workerInstanceId": "6d4d7410-b2ee-4a98-9147-bd19abb75866",
+  "rootActiveSessionId": "785594aac222",
+  "rootSessionId": "01a0b5e8-b137-72c0-ad6c-1f41f8315167",
+  "sessionFile": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/agent/sessions/01a0b5e8-b137-72c0-ad6c-1f41f8315167.jsonl",
+  "sessionDir": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/agent/sessions",
+  "createdAt": "2026-09-18T19:05:15.283Z",
+  "updatedAt": "2026-09-18T19:10:07.285Z",
+  "lifecycle": "failed",
+  "createCommand": {
+    "type": "create",
+    "sessionPath": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/agent/sessions/01a0b5e8-b137-72c0-ad6c-1f41f8315167.jsonl"
+  },
+  "consecutiveFailures": 0,
+  "lastError": "Waiting for a client with fresh runtime context"
+}

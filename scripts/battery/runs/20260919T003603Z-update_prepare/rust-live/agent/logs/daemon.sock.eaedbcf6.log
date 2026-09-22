@@ -1,0 +1,5 @@
+supervisor started pid 139520
+[2026-09-19T00:35:59.361Z] session worker 4f985c12f207 registered (epoch 1, pid 139525)
+[2026-09-19T00:35:59.432Z] session worker 4f985c12f207 re-registered (epoch 2, pid 139525)
+[2026-09-19T00:35:59.442Z] session worker 4f985c12f207 stopped intentionally (status Ok(ExitStatus(unix_wait_status(0))))
+[2026-09-19T00:35:59.689Z] update upd-live: all 1 worker(s) stopped; exiting for the update

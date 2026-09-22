@@ -1,0 +1,123 @@
+{
+ "command": "attach",
+ "data": {
+  "activeSessionId": "093c6b25fb53",
+  "client": {
+   "capabilities": [
+    "attach_snapshot",
+    "event_sequence"
+   ],
+   "id": "ce8178292747"
+  },
+  "lastEventCursor": {
+   "generation": "cab1792655a7",
+   "sequence": 0
+  },
+  "lastEventSequence": 0,
+  "protocol": {
+   "name": "prime-agent.daemon",
+   "version": 7
+  },
+  "replay": {
+   "status": "complete",
+   "toCursor": {
+    "generation": "cab1792655a7",
+    "sequence": 0
+   },
+   "toSequence": 0
+  },
+  "snapshot": {
+   "activeSessionId": "093c6b25fb53",
+   "children": [],
+   "lastEventCursor": {
+    "generation": "cab1792655a7",
+    "sequence": 0
+   },
+   "lastEventSequence": 0,
+   "messages": [],
+   "state": {
+    "activeSessionId": "093c6b25fb53",
+    "activeToolNames": [],
+    "autoCompactionEnabled": true,
+    "availableThinkingLevels": [
+     "off"
+    ],
+    "compactionCount": 0,
+    "cwd": "/home/ubuntu/lane-worktrees/turn-end-frame/scripts/battery/runs/20260921T080016Z/rust/work",
+    "followUpMode": "one-at-a-time",
+    "goal": {
+     "active": false,
+     "continuationsUsed": 0,
+     "status": "idle",
+     "timeUsedSeconds": 0,
+     "tokensUsed": 0
+    },
+    "isBashRunning": false,
+    "isCompacting": false,
+    "isStreaming": false,
+    "leafId": "4ad12f58",
+    "messageCount": 0,
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "provider": "prime-inference",
+     "reasoning": false
+    },
+    "retryAttempt": 0,
+    "scopedModels": [],
+    "serviceTier": "default",
+    "sessionActions": {
+     "followUps": [],
+     "queuedCount": 0,
+     "steering": []
+    },
+    "sessionDir": "/home/ubuntu/lane-worktrees/turn-end-frame/scripts/battery/runs/20260921T080016Z/rust/agent/sessions",
+    "sessionFile": "/home/ubuntu/lane-worktrees/turn-end-frame/scripts/battery/runs/20260921T080016Z/rust/agent/sessions/01a0c2fb-0c9e-747e-8ad6-06eb23273435.jsonl",
+    "sessionId": "01a0c2fb-0c9e-747e-8ad6-06eb23273435",
+    "sessionName": "battery-side-questions",
+    "steeringMode": "one-at-a-time",
+    "thinkingLevel": "off"
+   },
+   "summary": {
+    "activeSessionId": "093c6b25fb53",
+    "activity": "idle",
+    "attachedClients": 1,
+    "created": "2026-09-21T08:00:27.806Z",
+    "cwd": "/home/ubuntu/lane-worktrees/turn-end-frame/scripts/battery/runs/20260921T080016Z/rust/work",
+    "hasRegisteredCronJob": false,
+    "id": "093c6b25fb53",
+    "isBashRunning": false,
+    "isCompacting": false,
+    "isSessionActive": false,
+    "isStreaming": false,
+    "lastActivityAt": "2026-09-21T08:00:27.816Z",
+    "lifecycle": "draft",
+    "messageCount": 0,
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "provider": "prime-inference",
+     "reasoning": false
+    },
+    "modified": "2026-09-21T08:00:27.816Z",
+    "rlmDepth": 0,
+    "runtimeKind": "top-level",
+    "sessionActions": {
+     "followUps": [],
+     "queuedCount": 0,
+     "steering": []
+    },
+    "sessionFile": "/home/ubuntu/lane-worktrees/turn-end-frame/scripts/battery/runs/20260921T080016Z/rust/agent/sessions/01a0c2fb-0c9e-747e-8ad6-06eb23273435.jsonl",
+    "sessionId": "01a0c2fb-0c9e-747e-8ad6-06eb23273435",
+    "sessionName": "battery-side-questions",
+    "thinkingLevel": "off",
+    "unfinishedActionCount": 0,
+    "workerPid": 1837497,
+    "workerState": "ready"
+   }
+  }
+ },
+ "id": "a0",
+ "success": true,
+ "type": "response"
+}

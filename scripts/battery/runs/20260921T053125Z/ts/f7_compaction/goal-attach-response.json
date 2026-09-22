@@ -1,0 +1,164 @@
+{
+ "id": "ga1",
+ "type": "response",
+ "command": "attach",
+ "success": true,
+ "data": {
+  "protocol": {
+   "name": "prime-agent.daemon",
+   "version": 7
+  },
+  "activeSessionId": "da8a0c252b46",
+  "snapshot": {
+   "activeSessionId": "da8a0c252b46",
+   "summary": {
+    "id": "da8a0c252b46",
+    "lifecycle": "draft",
+    "activity": "idle",
+    "isSessionActive": false,
+    "lastActivityAt": "2026-09-21T05:31:47.996Z",
+    "runtimeKind": "top-level",
+    "rlmDepth": 0,
+    "activeSessionId": "da8a0c252b46",
+    "sessionId": "01a0c272-f16d-7083-a4e3-18e0e26f13d7",
+    "sessionFile": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/ts/agent/sessions/01a0c272-f16d-7083-a4e3-18e0e26f13d7.jsonl",
+    "sessionName": "battery-goal-continue",
+    "cwd": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/ts/work",
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "api": "openai-completions",
+     "provider": "prime-inference",
+     "baseUrl": "http://127.0.0.1:39499/v1",
+     "reasoning": false,
+     "input": [
+      "text"
+     ],
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+     },
+     "contextWindow": 128000,
+     "maxTokens": 4096
+    },
+    "thinkingLevel": "off",
+    "isStreaming": false,
+    "isCompacting": false,
+    "isBashRunning": false,
+    "hasRunningRlmChildren": false,
+    "isRunningTools": false,
+    "attachedClients": 1,
+    "messageCount": 0,
+    "unfinishedActionCount": 0,
+    "sessionActions": {
+     "queuedCount": 0,
+     "steering": [],
+     "followUps": []
+    },
+    "created": "2026-09-21T05:31:47.949Z",
+    "modified": "2026-09-21T05:31:47.996Z",
+    "diagnostics": [
+     {
+      "type": "info",
+      "message": "Prime Agent sends pseudonymous usage and performance metrics without prompts, responses, tool content, file paths, or repository data. Disable this with telemetry.enabled=false, PRIME_AGENT_TELEMETRY=0, DO_NOT_TRACK=1, or offline mode."
+     }
+    ],
+    "workerState": "ready",
+    "workerPid": 1733671
+   },
+   "state": {
+    "activeSessionId": "da8a0c252b46",
+    "cwd": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/ts/work",
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "api": "openai-completions",
+     "provider": "prime-inference",
+     "baseUrl": "http://127.0.0.1:39499/v1",
+     "reasoning": false,
+     "input": [
+      "text"
+     ],
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+     },
+     "contextWindow": 128000,
+     "maxTokens": 4096
+    },
+    "thinkingLevel": "off",
+    "serviceTier": "default",
+    "availableThinkingLevels": [
+     "off"
+    ],
+    "isStreaming": false,
+    "isCompacting": false,
+    "isBashRunning": false,
+    "retryAttempt": 0,
+    "steeringMode": "one-at-a-time",
+    "followUpMode": "one-at-a-time",
+    "sessionFile": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/ts/agent/sessions/01a0c272-f16d-7083-a4e3-18e0e26f13d7.jsonl",
+    "sessionId": "01a0c272-f16d-7083-a4e3-18e0e26f13d7",
+    "sessionName": "battery-goal-continue",
+    "sessionDir": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/ts/agent/sessions",
+    "leafId": "77e68119",
+    "autoCompactionEnabled": true,
+    "messageCount": 0,
+    "sessionActions": {
+     "queuedCount": 0,
+     "steering": [],
+     "followUps": []
+    },
+    "compactionCount": 0,
+    "goal": {
+     "active": false,
+     "status": "idle",
+     "tokensUsed": 0,
+     "timeUsedSeconds": 0,
+     "continuationsUsed": 0
+    },
+    "scopedModels": [],
+    "activeToolNames": [
+     "ipython"
+    ],
+    "contextUsage": {
+     "tokens": 0,
+     "contextWindow": 128000,
+     "percent": 0
+    },
+    "heartbeat": null
+   },
+   "messages": [],
+   "lastEventSequence": 0,
+   "lastEventCursor": {
+    "generation": "87f626628412",
+    "sequence": 0
+   },
+   "children": []
+  },
+  "replay": {
+   "status": "complete",
+   "toSequence": 0,
+   "toCursor": {
+    "generation": "87f626628412",
+    "sequence": 0
+   }
+  },
+  "lastEventSequence": 0,
+  "lastEventCursor": {
+   "generation": "87f626628412",
+   "sequence": 0
+  },
+  "client": {
+   "id": "b464006a33e3",
+   "capabilities": [
+    "attach_snapshot",
+    "event_sequence"
+   ]
+  }
+ }
+}

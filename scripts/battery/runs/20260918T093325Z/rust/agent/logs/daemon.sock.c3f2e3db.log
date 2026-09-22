@@ -1,0 +1,11 @@
+supervisor started pid 92515
+[2026-09-18T09:33:42.282Z] session worker b003cdf90757 registered (epoch 1, pid 92538)
+[2026-09-18T09:33:42.332Z] session worker b003cdf90757 re-registered (epoch 2, pid 92538)
+[2026-09-18T09:33:58.923Z] session worker 810be2ed4e82 registered (epoch 1, pid 93003)
+[2026-09-18T09:33:58.994Z] session worker 810be2ed4e82 re-registered (epoch 2, pid 93003)
+[2026-09-18T09:34:00.292Z] session worker 73b6dd47d9ab registered (epoch 1, pid 93047)
+[2026-09-18T09:34:00.375Z] session worker 73b6dd47d9ab re-registered (epoch 2, pid 93047)
+[2026-09-18T09:34:01.158Z] session worker 73b6dd47d9ab exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-18T09:34:01.442Z] session worker 73b6dd47d9ab re-registered (epoch 3, pid 93076)
+[2026-09-18T09:34:02.491Z] session worker 73b6dd47d9ab re-registered (epoch 4, pid 93076)
+[2026-09-18T09:34:04.147Z] session worker b003cdf90757 stopped intentionally (status Ok(ExitStatus(unix_wait_status(0))))

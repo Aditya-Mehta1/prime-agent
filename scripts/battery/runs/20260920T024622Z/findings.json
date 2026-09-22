@@ -1,0 +1,282 @@
+[
+ {
+  "flow": "f11_provider_failure",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: provider failure surfaces (retry banner + 4 error row(s))",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f11_provider_failure",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: provider failure surfaces (retry banner + 4 error row(s))",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f11_provider_failure",
+  "category": "visual",
+  "gap": false,
+  "summary": "provider-failure rendering parity: 4 error row(s) on both sides",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: /compact shows the durable '\u25c6 Context compacted' summary row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the Ctrl+O detail cycle expands the compaction summary block",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the third Ctrl+O re-collapses the compaction summary block",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: crossing the compaction threshold auto-compacts and shows the summary row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: /compact shows the durable '\u25c6 Context compacted' summary row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the Ctrl+O detail cycle expands the compaction summary block",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the third Ctrl+O re-collapses the compaction summary block",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "behavior",
+  "gap": true,
+  "summary": "rust: threshold crossing produced no visible auto-compaction outcome",
+  "evidence": "rust/f14_compact/05-auto-after.txt",
+  "expectedFail": "compact-fb-2"
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "manual-compact: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": false,
+  "summary": "manual-expanded: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f14_compact",
+  "category": "visual",
+  "gap": true,
+  "summary": "auto-compact: frames differ TS vs Rust (see frame-diff-auto-compact.txt)",
+  "evidence": "ts/f14_compact/frame-diff-auto-compact.txt",
+  "expectedFail": "compact-fb-2"
+ },
+ {
+  "flow": "f22_provider_failover",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: the TS product has no provider failover \u2014 the same flow exhausts its quick retries and surfaces the failure (the resilience feature is Rust-side only; intentional divergence)",
+  "evidence": "ts/f22_provider_failover/02-provider-failure.txt",
+  "expectedFail": null
+ },
+ {
+  "flow": "f22_provider_failover",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: provider failure re-routed to prime-backup/mock-1, the backup answered, and the primary was restored (switch surface rendered: False)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f22_provider_failover",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the provider-switch loader row was not captured (it is transient; the switch itself settled: primary restored: True, backup answered: True)",
+  "evidence": "rust/f22_provider_failover/02-provider-failure.txt",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the prompt-context hint renders the user override (X), not the default",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the override key cycled the conversation detail",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the removed default key no longer cycles the detail",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: /hotkeys documents the effective override (X row)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the ? quick-shortcut guide mounted with the effective bindings",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: the submission cleared the quick-shortcut guide",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the prompt-context hint renders the user override (X), not the default",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the override key cycled the conversation detail",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the removed default key no longer cycles the detail",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: /hotkeys documents the effective override (X row)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the ? quick-shortcut guide mounted with the effective bindings",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: the submission cleared the quick-shortcut guide",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "detail-hint: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "override-fired: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "default-key: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "hotkeys-guide: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "shortcut-guide: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f23_keybindings",
+  "category": "visual",
+  "gap": false,
+  "summary": "guide-cleared: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ }
+]

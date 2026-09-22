@@ -1,0 +1,39 @@
+Prime Agent daemon supervisor 8f84aa62-196a-4ba7-979c-4df3111a6596 listening on /home/ubuntu/lane-worktrees/wire-order/scripts/battery/runs/20260921T164229Z/ts/daemon.sock
+Session worker 5b56d5d55937 stderr: Prime Agent daemon listening on /tmp/vbat20260921T164229Z-ts/prime-agent-1000/worker-5a8c4e4e8a1e-5b56d5d55937.sock
+Session worker 6569c19932e0 stderr: Prime Agent daemon listening on /tmp/vbat20260921T164229Z-ts/prime-agent-1000/worker-5a8c4e4e8a1e-6569c19932e0.sock
+Session worker ae0b1185de50 stderr: Prime Agent daemon listening on /tmp/vbat20260921T164229Z-ts/prime-agent-1000/worker-5a8c4e4e8a1e-ae0b1185de50.sock
+Session worker a254f8817ef1 stderr: Prime Agent daemon listening on /tmp/vbat20260921T164229Z-ts/prime-agent-1000/worker-5a8c4e4e8a1e-a254f8817ef1.sock
+Session worker 54f79699c3d2 stderr: Prime Agent daemon listening on /tmp/vbat20260921T164229Z-ts/prime-agent-1000/worker-5a8c4e4e8a1e-54f79699c3d2.sock
+Session worker 54f79699c3d2 stderr: daemon command "compact" failed: Error: Session is too short to compact — try again once it grows
+Session worker 54f79699c3d2 stderr:     at _performCompaction (/$bunfs/root/prime-agent:2256:2495)
+Session worker 54f79699c3d2 stderr:     at compact (/$bunfs/root/prime-agent:2256:941)
+Session worker 54f79699c3d2 stderr:     at async handleCommand (/$bunfs/root/prime-agent:2181:89202)
+Session worker 54f79699c3d2 stderr:     at async handleLine (/$bunfs/root/prime-agent:2181:62568)
+Session worker 54f79699c3d2 stderr:     at processTicksAndRejections (native:7:39)
+Session worker 54f79699c3d2 stderr: daemon command "prompt_and_wait" failed: Error: Cannot admit a session action while queued session input is suspended.
+Session worker 54f79699c3d2 stderr:     at _assertSessionActionAdmissionAvailable (/$bunfs/root/prime-agent:2253:8126)
+Session worker 54f79699c3d2 stderr:     at _prompt (/$bunfs/root/prime-agent:2247:11158)
+Session worker 54f79699c3d2 stderr:     at promptUntilAccepted (/$bunfs/root/prime-agent:2247:3835)
+Session worker 54f79699c3d2 stderr:     at promptAndWait (/$bunfs/root/prime-agent:2247:4181)
+Session worker 54f79699c3d2 stderr:     at handleCommand (/$bunfs/root/prime-agent:2181:73548)
+Session worker 54f79699c3d2 stderr:     at handleLine (/$bunfs/root/prime-agent:2181:62568)
+Session worker 54f79699c3d2 stderr:     at processTicksAndRejections (native:7:39)
+Session worker 54f79699c3d2 stderr: daemon command "prompt_and_wait" failed: Error: Cannot admit a session action while queued session input is suspended.
+Session worker 54f79699c3d2 stderr:     at _assertSessionActionAdmissionAvailable (/$bunfs/root/prime-agent:2253:8126)
+Session worker 54f79699c3d2 stderr:     at _prompt (/$bunfs/root/prime-agent:2247:11158)
+Session worker 54f79699c3d2 stderr:     at promptUntilAccepted (/$bunfs/root/prime-agent:2247:3835)
+Session worker 54f79699c3d2 stderr:     at promptAndWait (/$bunfs/root/prime-agent:2247:4181)
+Session worker 54f79699c3d2 stderr:     at handleCommand (/$bunfs/root/prime-agent:2181:73548)
+Session worker 54f79699c3d2 stderr:     at handleLine (/$bunfs/root/prime-agent:2181:62568)
+Session worker 54f79699c3d2 stderr:     at processTicksAndRejections (native:7:39)
+Session worker 0078f892a91e stderr: Prime Agent daemon listening on /tmp/vbat20260921T164229Z-ts/prime-agent-1000/worker-5a8c4e4e8a1e-0078f892a91e.sock
+Session worker d221b0d79fc8 stderr: Prime Agent daemon listening on /tmp/vbat20260921T164229Z-ts/prime-agent-1000/worker-5a8c4e4e8a1e-d221b0d79fc8.sock
+Session worker 364e22b4409f stderr: Prime Agent daemon listening on /tmp/vbat20260921T164229Z-ts/prime-agent-1000/worker-5a8c4e4e8a1e-364e22b4409f.sock
+Session worker a254f8817ef1 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 54f79699c3d2 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker ae0b1185de50 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker d221b0d79fc8 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 5b56d5d55937 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 364e22b4409f stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 6569c19932e0 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 0078f892a91e stderr: shutting down (exit 0); closing 0 active session(s)

@@ -1,0 +1,36 @@
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.5
+  ▗█▛ ▟██▙▄██▛ ▟▛         agents 0 running, 4 idle, 2 inactive
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/gap-cli/scripts/battery/runs/20260916T223657Z/ts/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+ >   Search sessions
+
+Session                       Model         Activity                                                           Cost  Age
+
+Idle (4)
+• battery-compact             mock-1                                                                          $0.00   4s
+• battery-attach              mock-1                                                                          $0.00  18s
+• battery-side-questions      mock-1                                                                          $0.00  40s
+• hi                          mock-1                                                                          $0.00   1m
+
+Inactive (2)
+• Run the tool                mock-1                                                                          $0.00   1m
+• Say hello                   mock-1                                                                          $0.00   1m
+
+
+
+
+
+
+
+
+
+
+
+
+
+↑/↓ navigate   Enter/→ open   Ctrl+N new

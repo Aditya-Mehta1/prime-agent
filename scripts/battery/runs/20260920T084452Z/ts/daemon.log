@@ -1,0 +1,9 @@
+Prime Agent daemon supervisor 96643245-f65c-424e-845c-3eb6547d175a listening on /home/ubuntu/lane-worktrees/harness-digest/scripts/battery/runs/20260920T084452Z/ts/daemon.sock
+Session worker 5f5211b204b5 stderr: Prime Agent daemon listening on /tmp/vbat20260920T084452Z-ts/prime-agent-1000/worker-cbdd94530049-5f5211b204b5.sock
+Session worker ed80d294243b stderr: Prime Agent daemon listening on /tmp/vbat20260920T084452Z-ts/prime-agent-1000/worker-cbdd94530049-ed80d294243b.sock
+Session worker 3922e5730cd0 stderr: Prime Agent daemon listening on /tmp/vbat20260920T084452Z-ts/prime-agent-1000/worker-cbdd94530049-3922e5730cd0.sock
+Session worker ef08bd16afda stderr: Prime Agent daemon listening on /tmp/vbat20260920T084452Z-ts/prime-agent-1000/worker-cbdd94530049-ef08bd16afda.sock
+Session worker 5f5211b204b5 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 3922e5730cd0 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker ef08bd16afda stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker ed80d294243b stderr: shutting down (exit 0); closing 0 active session(s)

@@ -1,0 +1,7 @@
+Prime Agent daemon supervisor d30fc868-390b-48cf-8b12-4ef7af143f56 listening on /home/ubuntu/lane-worktrees/compaction-outcome/scripts/battery/runs/20260920T050501Z/ts/daemon.sock
+Session worker 95539f1737fa stderr: Prime Agent daemon listening on /tmp/vbat20260920T050501Z-ts/prime-agent-1000/worker-f3605c9a0eaf-95539f1737fa.sock
+Session worker 11f73d7ad8ca stderr: Prime Agent daemon listening on /tmp/vbat20260920T050501Z-ts/prime-agent-1000/worker-f3605c9a0eaf-11f73d7ad8ca.sock
+Session worker 825e528816f3 stderr: Prime Agent daemon listening on /tmp/vbat20260920T050501Z-ts/prime-agent-1000/worker-f3605c9a0eaf-825e528816f3.sock
+Session worker 825e528816f3 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 11f73d7ad8ca stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 95539f1737fa stderr: shutting down (exit 0); closing 0 active session(s)

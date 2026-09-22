@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/trial-send-2/scripts/battery/runs/20260917T062810Z/rust/perf/sock-2.sock",
+  "defaultSessionDir": "/home/ubuntu/lane-worktrees/trial-send-2/scripts/battery/runs/20260917T062810Z/rust/agent/sessions"
+}

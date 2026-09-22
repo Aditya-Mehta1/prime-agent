@@ -1,0 +1,37 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "30e648bf7a3c",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-16T21:04:45.923Z",
+  "cwd": "/home/ubuntu/lane-worktrees/battery/scripts/battery/runs/20260916T210320Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "30e648bf7a3c",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-16T21:04:45.923Z",
+  "lifecycle": "resident",
+  "messageCount": 0,
+  "modified": "2026-09-16T21:04:45.923Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/battery/scripts/battery/runs/20260916T210320Z/rust/agent/sessions/01a0ac09-4d63-70cb-856c-fc7ee5bd0d6d.jsonl",
+  "sessionId": "01a0ac09-4d63-70cb-856c-fc7ee5bd0d6d",
+  "sessionName": "battery-side-questions",
+  "thinkingLevel": "default",
+  "unfinishedActionCount": 0,
+  "workerPid": 1682778,
+  "workerState": "ready"
+ },
+ "id": "c1",
+ "success": true,
+ "type": "response"
+}

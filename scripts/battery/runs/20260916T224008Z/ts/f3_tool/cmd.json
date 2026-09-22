@@ -1,0 +1,19 @@
+{
+ "argv": [
+  "prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/thin2/scripts/battery/runs/20260916T224008Z/ts/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "Run the tool"
+ ],
+ "exit_code": 0,
+ "stdout": "tool turn done\n",
+ "stderr": "",
+ "duration_s": 1.3,
+ "timeout": false
+}

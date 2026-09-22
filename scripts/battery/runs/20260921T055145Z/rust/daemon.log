@@ -1,0 +1,658 @@
+pa-daemon client connection error: Broken pipe (os error 32)
+pa-daemon: auto-refinement after compaction failed: Refiner did not return a JSON object
+› setting up python kernel (one-time, ~30s)…
+rebuilding kernel venv
+Python 3.11 is already installed
+Using CPython 3.11.16
+Creating virtual environment with seed packages at: /home/ubuntu/.prime/agent/kernel-venv
+ + packaging==26.3
+ + pip==26.2.1
+ + setuptools==84.0.0
+ + wheel==0.48.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 50 packages in 13ms
+   Building prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+      Built prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+Prepared 1 package in 205ms
+Installed 50 packages in 39ms
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + beautifulsoup4==4.15.0
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + cryptography==50.0.1
+ + dill==0.4.1
+ + docstring-parser==0.18.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpcore2==2.13.0
+ + httpx==0.28.1
+ + httpx2==2.13.0
+ + idna==3.20
+ + jsonschema==4.26.0
+ + jsonschema-specifications==2025.9.1
+ + lxml==6.1.3
+ + mcp==2.2.0
+ + mcp-types==2.2.0
+ + numpy==2.4.6
+ + opentelemetry-api==1.44.0
+ + pandas==3.0.6
+ + prime-agent-runtime==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime)
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pyjwt==2.14.0
+ + python-dateutil==2.9.0.post0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + requests==2.34.2
+ + rpds-py==2026.6.3
+ + scipy==1.17.1
+ + six==1.17.0
+ + soupsieve==2.9.2
+ + sse-starlette==3.4.11
+ + starlette==1.6.0
+ + tomli==2.4.1
+ + truststore==0.10.4
+ + typeguard==4.6.0
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tyro==1.0.16
+ + urllib3==2.8.0
+ + uvicorn==0.53.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+      Built agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+Prepared 1 package in 213ms
+Installed 1 package in 0.55ms
+ + agent-message==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+      Built agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+Prepared 1 package in 202ms
+Installed 1 package in 0.58ms
+ + agent-observe==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 34 packages in 49ms
+   Building prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+      Built prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+Prepared 1 package in 202ms
+Installed 2 packages in 2ms
+ + pillow==12.3.0
+ + prime-agent-skill-attach-image==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+      Built compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+Prepared 1 package in 207ms
+Installed 1 package in 0.52ms
+ + compact==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+      Built edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+Prepared 1 package in 204ms
+Installed 1 package in 0.68ms
+ + edit==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+      Built goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+Prepared 1 package in 203ms
+Installed 1 package in 0.53ms
+ + goal==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+      Built refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+Prepared 1 package in 202ms
+Installed 1 package in 0.58ms
+ + refine==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+      Built rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+Prepared 1 package in 201ms
+Installed 1 package in 0.52ms
+ + rlm-heartbeat==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 36 packages in 50ms
+   Building prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+      Built prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+Prepared 1 package in 210ms
+Installed 1 package in 0.66ms
+ + prime-agent-skill-websearch==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch)
+✓ ready
+› setting up python kernel (one-time, ~30s)…
+rebuilding kernel venv
+Python 3.11 is already installed
+Using CPython 3.11.16
+Creating virtual environment with seed packages at: /home/ubuntu/.prime/agent/kernel-venv
+ + packaging==26.3
+ + pip==26.2.1
+ + setuptools==84.0.0
+ + wheel==0.48.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 50 packages in 13ms
+   Building prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+      Built prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+Prepared 1 package in 208ms
+Installed 50 packages in 38ms
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + beautifulsoup4==4.15.0
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + cryptography==50.0.1
+ + dill==0.4.1
+ + docstring-parser==0.18.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpcore2==2.13.0
+ + httpx==0.28.1
+ + httpx2==2.13.0
+ + idna==3.20
+ + jsonschema==4.26.0
+ + jsonschema-specifications==2025.9.1
+ + lxml==6.1.3
+ + mcp==2.2.0
+ + mcp-types==2.2.0
+ + numpy==2.4.6
+ + opentelemetry-api==1.44.0
+ + pandas==3.0.6
+ + prime-agent-runtime==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime)
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pyjwt==2.14.0
+ + python-dateutil==2.9.0.post0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + requests==2.34.2
+ + rpds-py==2026.6.3
+ + scipy==1.17.1
+ + six==1.17.0
+ + soupsieve==2.9.2
+ + sse-starlette==3.4.11
+ + starlette==1.6.0
+ + tomli==2.4.1
+ + truststore==0.10.4
+ + typeguard==4.6.0
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tyro==1.0.16
+ + urllib3==2.8.0
+ + uvicorn==0.53.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+      Built agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+Prepared 1 package in 202ms
+Installed 1 package in 0.52ms
+ + agent-message==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+      Built agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+Prepared 1 package in 205ms
+Installed 1 package in 0.54ms
+ + agent-observe==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 34 packages in 51ms
+   Building prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+      Built prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+Prepared 1 package in 201ms
+Installed 2 packages in 2ms
+ + pillow==12.3.0
+ + prime-agent-skill-attach-image==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+      Built compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+Prepared 1 package in 208ms
+Installed 1 package in 0.57ms
+ + compact==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+      Built edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+Prepared 1 package in 202ms
+Installed 1 package in 0.68ms
+ + edit==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+      Built goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+Prepared 1 package in 217ms
+Installed 1 package in 0.54ms
+ + goal==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+      Built refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+Prepared 1 package in 202ms
+Installed 1 package in 0.55ms
+ + refine==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+      Built rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+Prepared 1 package in 216ms
+Installed 1 package in 0.74ms
+ + rlm-heartbeat==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 36 packages in 50ms
+   Building prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+      Built prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+Prepared 1 package in 202ms
+Installed 1 package in 0.65ms
+ + prime-agent-skill-websearch==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch)
+✓ ready
+✓ ready
+✓ ready
+› setting up python kernel (one-time, ~30s)…
+rebuilding kernel venv
+Python 3.11 is already installed
+Using CPython 3.11.16
+Creating virtual environment with seed packages at: /home/ubuntu/.prime/agent/kernel-venv
+ + packaging==26.3
+ + pip==26.2.1
+ + setuptools==84.0.0
+ + wheel==0.48.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 50 packages in 13ms
+   Building prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+      Built prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+Prepared 1 package in 207ms
+Installed 50 packages in 36ms
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + beautifulsoup4==4.15.0
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + cryptography==50.0.1
+ + dill==0.4.1
+ + docstring-parser==0.18.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpcore2==2.13.0
+ + httpx==0.28.1
+ + httpx2==2.13.0
+ + idna==3.20
+ + jsonschema==4.26.0
+ + jsonschema-specifications==2025.9.1
+ + lxml==6.1.3
+ + mcp==2.2.0
+ + mcp-types==2.2.0
+ + numpy==2.4.6
+ + opentelemetry-api==1.44.0
+ + pandas==3.0.6
+ + prime-agent-runtime==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime)
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pyjwt==2.14.0
+ + python-dateutil==2.9.0.post0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + requests==2.34.2
+ + rpds-py==2026.6.3
+ + scipy==1.17.1
+ + six==1.17.0
+ + soupsieve==2.9.2
+ + sse-starlette==3.4.11
+ + starlette==1.6.0
+ + tomli==2.4.1
+ + truststore==0.10.4
+ + typeguard==4.6.0
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tyro==1.0.16
+ + urllib3==2.8.0
+ + uvicorn==0.53.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+      Built agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+Prepared 1 package in 210ms
+Installed 1 package in 0.56ms
+ + agent-message==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+      Built agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+Prepared 1 package in 202ms
+Installed 1 package in 0.54ms
+ + agent-observe==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 34 packages in 49ms
+   Building prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+      Built prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+Prepared 1 package in 205ms
+Installed 2 packages in 2ms
+ + pillow==12.3.0
+ + prime-agent-skill-attach-image==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+      Built compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+Prepared 1 package in 203ms
+Installed 1 package in 0.53ms
+ + compact==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+      Built edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+Prepared 1 package in 202ms
+Installed 1 package in 0.66ms
+ + edit==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+      Built goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+Prepared 1 package in 201ms
+Installed 1 package in 0.52ms
+ + goal==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+      Built refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+Prepared 1 package in 202ms
+Installed 1 package in 0.56ms
+ + refine==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+      Built rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+Prepared 1 package in 202ms
+Installed 1 package in 0.59ms
+ + rlm-heartbeat==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 36 packages in 50ms
+   Building prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+      Built prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+Prepared 1 package in 201ms
+Installed 1 package in 0.72ms
+ + prime-agent-skill-websearch==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch)
+✓ ready
+
+thread 'tokio-rt-worker' (1752751) panicked at crates/pa-daemon/src/agent_engine.rs:3157:43:
+`async fn` resumed after completion
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+› setting up python kernel (one-time, ~30s)…
+rebuilding kernel venv
+Python 3.11 is already installed
+Using CPython 3.11.16
+Creating virtual environment with seed packages at: /home/ubuntu/.prime/agent/kernel-venv
+ + packaging==26.3
+ + pip==26.2.1
+ + setuptools==84.0.0
+ + wheel==0.48.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 50 packages in 13ms
+   Building prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+      Built prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+Prepared 1 package in 207ms
+Installed 50 packages in 40ms
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + beautifulsoup4==4.15.0
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + cryptography==50.0.1
+ + dill==0.4.1
+ + docstring-parser==0.18.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpcore2==2.13.0
+ + httpx==0.28.1
+ + httpx2==2.13.0
+ + idna==3.20
+ + jsonschema==4.26.0
+ + jsonschema-specifications==2025.9.1
+ + lxml==6.1.3
+ + mcp==2.2.0
+ + mcp-types==2.2.0
+ + numpy==2.4.6
+ + opentelemetry-api==1.44.0
+ + pandas==3.0.6
+ + prime-agent-runtime==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime)
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pyjwt==2.14.0
+ + python-dateutil==2.9.0.post0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + requests==2.34.2
+ + rpds-py==2026.6.3
+ + scipy==1.17.1
+ + six==1.17.0
+ + soupsieve==2.9.2
+ + sse-starlette==3.4.11
+ + starlette==1.6.0
+ + tomli==2.4.1
+ + truststore==0.10.4
+ + typeguard==4.6.0
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tyro==1.0.16
+ + urllib3==2.8.0
+ + uvicorn==0.53.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+      Built agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+Prepared 1 package in 203ms
+Installed 1 package in 0.56ms
+ + agent-message==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+      Built agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+Prepared 1 package in 215ms
+Installed 1 package in 0.63ms
+ + agent-observe==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 34 packages in 50ms
+   Building prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+      Built prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+Prepared 1 package in 204ms
+Installed 2 packages in 2ms
+ + pillow==12.3.0
+ + prime-agent-skill-attach-image==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+      Built compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+Prepared 1 package in 204ms
+Installed 1 package in 0.55ms
+ + compact==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+      Built edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+Prepared 1 package in 207ms
+Installed 1 package in 0.68ms
+ + edit==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+      Built goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+Prepared 1 package in 211ms
+Installed 1 package in 0.57ms
+ + goal==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+      Built refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+Prepared 1 package in 206ms
+Installed 1 package in 0.57ms
+ + refine==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+      Built rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+Prepared 1 package in 206ms
+Installed 1 package in 0.53ms
+ + rlm-heartbeat==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 36 packages in 68ms
+   Building prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+      Built prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+Prepared 1 package in 210ms
+Installed 1 package in 0.84ms
+ + prime-agent-skill-websearch==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch)
+✓ ready
+› setting up python kernel (one-time, ~30s)…
+rebuilding kernel venv
+Python 3.11 is already installed
+Using CPython 3.11.16
+Creating virtual environment with seed packages at: /home/ubuntu/.prime/agent/kernel-venv
+ + packaging==26.3
+ + pip==26.2.1
+ + setuptools==84.0.0
+ + wheel==0.48.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 50 packages in 14ms
+   Building prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+      Built prime-agent-runtime @ file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime
+Prepared 1 package in 207ms
+Installed 50 packages in 38ms
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + beautifulsoup4==4.15.0
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + cryptography==50.0.1
+ + dill==0.4.1
+ + docstring-parser==0.18.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpcore2==2.13.0
+ + httpx==0.28.1
+ + httpx2==2.13.0
+ + idna==3.20
+ + jsonschema==4.26.0
+ + jsonschema-specifications==2025.9.1
+ + lxml==6.1.3
+ + mcp==2.2.0
+ + mcp-types==2.2.0
+ + numpy==2.4.6
+ + opentelemetry-api==1.44.0
+ + pandas==3.0.6
+ + prime-agent-runtime==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/prime-agent-runtime)
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pyjwt==2.14.0
+ + python-dateutil==2.9.0.post0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + requests==2.34.2
+ + rpds-py==2026.6.3
+ + scipy==1.17.1
+ + six==1.17.0
+ + soupsieve==2.9.2
+ + sse-starlette==3.4.11
+ + starlette==1.6.0
+ + tomli==2.4.1
+ + truststore==0.10.4
+ + typeguard==4.6.0
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tyro==1.0.16
+ + urllib3==2.8.0
+ + uvicorn==0.53.0
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+      Built agent-message @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message
+Prepared 1 package in 206ms
+Installed 1 package in 0.56ms
+ + agent-message==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-message)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+      Built agent-observe @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe
+Prepared 1 package in 207ms
+Installed 1 package in 0.54ms
+ + agent-observe==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/agent-observe)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 34 packages in 172ms
+   Building prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+      Built prime-agent-skill-attach-image @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image
+Prepared 1 package in 202ms
+Installed 2 packages in 2ms
+ + pillow==12.3.0
+ + prime-agent-skill-attach-image==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/attach-image)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+      Built compact @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact
+Prepared 1 package in 203ms
+Installed 1 package in 0.54ms
+ + compact==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/compact)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+      Built edit @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit
+Prepared 1 package in 204ms
+Installed 1 package in 0.65ms
+ + edit==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/edit)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+      Built goal @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal
+Prepared 1 package in 203ms
+Installed 1 package in 0.54ms
+ + goal==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/goal)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+      Built refine @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine
+Prepared 1 package in 205ms
+Installed 1 package in 0.53ms
+ + refine==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/refine)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 1 package in 1ms
+   Building rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+      Built rlm-heartbeat @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat
+Prepared 1 package in 203ms
+Installed 1 package in 0.53ms
+ + rlm-heartbeat==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/rlm-heartbeat)
+Using Python 3.11.16 environment at: /home/ubuntu/.prime/agent/kernel-venv
+Resolved 36 packages in 50ms
+   Building prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+      Built prime-agent-skill-websearch @ file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch
+Prepared 1 package in 202ms
+Installed 1 package in 0.63ms
+ + prime-agent-skill-websearch==0.1.0 (from file:///home/ubuntu/lane-worktrees/aborted-row/skills/websearch)
+✓ ready

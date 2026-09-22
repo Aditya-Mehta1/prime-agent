@@ -1,0 +1,21 @@
+{
+ "scenario": "bedrock_400_validation",
+ "api": "bedrock-converse-stream",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "Protocol error\n",
+  "duration_s": 0.19,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-90f0-7378-ae84-0096562f37fc.jsonl",
+ "errorMessage": "Protocol error",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "Error",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": "ERR_HTTP2_ERROR",
+  "retryAfterMs": null
+ }
+}

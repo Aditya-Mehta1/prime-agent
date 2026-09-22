@@ -1,0 +1,21 @@
+{
+ "scenario": "codex_429_usage_limit",
+ "api": "openai-codex-responses",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "You have hit your ChatGPT usage limit (free plan).\n",
+  "duration_s": 0.19,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-8f3a-76ec-8619-adc51e76d9dd.jsonl",
+ "errorMessage": "You have hit your ChatGPT usage limit (free plan).",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "CodexApiError",
+  "kind": "rate_limit",
+  "status": 429,
+  "providerErrorType": "usage_limit_reached",
+  "retryAfterMs": null
+ }
+}

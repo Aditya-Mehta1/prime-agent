@@ -1,0 +1,2 @@
+[2026-09-21T20:17:48.096Z] supervisor: Prime Agent daemon supervisor 49aa679b-7744-4719-8027-c42d6775dfc1 listening on /home/ubuntu/lane-worktrees/utility-commands/scripts/battery/runs/20260921T201747Z/ts/daemon.sock
+[2026-09-21T20:17:48.386Z] supervisor: Session worker 46ae8f9848da stderr: Prime Agent daemon listening on /tmp/util20260921T201747Z-ts/prime-agent-1000/worker-07d1fa9f67b4-46ae8f9848da.sock

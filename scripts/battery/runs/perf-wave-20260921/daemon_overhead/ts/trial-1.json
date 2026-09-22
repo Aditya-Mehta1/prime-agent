@@ -1,0 +1,308 @@
+{
+ "created": 10,
+ "baseline_kb": 1688280,
+ "loaded": {
+  "total_kb": 5094828,
+  "by_role_kb": {
+   "interactive": 1240868,
+   "daemon": 3207360,
+   "other": 250708,
+   "kernel": 395892
+  },
+  "processes": [
+   {
+    "pid": 33182,
+    "role": "interactive",
+    "rss_kb": 321068,
+    "argv": [
+     "prime-agent",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/ts/daemon.sock",
+     "--provider",
+     "prime-inference",
+     "--model"
+    ]
+   },
+   {
+    "pid": 33240,
+    "role": "interactive",
+    "rss_kb": 323876,
+    "argv": [
+     "prime-agent",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/ts/daemon.sock",
+     "--provider",
+     "prime-inference",
+     "--model"
+    ]
+   },
+   {
+    "pid": 33340,
+    "role": "interactive",
+    "rss_kb": 322320,
+    "argv": [
+     "prime-agent",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/ts/daemon.sock",
+     "--provider",
+     "prime-inference",
+     "--model"
+    ]
+   },
+   {
+    "pid": 35510,
+    "role": "interactive",
+    "rss_kb": 273604,
+    "argv": [
+     "prime-agent",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/ts/daemon.sock",
+     "--provider",
+     "prime-inference",
+     "--model"
+    ]
+   },
+   {
+    "pid": 39904,
+    "role": "daemon",
+    "rss_kb": 257372,
+    "argv": [
+     "prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/opt/repo/repo/scripts/battery/runs/perf-wave-20260921/ts/daemon.sock"
+    ]
+   },
+   {
+    "pid": 39929,
+    "role": "other",
+    "rss_kb": 250708,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--version"
+    ]
+   },
+   {
+    "pid": 39953,
+    "role": "daemon",
+    "rss_kb": 291992,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-e3bd8ed39fd0.sock"
+    ]
+   },
+   {
+    "pid": 39977,
+    "role": "daemon",
+    "rss_kb": 300960,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-526ba8d0e517.sock"
+    ]
+   },
+   {
+    "pid": 39980,
+    "role": "kernel",
+    "rss_kb": 37820,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40006,
+    "role": "daemon",
+    "rss_kb": 296416,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-ad72332163fe.sock"
+    ]
+   },
+   {
+    "pid": 40010,
+    "role": "kernel",
+    "rss_kb": 42540,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40039,
+    "role": "daemon",
+    "rss_kb": 287248,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-aa6c0c63da8a.sock"
+    ]
+   },
+   {
+    "pid": 40042,
+    "role": "kernel",
+    "rss_kb": 36096,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40070,
+    "role": "daemon",
+    "rss_kb": 306144,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-b32990b9e510.sock"
+    ]
+   },
+   {
+    "pid": 40073,
+    "role": "kernel",
+    "rss_kb": 41360,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40098,
+    "role": "daemon",
+    "rss_kb": 292848,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-405c60f46ab9.sock"
+    ]
+   },
+   {
+    "pid": 40102,
+    "role": "kernel",
+    "rss_kb": 35796,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40126,
+    "role": "daemon",
+    "rss_kb": 289120,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-755cdcba9839.sock"
+    ]
+   },
+   {
+    "pid": 40130,
+    "role": "kernel",
+    "rss_kb": 41444,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40154,
+    "role": "daemon",
+    "rss_kb": 295388,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-7d4b316ce09e.sock"
+    ]
+   },
+   {
+    "pid": 40157,
+    "role": "kernel",
+    "rss_kb": 41560,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40182,
+    "role": "daemon",
+    "rss_kb": 288956,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-479d22ff229e.sock"
+    ]
+   },
+   {
+    "pid": 40185,
+    "role": "kernel",
+    "rss_kb": 36492,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40211,
+    "role": "daemon",
+    "rss_kb": 300916,
+    "argv": [
+     "/opt/ts-release/0.9.5-linux-x64-bc4b0ed791d1e8b3b5d6a95249a60306d9579fc0d6038e5d7d82f068d81f008d/prime-agent",
+     "--mode",
+     "daemon",
+     "--daemon-socket",
+     "/tmp/vwaveperf-wave-20260921-ts/prime-agent-0/worker-7fa733f4c11c-090c24e327dc.sock"
+    ]
+   },
+   {
+    "pid": 40214,
+    "role": "kernel",
+    "rss_kb": 41716,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   },
+   {
+    "pid": 40240,
+    "role": "kernel",
+    "rss_kb": 41068,
+    "argv": [
+     "/root/.prime/agent/kernel-venv/bin/python",
+     "-m",
+     "rlm.repl"
+    ]
+   }
+  ]
+ }
+}

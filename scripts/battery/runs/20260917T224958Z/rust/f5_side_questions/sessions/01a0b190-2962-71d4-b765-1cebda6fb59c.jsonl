@@ -1,0 +1,7 @@
+{"cwd":"/home/ubuntu/lane-worktrees/branding-scrub/scripts/battery/runs/20260917T224958Z/rust/work","id":"01a0b190-2962-71d4-b765-1cebda6fb59c","rlmDepth":0,"timestamp":"2026-09-17T22:50:10.146Z","type":"session","version":3}
+{"type":"model_change","id":"f3da597c","parentId":null,"timestamp":"2026-09-17T22:50:10.161Z","modelId":"mock-1","provider":"prime-inference"}
+{"type":"thinking_level_change","id":"21a9feef","parentId":"f3da597c","timestamp":"2026-09-17T22:50:10.161Z","thinkingLevel":"off"}
+{"type":"service_tier_change","id":"a3c61dc7","parentId":"21a9feef","timestamp":"2026-09-17T22:50:10.161Z","serviceTier":"default"}
+{"type":"session_state","id":"d954c4b6","parentId":"a3c61dc7","timestamp":"2026-09-17T22:50:10.161Z","state":{"status":"active"}}
+{"type":"message","id":"36ac7297","parentId":"d954c4b6","timestamp":"2026-09-17T22:50:15.798Z","message":{"content":[{"text":"hi","type":"text"}],"role":"user","timestamp":1789685415798}}
+{"type":"message","id":"a8fc640d","parentId":"36ac7297","timestamp":"2026-09-17T22:50:17.478Z","message":{"api":"openai-completions","content":[{"text":"battery hello from mock","type":"text"}],"model":"mock-1","provider":"prime-inference","responseId":"chatcmpl-battery","role":"assistant","stopReason":"stop","timestamp":1789685417462,"usage":{"cacheRead":80,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":20,"output":10,"totalTokens":110}}}

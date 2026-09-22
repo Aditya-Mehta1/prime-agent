@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "workerId": "aec44f1a55ff",
+  "pid": 72878,
+  "socketPath": "/tmp/vbat20260918T091229Z-rust/prime-agent-1000/worker-af9cd5f53bad-aec44f1a55ff.sock",
+  "recoveryJournalPath": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/rust/agent/daemon-workers/af9cd5f53bad/aec44f1a55ff.recovery.jsonl",
+  "supervisorSocketPath": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/rust/f12_scale_resume/scale.sock",
+  "authenticationToken": "03973daf-55a3-4f93-bd07-e1ba8d88ae5b",
+  "workerInstanceId": "cf69a5f0-07ba-424a-b7b2-a489b12ee9ca",
+  "rootActiveSessionId": "aec44f1a55ff",
+  "ownerClientId": "daemon-tui:72865",
+  "rootSessionId": "scale-corpus",
+  "sessionFile": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/scale-corpus-5000.jsonl",
+  "sessionDir": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/rust/agent/sessions",
+  "telemetryDisabled": true,
+  "createdAt": "2026-09-18T09:12:57.284Z",
+  "updatedAt": "2026-09-18T09:12:58.792Z",
+  "lifecycle": "ready",
+  "createCommand": {
+    "sessionPath": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/scale-corpus-5000.jsonl",
+    "cwd": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/rust/work",
+    "model": "mock-1",
+    "provider": "prime-inference",
+    "sessionDir": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/rust/agent/sessions"
+  },
+  "consecutiveFailures": 0
+}

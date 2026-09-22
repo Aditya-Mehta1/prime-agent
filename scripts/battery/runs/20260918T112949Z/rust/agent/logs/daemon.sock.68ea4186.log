@@ -1,0 +1,10 @@
+supervisor started pid 194392
+[2026-09-18T11:30:34.908Z] session worker 5240110ee2a1 registered (epoch 1, pid 194409)
+[2026-09-18T11:30:34.978Z] session worker 5240110ee2a1 re-registered (epoch 2, pid 194409)
+[2026-09-18T11:30:50.646Z] session worker dc88a7a9f1f5 registered (epoch 1, pid 194602)
+[2026-09-18T11:30:50.712Z] session worker dc88a7a9f1f5 re-registered (epoch 2, pid 194602)
+[2026-09-18T11:30:51.915Z] session worker f1968d12166c registered (epoch 1, pid 194639)
+[2026-09-18T11:30:51.976Z] session worker f1968d12166c re-registered (epoch 2, pid 194639)
+[2026-09-18T11:30:52.788Z] session worker f1968d12166c exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-18T11:30:53.067Z] session worker f1968d12166c re-registered (epoch 3, pid 194656)
+[2026-09-18T11:30:54.086Z] session worker f1968d12166c re-registered (epoch 4, pid 194656)

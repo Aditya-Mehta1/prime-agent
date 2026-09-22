@@ -1,0 +1,23 @@
+[
+ {
+  "flow": "f11_provider_failure",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: provider failure surfaces (retry banner + 4 error row(s))",
+  "evidence": ""
+ },
+ {
+  "flow": "f11_provider_failure",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: provider failure surfaces (retry banner + 4 error row(s))",
+  "evidence": ""
+ },
+ {
+  "flow": "f11_provider_failure",
+  "category": "visual",
+  "gap": false,
+  "summary": "provider-failure rendering parity: 4 error row(s) on both sides",
+  "evidence": ""
+ }
+]

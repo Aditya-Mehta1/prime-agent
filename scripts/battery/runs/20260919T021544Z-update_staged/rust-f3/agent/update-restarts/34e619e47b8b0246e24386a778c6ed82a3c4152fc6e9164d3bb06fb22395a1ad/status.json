@@ -1,0 +1,21 @@
+{
+  "coordinator": {
+    "pid": 214051,
+    "processStartId": "proc:1296854"
+  },
+  "counts": {
+    "failed": 0,
+    "restored": 0,
+    "resumed": 0,
+    "total": 0
+  },
+  "epoch": 4,
+  "heartbeatAt": "2026-09-19T02:15:20.374Z",
+  "message": "No valid previous compiled release is available.",
+  "socketPath": "/tmp/prime-agent-1000/daemon.sock",
+  "startedAt": "2026-09-19T02:15:20.370Z",
+  "state": "aborted",
+  "updateId": "01a0b772-5c2f-7696-97f2-4554494d694f",
+  "updatedAt": "2026-09-19T02:15:20.374Z",
+  "version": 1
+}

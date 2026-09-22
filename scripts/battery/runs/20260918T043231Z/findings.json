@@ -1,0 +1,23 @@
+[
+ {
+  "flow": "f3_tool",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: ipython tool call executed and output captured",
+  "evidence": ""
+ },
+ {
+  "flow": "f3_tool",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: ipython tool call executed and output captured",
+  "evidence": ""
+ },
+ {
+  "flow": "f3_tool",
+  "category": "protocol",
+  "gap": true,
+  "summary": "session entry types differ: ts-only=['session_state'] rust-only=[]; full counts in f3_tool-session-shapes.json",
+  "evidence": "f3_tool-session-shapes.json"
+ }
+]

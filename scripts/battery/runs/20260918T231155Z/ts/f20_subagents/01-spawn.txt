@@ -1,0 +1,36 @@
+                                                      battery-f20  $0.00
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.5
+  ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/battery-flows/scripts/battery/runs/20260918T231155Z/ts/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+  f20 seed turn
+
+
+ f20 parent fixture reply
+
+
+  f20 spawn the subagent now
+
+
+ ✓ python · ↑ 1 ↓ 1 lines · 197ms
+
+ f20 child fixture reply
+
+
+
+
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                                               mock-1 · 110 (0%)
+╭─ subagents ──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ● 1 running   ◐ 0 idle   ○ 0 inactive                                                                       ↓ select │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

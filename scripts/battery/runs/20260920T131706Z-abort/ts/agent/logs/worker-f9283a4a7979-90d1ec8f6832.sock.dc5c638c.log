@@ -1,0 +1,2 @@
+[2026-09-20T13:17:07.539Z] Prime Agent daemon listening on /tmp/compaction-abort-ts-1133506/prime-agent-1000/worker-f9283a4a7979-90d1ec8f6832.sock
+[2026-09-20T13:17:22.131Z] replacement supervisor 1133670 left running without a current authenticated supervisor

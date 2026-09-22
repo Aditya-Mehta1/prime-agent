@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/daemon.sock",
+  "defaultSessionConfig": {
+    "cwd": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/work",
+    "agentDir": "/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/agent",
+    "telemetryDisabled": true
+  }
+}

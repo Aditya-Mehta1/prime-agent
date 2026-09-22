@@ -1,0 +1,3 @@
+[2026-09-17T11:52:43.065Z] Prime Agent daemon listening on /tmp/vbat20260917T115203Z-ts/prime-agent-1000/worker-3f858c3b334e-2e79a576d837.sock
+[2026-09-17T11:52:43.193Z] shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-17T11:52:43.197Z] shutting down (exit 0); closing 1 active session(s)

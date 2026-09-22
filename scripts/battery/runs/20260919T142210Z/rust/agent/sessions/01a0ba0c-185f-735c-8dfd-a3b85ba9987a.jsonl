@@ -1,0 +1,6 @@
+{"cwd":"/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T142210Z/rust/work","id":"01a0ba0c-185f-735c-8dfd-a3b85ba9987a","rlmDepth":0,"timestamp":"2026-09-19T14:22:29.983Z","type":"session","version":3}
+{"type":"model_change","id":"52c11cab","parentId":null,"timestamp":"2026-09-19T14:22:29.988Z","modelId":"mock-1","provider":"prime-inference"}
+{"type":"thinking_level_change","id":"5fbefb07","parentId":"52c11cab","timestamp":"2026-09-19T14:22:29.988Z","thinkingLevel":"off"}
+{"type":"service_tier_change","id":"dc728047","parentId":"5fbefb07","timestamp":"2026-09-19T14:22:29.988Z","serviceTier":"default"}
+{"type":"session_state","id":"3660a603","parentId":"dc728047","timestamp":"2026-09-19T14:22:29.988Z","state":{"status":"active"}}
+{"type":"message","id":"fef34ee2","parentId":"3660a603","timestamp":"2026-09-19T14:22:30.460Z","message":{"content":[{"text":"hold the turn","type":"text"}],"role":"user","timestamp":1789827750460}}

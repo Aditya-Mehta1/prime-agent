@@ -1,0 +1,15 @@
+{
+ "command": "compact",
+ "data": {
+  "details": {
+   "modifiedFiles": [],
+   "readFiles": []
+  },
+  "firstKeptEntryId": "cca946e8",
+  "summary": "the prewarm first compaction summary",
+  "tokensBefore": 110
+ },
+ "id": "prewarm-notice-k1",
+ "success": true,
+ "type": "response"
+}

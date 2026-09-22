@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/session-scoped-mock/scripts/battery/runs/20260920T024329Z/rust/daemon.sock",
+  "defaultSessionDir": "/home/ubuntu/lane-worktrees/session-scoped-mock/scripts/battery/runs/20260920T024329Z/rust/agent/sessions"
+}

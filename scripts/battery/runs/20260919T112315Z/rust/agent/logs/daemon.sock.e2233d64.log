@@ -1,0 +1,6 @@
+supervisor started pid 1058424
+[2026-09-19T11:23:37.600Z] session worker f8b00467d7cf registered (epoch 1, pid 1058438)
+[2026-09-19T11:23:37.680Z] session worker f8b00467d7cf re-registered (epoch 2, pid 1058438)
+[2026-09-19T11:23:58.170Z] session worker 70b150134f84 registered (epoch 1, pid 1058906)
+[2026-09-19T11:23:58.255Z] session worker 70b150134f84 re-registered (epoch 2, pid 1058906)
+[2026-09-19T11:23:58.261Z] RLM ledger: skipped record with unknown op on line 1

@@ -1,0 +1,21 @@
+{
+ "scenario": "connection_bedrock-converse-stream",
+ "api": "bedrock-converse-stream",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "The pending stream has been canceled (caused by: connect ECONNREFUSED 127.0.0.1:1)\n",
+  "duration_s": 0.16,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-9e1f-75dc-b06b-8e0bbaebcd33.jsonl",
+ "errorMessage": "The pending stream has been canceled (caused by: connect ECONNREFUSED 127.0.0.1:1)",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "Error",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": "ERR_HTTP2_STREAM_CANCEL",
+  "retryAfterMs": null
+ }
+}

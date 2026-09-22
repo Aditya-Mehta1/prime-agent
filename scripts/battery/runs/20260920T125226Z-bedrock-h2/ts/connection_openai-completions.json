@@ -1,0 +1,21 @@
+{
+ "scenario": "connection_openai-completions",
+ "api": "openai-completions",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "Connection error.\n",
+  "duration_s": 2.25,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-8946-744e-8832-c33b14a7c0c3.jsonl",
+ "errorMessage": "Connection error.",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "Error",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": null,
+  "retryAfterMs": null
+ }
+}

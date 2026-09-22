@@ -1,0 +1,60 @@
+{
+  "stamp": "20260921T201747Z",
+  "findings": [
+    {
+      "command": "name-set",
+      "summary": "name-set: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "rlm-max-depth-view",
+      "summary": "rlm-max-depth-view: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "rlm-max-depth-set",
+      "summary": "rlm-max-depth-set: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "fast",
+      "summary": "fast: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "fullscreen-off",
+      "summary": "fullscreen-off: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "fullscreen-on",
+      "summary": "fullscreen-on: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "reload",
+      "summary": "reload: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "btw",
+      "summary": "btw: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "settings",
+      "summary": "settings: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "scoped-models",
+      "summary": "scoped-models: identical (normalized)",
+      "gap": false
+    },
+    {
+      "command": "thinking",
+      "summary": "thinking: identical (normalized)",
+      "gap": false
+    }
+  ]
+}

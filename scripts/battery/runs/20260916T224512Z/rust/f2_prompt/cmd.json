@@ -1,0 +1,19 @@
+{
+ "argv": [
+  "/home/ubuntu/lane-worktrees/gap-model/target/release/prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/gap-model/scripts/battery/runs/20260916T224512Z/rust/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "Say hello"
+ ],
+ "exit_code": 0,
+ "stdout": "battery hello from mock\n",
+ "stderr": "",
+ "duration_s": 0.11,
+ "timeout": false
+}

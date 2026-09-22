@@ -1,0 +1,33 @@
+{
+  "coordinator": {
+    "pid": 283197,
+    "processStartId": "proc:1642567"
+  },
+  "counts": {
+    "failed": 0,
+    "restored": 1,
+    "resumed": 0,
+    "total": 1
+  },
+  "epoch": 18,
+  "heartbeatAt": "2026-09-19T03:12:58.363Z",
+  "message": "Restarted the daemon after the update",
+  "predecessor": {
+    "pid": 283125,
+    "processStartId": "proc:1642519",
+    "supervisorGeneration": "sup:283125",
+    "supervisorOwnerToken": "ea439988-79fa-4f5c-b6dd-ca1a5aa0d9c3"
+  },
+  "socketPath": "/tmp/usw-rust-f2-20260919T031120Z/prime-agent-1000/daemon.sock",
+  "startedAt": "2026-09-19T03:12:57.416Z",
+  "state": "complete",
+  "successor": {
+    "pid": 283259,
+    "processStartId": "proc:1642627",
+    "supervisorGeneration": "sup:283259",
+    "supervisorOwnerToken": "0dcaf34b-47a9-445a-ab77-286b0cf91f3d"
+  },
+  "updateId": "01a0b7a7-1c3a-734f-972e-ad5d04b4a33a",
+  "updatedAt": "2026-09-19T03:12:58.363Z",
+  "version": 1
+}

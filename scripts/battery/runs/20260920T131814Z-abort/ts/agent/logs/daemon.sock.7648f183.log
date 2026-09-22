@@ -1,0 +1,4 @@
+[2026-09-20T13:18:15.121Z] supervisor: Prime Agent daemon supervisor 325632f3-742e-4a8d-a9fc-dcff85ec5be3 listening on /home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/daemon.sock
+[2026-09-20T13:18:15.422Z] supervisor: Session worker e6f66d4b8996 stderr: Prime Agent daemon listening on /tmp/compaction-abort-ts-1134973/prime-agent-1000/worker-7648f18322ed-e6f66d4b8996.sock
+[2026-09-20T13:19:04.152Z] supervisor: Could not adopt worker e6f66d4b8996: Error: Timed out connecting to daemon session worker: Error: connect ENOENT /tmp/compaction-abort-ts-1134973/prime-agent-1000/worker-7648f18322ed-e6f66d4b8996.sock
+[2026-09-20T13:19:04.156Z] supervisor: Prime Agent daemon supervisor 9a7c5481-2e1d-44ba-9e02-23ff14ec9a40 listening on /home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/daemon.sock

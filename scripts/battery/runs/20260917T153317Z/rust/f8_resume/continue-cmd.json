@@ -1,0 +1,20 @@
+{
+ "argv": [
+  "/home/ubuntu/lane-worktrees/extensions-2/target/release/prime-agent",
+  "-p",
+  "--daemon-socket",
+  "/home/ubuntu/lane-worktrees/extensions-2/scripts/battery/runs/20260917T153317Z/rust/daemon.sock",
+  "--provider",
+  "prime-inference",
+  "--model",
+  "mock-1",
+  "--offline",
+  "-c",
+  "Continue this session"
+ ],
+ "exit_code": 1,
+ "stdout": "",
+ "stderr": "Error: Session is already active in 8a0fbe353873: /home/ubuntu/lane-worktrees/extensions-2/scripts/battery/runs/20260917T153317Z/rust/agent/sessions/01a0b000-fc6b-76f1-8a2c-cf5a56081213.jsonl\n",
+ "duration_s": 0.01,
+ "timeout": false
+}

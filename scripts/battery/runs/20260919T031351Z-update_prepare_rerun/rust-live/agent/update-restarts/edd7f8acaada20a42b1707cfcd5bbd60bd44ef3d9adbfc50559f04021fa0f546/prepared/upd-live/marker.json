@@ -1,0 +1,9 @@
+{
+  "update_id": "upd-live",
+  "expires_at": "2026-09-19T03:13:49.957Z",
+  "supervisor": {
+    "pid": 288060,
+    "process_start_id": "proc:1647483",
+    "generation": "sup:288060"
+  }
+}

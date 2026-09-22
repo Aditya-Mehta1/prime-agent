@@ -1,0 +1,37 @@
+[
+ {
+  "wire": "message_start",
+  "role": "user",
+  "stopReason": null,
+  "errorMessage": null,
+  "text": "held turn for the abort probe"
+ },
+ {
+  "wire": "message_end",
+  "role": "user",
+  "stopReason": null,
+  "errorMessage": null,
+  "text": "held turn for the abort probe"
+ },
+ {
+  "wire": "message_start",
+  "role": "assistant",
+  "stopReason": "aborted",
+  "errorMessage": "Request was aborted",
+  "text": ""
+ },
+ {
+  "wire": "message_end",
+  "role": "assistant",
+  "stopReason": "aborted",
+  "errorMessage": "Request was aborted",
+  "text": ""
+ },
+ {
+  "wire": "agent_end",
+  "role": null,
+  "stopReason": null,
+  "errorMessage": null,
+  "text": ""
+ }
+]

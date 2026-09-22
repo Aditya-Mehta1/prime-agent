@@ -1,0 +1,1 @@
+{"socketPath":"/tmp/upw-s3/ts/daemon.sock","ts":"2026-09-19T00:35:44.530Z","level":"warn","component":"coding-agent.daemon-supervisor","msg":"Prime Agent daemon supervisor f6039708-df95-4f52-af12-fcf72a237af9 listening on /tmp/upw-s3/ts/daemon.sock","pid":139334,"mode":"daemon"}

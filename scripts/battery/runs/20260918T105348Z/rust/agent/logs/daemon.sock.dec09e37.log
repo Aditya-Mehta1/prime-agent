@@ -1,0 +1,3 @@
+supervisor started pid 174295
+[2026-09-18T10:53:48.942Z] session worker 40b4827abd30 registered (epoch 1, pid 174316)
+[2026-09-18T10:53:49.039Z] session worker 40b4827abd30 re-registered (epoch 2, pid 174316)

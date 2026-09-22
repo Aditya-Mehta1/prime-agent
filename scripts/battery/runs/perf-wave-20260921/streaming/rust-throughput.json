@@ -1,0 +1,14 @@
+{
+ "turns": [
+  {
+   "prompt": "Write the first big answer.",
+   "settle_seconds": 0.93,
+   "marks_seen": 4
+  },
+  {
+   "prompt": "Write the second big answer.",
+   "settle_seconds": 0.45,
+   "marks_seen": 2
+  }
+ ]
+}

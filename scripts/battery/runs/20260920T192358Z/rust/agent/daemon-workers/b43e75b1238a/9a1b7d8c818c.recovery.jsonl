@@ -1,0 +1,6 @@
+{"activeSessionId":"9a1b7d8c818c","busy":true,"operation":"create","recordedAt":"2026-09-20T19:24:19.844Z","sessionFile":"/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T192358Z/rust/agent/sessions/01a0c046-c9f1-73b2-95a2-7e0120228c12.jsonl","sessionId":"01a0c046-c9f1-73b2-95a2-7e0120228c12"}
+{"active_session_id":"9a1b7d8c818c","follow_up":[],"recorded_at":"2026-09-20T19:24:19.877Z","steering":["start the kernel and define notice_var"],"type":"queue_snapshot","version":1}
+{"active_session_id":"9a1b7d8c818c","follow_up":[],"recorded_at":"2026-09-20T19:24:23.665Z","steering":["history turn for the summary"],"type":"queue_snapshot","version":1}
+{"active_session_id":"9a1b7d8c818c","follow_up":[],"recorded_at":"2026-09-20T19:24:23.666Z","steering":["history turn for the summary"],"type":"queue_snapshot","version":1}
+{"active_session_id":"9a1b7d8c818c","follow_up":[],"recorded_at":"2026-09-20T19:24:23.725Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"9a1b7d8c818c","busy":false,"operation":"shutdown","recordedAt":"2026-09-20T19:24:25.852Z","sessionFile":"/home/ubuntu/lane-worktrees/ipython-state/scripts/battery/runs/20260920T192358Z/rust/agent/sessions/01a0c046-c9f1-73b2-95a2-7e0120228c12.jsonl","sessionId":"01a0c046-c9f1-73b2-95a2-7e0120228c12"}

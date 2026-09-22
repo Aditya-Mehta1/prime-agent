@@ -1,0 +1,43 @@
+{
+ "id": "c1",
+ "type": "response",
+ "command": "create",
+ "success": true,
+ "data": {
+  "id": "b87189cd346b",
+  "lifecycle": "draft",
+  "activity": "idle",
+  "isSessionActive": false,
+  "hasRegisteredCronJob": false,
+  "lastActivityAt": "2026-09-21T16:55:03.408Z",
+  "rlmDepth": 0,
+  "activeSessionId": "b87189cd346b",
+  "sessionId": "01a0c4e4-7bc9-722d-905c-b814156e2ab8",
+  "sessionFile": "/home/ubuntu/lane-worktrees/wire-order/scripts/battery/runs/20260921T165454Z/rust/agent/sessions/01a0c4e4-7bc9-722d-905c-b814156e2ab8.jsonl",
+  "sessionName": "battery-compact",
+  "cwd": "/home/ubuntu/lane-worktrees/wire-order/scripts/battery/runs/20260921T165454Z/rust/work",
+  "thinkingLevel": "off",
+  "isStreaming": false,
+  "isCompacting": false,
+  "isBashRunning": false,
+  "attachedClients": 0,
+  "messageCount": 0,
+  "sessionActions": {
+   "queuedCount": 0,
+   "steering": [],
+   "followUps": []
+  },
+  "created": "2026-09-21T16:55:03.369Z",
+  "modified": "2026-09-21T16:55:03.408Z",
+  "workerState": "ready",
+  "workerPid": 2293244,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "runtimeKind": "top-level",
+  "unfinishedActionCount": 0
+ }
+}

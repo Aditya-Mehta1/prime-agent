@@ -1,0 +1,33 @@
+{
+ "session": "vwaveperf-wave-20260921-start-rust-2",
+ "first_frame_s": 0.274,
+ "ready_s": 0.274,
+ "typing_ms": [
+  32.2,
+  35.7,
+  35.6,
+  44.1,
+  35.1,
+  82.1,
+  31.8,
+  32.8,
+  40.1,
+  36.8,
+  39.2,
+  39.0,
+  34.7,
+  37.0,
+  36.5,
+  42.3,
+  31.9,
+  47.3,
+  32.1,
+  27.9,
+  32.5,
+  70.4,
+  52.5,
+  41.0,
+  34.2
+ ],
+ "ready_frame": "                                                          work  $0.00\n\n                  \u2597\u2584\u2584\u2588\u2580\n    \u2588\u2588\u2588\u2584       \u2597\u2584\u2588\u2588\u2588\u2580\n   \u2597\u2588\u259b\u2590\u2588\u2599   \u2597\u2584\u2588\u2580\u2597\u2588\u2580       prime agent v0.1.0\n  \u2597\u2588\u259b \u259f\u2588\u2588\u2599\u2584\u2588\u2588\u259b \u259f\u259b         model mock-1\n  \u2597\u259f\u258c \u2590\u2588\u2588\u2588\u259b\u2598\u2597\u2584\u2588\u2596          cwd /opt/repo/repo/scripts/battery/runs/perf-wave-20260921/rust/work\n \u259f\u2588\u2588\u2588\u2584  \u2584\u2584\u259f\u2588\u2588\u2588\u2580\n \u259c\u2588\u259b\u2580\u2598  \u259c\u2588\u259b\u2580\u2598\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                      Collapsed mode (Ctrl+O to expand)\n\n >\n\n\u2190 manage                                                                                                 mock-1 \u00b7 0 (0%)\n"
+}

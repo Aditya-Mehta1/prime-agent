@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "9700b3e05be2",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-21T05:31:36.875Z",
+  "cwd": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "9700b3e05be2",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T05:31:36.876Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T05:31:36.876Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/aborted-row/scripts/battery/runs/20260921T053125Z/rust/agent/sessions/01a0c272-c62b-7624-a764-6f9bcddec841.jsonl",
+  "sessionId": "01a0c272-c62b-7624-a764-6f9bcddec841",
+  "sessionName": "battery-overflow",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 1733093,
+  "workerState": "ready"
+ },
+ "id": "oc1",
+ "success": true,
+ "type": "response"
+}

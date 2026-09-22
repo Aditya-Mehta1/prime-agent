@@ -1,0 +1,12 @@
+[
+ {
+  "role": "user",
+  "stopReason": null,
+  "errorMessage": null
+ },
+ {
+  "role": "assistant",
+  "stopReason": "aborted",
+  "errorMessage": "Request was aborted"
+ }
+]

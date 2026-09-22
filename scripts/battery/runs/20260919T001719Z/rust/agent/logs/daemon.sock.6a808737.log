@@ -1,0 +1,10 @@
+supervisor started pid 130176
+[2026-09-19T00:17:26.369Z] session worker 6baee67de2a8 registered (epoch 1, pid 130195)
+[2026-09-19T00:17:26.446Z] session worker 6baee67de2a8 re-registered (epoch 2, pid 130195)
+[2026-09-19T00:17:29.588Z] session worker d5733e2278c4 registered (epoch 1, pid 130236)
+[2026-09-19T00:17:29.650Z] session worker d5733e2278c4 re-registered (epoch 2, pid 130236)
+[2026-09-19T00:17:30.369Z] session worker d5733e2278c4 exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-19T00:17:30.649Z] session worker d5733e2278c4 re-registered (epoch 3, pid 130251)
+[2026-09-19T00:17:31.699Z] session worker d5733e2278c4 re-registered (epoch 4, pid 130251)
+[2026-09-19T00:17:31.789Z] session worker e0378c1ce72d registered (epoch 1, pid 130285)
+[2026-09-19T00:17:31.870Z] session worker e0378c1ce72d re-registered (epoch 2, pid 130285)

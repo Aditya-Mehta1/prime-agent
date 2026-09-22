@@ -1,0 +1,51 @@
+[
+ {
+  "flow": "f2_prompt",
+  "category": "behavior",
+  "gap": false,
+  "summary": "print-mode stdout identical: 'battery hello from mock'",
+  "evidence": ""
+ },
+ {
+  "flow": "f3_tool",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: ipython tool call executed and output captured",
+  "evidence": ""
+ },
+ {
+  "flow": "f3_tool",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: ipython tool call executed and output captured",
+  "evidence": ""
+ },
+ {
+  "flow": "f3_tool",
+  "category": "protocol",
+  "gap": true,
+  "summary": "session entry types differ: ts-only=['service_tier_change', 'session_state'] rust-only=[]; full counts in f3_tool-session-shapes.json",
+  "evidence": "f3_tool-session-shapes.json"
+ },
+ {
+  "flow": "f8_resume",
+  "category": "behavior",
+  "gap": true,
+  "summary": "ts: print '-c' did not refuse the active session (exit=0): resumed turn reply",
+  "evidence": "ts/f8_resume/continue-cmd.json"
+ },
+ {
+  "flow": "f8_resume",
+  "category": "behavior",
+  "gap": true,
+  "summary": "rust: print '-c' did not refuse the active session (exit=0): resumed turn reply",
+  "evidence": "rust/f8_resume/continue-cmd.json"
+ },
+ {
+  "flow": "f8_resume",
+  "category": "protocol",
+  "gap": true,
+  "summary": "session entry types differ: ts-only=['service_tier_change', 'session_state'] rust-only=[]; full counts in f8_resume-session-shapes.json",
+  "evidence": "f8_resume-session-shapes.json"
+ }
+]

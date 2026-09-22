@@ -1,0 +1,24 @@
+[2026-09-21T14:03:15.078Z] Prime Agent daemon listening on /tmp/vbat20260921T140248Z-ts/prime-agent-1000/worker-9678a7981b2d-04ea378d2d4e.sock
+[2026-09-21T14:03:15.409Z] daemon command "compact" failed: Error: Session is too short to compact — try again once it grows
+    at _performCompaction (/$bunfs/root/prime-agent:2256:2495)
+    at compact (/$bunfs/root/prime-agent:2256:941)
+    at async handleCommand (/$bunfs/root/prime-agent:2181:89202)
+    at async handleLine (/$bunfs/root/prime-agent:2181:62568)
+    at processTicksAndRejections (native:7:39)
+[2026-09-21T14:03:15.416Z] daemon command "prompt_and_wait" failed: Error: Cannot admit a session action while queued session input is suspended.
+    at _assertSessionActionAdmissionAvailable (/$bunfs/root/prime-agent:2253:8126)
+    at _prompt (/$bunfs/root/prime-agent:2247:11158)
+    at promptUntilAccepted (/$bunfs/root/prime-agent:2247:3835)
+    at promptAndWait (/$bunfs/root/prime-agent:2247:4181)
+    at handleCommand (/$bunfs/root/prime-agent:2181:73548)
+    at handleLine (/$bunfs/root/prime-agent:2181:62568)
+    at processTicksAndRejections (native:7:39)
+[2026-09-21T14:03:15.674Z] daemon command "prompt_and_wait" failed: Error: Cannot admit a session action while queued session input is suspended.
+    at _assertSessionActionAdmissionAvailable (/$bunfs/root/prime-agent:2253:8126)
+    at _prompt (/$bunfs/root/prime-agent:2247:11158)
+    at promptUntilAccepted (/$bunfs/root/prime-agent:2247:3835)
+    at promptAndWait (/$bunfs/root/prime-agent:2247:4181)
+    at handleCommand (/$bunfs/root/prime-agent:2181:73548)
+    at handleLine (/$bunfs/root/prime-agent:2181:62568)
+    at processTicksAndRejections (native:7:39)
+[2026-09-21T14:15:01.401Z] shutting down (exit 0); closing 0 active session(s)

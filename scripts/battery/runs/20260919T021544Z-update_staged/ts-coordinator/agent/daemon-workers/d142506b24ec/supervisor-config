@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "socketPath": "/tmp/usw-s4/ts-coordinator/daemon.sock",
+  "defaultSessionConfig": {
+    "cwd": "/tmp/usw-s4/ts-coordinator/work",
+    "agentDir": "/tmp/usw-s4/ts-coordinator/agent"
+  }
+}

@@ -1,0 +1,28 @@
+supervisor started pid 405964
+[2026-09-19T04:26:34.926Z] session worker c89561312521 registered (epoch 1, pid 406004)
+[2026-09-19T04:26:35.467Z] session worker c89561312521 re-registered (epoch 2, pid 406004)
+[2026-09-19T04:26:37.173Z] session worker c89561312521 stopped intentionally (status Ok(ExitStatus(unix_wait_status(0))))
+[2026-09-19T04:26:37.422Z] update 01a0b7ea-884a-720b-8833-095d0d1db951: all 1 worker(s) stopped; exiting for the update
+supervisor started pid 406206
+[2026-09-19T04:26:37.804Z] session worker c89561312521 exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-19T04:26:37.804Z] adopted session worker c89561312521 (was alive: false)
+[2026-09-19T04:26:37.805Z] session worker c89561312521 registered (epoch 1, pid 406213)
+[2026-09-19T04:26:37.807Z] session worker c89561312521 re-registered (epoch 2, pid 406213)
+[2026-09-19T04:26:38.030Z] session worker 260483e17d9d registered (epoch 1, pid 406255)
+[2026-09-19T04:26:38.064Z] session worker c89561312521 re-registered (epoch 3, pid 406268)
+[2026-09-19T04:26:38.080Z] session worker 260483e17d9d re-registered (epoch 2, pid 406255)
+[2026-09-19T04:26:38.081Z] session worker c89561312521 exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-19T04:26:38.404Z] session worker c89561312521 exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-19T04:26:38.426Z] session worker 260483e17d9d stopped intentionally (status Ok(ExitStatus(unix_wait_status(0))))
+[2026-09-19T04:26:38.655Z] worker c89561312521 relaunch failed: supervisor is shutting down
+[2026-09-19T04:26:38.655Z] session worker c89561312521 exited unexpectedly; restarting in 500ms (failure 2/5)
+[2026-09-19T04:26:38.675Z] update 01a0b7ea-908e-70a6-9bf5-79313472f4de: all 2 worker(s) stopped; exiting for the update
+supervisor started pid 406359
+[2026-09-19T04:26:39.051Z] session worker c89561312521 exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-19T04:26:39.051Z] adopted session worker c89561312521 (was alive: false)
+[2026-09-19T04:26:39.052Z] session worker c89561312521 registered (epoch 1, pid 406365)
+[2026-09-19T04:26:39.054Z] session worker c89561312521 re-registered (epoch 2, pid 406365)
+[2026-09-19T04:26:39.091Z] session worker 260483e17d9d exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-19T04:26:39.092Z] adopted session worker 260483e17d9d (was alive: false)
+[2026-09-19T04:26:39.094Z] session worker 260483e17d9d registered (epoch 1, pid 406364)
+[2026-09-19T04:26:39.097Z] session worker 260483e17d9d re-registered (epoch 2, pid 406364)

@@ -1,0 +1,65 @@
+[
+ {
+  "flow": "f2_prompt",
+  "category": "behavior",
+  "gap": false,
+  "summary": "print-mode stdout identical: 'battery hello from mock'",
+  "evidence": ""
+ },
+ {
+  "flow": "f2_prompt",
+  "category": "protocol",
+  "gap": false,
+  "summary": "system prompt: rust layered redesign (cached static layers + dynamic tail; TS-prompt parity superseded; raw prompts in protocol-request-diff.txt)",
+  "evidence": ""
+ },
+ {
+  "flow": "f3_tool",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: ipython tool call executed and output captured",
+  "evidence": ""
+ },
+ {
+  "flow": "f3_tool",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: ipython tool call executed and output captured",
+  "evidence": ""
+ },
+ {
+  "flow": "f3_tool",
+  "category": "protocol",
+  "gap": true,
+  "summary": "session entry types differ: ts-only=['session_state'] rust-only=[]; full counts in f3_tool-session-shapes.json",
+  "evidence": "f3_tool-session-shapes.json"
+ },
+ {
+  "flow": "f7_compaction",
+  "category": "protocol",
+  "gap": false,
+  "summary": "ts: daemon 'compact' succeeded: {\"summary\": \"pre-compaction reply 6\", \"firstKeptEntryId\": \"d33c3984\", \"tokensBefore\": 110, \"details\": {\"readFiles\": [], \"modifiedFiles\": []}}",
+  "evidence": ""
+ },
+ {
+  "flow": "f7_compaction",
+  "category": "protocol",
+  "gap": false,
+  "summary": "rust: daemon 'compact' succeeded: {\"firstKeptEntryId\": \"d8f8e5fe\", \"summary\": \"pre-compaction reply 6\", \"tokensBefore\": 110}",
+  "evidence": ""
+ },
+ {
+  "flow": "f8_resume",
+  "category": "behavior",
+  "gap": false,
+  "summary": "print '-c' refuses a session active in the daemon on both sides: 2a5fee61639c (ts) vs 02073a81fa05 (rust)",
+  "evidence": ""
+ },
+ {
+  "flow": "f8_resume",
+  "category": "protocol",
+  "gap": false,
+  "summary": "session entry type sets match (['compaction', 'custom_message', 'message', 'model_change', 'service_tier_change', 'session', 'session_info', 'session_state', 'thinking_level_change'])",
+  "evidence": ""
+ }
+]

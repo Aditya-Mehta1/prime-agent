@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "socketPath": "/repo/scripts/battery/runs/20260920T221429Z/rust/daemon.sock",
+  "defaultSessionDir": "/repo/scripts/battery/runs/20260920T221429Z/rust/agent/sessions"
+}

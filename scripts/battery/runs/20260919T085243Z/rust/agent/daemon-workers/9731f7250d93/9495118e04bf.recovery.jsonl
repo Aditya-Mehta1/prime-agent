@@ -1,0 +1,8 @@
+{"activeSessionId":"9495118e04bf","busy":true,"operation":"create","recordedAt":"2026-09-19T08:53:08.240Z","sessionFile":"/home/ubuntu/lane-worktrees/subagent-surface/scripts/battery/runs/20260919T085243Z/rust/agent/sessions/01a0b8de-8dcb-7628-a53f-a433b3608fd8.jsonl","sessionId":"01a0b8de-8dcb-7628-a53f-a433b3608fd8"}
+{"active_session_id":"9495118e04bf","follow_up":["f20 seed turn"],"recorded_at":"2026-09-19T08:53:08.271Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"9495118e04bf","follow_up":[],"recorded_at":"2026-09-19T08:53:08.419Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"9495118e04bf","follow_up":["f20 spawn the subagent now"],"recorded_at":"2026-09-19T08:53:14.149Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"9495118e04bf","follow_up":[],"recorded_at":"2026-09-19T08:53:41.063Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"9495118e04bf","follow_up":["[child-exited: no-reply child:f20-worker]\n\nLast assistant text: f20 parent fixture reply"],"recorded_at":"2026-09-19T08:53:41.524Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"9495118e04bf","follow_up":[],"recorded_at":"2026-09-19T08:53:41.559Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"9495118e04bf","busy":false,"operation":"shutdown","recordedAt":"2026-09-19T08:53:54.501Z","sessionFile":"/home/ubuntu/lane-worktrees/subagent-surface/scripts/battery/runs/20260919T085243Z/rust/agent/sessions/01a0b8de-8dcb-7628-a53f-a433b3608fd8.jsonl","sessionId":"01a0b8de-8dcb-7628-a53f-a433b3608fd8"}

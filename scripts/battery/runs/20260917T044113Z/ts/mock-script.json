@@ -1,0 +1,1 @@
+{"responses": [{"toolCall": {"name": "ipython", "arguments": {"code": "print('battery-tool-ok')"}}}, {"text": "tool turn done"}]}

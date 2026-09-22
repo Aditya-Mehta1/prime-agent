@@ -1,0 +1,21 @@
+{
+ "scenario": "codex_400_body",
+ "api": "openai-codex-responses",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "mock codex bad request\n",
+  "duration_s": 0.24,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-9005-73c3-9602-c6b3f8bc662e.jsonl",
+ "errorMessage": "mock codex bad request",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "CodexApiError",
+  "kind": "invalid_request",
+  "status": 400,
+  "providerErrorType": "CodexApiError",
+  "retryAfterMs": null
+ }
+}

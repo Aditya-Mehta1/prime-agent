@@ -1,0 +1,924 @@
+[
+ {
+  "scenario": "mistral_400_body",
+  "api": "mistral-conversations",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Mistral API error (400): {\"message\": \"mock mistral bad request\"}\n",
+   "duration_s": 1.11,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-9a3b-73cd-b53c-39190c772e9c.jsonl",
+  "errorMessage": "Mistral API error (400): {\"message\": \"mock mistral bad request\"}",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "SDKError",
+   "kind": "invalid_request",
+   "status": 400,
+   "providerErrorType": "SDKError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "anthropic_400_body",
+  "api": "anthropic-messages",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Provider rejected the request (invalid_request_error, 400): mock anthropic bad request\n",
+   "duration_s": 1.1,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-9e9a-73aa-9f00-df0e4bf767c9.jsonl",
+  "errorMessage": "Provider rejected the request (invalid_request_error, 400): mock anthropic bad request",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "invalid_request",
+   "status": 400,
+   "providerErrorType": "invalid_request_error",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "codex_429_usage_limit",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "You have hit your ChatGPT usage limit (free plan).\n",
+   "duration_s": 1.0,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-a2f0-75d9-b12f-176abd418693.jsonl",
+  "errorMessage": "You have hit your ChatGPT usage limit (free plan).",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "CodexApiError",
+   "kind": "rate_limit",
+   "status": 429,
+   "providerErrorType": "usage_limit_reached",
+   "retryAfterMs": null
+  },
+  "transportDiagnostics": [
+   {
+    "name": "Error",
+    "message": "WebSocket connection to 'ws://127.0.0.1:46675/codex/responses' failed: Expected 101 status code",
+    "code": null,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "codex_400_body",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "mock codex bad request\n",
+   "duration_s": 1.03,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-a6db-77ff-9463-0bbc3b13923a.jsonl",
+  "errorMessage": "mock codex bad request",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "CodexApiError",
+   "kind": "invalid_request",
+   "status": 400,
+   "providerErrorType": "CodexApiError",
+   "retryAfterMs": null
+  },
+  "transportDiagnostics": [
+   {
+    "name": "Error",
+    "message": "WebSocket connection to 'ws://127.0.0.1:46675/codex/responses' failed: Expected 101 status code",
+    "code": null,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "bedrock_400_validation",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Protocol error\n",
+   "duration_s": 1.07,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-aaf8-70ec-8a20-6fc7d9270f83.jsonl",
+  "errorMessage": "Protocol error",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_ERROR",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_400_validation_http1",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Validation error: mock bedrock bad request\n",
+   "duration_s": 1.02,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-af01-7218-94e8-e8c71833e07b.jsonl",
+  "errorMessage": "Validation error: mock bedrock bad request",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "ValidationException",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ValidationException",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "google_400_body",
+  "api": "google-generative-ai",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Provider rejected the request (ApiError, 400)\n",
+   "duration_s": 1.11,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-b305-717d-87e9-f8a9af7a8ab8.jsonl",
+  "errorMessage": "Provider rejected the request (ApiError, 400)",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "ApiError",
+   "kind": "invalid_request",
+   "status": 400,
+   "providerErrorType": "ApiError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_400_validation",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Validation error: mock bedrock bad request\n",
+   "duration_s": 1.06,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-b776-72fb-9d41-0a96bd1ead0e.jsonl",
+  "errorMessage": "Validation error: mock bedrock bad request",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "ValidationException",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ValidationException",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_rststream_midstream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Stream closed with error code NGHTTP2_INTERNAL_ERROR\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+   "duration_s": 1.26,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-bb8a-741a-9c56-4213cb6aca61.jsonl",
+  "errorMessage": "Stream closed with error code NGHTTP2_INTERNAL_ERROR\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_STREAM_ERROR",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_goaway_midstream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Session closed with error code 1\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+   "duration_s": 1.26,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-c075-765d-be80-598dd1cf123d.jsonl",
+  "errorMessage": "Session closed with error code 1\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_SESSION_ERROR",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_tcp_rst_midstream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+   "duration_s": 1.33,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-c562-71df-b036-963d0e9a16e4.jsonl",
+  "errorMessage": "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_STREAM_CANCEL",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_tcp_fin_midstream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+   "duration_s": 1.38,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-ca8f-760e-80be-74c90a2d9d8f.jsonl",
+  "errorMessage": "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_STREAM_CANCEL",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_400_validation_http1",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "read ECONNRESET\n",
+   "duration_s": 1.03,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-cfef-70f9-8e42-9d31a40784b3.jsonl",
+  "errorMessage": "read ECONNRESET",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "TimeoutError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ECONNRESET",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "ws_handshake_reject_401",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.03,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-d401-72ef-8d2d-8fc1176257de.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "Error",
+    "message": "WebSocket connection to 'ws://127.0.0.1:44481/codex/responses' failed: Expected 101 status code",
+    "code": null,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_handshake_reject_500",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.03,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-d809-769a-869f-3cf5a9cd7605.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "Error",
+    "message": "WebSocket connection to 'ws://127.0.0.1:44481/codex/responses' failed: Expected 101 status code",
+    "code": null,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_bad_accept_key",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.12,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-dc08-7358-b5e9-8713925aa7a2.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "Error",
+    "message": "WebSocket connection to 'ws://127.0.0.1:44481/codex/responses' failed: Mismatch websocket accept header",
+    "code": null,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_close_1011_reason",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.12,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-e087-73be-a867-8d27102e54f1.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1011 mock server reason",
+    "code": 1011,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_close_1009_no_reason",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.15,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-e4c7-754b-8e28-2a1219f9f29c.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1009 message too big",
+    "code": 1009,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_close_1000_done",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.15,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-e94d-752a-b1eb-0e47f5afffa0.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1000 done",
+    "code": 1000,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_close_no_code",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.06,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-edc6-77d1-ac5a-1ebba3b50995.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1005",
+    "code": 1005,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_fin_no_close",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.13,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-f1ee-70ba-bbf7-dfb4e0b031e2.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1006 Connection ended",
+    "code": 1006,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_tcp_rst",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.07,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-f666-70db-8e67-3622dce7c941.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1006 Connection ended",
+    "code": 1006,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_reserved_opcode",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.19,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-fa93-76cc-9134-8f8e938c4604.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1002 Protocol error - unsupported control frame",
+    "code": 1002,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_reserved_control_opcode",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.08,
+   "timeout": false
+  },
+  "session_file": "01a0bf17-ff42-72ee-8801-fce944b02d1d.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1002 Protocol error - unsupported control frame",
+    "code": 1002,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_rsv_bits",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 0,
+   "stdout": "",
+   "stderr": "",
+   "duration_s": 1.1,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-037c-749c-b1de-bae37223a588.jsonl",
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1011 Compression not implemented yet",
+    "code": 1011,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_wss_to_plain",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "unknown certificate verification error\n",
+   "duration_s": 1.04,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-07c1-77b9-b7bd-60e6f578c68c.jsonl",
+  "errorMessage": "unknown certificate verification error",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "TypeError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
+   "retryAfterMs": null
+  },
+  "transportDiagnostics": [
+   {
+    "name": "Error",
+    "message": "WebSocket connection to 'wss://127.0.0.1:44481/codex/responses' failed: TLS handshake failed",
+    "code": null,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_invalid_json",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Invalid Codex WebSocket JSON: JSON Parse error: Unexpected identifier \"not\"\n",
+   "duration_s": 1.23,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-0bde-745b-8c64-e874e7d61250.jsonl",
+  "errorMessage": "Invalid Codex WebSocket JSON: JSON Parse error: Unexpected identifier \"not\"",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "CodexProtocolError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "CodexProtocolError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "ws_error_event_then_close",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Codex error: mock in-stream error\n",
+   "duration_s": 1.13,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-10a7-746c-8fbc-96a3fd10e744.jsonl",
+  "errorMessage": "Codex error: mock in-stream error",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "CodexApiError",
+   "kind": "server_error",
+   "status": null,
+   "providerErrorType": "server_error",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "ws_start_then_close_1011",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "WebSocket closed 1011 mock server reason\n",
+   "duration_s": 1.15,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-1512-7710-9588-7deecd89a69f.jsonl",
+  "errorMessage": "WebSocket closed 1011 mock server reason",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "WebSocketCloseError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "WebSocketCloseError",
+   "retryAfterMs": null
+  },
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1011 mock server reason",
+    "code": 1011,
+    "details": {
+     "configuredTransport": "auto",
+     "eventsEmitted": true,
+     "phase": "after_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_start_then_fin",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "WebSocket closed 1006 Connection ended\n",
+   "duration_s": 1.32,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-19a1-7025-b18f-e4ece550587d.jsonl",
+  "errorMessage": "WebSocket closed 1006 Connection ended",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "WebSocketCloseError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "WebSocketCloseError",
+   "retryAfterMs": null
+  },
+  "transportDiagnostics": [
+   {
+    "name": "WebSocketCloseError",
+    "message": "WebSocket closed 1006 Connection ended",
+    "code": 1006,
+    "details": {
+     "configuredTransport": "auto",
+     "eventsEmitted": true,
+     "phase": "after_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "ws_start_then_invalid_json",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Invalid Codex WebSocket JSON: JSON Parse error: Unexpected identifier \"not\"\n",
+   "duration_s": 1.22,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-1ec3-767c-afa7-36a1f34cdfbf.jsonl",
+  "errorMessage": "Invalid Codex WebSocket JSON: JSON Parse error: Unexpected identifier \"not\"",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "CodexProtocolError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "CodexProtocolError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_anthropic-messages",
+  "api": "anthropic-messages",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Connection error.\n",
+   "duration_s": 1.08,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-2381-771f-83ae-87487f26616a.jsonl",
+  "errorMessage": "Connection error.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": null,
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_mistral-conversations",
+  "api": "mistral-conversations",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?\n",
+   "duration_s": 1.12,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-27da-741d-9925-55a52f8d9e5b.jsonl",
+  "errorMessage": "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "UnexpectedClientError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "UnexpectedClientError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_openai-codex-responses",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Unable to connect. Is the computer able to access the url?\n",
+   "duration_s": 1.17,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-2c27-744d-8537-e7fb96b7af29.jsonl",
+  "errorMessage": "Unable to connect. Is the computer able to access the url?",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "TypeError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ConnectionRefused",
+   "retryAfterMs": null
+  },
+  "transportDiagnostics": [
+   {
+    "name": "Error",
+    "message": "WebSocket connection to 'ws://127.0.0.1:1/codex/responses' failed: Failed to connect",
+    "code": null,
+    "details": {
+     "configuredTransport": "auto",
+     "fallbackTransport": "sse",
+     "eventsEmitted": false,
+     "phase": "before_message_stream_start"
+    }
+   }
+  ]
+ },
+ {
+  "scenario": "connection_bedrock-converse-stream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "The pending stream has been canceled (caused by: connect ECONNREFUSED 127.0.0.1:1)\n",
+   "duration_s": 1.06,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-30c2-74eb-b0dc-420b941731e1.jsonl",
+  "errorMessage": "The pending stream has been canceled (caused by: connect ECONNREFUSED 127.0.0.1:1)",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_STREAM_CANCEL",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_bedrock-converse-stream_http1",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "connect ECONNREFUSED 127.0.0.1:1\n",
+   "duration_s": 1.06,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-34e2-76e9-b62f-1d65b3e29b90.jsonl",
+  "errorMessage": "connect ECONNREFUSED 127.0.0.1:1",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ECONNREFUSED",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_google-generative-ai",
+  "api": "google-generative-ai",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Unable to connect. Is the computer able to access the url?\n",
+   "duration_s": 1.08,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-394c-70e4-911d-0e566a0ec68a.jsonl",
+  "errorMessage": "Unable to connect. Is the computer able to access the url?",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "TypeError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ConnectionRefused",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_openai-completions",
+  "api": "openai-completions",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Connection error.\n",
+   "duration_s": 1.04,
+   "timeout": false
+  },
+  "session_file": "01a0bf18-3d40-70b0-85d9-997f6584748c.jsonl",
+  "errorMessage": "Connection error.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": null,
+   "retryAfterMs": null
+  }
+ }
+]

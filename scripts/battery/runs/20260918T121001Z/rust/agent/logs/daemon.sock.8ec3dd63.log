@@ -1,0 +1,10 @@
+supervisor started pid 219224
+[2026-09-18T12:10:17.816Z] session worker 8da8d3211c3c registered (epoch 1, pid 219237)
+[2026-09-18T12:10:17.878Z] session worker 8da8d3211c3c re-registered (epoch 2, pid 219237)
+[2026-09-18T12:10:33.964Z] session worker b6298e108f81 registered (epoch 1, pid 219431)
+[2026-09-18T12:10:34.022Z] session worker b6298e108f81 re-registered (epoch 2, pid 219431)
+[2026-09-18T12:10:35.272Z] session worker e06dfdd88455 registered (epoch 1, pid 219471)
+[2026-09-18T12:10:35.323Z] session worker e06dfdd88455 re-registered (epoch 2, pid 219471)
+[2026-09-18T12:10:36.165Z] session worker e06dfdd88455 exited unexpectedly; restarting in 250ms (failure 1/5)
+[2026-09-18T12:10:36.460Z] session worker e06dfdd88455 re-registered (epoch 3, pid 219488)
+[2026-09-18T12:10:37.502Z] session worker e06dfdd88455 re-registered (epoch 4, pid 219488)

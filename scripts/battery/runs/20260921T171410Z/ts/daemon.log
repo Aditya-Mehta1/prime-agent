@@ -1,0 +1,45 @@
+Prime Agent daemon supervisor b6780f01-7b9f-4d5d-a214-678542292ef6 listening on /home/ubuntu/lane-worktrees/wire-order/scripts/battery/runs/20260921T171410Z/ts/daemon.sock
+Session worker 8ec5e102e4f9 stderr: Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-8ec5e102e4f9.sock
+Session worker 3c46510c8327 stderr: Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-3c46510c8327.sock
+Session worker 18a14e3104b2 stderr: Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-18a14e3104b2.sock
+Session worker 5df56dba5b2b stderr: Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-5df56dba5b2b.sock
+Session worker f86f3bec5b83 stderr: Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-f86f3bec5b83.sock
+Session worker f86f3bec5b83 stderr: daemon command "compact" failed: Error: Session is too short to compact — try again once it grows
+Session worker f86f3bec5b83 stderr:     at _performCompaction (/$bunfs/root/prime-agent:2256:2495)
+Session worker f86f3bec5b83 stderr:     at compact (/$bunfs/root/prime-agent:2256:941)
+Session worker f86f3bec5b83 stderr:     at async handleCommand (/$bunfs/root/prime-agent:2181:89202)
+Session worker f86f3bec5b83 stderr:     at async handleLine (/$bunfs/root/prime-agent:2181:62568)
+Session worker f86f3bec5b83 stderr:     at processTicksAndRejections (native:7:39)
+Session worker f86f3bec5b83 stderr: daemon command "prompt_and_wait" failed: Error: Cannot admit a session action while queued session input is suspended.
+Session worker f86f3bec5b83 stderr:     at _assertSessionActionAdmissionAvailable (/$bunfs/root/prime-agent:2253:8126)
+Session worker f86f3bec5b83 stderr:     at _prompt (/$bunfs/root/prime-agent:2247:11158)
+Session worker f86f3bec5b83 stderr:     at promptUntilAccepted (/$bunfs/root/prime-agent:2247:3835)
+Session worker f86f3bec5b83 stderr:     at promptAndWait (/$bunfs/root/prime-agent:2247:4181)
+Session worker f86f3bec5b83 stderr:     at handleCommand (/$bunfs/root/prime-agent:2181:73548)
+Session worker f86f3bec5b83 stderr:     at handleLine (/$bunfs/root/prime-agent:2181:62568)
+Session worker f86f3bec5b83 stderr:     at processTicksAndRejections (native:7:39)
+Session worker f86f3bec5b83 stderr: daemon command "prompt_and_wait" failed: Error: Cannot admit a session action while queued session input is suspended.
+Session worker f86f3bec5b83 stderr:     at _assertSessionActionAdmissionAvailable (/$bunfs/root/prime-agent:2253:8126)
+Session worker f86f3bec5b83 stderr:     at _prompt (/$bunfs/root/prime-agent:2247:11158)
+Session worker f86f3bec5b83 stderr:     at promptUntilAccepted (/$bunfs/root/prime-agent:2247:3835)
+Session worker f86f3bec5b83 stderr:     at promptAndWait (/$bunfs/root/prime-agent:2247:4181)
+Session worker f86f3bec5b83 stderr:     at handleCommand (/$bunfs/root/prime-agent:2181:73548)
+Session worker f86f3bec5b83 stderr:     at handleLine (/$bunfs/root/prime-agent:2181:62568)
+Session worker f86f3bec5b83 stderr:     at processTicksAndRejections (native:7:39)
+Session worker 28e4e8b75558 stderr: Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-28e4e8b75558.sock
+Session worker b462290e7f91 stderr: Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-b462290e7f91.sock
+Session worker 52ad784a1318 stderr: Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-52ad784a1318.sock
+Session worker 52ad784a1318 stderr: daemon command "compact" failed: Error: Already compacted
+Session worker 52ad784a1318 stderr:     at _performCompaction (/$bunfs/root/prime-agent:2256:2461)
+Session worker 52ad784a1318 stderr:     at compact (/$bunfs/root/prime-agent:2256:941)
+Session worker 52ad784a1318 stderr:     at async handleCommand (/$bunfs/root/prime-agent:2181:89202)
+Session worker 52ad784a1318 stderr:     at async handleLine (/$bunfs/root/prime-agent:2181:62568)
+Session worker 52ad784a1318 stderr:     at processTicksAndRejections (native:7:39)
+Session worker b462290e7f91 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 3c46510c8327 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 18a14e3104b2 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 8ec5e102e4f9 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 5df56dba5b2b stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker f86f3bec5b83 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 52ad784a1318 stderr: shutting down (exit 0); closing 0 active session(s)
+Session worker 28e4e8b75558 stderr: shutting down (exit 0); closing 0 active session(s)

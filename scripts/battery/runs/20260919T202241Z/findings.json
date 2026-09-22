@@ -1,0 +1,106 @@
+[
+ {
+  "flow": "f21_worker_recovery",
+  "category": "protocol",
+  "gap": false,
+  "summary": "ts: the session summary exposes the live worker pid (workerState: ready)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: the attached TUI keeps the transcript after the worker process is killed",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts: the worker death surfaces the daemon reconnection status row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "behavior",
+  "gap": true,
+  "summary": "ts ground truth (EXPECTED-FAIL, ruling in the flow docstring): the wire-created (unowned) session does not survive its worker's death \u2014 the daemon parks the worker failed and the follow-up submit fails with \"Session worker is failed\"; the owned-path respawn is the behavior Rust ports",
+  "evidence": "ts/f21_worker_recovery/06-recovered-settled.txt",
+  "expectedFail": "worker-recovery"
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "behavior",
+  "gap": false,
+  "summary": "ts ground truth: the failed follow-up surfaces the \"\u26a0 Error: Session worker is failed\" and \"\u26a0 Error: Daemon reconnection failed: Session worker is failed\" rows with the typed text preserved in the input",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "protocol",
+  "gap": true,
+  "summary": "ts ground truth (EXPECTED-FAIL, ruling in the flow docstring): get_state fails with \"Session worker is failed\" \u2014 the unowned worker stays parked failed, no new ready worker in this daemon's lifetime",
+  "evidence": "ts/f21_worker_recovery/07-post-recovery-state.json",
+  "expectedFail": "worker-recovery"
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "protocol",
+  "gap": false,
+  "summary": "rust: the session summary exposes the live worker pid (workerState: ready)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: the attached TUI keeps the transcript after the worker process is killed",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: the worker death surfaces the daemon reconnection status row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "behavior",
+  "gap": false,
+  "summary": "rust: after the worker is killed the session recovers \u2014 the next turn completes with the transcript intact",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "protocol",
+  "gap": false,
+  "summary": "rust: recovery respawned the worker (pid 363953 -> 364004, workerState ready)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "visual",
+  "gap": true,
+  "summary": "post-kill: frames differ TS vs Rust (see frame-diff-post-kill.txt)",
+  "evidence": "ts/f21_worker_recovery/frame-diff-post-kill.txt",
+  "expectedFail": "worker-recovery"
+ },
+ {
+  "flow": "f21_worker_recovery",
+  "category": "visual",
+  "gap": true,
+  "summary": "recovered: frames differ TS vs Rust (see frame-diff-recovered.txt)",
+  "evidence": "ts/f21_worker_recovery/frame-diff-recovered.txt",
+  "expectedFail": "worker-recovery"
+ }
+]

@@ -1,0 +1,12 @@
+{"cwd":"/home/ubuntu/lane-worktrees/agent-end-messages/scripts/battery/runs/20260921T140248Z/rust/work","id":"01a0c44c-d669-7664-a0bb-032bd4cc0d71","rlmDepth":0,"timestamp":"2026-09-21T14:09:25.097Z","type":"session","version":3}
+{"type":"model_change","id":"8bb60597","parentId":null,"timestamp":"2026-09-21T14:09:25.113Z","modelId":"mock-1","provider":"prime-inference"}
+{"type":"thinking_level_change","id":"dddc4c9b","parentId":"8bb60597","timestamp":"2026-09-21T14:09:25.113Z","thinkingLevel":"off"}
+{"type":"service_tier_change","id":"37eadf61","parentId":"dddc4c9b","timestamp":"2026-09-21T14:09:25.113Z","serviceTier":"default"}
+{"type":"session_state","id":"4fef3c5a","parentId":"37eadf61","timestamp":"2026-09-21T14:09:25.113Z","state":{"status":"active"}}
+{"type":"session_info","id":"5cee098d","parentId":"4fef3c5a","timestamp":"2026-09-21T14:09:25.115Z","name":"battery-f21"}
+{"type":"message","id":"044cb79c","parentId":"5cee098d","timestamp":"2026-09-21T14:09:25.278Z","message":{"content":[{"text":"f21 seed turn","type":"text"}],"role":"user","timestamp":1789999765278}}
+{"type":"message","id":"87bdec1c","parentId":"044cb79c","timestamp":"2026-09-21T14:09:25.348Z","message":{"api":"openai-completions","content":[{"text":"f21 recovery fixture reply","type":"text"}],"model":"mock-1","provider":"prime-inference","responseId":"chatcmpl-battery","role":"assistant","stopReason":"stop","timestamp":1789999765338,"usage":{"cacheRead":80,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":20,"output":10,"totalTokens":110}}}
+{"type":"session_state","id":"61ebc4bf","parentId":"87bdec1c","timestamp":"2026-09-21T14:09:34.463Z","state":{"status":"active"}}
+{"type":"session_info","id":"a969d322","parentId":"61ebc4bf","timestamp":"2026-09-21T14:09:34.465Z","name":"battery-f21"}
+{"type":"message","id":"1de95fbc","parentId":"a969d322","timestamp":"2026-09-21T14:09:39.390Z","message":{"content":[{"text":"f21 keep working after the crash","type":"text"}],"role":"user","timestamp":1789999779390}}
+{"type":"message","id":"e0b8762a","parentId":"1de95fbc","timestamp":"2026-09-21T14:09:39.460Z","message":{"api":"openai-completions","content":[{"text":"f21 post-recovery fixture reply","type":"text"}],"model":"mock-1","provider":"prime-inference","responseId":"chatcmpl-battery","role":"assistant","stopReason":"stop","timestamp":1789999779450,"usage":{"cacheRead":80,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":20,"output":10,"totalTokens":110}}}

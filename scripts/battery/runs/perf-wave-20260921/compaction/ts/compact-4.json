@@ -1,0 +1,15 @@
+{
+ "id": "kc4",
+ "type": "response",
+ "command": "compact",
+ "success": true,
+ "data": {
+  "summary": "compaction summary 4\n\n---\n\n**Turn Context (split turn):**\n\ncompaction summary 4",
+  "firstKeptEntryId": "dbfb6319",
+  "tokensBefore": 110,
+  "details": {
+   "readFiles": [],
+   "modifiedFiles": []
+  }
+ }
+}

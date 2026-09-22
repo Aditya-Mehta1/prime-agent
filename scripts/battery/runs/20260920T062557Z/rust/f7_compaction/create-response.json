@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "b101809a15cc",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-20T06:25:58.937Z",
+  "cwd": "/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T062557Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "b101809a15cc",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-20T06:25:58.943Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-20T06:25:58.943Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T062557Z/rust/agent/sessions/01a0bd7e-3099-73d6-815f-a3de7601e4c7.jsonl",
+  "sessionId": "01a0bd7e-3099-73d6-815f-a3de7601e4c7",
+  "sessionName": "battery-compact",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 792464,
+  "workerState": "ready"
+ },
+ "id": "c1",
+ "success": true,
+ "type": "response"
+}

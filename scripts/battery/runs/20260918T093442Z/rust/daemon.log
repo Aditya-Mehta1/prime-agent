@@ -1,0 +1,37 @@
+pa-daemon client connection error: Broken pipe (os error 32)
+[supervisor] spawned worker pid Some(93764)
+[supervisor] wrote worker frame worker_auth: Ok("ok")
+[worker 93764] accepted connection
+[worker 93764] accepted connection
+[supervisor] worker frame: Some(String("daemon_hello"))
+[worker 93764] hello write failed: write private frame: Broken pipe (os error 32)
+[worker 93764] got command worker_auth
+[worker 93764] auth ok
+[supervisor] worker frame: Some(String("response"))
+[supervisor] wrote worker frame create: Ok("ok")
+[worker 93764] got command create
+[supervisor] wrote worker frame get_state: Ok("ok")
+[supervisor] worker frame: Some(String("response"))
+[worker 93764] got command get_state
+[supervisor] wrote worker frame get_state: Ok("ok")
+[supervisor] worker frame: Some(String("response"))
+[worker 93764] got command get_state
+[supervisor] worker frame: Some(String("response"))
+[supervisor] wrote worker frame worker_register_peer_transport: Ok("[worker ok93764"] got command )worker_register_peer_transport
+
+[supervisor] worker frame: Some(String("response"))
+[worker 93764] accepted connection
+[worker 93764] got command peer_auth
+[worker 93764] got command attach
+[worker 93764] got command get_session_stats
+[worker 93764] got command prompt
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[supervisor] worker frame: Some(String("session_event"))
+[worker 93764] got command abort
+[worker 93764] got command get_session_stats
+[worker 93764] got command detach
+[supervisor] wrote worker frame shutdown: Ok("ok")
+[worker 93764] got command shutdown
+[worker 93764 registration] registration connection lost: supervisor closed the registration connection

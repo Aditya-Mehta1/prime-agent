@@ -1,0 +1,2 @@
+Prime Agent daemon supervisor 38be3391-b7bc-49f4-98f6-44de450e16ae listening on /home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T062530Z-abort/ts/daemon.sock
+Session worker 34958f2bacbc stderr: Prime Agent daemon listening on /tmp/compaction-abort-ts-792078/prime-agent-1000/worker-bc1beb607eb3-34958f2bacbc.sock

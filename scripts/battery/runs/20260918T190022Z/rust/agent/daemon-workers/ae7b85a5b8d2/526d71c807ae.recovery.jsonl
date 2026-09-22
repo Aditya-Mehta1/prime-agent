@@ -1,0 +1,9 @@
+{"activeSessionId":"526d71c807ae","busy":true,"operation":"create","recordedAt":"2026-09-18T19:03:01.848Z","sessionFile":"/home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/rust/agent/sessions/01a0b5e6-91b3-72f8-bbc9-abfa87baf921.jsonl","sessionId":"01a0b5e6-91b3-72f8-bbc9-abfa87baf921"}
+{"active_session_id":"526d71c807ae","follow_up":["f14 seed turn 1 of the parity battery with deterministic content"],"recorded_at":"2026-09-18T19:03:01.855Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"526d71c807ae","follow_up":["f14 seed turn 2 of the parity battery with deterministic content"],"recorded_at":"2026-09-18T19:03:02.105Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"526d71c807ae","follow_up":["f14 seed turn 2 of the parity battery with deterministic content"],"recorded_at":"2026-09-18T19:03:02.106Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"526d71c807ae","follow_up":[],"recorded_at":"2026-09-18T19:03:02.177Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"526d71c807ae","follow_up":["/compact"],"recorded_at":"2026-09-18T19:03:05.339Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"526d71c807ae","follow_up":[],"recorded_at":"2026-09-18T19:03:05.351Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"526d71c807ae","follow_up":["f14 threshold crossing turn"],"recorded_at":"2026-09-18T19:03:41.985Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"526d71c807ae","follow_up":[],"recorded_at":"2026-09-18T19:03:42.114Z","steering":[],"type":"queue_snapshot","version":1}

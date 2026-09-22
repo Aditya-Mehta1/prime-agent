@@ -1,0 +1,6 @@
+{"id": "s1", "type": "response", "command": "list", "success": true, "data": {"sessions": []}}
+{"id": "s2", "type": "response", "command": "prepare_update_restart", "success": true, "data": {"formatVersion": 1, "createdAt": "2026-09-19T00:35:44.535Z", "sessions": []}}
+{"id": "s3", "type": "response", "command": "create", "success": false, "error": "Daemon is preparing an update restart"}
+{"id": "s4", "type": "response", "command": "list", "success": true, "data": {"sessions": []}}
+{"id": "s5", "type": "response", "command": "create", "success": false, "error": "Daemon is preparing an update restart"}
+{"id": "s6", "type": "response", "command": "shutdown", "success": true}

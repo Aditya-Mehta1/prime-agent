@@ -1,0 +1,9 @@
+[2026-09-19T03:13:44.409Z] supervisor: Prime Agent daemon supervisor 543fb741-0f51-4aec-85fe-301186f3c790 listening on /tmp/upw-s5/ts-live/daemon.sock
+[2026-09-19T03:13:45.740Z] supervisor: Session worker f569fe612746 stderr: Prime Agent daemon listening on /tmp/upw-ts-live/prime-agent-1000/worker-d350589379a2-f569fe612746.sock
+[2026-09-19T03:13:46.237Z] supervisor: Session worker f569fe612746 stderr: shutdown command received over socket; 0 active session(s) will be closed
+[2026-09-19T03:13:46.237Z] supervisor: Session worker f569fe612746 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-19T03:13:46.322Z] supervisor: Supervisor command get_state failed: Error: Unknown active session: 315e1dd66128
+    at findWorker (/$bunfs/root/prime-agent:2190:72864)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:27285)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)

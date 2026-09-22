@@ -1,0 +1,7 @@
+{"cwd":"/home/ubuntu/lane-worktrees/tui-interaction/scripts/battery/runs/20260918T105318Z/rust/work","id":"01a0b426-396c-738c-b3e1-cd79a2fe3da8","rlmDepth":0,"timestamp":"2026-09-18T10:53:19.084Z","type":"session","version":3}
+{"type":"model_change","id":"b839795c","parentId":null,"timestamp":"2026-09-18T10:53:19.122Z","modelId":"mock-1","provider":"prime-inference"}
+{"type":"thinking_level_change","id":"b7af2599","parentId":"b839795c","timestamp":"2026-09-18T10:53:19.122Z","thinkingLevel":"off"}
+{"type":"service_tier_change","id":"f979f82d","parentId":"b7af2599","timestamp":"2026-09-18T10:53:19.122Z","serviceTier":"default"}
+{"type":"session_state","id":"b91157c3","parentId":"f979f82d","timestamp":"2026-09-18T10:53:19.122Z","state":{"status":"active"}}
+{"type":"message","id":"03c6906d","parentId":"b91157c3","timestamp":"2026-09-18T10:53:21.168Z","message":{"content":[{"text":"quick turn","type":"text"}],"role":"user","timestamp":1789728801168}}
+{"type":"message","id":"0dac8ba5","parentId":"03c6906d","timestamp":"2026-09-18T10:53:21.268Z","message":{"api":"openai-completions","content":[{"text":"fast reply","type":"text"}],"model":"mock-1","provider":"prime-inference","responseId":"chatcmpl-battery","role":"assistant","stopReason":"stop","timestamp":1789728801244,"usage":{"cacheRead":80,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":20,"output":10,"totalTokens":110}}}

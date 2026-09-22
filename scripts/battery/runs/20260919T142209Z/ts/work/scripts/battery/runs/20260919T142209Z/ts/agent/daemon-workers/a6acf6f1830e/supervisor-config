@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/keybindings/scripts/battery/runs/20260919T142209Z/ts/work/scripts/battery/runs/20260919T142209Z/ts/daemon.sock",
+  "defaultSessionConfig": {
+    "cwd": "/home/ubuntu/lane-worktrees/keybindings/scripts/battery/runs/20260919T142209Z/ts/work",
+    "agentDir": "scripts/battery/runs/20260919T142209Z/ts/agent"
+  }
+}

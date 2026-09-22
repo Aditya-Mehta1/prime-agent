@@ -1,0 +1,35 @@
+[2026-09-18T00:48:29.262Z] supervisor: Prime Agent daemon supervisor 2923a16c-7e94-48fe-90c6-11316ec17475 listening on /home/ubuntu/lane-worktrees/prompt-redesign/scripts/battery/runs/20260918T004824Z/ts/daemon.sock
+[2026-09-18T00:48:31.313Z] supervisor: Session worker f0506d446a64 stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-f0506d446a64.sock
+[2026-09-18T00:48:49.274Z] supervisor: Session worker 140840d5af09 stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-140840d5af09.sock
+[2026-09-18T00:48:49.985Z] supervisor: Session worker 140840d5af09 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-18T00:48:49.985Z] supervisor: Session worker 140840d5af09 stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-18T00:48:55.017Z] supervisor: Session worker c81adbbfe499 stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-c81adbbfe499.sock
+[2026-09-18T00:49:06.081Z] supervisor: Session worker c81adbbfe499 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-18T00:49:06.081Z] supervisor: Session worker c81adbbfe499 stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-18T00:49:13.956Z] supervisor: Session worker 0a37b490de9e stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-0a37b490de9e.sock
+[2026-09-18T00:49:18.068Z] supervisor: Session worker 0a37b490de9e stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-18T00:49:18.068Z] supervisor: Session worker 0a37b490de9e stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-18T00:49:18.197Z] supervisor: Evicted empty session worker 0a37b490de9e root=01a0b1fd-2aed-713f-8cff-fa294860fde6 on last client detach
+[2026-09-18T00:49:22.789Z] supervisor: Session worker 2ec0ea39dafa stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-2ec0ea39dafa.sock
+[2026-09-18T00:49:45.530Z] supervisor: Session worker 913d77bdedf2 stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-913d77bdedf2.sock
+[2026-09-18T00:50:01.658Z] supervisor: Session worker c7cdca05e5b5 stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-c7cdca05e5b5.sock
+[2026-09-18T00:50:07.933Z] supervisor: Supervisor command create failed: SessionAlreadyActiveError: Session is already active in 38bf2cedc800: /home/ubuntu/lane-worktrees/prompt-redesign/scripts/battery/runs/20260918T004824Z/ts/agent/sessions/01a0b1fd-e556-70cf-bb74-4c3b116d58b6.jsonl
+    at assertWorkerCreateOwner (/$bunfs/root/prime-agent:2190:35183)
+    at reuseWorkerForCreate (/$bunfs/root/prime-agent:2190:34316)
+    at async handleCommand (/$bunfs/root/prime-agent:2190:11504)
+    at async handleLine (/$bunfs/root/prime-agent:2190:9053)
+    at processTicksAndRejections (native:7:39)
+[2026-09-18T00:50:11.159Z] supervisor: Session worker c7cdca05e5b5 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T00:50:11.182Z] supervisor: Session worker 2ec0ea39dafa stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T00:50:11.240Z] supervisor: Session worker f0506d446a64 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T00:50:11.388Z] supervisor: Session worker 913d77bdedf2 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T00:50:14.800Z] supervisor: Prime Agent daemon supervisor 6888db4c-e224-4397-bcd2-2994ffc0c885 listening on /home/ubuntu/lane-worktrees/prompt-redesign/scripts/battery/runs/20260918T004824Z/ts/daemon.sock
+[2026-09-18T00:50:16.600Z] supervisor: Session worker aa51c44dbce5 stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-aa51c44dbce5.sock
+[2026-09-18T00:50:20.962Z] supervisor: Session worker 796c6db15b23 stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-796c6db15b23.sock
+[2026-09-18T00:50:21.658Z] supervisor: Session worker 796c6db15b23 stderr: shutdown command received over socket; 1 active session(s) will be closed
+[2026-09-18T00:50:21.658Z] supervisor: Session worker 796c6db15b23 stderr: shutting down (exit 0); closing 1 active session(s)
+[2026-09-18T00:50:25.863Z] supervisor: Session worker b793b18a5b31 stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-b793b18a5b31.sock
+[2026-09-18T00:52:10.357Z] supervisor: Session worker b13350277eea stderr: Prime Agent daemon listening on /tmp/vbat20260918T004824Z-ts/prime-agent-1000/worker-17074f169d6c-b13350277eea.sock
+[2026-09-18T00:52:28.989Z] supervisor: Session worker b13350277eea stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T00:52:29.059Z] supervisor: Session worker aa51c44dbce5 stderr: shutting down (exit 0); closing 0 active session(s)
+[2026-09-18T00:52:29.110Z] supervisor: Session worker b793b18a5b31 stderr: shutting down (exit 0); closing 0 active session(s)

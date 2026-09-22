@@ -1,0 +1,21 @@
+{
+ "scenario": "bedrock_h2_goaway_midstream",
+ "api": "bedrock-converse-stream",
+ "run": {
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "Session closed with error code 1\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+  "duration_s": 2.23,
+  "timeout": false
+ },
+ "session_file": "01a0bee1-2ec0-70dc-8375-f7e9b640cfa3.jsonl",
+ "errorMessage": "Session closed with error code 1\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+ "stopReason": "error",
+ "diagnostic": {
+  "name": "Error",
+  "kind": "unknown",
+  "status": null,
+  "providerErrorType": "ERR_HTTP2_SESSION_ERROR",
+  "retryAfterMs": null
+ }
+}

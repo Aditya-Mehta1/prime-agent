@@ -1,0 +1,2 @@
+{"activeSessionId":"b82aad2f5f01","busy":true,"operation":"create","recordedAt":"2026-09-18T09:34:42.739Z","sessionFile":"/home/ubuntu/lane-worktrees/tui-interaction/scripts/battery/runs/20260918T093442Z/rust/agent/sessions/01a0b3de-4218-7203-8089-fc4b4b82ceec.jsonl","sessionId":"01a0b3de-4218-7203-8089-fc4b4b82ceec"}
+{"active_session_id":"b82aad2f5f01","follow_up":["hold the turn"],"recorded_at":"2026-09-18T09:34:44.836Z","steering":[],"type":"queue_snapshot","version":1}

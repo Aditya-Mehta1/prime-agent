@@ -1,0 +1,36 @@
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.5
+  ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/tui-interaction/scripts/battery/runs/20260918T093325Z/ts/work
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+  hold the turn
+
+
+ Operation aborted · 0s
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                                               mock-1 · 666 (1%)
+
+Resume this session with: prime-agent --resume 01a0b3dd-90b0-7300-a6af-22558e4a5ee1
+
+
+
+
+
+
+
+
+
+
+
+
+
+

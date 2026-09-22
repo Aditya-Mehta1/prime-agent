@@ -1,0 +1,50 @@
+                                                      battery-f18  $0.00
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.1.0
+  ▗█▛ ▟██▙▄██▛ ▟▛         model mock-1
+<<<<<<<< HEAD:scripts/battery/runs/20260921T181530Z/rust/f18_goal_autonomous/01-goal-start.txt
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/autonomous-ordering/scripts/battery/runs/20260921T181530Z/rust/work
+========
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd ~/lane-worktrees/utility-commands/scripts/battery/runs/20260921T180927Z/rust/work
+>>>>>>>> bdfd0884 (pa-tui: /fullscreen top-bar gate + /reload transcript rebuild (TS re-mount parity); rlm-max-depth set row plain; parity evidence + normalizer):scripts/battery/runs/20260921T180927Z/rust/utility-commands/btw.txt
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+<<<<<<<< HEAD:scripts/battery/runs/20260921T181530Z/rust/f18_goal_autonomous/01-goal-start.txt
+  f18 seed turn
+========
+ Session name set: parity session
+
+ Session name: parity session
+
+ RLM max depth: 2 (default)
+
+ Reloaded keybindings, extensions, skills, prompts, themes
+
+
+>>>>>>>> bdfd0884 (pa-tui: /fullscreen top-bar gate + /reload transcript rebuild (TS re-mount parity); rlm-max-depth set row plain; parity evidence + normalizer):scripts/battery/runs/20260921T180927Z/rust/utility-commands/btw.txt
+
+
+ f18 goal fixture reply
+
+
+  /goal f18 parity objective: land the battery flows
+
+
+  Goal active: f18 parity objective: land the battery flows
+
+
+ Goal: f18 parity objective: land the battery flows
+
+ Goal continuation · f18 parity objective: land the battery flows
+
+ ⠧ Waiting · 0s
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                          Pursuing goal (0s) · mock-1 · 110 (0%)

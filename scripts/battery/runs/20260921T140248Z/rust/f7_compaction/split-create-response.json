@@ -1,0 +1,43 @@
+{
+ "command": "create",
+ "data": {
+  "activeSessionId": "827322137cca",
+  "activity": "idle",
+  "attachedClients": 0,
+  "created": "2026-09-21T14:03:11.629Z",
+  "cwd": "/home/ubuntu/lane-worktrees/agent-end-messages/scripts/battery/runs/20260921T140248Z/rust/work",
+  "hasRegisteredCronJob": false,
+  "id": "827322137cca",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-21T14:03:11.658Z",
+  "lifecycle": "draft",
+  "messageCount": 0,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-21T14:03:11.658Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/home/ubuntu/lane-worktrees/agent-end-messages/scripts/battery/runs/20260921T140248Z/rust/agent/sessions/01a0c447-238d-71a3-93d0-cd7b820ee9eb.jsonl",
+  "sessionId": "01a0c447-238d-71a3-93d0-cd7b820ee9eb",
+  "sessionName": "battery-split",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "workerPid": 2144776,
+  "workerState": "ready"
+ },
+ "id": "sc1",
+ "success": true,
+ "type": "response"
+}

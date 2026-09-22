@@ -1,0 +1,1 @@
+{"responses": [{"toolCall": {"name": "ipython", "arguments": {"code": "import agent_message; await agent_message.send('f15 a2a payload from a to b', receiver_role='sibling', receiver_name='battery-f15-b')"}}}, {"text": "f15 a2a turn reply"}]}

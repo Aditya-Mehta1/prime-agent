@@ -1,0 +1,6 @@
+{"activeSessionId":"264d83cc7949","busy":true,"operation":"create","recordedAt":"2026-09-19T20:27:00.884Z","sessionFile":"/tmp/f21-wr/20260919T202241Z/rust/agent/sessions/01a0bb59-d180-734e-9788-7df3231abb52.jsonl","sessionId":"01a0bb59-d180-734e-9788-7df3231abb52"}
+{"active_session_id":"264d83cc7949","follow_up":[],"recorded_at":"2026-09-19T20:27:00.920Z","steering":["f21 seed turn"],"type":"queue_snapshot","version":1}
+{"active_session_id":"264d83cc7949","follow_up":[],"recorded_at":"2026-09-19T20:27:00.965Z","steering":[],"type":"queue_snapshot","version":1}
+{"active_session_id":"264d83cc7949","follow_up":[],"recorded_at":"2026-09-19T20:27:12.585Z","steering":["f21 keep working after the crash"],"type":"queue_snapshot","version":1}
+{"active_session_id":"264d83cc7949","follow_up":[],"recorded_at":"2026-09-19T20:27:12.661Z","steering":[],"type":"queue_snapshot","version":1}
+{"activeSessionId":"264d83cc7949","busy":false,"operation":"shutdown","recordedAt":"2026-09-19T20:27:18.125Z","sessionFile":"/tmp/f21-wr/20260919T202241Z/rust/agent/sessions/01a0bb59-d180-734e-9788-7df3231abb52.jsonl","sessionId":"01a0bb59-d180-734e-9788-7df3231abb52"}

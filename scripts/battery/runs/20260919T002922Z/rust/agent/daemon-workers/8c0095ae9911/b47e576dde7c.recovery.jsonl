@@ -1,0 +1,2 @@
+{"activeSessionId":"b47e576dde7c","busy":true,"operation":"create","recordedAt":"2026-09-19T00:29:36.044Z","sessionFile":"/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/agent/sessions/01a0b711-8d95-76e8-a5ef-fa3bfbee25a1.jsonl","sessionId":"01a0b711-8d95-76e8-a5ef-fa3bfbee25a1"}
+{"active_session_id":"b47e576dde7c","follow_up":["hold the turn"],"recorded_at":"2026-09-19T00:29:36.506Z","steering":[],"type":"queue_snapshot","version":1}

@@ -1,0 +1,111 @@
+{
+ "command": "attach",
+ "data": {
+  "activeSessionId": "47d48e5aa6f6",
+  "client": {
+   "capabilities": [
+    "attach_snapshot",
+    "event_sequence"
+   ],
+   "id": "3e0bc947ecde"
+  },
+  "lastEventCursor": {
+   "generation": "21b028d75f20",
+   "sequence": 0
+  },
+  "lastEventSequence": 0,
+  "protocol": {
+   "name": "prime-agent.daemon",
+   "version": 7
+  },
+  "replay": {
+   "status": "complete",
+   "toCursor": {
+    "generation": "21b028d75f20",
+    "sequence": 0
+   },
+   "toSequence": 0
+  },
+  "snapshot": {
+   "activeSessionId": "47d48e5aa6f6",
+   "children": [],
+   "lastEventCursor": {
+    "generation": "21b028d75f20",
+    "sequence": 0
+   },
+   "lastEventSequence": 0,
+   "messages": [],
+   "state": {
+    "activeSessionId": "47d48e5aa6f6",
+    "activeToolNames": [],
+    "autoCompactionEnabled": true,
+    "availableThinkingLevels": [
+     "default"
+    ],
+    "compactionCount": 0,
+    "cwd": "/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/work",
+    "followUpMode": "all",
+    "goal": null,
+    "isBashRunning": false,
+    "isCompacting": false,
+    "isStreaming": false,
+    "leafId": "aecd280c",
+    "messageCount": 0,
+    "model": {
+     "id": "mock-1",
+     "name": "Mock 1",
+     "provider": "prime-inference",
+     "reasoning": false
+    },
+    "retryAttempt": 0,
+    "scopedModels": [],
+    "serviceTier": "auto",
+    "sessionActions": {
+     "followUps": [],
+     "queuedCount": 0,
+     "steering": []
+    },
+    "sessionDir": "/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/agent/sessions",
+    "sessionFile": "/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/agent/sessions/01a0afa1-a286-75d3-b640-327a0e5d9779.jsonl",
+    "sessionId": "01a0afa1-a286-75d3-b640-327a0e5d9779",
+    "sessionName": "battery-side-questions",
+    "steeringMode": "all",
+    "thinkingLevel": "off"
+   },
+   "summary": {
+    "activeSessionId": "47d48e5aa6f6",
+    "activity": "idle",
+    "attachedClients": 1,
+    "created": "2026-09-17T13:50:00.838Z",
+    "cwd": "/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/work",
+    "hasRegisteredCronJob": false,
+    "id": "47d48e5aa6f6",
+    "isBashRunning": false,
+    "isCompacting": false,
+    "isSessionActive": false,
+    "isStreaming": false,
+    "lastActivityAt": "2026-09-17T13:50:00.839Z",
+    "lifecycle": "resident",
+    "messageCount": 0,
+    "modified": "2026-09-17T13:50:00.839Z",
+    "rlmDepth": 0,
+    "runtimeKind": "top-level",
+    "sessionActions": {
+     "followUps": [],
+     "queuedCount": 0,
+     "steering": []
+    },
+    "sessionFile": "/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/agent/sessions/01a0afa1-a286-75d3-b640-327a0e5d9779.jsonl",
+    "sessionId": "01a0afa1-a286-75d3-b640-327a0e5d9779",
+    "sessionName": "battery-side-questions",
+    "thinkingLevel": "off",
+    "unfinishedActionCount": 0,
+    "workerPid": 3370653,
+    "workerState": "ready"
+   }
+  }
+ },
+ "id": "a0",
+ "success": true,
+ "type": "response"
+}

@@ -1,0 +1,74 @@
+[
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: /model opens the selector with the configured model listed",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: picking a model in the selector shows the 'Model: <id>' confirm row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "ts: /effort shows the thinking-level picker or its unsupported-model row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: /model opens the selector with the configured model listed",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: picking a model in the selector shows the 'Model: <id>' confirm row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "rust: /effort shows the thinking-level picker or its unsupported-model row",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "model-selector: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "model-selected: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ },
+ {
+  "flow": "f17_slash_model",
+  "category": "visual",
+  "gap": false,
+  "summary": "effort-picker: frames identical TS vs Rust (normalized)",
+  "evidence": "",
+  "expectedFail": null
+ }
+]

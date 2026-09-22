@@ -1,0 +1,49 @@
+{
+ "command": "get_state",
+ "data": {
+  "activeSessionId": "264d83cc7949",
+  "activity": "idle",
+  "attachedClients": 1,
+  "created": "2026-09-19T20:27:00.864Z",
+  "cwd": "/tmp/f21-wr/20260919T202241Z/rust/work",
+  "firstMessage": "f21 seed turn",
+  "hasRegisteredCronJob": false,
+  "id": "264d83cc7949",
+  "isBashRunning": false,
+  "isCompacting": false,
+  "isSessionActive": false,
+  "isStreaming": false,
+  "lastActivityAt": "2026-09-19T20:27:00.953Z",
+  "lifecycle": "resident",
+  "messageCount": 2,
+  "model": {
+   "id": "mock-1",
+   "name": "Mock 1",
+   "provider": "prime-inference",
+   "reasoning": false
+  },
+  "modified": "2026-09-19T20:27:07.830Z",
+  "rlmDepth": 0,
+  "runtimeKind": "top-level",
+  "sessionActions": {
+   "followUps": [],
+   "queuedCount": 0,
+   "steering": []
+  },
+  "sessionFile": "/tmp/f21-wr/20260919T202241Z/rust/agent/sessions/01a0bb59-d180-734e-9788-7df3231abb52.jsonl",
+  "sessionId": "01a0bb59-d180-734e-9788-7df3231abb52",
+  "sessionName": "battery-f21",
+  "thinkingLevel": "off",
+  "unfinishedActionCount": 0,
+  "usage": {
+   "cost": 0.0,
+   "inputTokens": 100,
+   "outputTokens": 10
+  },
+  "workerPid": 364004,
+  "workerState": "ready"
+ },
+ "id": "g21k",
+ "success": true,
+ "type": "response"
+}

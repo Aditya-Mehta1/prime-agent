@@ -1,0 +1,12 @@
+{
+  "agentTraces": {
+    "enabled": false
+  },
+  "onboardingShown": true,
+  "terminal": {
+    "fullscreen": true
+  },
+  "compaction": {
+    "enabled": true
+  }
+}

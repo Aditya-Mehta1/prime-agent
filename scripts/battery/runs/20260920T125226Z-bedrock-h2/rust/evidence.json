@@ -1,0 +1,422 @@
+[
+ {
+  "scenario": "mistral_400_body",
+  "api": "mistral-conversations",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Mistral API error (400): {\"message\": \"mock mistral bad request\"}\n",
+   "duration_s": 0.16,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-8de9-721a-b434-23db655f2010.jsonl",
+  "errorMessage": "Mistral API error (400): {\"message\": \"mock mistral bad request\"}",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "SDKError",
+   "kind": "invalid_request",
+   "status": 400,
+   "providerErrorType": "SDKError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "anthropic_400_body",
+  "api": "anthropic-messages",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Provider rejected the request (invalid_request_error, 400): mock anthropic bad request\n",
+   "duration_s": 0.18,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-8e78-70b6-b7e8-c4623fea0a4b.jsonl",
+  "errorMessage": "Provider rejected the request (invalid_request_error, 400): mock anthropic bad request",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "invalid_request",
+   "status": 400,
+   "providerErrorType": "invalid_request_error",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "codex_429_usage_limit",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "You have hit your ChatGPT usage limit (free plan).\n",
+   "duration_s": 0.19,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-8f3a-76ec-8619-adc51e76d9dd.jsonl",
+  "errorMessage": "You have hit your ChatGPT usage limit (free plan).",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "CodexApiError",
+   "kind": "rate_limit",
+   "status": 429,
+   "providerErrorType": "usage_limit_reached",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "codex_400_body",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "mock codex bad request\n",
+   "duration_s": 0.24,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9005-73c3-9602-c6b3f8bc662e.jsonl",
+  "errorMessage": "mock codex bad request",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "CodexApiError",
+   "kind": "invalid_request",
+   "status": 400,
+   "providerErrorType": "CodexApiError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_400_validation",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Protocol error\n",
+   "duration_s": 0.19,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-90f0-7378-ae84-0096562f37fc.jsonl",
+  "errorMessage": "Protocol error",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_ERROR",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_400_validation_http1",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Validation error: mock bedrock bad request\n",
+   "duration_s": 0.18,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-91b2-745e-bff1-ae9efbd1d662.jsonl",
+  "errorMessage": "Validation error: mock bedrock bad request",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "ValidationException",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ValidationException",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "google_400_body",
+  "api": "google-generative-ai",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Provider rejected the request (ApiError, 400)\n",
+   "duration_s": 0.16,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-926c-7785-a4fc-f43fe7dfcda3.jsonl",
+  "errorMessage": "Provider rejected the request (ApiError, 400)",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "ApiError",
+   "kind": "invalid_request",
+   "status": 400,
+   "providerErrorType": "ApiError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_400_validation",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Validation error: mock bedrock bad request\n",
+   "duration_s": 0.23,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-930c-70fa-bd16-da2ca3215e9b.jsonl",
+  "errorMessage": "Validation error: mock bedrock bad request",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "ValidationException",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ValidationException",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_rststream_midstream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Stream closed with error code NGHTTP2_INTERNAL_ERROR\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+   "duration_s": 0.39,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-93fd-75a0-a4ba-9158e6ed06fc.jsonl",
+  "errorMessage": "Stream closed with error code NGHTTP2_INTERNAL_ERROR\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_STREAM_ERROR",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_goaway_midstream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Session closed with error code 1\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+   "duration_s": 0.59,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9588-7730-9f15-48a23e645bfa.jsonl",
+  "errorMessage": "Session closed with error code 1\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_SESSION_ERROR",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_tcp_rst_midstream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+   "duration_s": 0.42,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-97da-7738-97fe-e77953cf0061.jsonl",
+  "errorMessage": "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_STREAM_CANCEL",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_tcp_fin_midstream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.\n",
+   "duration_s": 0.4,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-997e-76e9-abc3-254b0cdada58.jsonl",
+  "errorMessage": "The pending stream has been canceled\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_STREAM_CANCEL",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "bedrock_h2_400_validation_http1",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "read ECONNRESET\n",
+   "duration_s": 0.2,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9b09-7566-8a3a-f888073aff71.jsonl",
+  "errorMessage": "read ECONNRESET",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "TimeoutError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ECONNRESET",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_anthropic-messages",
+  "api": "anthropic-messages",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Connection error.\n",
+   "duration_s": 0.22,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9bdc-7641-b67e-750aed2ef338.jsonl",
+  "errorMessage": "Connection error.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": null,
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_mistral-conversations",
+  "api": "mistral-conversations",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?\n",
+   "duration_s": 0.21,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9cb5-77ca-9a65-77ba97a21880.jsonl",
+  "errorMessage": "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "UnexpectedClientError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "UnexpectedClientError",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_openai-codex-responses",
+  "api": "openai-codex-responses",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Unable to connect. Is the computer able to access the url?\n",
+   "duration_s": 0.17,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9d87-7743-baee-814b45bff97e.jsonl",
+  "errorMessage": "Unable to connect. Is the computer able to access the url?",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "TypeError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ConnectionRefused",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_bedrock-converse-stream",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "The pending stream has been canceled (caused by: connect ECONNREFUSED 127.0.0.1:1)\n",
+   "duration_s": 0.16,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9e1f-75dc-b06b-8e0bbaebcd33.jsonl",
+  "errorMessage": "The pending stream has been canceled (caused by: connect ECONNREFUSED 127.0.0.1:1)",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ERR_HTTP2_STREAM_CANCEL",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_bedrock-converse-stream_http1",
+  "api": "bedrock-converse-stream",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "connect ECONNREFUSED 127.0.0.1:1\n",
+   "duration_s": 0.16,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9ebf-760e-bd3c-7ce7bdd8ffb2.jsonl",
+  "errorMessage": "connect ECONNREFUSED 127.0.0.1:1",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ECONNREFUSED",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_google-generative-ai",
+  "api": "google-generative-ai",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Unable to connect. Is the computer able to access the url?\n",
+   "duration_s": 0.2,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-9f74-75fc-b85b-6afc8e9591be.jsonl",
+  "errorMessage": "Unable to connect. Is the computer able to access the url?",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "TypeError",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": "ConnectionRefused",
+   "retryAfterMs": null
+  }
+ },
+ {
+  "scenario": "connection_openai-completions",
+  "api": "openai-completions",
+  "run": {
+   "exit_code": 1,
+   "stdout": "",
+   "stderr": "Connection error.\n",
+   "duration_s": 0.19,
+   "timeout": false
+  },
+  "session_file": "01a0bee1-a03c-727f-8982-319a019ce772.jsonl",
+  "errorMessage": "Connection error.",
+  "stopReason": "error",
+  "diagnostic": {
+   "name": "Error",
+   "kind": "unknown",
+   "status": null,
+   "providerErrorType": null,
+   "retryAfterMs": null
+  }
+ }
+]

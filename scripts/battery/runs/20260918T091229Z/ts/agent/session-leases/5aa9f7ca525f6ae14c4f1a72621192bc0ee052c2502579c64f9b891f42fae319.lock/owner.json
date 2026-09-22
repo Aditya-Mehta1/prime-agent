@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "token": "24a03155-bb2c-41da-9c39-a844fc301f43",
+  "pid": 72688,
+  "processStartId": "proc:247906",
+  "activeSessionId": "010863e0314e",
+  "sessionPath": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/scale-corpus-5000.jsonl",
+  "createdAt": "2026-09-18T09:12:42.993Z"
+}

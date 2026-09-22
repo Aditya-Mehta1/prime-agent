@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "socketPath": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/ts/f12_scale_resume/scale.sock",
+  "defaultSessionConfig": {
+    "cwd": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/ts/work",
+    "agentDir": "/home/ubuntu/lane-worktrees/replay-perf/scripts/battery/runs/20260918T091229Z/ts/agent",
+    "telemetryDisabled": true
+  }
+}

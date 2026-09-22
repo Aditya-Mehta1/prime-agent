@@ -1,0 +1,33 @@
+{
+ "session": "vbat20260918T005305Z-perf-rust-0",
+ "first_frame_s": 0.402,
+ "ready_s": 0.402,
+ "typing_ms": [
+  22.9,
+  33.6,
+  35.1,
+  43.9,
+  46.2,
+  56.5,
+  54.1,
+  29.5,
+  58.4,
+  41.4,
+  71.0,
+  57.5,
+  51.8,
+  63.3,
+  68.4,
+  70.1,
+  56.6,
+  33.3,
+  33.2,
+  39.7,
+  36.7,
+  47.0,
+  69.5,
+  71.0,
+  42.4
+ ],
+ "ready_frame": "                                                          work  $0.00\n\n                  \u2597\u2584\u2584\u2588\u2580\n    \u2588\u2588\u2588\u2584       \u2597\u2584\u2588\u2588\u2588\u2580\n   \u2597\u2588\u259b\u2590\u2588\u2599   \u2597\u2584\u2588\u2580\u2597\u2588\u2580       prime agent v0.1.0\n  \u2597\u2588\u259b \u259f\u2588\u2588\u2599\u2584\u2588\u2588\u259b \u259f\u259b         model mock-1\n  \u2597\u259f\u258c \u2590\u2588\u2588\u2588\u259b\u2598\u2597\u2584\u2588\u2596          cwd ~/lane-worktrees/onboarding-parity/scripts/battery/runs/20260918T005305Z/rust/work\n \u259f\u2588\u2588\u2588\u2584  \u2584\u2584\u259f\u2588\u2588\u2588\u2580\n \u259c\u2588\u259b\u2580\u2598  \u259c\u2588\u259b\u2580\u2598\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                      Collapsed mode (Ctrl+O to expand)\n\n >\n\n\u2190 manage                                                                                                 mock-1 \u00b7 0 (0%)\n"
+}
