@@ -15,13 +15,15 @@ use crate::width::is_whitespace_char;
 use std::collections::HashMap;
 
 use text_utils::{char_at, split_at_char};
-use wrap::segment_with_markers;
+use wrap::{parse_paste_marker, segment_with_markers};
 
 mod autocomplete;
 mod input;
 mod kill_ring;
 mod layout;
 mod motion;
+#[cfg(test)]
+mod paste_tests;
 mod text_ops;
 mod text_utils;
 mod wrap;
@@ -63,6 +65,16 @@ pub enum PasteDisposition {
     Inline,
     /// Large paste stored as an atomic `[paste #N ...]` marker.
     Marker { id: usize },
+}
+
+/// The collapsed-paste registry of an editor (TS `EditorPasteSnapshot`):
+/// the id/content map behind `[paste #N ...]` markers plus the id
+/// counter, so a draft moved to another editor still expands and keeps
+/// its markers atomic.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EditorPasteSnapshot {
+    pub pastes: Vec<(usize, String)>,
+    pub paste_counter: usize,
 }
 
 /// Outcome of a submit.
@@ -229,24 +241,35 @@ impl Editor {
     }
 
     fn expand_paste_markers(&self, text: &str) -> String {
-        let mut result = text.to_string();
-        for (id, content) in self.pastes.clone() {
-            while let Some(idx) = result.find(&format!("[paste #{id}")) {
-                let end = match result[idx..].find(']') {
-                    Some(rel) => idx + rel + 1,
-                    None => break,
-                };
-                let marker = result[idx..end].to_string();
-                let body = marker[8..marker.len() - 1].to_string();
-                let valid = body.strip_prefix(&format!("{id}")).is_some_and(|rest| {
-                    rest.is_empty() || rest.starts_with(' ') || rest.starts_with('+')
-                });
-                if !valid {
-                    break;
+        // One scan with the shared marker shape (TS builds one regex per
+        // registered id): a marker expands only when its parsed id is
+        // registered, so a typed or edited look-alike stays literal, and
+        // `[paste #1` never swallows the head of `[paste #10]`.
+        let mut result = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(idx) = rest.find("[paste #") {
+            result.push_str(&rest[..idx]);
+            let candidate = &rest[idx..];
+            match parse_paste_marker(candidate) {
+                Some((id, len)) => {
+                    if let Some(content) = self.pastes.get(&id) {
+                        result.push_str(content);
+                    } else {
+                        // Well-formed but unregistered: keep it literal.
+                        result.push_str(&candidate[..len]);
+                    }
+                    rest = &candidate[len..];
                 }
-                result.replace_range(idx..end, &content);
+                // Malformed marker head: keep up to the next `]` (or the
+                // rest when none remains) so the scan still progresses.
+                None => {
+                    let skip = candidate.find(']').map_or(candidate.len(), |p| p + 1);
+                    result.push_str(&candidate[..skip]);
+                    rest = &candidate[skip..];
+                }
             }
         }
+        result.push_str(rest);
         result
     }
 
@@ -267,16 +290,19 @@ impl Editor {
         self.cursor_line == last && self.cursor_col == self.lines[last].chars().count()
     }
 
-    pub fn get_paste_snapshot(&self) -> (Vec<(usize, String)>, usize) {
+    pub fn get_paste_snapshot(&self) -> EditorPasteSnapshot {
         let mut pastes: Vec<(usize, String)> =
             self.pastes.iter().map(|(k, v)| (*k, v.clone())).collect();
         pastes.sort();
-        (pastes, self.paste_counter)
+        EditorPasteSnapshot {
+            pastes,
+            paste_counter: self.paste_counter,
+        }
     }
 
-    pub fn restore_paste_snapshot(&mut self, pastes: Vec<(usize, String)>, counter: usize) {
-        self.pastes = pastes.into_iter().collect();
-        self.paste_counter = counter;
+    pub fn restore_paste_snapshot(&mut self, snapshot: EditorPasteSnapshot) {
+        self.pastes = snapshot.pastes.into_iter().collect();
+        self.paste_counter = snapshot.paste_counter;
     }
 
     pub fn set_text(&mut self, text: &str) {

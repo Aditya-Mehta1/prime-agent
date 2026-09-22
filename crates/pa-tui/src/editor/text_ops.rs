@@ -45,7 +45,11 @@ impl Editor {
                 .first()
                 .map(|g| g.segment.chars().count())
                 .unwrap_or(1);
-            let (before, after) = split_at_char(&current_line, self.cursor_col + first_len);
+            // Drop the first atomic segment after the cursor (TS
+            // `handleForwardDelete`: before + after with the segment
+            // removed — an atomic marker goes whole).
+            let (before, after) = split_at_char(&current_line, self.cursor_col);
+            let after = char_suffix(&after, first_len);
             self.lines[self.cursor_line] = format!("{}{}", before, after);
         } else if self.cursor_line < self.lines.len() - 1 {
             self.push_undo_snapshot();
@@ -301,5 +305,27 @@ mod tests {
         // Ring holds one entry: yank-pop is a no-op.
         e.handle_input("alt+y");
         assert_eq!(e.get_text(), "hello world");
+    }
+
+    /// Forward delete drops the grapheme after the cursor (found red by
+    /// the paste-marker suite: the pre-fix split kept the deleted span, so
+    /// delete was a no-op everywhere).
+    #[test]
+    fn forward_delete_drops_the_next_grapheme() {
+        let mut e = ed();
+        for c in ["a", "b", "c"] {
+            e.handle_input(c);
+        }
+        e.handle_input("home");
+        e.handle_input("right");
+        assert_eq!(e.get_cursor(), (0, 1));
+        e.handle_input("delete");
+        assert_eq!(e.get_text(), "ac");
+        // At line end it merges with the next line (TS parity).
+        e.set_text("ac\nxy");
+        e.handle_input("up");
+        assert_eq!(e.get_cursor(), (0, 2));
+        e.handle_input("delete");
+        assert_eq!(e.get_lines(), vec!["acxy"]);
     }
 }

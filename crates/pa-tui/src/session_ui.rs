@@ -1232,8 +1232,15 @@ impl SessionUi {
             .into_iter()
             .map(|(id, image)| (id, image.clone()))
             .collect();
+        // TS `snapshotPromptStashFrom`: a collapsed paste's content lives in
+        // the editor's registry, not in the text, so the registry must
+        // travel with the draft or the restored marker would stay literal
+        // instead of expanding on submit.
+        let snapshot = view.editor.get_paste_snapshot();
+        let paste_snapshot = (!snapshot.pastes.is_empty()).then_some(snapshot);
         Some(PromptStash {
             text,
+            paste_snapshot,
             images,
             restore_on_open: true,
         })
@@ -1324,6 +1331,12 @@ impl SessionUi {
             self.next_image_marker_id = self.next_image_marker_id.max(id + 1);
         }
         view.editor.set_text(&stash.text);
+        // TS `restorePromptStash` -> `restorePasteSnapshot`: the collapsed
+        // pastes re-enter the editor's registry so the restored markers
+        // stay atomic and expand on submit.
+        if let Some(snapshot) = &stash.paste_snapshot {
+            view.editor.restore_paste_snapshot(snapshot.clone());
+        }
         if let Some(telemetry) = self.telemetry.clone() {
             let had_images = !stash.images.is_empty();
             tokio::spawn(async move {

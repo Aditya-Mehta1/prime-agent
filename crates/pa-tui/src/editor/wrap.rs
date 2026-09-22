@@ -92,6 +92,39 @@ pub fn is_atomic_marker(seg: &str) -> bool {
     seg.len() >= 10 && (is_paste_marker(seg) || is_image_marker(seg))
 }
 
+/// Parse the well-formed paste marker heading `s` (TS
+/// `PASTE_MARKER_REGEX`): `[paste #<id>]`, `[paste #<id> +<N> lines]`, or
+/// `[paste #<id> <N> chars]`. Returns the parsed id and the marker's byte
+/// length; a malformed head yields `None`.
+pub(crate) fn parse_paste_marker(s: &str) -> Option<(usize, usize)> {
+    let rest = s.strip_prefix("[paste #")?;
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let id: usize = rest[..digits].parse().ok()?;
+    let bare = "[paste #".len() + digits + 1;
+    if rest[digits..].starts_with(']') {
+        return Some((id, bare));
+    }
+    // ` (+<N> lines | <N> chars)]`
+    let suffix = rest[digits..].strip_prefix(' ')?;
+    let suffix_len = if let Some(tail) = suffix.strip_prefix('+') {
+        let n = tail.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if n == 0 || !tail[n..].starts_with(" lines]") {
+            return None;
+        }
+        2 + n + " lines]".len()
+    } else {
+        let n = suffix.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if n == 0 || !suffix[n..].starts_with(" chars]") {
+            return None;
+        }
+        1 + n + " chars]".len()
+    };
+    Some((id, "[paste #".len() + digits + suffix_len))
+}
+
 /// Segment text merging valid paste markers and image markers into atomic units.
 pub(crate) fn segment_with_markers(
     text: &str,
