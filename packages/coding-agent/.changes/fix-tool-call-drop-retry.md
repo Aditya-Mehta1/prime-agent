@@ -1,0 +1,1 @@
+- Retry once instead of ending the turn when a reply delivers no tool call but the provider reports `tool_calls` (retry with required tool choice), or reports `length` on a Dynamo-served prime-inference GLM-5.3 model (retry with the run's own tool choice, since that `length` may also be genuine truncation). Dynamo reports a dropped incomplete or unparseable tool call this way.

@@ -1,0 +1,1 @@
+- Added the optional `toolChoice` stream option. The OpenAI Chat Completions adapter sends it as `tool_choice`; other adapters ignore it.
