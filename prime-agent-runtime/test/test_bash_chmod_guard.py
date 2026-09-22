@@ -27,10 +27,10 @@ SUBPROCESS_TIMEOUT = 60
 
 def _prepare(command: str) -> str:
     """The guard's own normalization pipeline, for detection-vector tests."""
-    resolved = bash_module._mask_shell_redirections(
-        bash_module._normalize_line_continuations(command)
+    resolved = bash_module._chmod_mask_shell_redirections(
+        bash_module._chmod_normalize_line_continuations(command)
     )
-    normalized, _index_map = bash_module._strip_shell_escapes(resolved)
+    normalized, _index_map = bash_module._chmod_strip_shell_escapes(resolved)
     return normalized
 
 
@@ -1195,7 +1195,7 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         command = "; ".join(["echo hi"] * 4000)
         start = time.monotonic()
         for _ in range(3):
-            bash_module._guard_destructive_chmod(command, False)
+            bash_module._guard_destructive_chmod(command, False, None)
         elapsed = time.monotonic() - start
         self.assertLess(elapsed, 1.5)
 
@@ -1580,6 +1580,47 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             result = await self._run("chmod -R 755 sub")
             self.assertEqual(result.exit_code, 0)
 
+    async def test_prefix_is_computed_once_per_command(self):
+        # One env read per call: the guard validates exactly the script the
+        # handle runs, so a mid-call change to the prefix cannot make the
+        # validated text differ from the executed text (the pre-fix flow
+        # read the env three times: twice in the guard, once in the handle).
+        seen: list[tuple[str, str | None]] = []
+        real_prefix_command = bash_module._prefix_command
+
+        def flip_then_build(command: str, prefix: str | None) -> str:
+            # A racing os.environ write landing between guard scan and spawn.
+            seen.append((command, prefix))
+            os.environ["PRIME_AGENT_BASH_COMMAND_PREFIX"] = "cd /escaped"
+            return real_prefix_command(command, prefix)
+
+        with mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /safe"}):
+            with mock.patch.object(bash_module, "_prefix_command", side_effect=flip_then_build):
+                with mock.patch.object(
+                    bash_module,
+                    "_guard_destructive_chmod",
+                    wraps=bash_module._guard_destructive_chmod,
+                ) as guarded:
+                    handle = bash("echo hi")
+        try:
+            self.assertEqual(seen, [("echo hi", "cd /safe")])
+            # The guard scanned exactly the text the handle runs.
+            self.assertEqual(guarded.call_args[0][0], handle._script)
+            self.assertEqual(handle._script, "cd /safe\necho hi")
+        finally:
+            handle.kill()
+
+    async def test_direct_handle_construction_is_still_guarded(self):
+        # A handle built directly on BashHandle (script=None) is guarded at
+        # construction, so the class is not a way around bash()'s guard.
+        self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "keep.txt").write_text("keep\n")
+        with mock.patch.dict(os.environ, {"HOME": home.name}):
+            with self.assertRaises(DestructiveChmodRefusalError):
+                bash_module.BashHandle("chmod -R 755 ~")
+
 
 class FrozenBypassEnvLaunchTest(unittest.TestCase):
     """Launch-level behavior of the frozen bypass env var, in fresh kernels."""
@@ -1654,6 +1695,16 @@ class FrozenBypassEnvLaunchTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("Refusing to run", completed.stderr)
 
+    def test_child_env_strips_late_bypass(self):
+        # A mid-session os.environ write must not arm a nested kernel: the
+        # child launch env drops a bypass value this kernel never started with.
+        os.environ[BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV] = "1"
+        self.addCleanup(os.environ.pop, BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, None)
+        self.assertNotIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, bash_module._child_env())
+        # A value the kernel actually started with is the intentional state.
+        with mock.patch.object(bash_module, "_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START", True):
+            self.assertIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, bash_module._child_env())
+
     def test_mid_session_os_environ_write_does_not_unlock_a_fresh_kernel(self):
         workspace, outside = self._workspace_with_outside_sibling()
         probe = (
@@ -1682,7 +1733,6 @@ class FrozenBypassEnvLaunchTest(unittest.TestCase):
         self.assertIn("Refusing to run", completed.stderr)
         self.assertIn("appeared after kernel start", completed.stderr)
         self.assertTrue((Path(outside) / "file.txt").exists())
-
 
 if __name__ == "__main__":
     unittest.main()

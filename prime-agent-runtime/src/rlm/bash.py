@@ -232,14 +232,26 @@ class BashHandle:
     handle; later awaits only wait and cancelling them leaves it running.
     """
 
-    def __init__(self, command: str) -> None:
-        # Every asyncio use in this module runs on a handle path (bash() is the
-        # only constructor), so bind the module global here, before
-        # _schedule_background_completion_notice or any await can run.
+    def __init__(self, command: str, script: str | None = None) -> None:
+        # Every asyncio use in this module runs on a handle path, so bind the
+        # module global here, before _schedule_background_completion_notice
+        # or any await can run.
         global asyncio
         import asyncio
 
+        # `command` is the text the caller wrote and stays the display value
+        # (the completion notice and repr use it). `script` is the text the
+        # shell runs, computed once by bash() and validated by the guard
+        # before it reached this handle; without one they are the same text,
+        # so a handle built directly is guarded here instead -- the class
+        # must not be a way around the guard, and the bash() path, whose
+        # script was already validated, pays no second scan.
+        if script is None:
+            prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+            script = _prefix_command(command, prefix)
+            _guard_destructive_chmod(script, False, prefix)
         self.command = command
+        self._script = script
         completion_context = _current_cell_completion_context()
         self._creating_cell_finished = completion_context[0] if completion_context else None
         self._creating_cell_task = completion_context[1] if completion_context else None
@@ -298,13 +310,13 @@ class BashHandle:
                 _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
             )
             script = _status_script(
-                _with_prefix(command),
+                self._script,
                 completion_token[:token_midpoint],
                 completion_token[token_midpoint:],
             )
         else:
             # Windows lacks a foreground-status channel, so its exit drain stays best-effort.
-            script = _with_prefix(command)
+            script = self._script
             self._job = _winjob.create_job()
             if self._job is None:
                 # Nothing spawned yet, so nothing can leak: refuse to start.
@@ -986,7 +998,7 @@ class DestructiveChmodRefusalError(RuntimeError):
 # resolver see the argv the shell will hand to chmod/chown.
 
 
-def _normalize_line_continuations(command: str) -> str:
+def _chmod_normalize_line_continuations(command: str) -> str:
     """Collapse unquoted backslash-newline line continuations.
 
     The shell removes the pair before it builds words, so `chmod -R \
@@ -995,7 +1007,7 @@ d -R 755 ~` runs as `chmod -R 755 ~` (an in-word continuation joins the
     word). A continuation between words becomes two spaces, which is
     length-preserving so the scan's character indices stay aligned with the
     original command; inside a word the pair is left for
-    `_strip_shell_escapes` to remove, because a two-character placeholder
+    `_chmod_strip_shell_escapes` to remove, because a two-character placeholder
     there would fuse with a preceding `$` into ANSI-C quoting and hide the
     expansion. Single-quoted
     backslash-newlines are literal data and a newline always ends a comment,
@@ -1025,7 +1037,7 @@ d -R 755 ~` runs as `chmod -R 755 ~` (an in-word continuation joins the
                 # Inside a word the pair must join it, and the empty quoted
                 # string it used to be replaced with fused with a preceding
                 # `$` into ANSI-C quoting; the pair now stays and
-                # `_strip_shell_escapes` removes both characters, so
+                # `_chmod_strip_shell_escapes` removes both characters, so
                 # `chmo<continuation>d` scans as `chmod` while
                 # `$<continuation>cmd` stays the expansion `$cmd`.
                 i += 1
@@ -1047,8 +1059,8 @@ d -R 755 ~` runs as `chmod -R 755 ~` (an in-word continuation joins the
 # substitution that executes. An operator directly followed by `(` is a
 # process substitution (`<(...)`, `>(...)`), not a redirection: it stays
 # live too, so the guard can see that a wrapper consumes its output.
-_REDIRECT_OPERATOR = re.compile(r"(?:&>{1,2}|>&|[0-9]*[<>]{1,3}(&[0-9]+)?)(?!\()")
-_STATIC_REDIRECT_TARGET = re.compile(r"""[^\s;&|<>()$`"']*""")
+_CHMOD_REDIRECT_OPERATOR = re.compile(r"(?:&>{1,2}|>&|[0-9]*[<>]{1,3}(&[0-9]+)?)(?!\()")
+_CHMOD_STATIC_REDIRECT_TARGET = re.compile(r"""[^\s;&|<>()$`"']*""")
 
 
 def _locate_heredoc(command: str, operator: re.Match) -> tuple[str | None, int, int | None, bool]:
@@ -1072,7 +1084,7 @@ def _locate_heredoc(command: str, operator: re.Match) -> tuple[str | None, int, 
         delim = command[delim_start + 1 : j]
         j += 1
     else:
-        delim_match = _STATIC_REDIRECT_TARGET.match(command, j)
+        delim_match = _CHMOD_STATIC_REDIRECT_TARGET.match(command, j)
         j = delim_match.end()
         delim = delim_match.group(0)
     if not delim or re.search(r"[$`\\]", delim):
@@ -1113,7 +1125,7 @@ def _format_chmod_nesting_refusal() -> str:
     )
 
 
-def _mask_shell_redirections(command: str, depth: int = 0) -> str:
+def _chmod_mask_shell_redirections(command: str, depth: int = 0) -> str:
     """Blank out shell redirection words, keeping character positions.
 
     The shell consumes redirections (`2>/dev/null`, `> log`, `2>&1`,
@@ -1152,7 +1164,7 @@ def _mask_shell_redirections(command: str, depth: int = 0) -> str:
             if ch == "\\" and i + 1 < n:
                 i += 2  # escaped character stays as-is
                 continue
-            operator = _REDIRECT_OPERATOR.match(command, i)
+            operator = _CHMOD_REDIRECT_OPERATOR.match(command, i)
             if operator and "<<<" in operator.group(0):
                 # A here-string feeds a command's stdin from command text:
                 # it stays live so the wrapper-fed gates can see the form.
@@ -1179,7 +1191,7 @@ def _mask_shell_redirections(command: str, depth: int = 0) -> str:
                 for j in range(operator.start(), operator.end()):
                     chars[j] = " "
                 i = operator.end()
-                attached = _STATIC_REDIRECT_TARGET.match(command, i)
+                attached = _CHMOD_STATIC_REDIRECT_TARGET.match(command, i)
                 if attached.end() > i:
                     target_start, target_end = attached.start(), attached.end()
                 elif operator.group(1):
@@ -1191,7 +1203,7 @@ def _mask_shell_redirections(command: str, depth: int = 0) -> str:
                     j = i
                     while j < n and chars[j].isspace():
                         j += 1
-                    detached = _STATIC_REDIRECT_TARGET.match(command, j)
+                    detached = _CHMOD_STATIC_REDIRECT_TARGET.match(command, j)
                     if detached.end() > j and j > i:
                         target_start, target_end = detached.start(), detached.end()
                     else:
@@ -1220,21 +1232,21 @@ def _mask_shell_redirections(command: str, depth: int = 0) -> str:
                     if paren_depth == 0:
                         break
                 j += 1
-            interior = _mask_shell_redirections(command[i + 2 : j], depth + 1)
+            interior = _chmod_mask_shell_redirections(command[i + 2 : j], depth + 1)
             chars[i + 2 : j] = list(interior)
             i = j
         elif ch == "`":
             j = i + 1
             while j < n and chars[j] != "`":
                 j += 1
-            interior = _mask_shell_redirections(command[i + 1 : j], depth + 1)
+            interior = _chmod_mask_shell_redirections(command[i + 1 : j], depth + 1)
             chars[i + 1 : j] = list(interior)
             i = j
         i += 1
     return "".join(chars)
 
 
-def _strip_shell_escapes(command: str) -> tuple[str, list[int]]:
+def _chmod_strip_shell_escapes(command: str) -> tuple[str, list[int]]:
     """Remove unquoted backslash escapes, mapping indices back to the input.
 
     The shell treats an unquoted `\\X` as a literal X, so `ch\\mod -R
@@ -1303,10 +1315,10 @@ def _strip_shell_escapes(command: str) -> tuple[str, list[int]]:
 # shell quoting layer at a time and rescan; a recursive chmod/chown found in
 # any layer is refused outright because the payload can relocate or chain
 # freely.
-_MAX_EVAL_SCAN_DEPTH = 10
+_CHMOD_MAX_EVAL_SCAN_DEPTH = 10
 
 
-def _unquote_one_level(text: str) -> str:
+def _chmod_unquote_one_level(text: str) -> str:
     """Remove the outermost quoting layer from `text`.
 
     Inner quotes stay quoted so the next scan layer still treats them as
@@ -1340,7 +1352,7 @@ def _unquote_one_level(text: str) -> str:
 
 
 @dataclass(frozen=True)
-class _ShellWord:
+class _ChmodShellWord:
     """One shell word: its unquoted argv value plus the span it came from."""
 
     value: str
@@ -1354,7 +1366,7 @@ class _ShellWord:
     contained: bool = False
 
 
-def _matching_paren(command: str, open_index: int, end: int) -> int:
+def _chmod_matching_paren(command: str, open_index: int, end: int) -> int:
     """Index of the `)` matching the `(` at `open_index`, or `end - 1`.
 
     A command substitution is a full subshell context, so parens inside
@@ -1406,7 +1418,7 @@ def _matching_paren(command: str, open_index: int, end: int) -> int:
 # `-R`. Bash keeps the backslash for escapes it does not recognize, so the
 # same folding here keeps command names, flags, and operands exact; an
 # unterminated word folds to end-of-string (bash would refuse the command).
-_ANSI_C_SIMPLE_ESCAPES = {
+_CHMOD_ANSI_C_SIMPLE_ESCAPES = {
     "a": "\a",
     "b": "\b",
     "e": "\x1b",
@@ -1436,8 +1448,8 @@ def _fold_ansi_c(body: str) -> str:
             i += 1
             continue
         esc = body[i + 1]
-        if esc in _ANSI_C_SIMPLE_ESCAPES:
-            out.append(_ANSI_C_SIMPLE_ESCAPES[esc])
+        if esc in _CHMOD_ANSI_C_SIMPLE_ESCAPES:
+            out.append(_CHMOD_ANSI_C_SIMPLE_ESCAPES[esc])
             i += 2
             continue
         if esc in "01234567":
@@ -1533,7 +1545,7 @@ def _expand_ansi_c_payloads(text: str) -> str:
 
 
 def _mark_contained_interiors(
-    words: list[_ShellWord],
+    words: list[_ChmodShellWord],
     scan_region: "Callable[..., None]",
     start: int,
     end: int,
@@ -1549,7 +1561,7 @@ def _mark_contained_interiors(
         words[k] = replace(words[k], contained=True)
 
 
-def _scan_shell_words(command: str) -> list[_ShellWord]:
+def _chmod_scan_shell_words(command: str) -> list[_ChmodShellWord]:
     """Split `command` into shell words the way the shell builds argv.
 
     Quotes and backslash escapes fold into the word value, comments are
@@ -1563,7 +1575,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
     `_MAX_SUBSTITUTION_NESTING` refuses with the guard's own error instead
     of exhausting the Python stack.
     """
-    words: list[_ShellWord] = []
+    words: list[_ChmodShellWord] = []
 
     def scan_region(
         start: int, end: int, *, starts_command: bool, depth: int = 0
@@ -1579,7 +1591,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
         def flush(starts_next_command: bool) -> None:
             nonlocal word_start, first_word_pending
             if word_start != -1:
-                words.append(_ShellWord("".join(value), word_start, i, word_starts_command))
+                words.append(_ChmodShellWord("".join(value), word_start, i, word_starts_command))
                 value.clear()
                 word_start = -1
                 first_word_pending = starts_next_command
@@ -1599,7 +1611,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                     j += 1
                     break
                 if inner == "$" and command[j + 1 : j + 2] == "(":
-                    close = _matching_paren(command, j + 1, end)
+                    close = _chmod_matching_paren(command, j + 1, end)
                     _mark_contained_interiors(words, scan_region, j + 2, close, depth)
                     value.append(command[j + 1 : close + 1])
                     j = close + 1
@@ -1662,7 +1674,7 @@ def _scan_shell_words(command: str) -> list[_ShellWord]:
                 i = scan_double_quote(i + 2, depth)
                 continue
             if ch == "$" and command[i + 1 : i + 2] == "(":
-                close = _matching_paren(command, i + 1, end)
+                close = _chmod_matching_paren(command, i + 1, end)
                 _mark_contained_interiors(words, scan_region, i + 2, close, depth)
                 value.append(command[i + 1 : close + 1])
                 i = close + 1
@@ -1715,7 +1727,7 @@ def _is_recursive_chmod_chown_token_run(tokens: list[str]) -> bool:
     return False
 
 
-def _contained_in_later_word(words: list[_ShellWord], index: int) -> bool:
+def _contained_in_later_word(words: list[_ChmodShellWord], index: int) -> bool:
     """True when words[index] is a command-substitution interior: its span
     sits inside the enclosing word, which the scanner appends after the
     interiors it recursed into, and the scan marks the flag at scan time.
@@ -1726,7 +1738,7 @@ def _contained_in_later_word(words: list[_ShellWord], index: int) -> bool:
 
 def _find_recursive_chmod_chown_invocations(
     command: str,
-    words: list[_ShellWord] | None = None,
+    words: list[_ChmodShellWord] | None = None,
     hash_alias_names: Collection[str] | None = None,
 ) -> list[tuple[int, int, int]]:
     """Find every recursive chmod/chown invocation, returning each as a
@@ -1738,7 +1750,7 @@ def _find_recursive_chmod_chown_invocations(
     the command points at chmod/chown (`hash -p /bin/chmod safe`), which run
     that file whatever the command word looks like."""
     if words is None:
-        words = _scan_shell_words(command)
+        words = _chmod_scan_shell_words(command)
     invocations: list[tuple[int, int, int]] = []
     for index, word in enumerate(words):
         if not _is_chmod_chown_word(word.value) and not (
@@ -1760,11 +1772,11 @@ def _find_recursive_chmod_chown_invocations(
     return invocations
 
 
-_HASH_BUILTIN = "hash"
+_CHMOD_HASH_BUILTIN = "hash"
 
 
-def _hash_registered_command_names(
-    words: list[_ShellWord],
+def _chmod_hash_registered_command_names(
+    words: list[_ChmodShellWord],
 ) -> tuple[set[str], bool]:
     """(names a `hash -p` registration points at chmod/chown, unreadable).
 
@@ -1779,7 +1791,7 @@ def _hash_registered_command_names(
     aliased: set[str] = set()
     unreadable = False
     for index, word in enumerate(words):
-        if os.path.basename(word.value) != _HASH_BUILTIN:
+        if os.path.basename(word.value) != _CHMOD_HASH_BUILTIN:
             continue
         has_pathname_option = False
         attached: str | None = None
@@ -1823,7 +1835,7 @@ _WRAPPER_PAYLOAD_KINDS = ("eval", "shell_c", "alias", "trap")
 
 
 def _wrapper_payload_sources(
-    words: list[_ShellWord], text: str, kinds: tuple[str, ...]
+    words: list[_ChmodShellWord], text: str, kinds: tuple[str, ...]
 ) -> list[str]:
     """Raw payload sources handed to wrapper words in already-scanned
     `words`: the words after each `eval` (joined with spaces), or the
@@ -1894,13 +1906,13 @@ def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
     process substitution feeding a shell wrapper. Each layer is unquoted one
     shell quoting level at a time, so quoted data stays inert while quoted
     code is caught. Absurd nesting is refused outright."""
-    if depth > _MAX_EVAL_SCAN_DEPTH:
+    if depth > _CHMOD_MAX_EVAL_SCAN_DEPTH:
         return "recursive_chmod"  # absurdly nested wrappers: refuse rather than risk a miss
-    normalized, _index_map = _strip_shell_escapes(
-        _mask_shell_redirections(_normalize_line_continuations(text))
+    normalized, _index_map = _chmod_strip_shell_escapes(
+        _chmod_mask_shell_redirections(_chmod_normalize_line_continuations(text))
     )
-    words = _scan_shell_words(normalized)
-    hash_alias_names, hash_unreadable = _hash_registered_command_names(words)
+    words = _chmod_scan_shell_words(normalized)
+    hash_alias_names, hash_unreadable = _chmod_hash_registered_command_names(words)
     if hash_unreadable:
         return "unresolvable_command"
     if _find_recursive_chmod_chown_invocations(normalized, words, hash_alias_names):
@@ -1913,7 +1925,7 @@ def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
         return "unresolvable_command"
     if _process_substitution_feeds_wrapper(normalized, words):
         return "process_substitution"
-    env_split_feeds, env_split_reasons = _env_split_string_feeds(words)
+    env_split_feeds, env_split_reasons = _chmod_env_split_string_feeds(words)
     for feed in env_split_feeds:
         reason = _payload_text_hides_shell_code(feed, depth + 1)
         if reason is not None:
@@ -1927,7 +1939,7 @@ def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
         if script_reason is not None:
             return "unscanned_script"
     for source in _wrapper_payload_sources(words, normalized, _WRAPPER_PAYLOAD_KINDS):
-        payload = _unquote_one_level(_expand_ansi_c_payloads(source))
+        payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
         reason = _payload_text_hides_shell_code(payload, depth + 1)
         if reason is not None:
             return reason
@@ -1950,11 +1962,11 @@ def _eval_payloads_hide_recursive_chmod(command: str, depth: int = 0) -> str | N
     check: its output is unknowable statically, and the substitution
     itself already runs (and is scanned) before eval sees the result.
     """
-    if depth > _MAX_EVAL_SCAN_DEPTH:
+    if depth > _CHMOD_MAX_EVAL_SCAN_DEPTH:
         return "recursive_chmod"  # absurdly nested evals: refuse rather than risk a miss
-    words = _scan_shell_words(command)
+    words = _chmod_scan_shell_words(command)
     for source in _wrapper_payload_sources(words, command, ("eval",)):
-        payload = _unquote_one_level(_expand_ansi_c_payloads(source))
+        payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
         reason = _payload_text_hides_shell_code(payload, depth)
         if reason is not None:
             return reason
@@ -2026,7 +2038,7 @@ def _statically_resolvable_cd_arg(raw: str) -> str | None:
     raw = _expand_ansi_c_payloads(raw)
     if re.search(r"[$`;&|()<>#]", raw):
         return None
-    words, well_formed = _shell_words(raw)
+    words, well_formed = _chmod_shell_words(raw)
     if not well_formed or len(words) != 1 or not words[0]:
         return None  # empty, multi-word, or inexact: refuse to guess
     return words[0]
@@ -2185,7 +2197,7 @@ def _chmod_operand_violation(
     return None
 
 
-def _shell_words(region: str) -> tuple[list[str | None], bool]:
+def _chmod_shell_words(region: str) -> tuple[list[str | None], bool]:
     """Split one invocation region into shell words, quoting-aware.
 
     Each word is the literal text the shell would pass (quotes removed,
@@ -2382,7 +2394,7 @@ _UNRESOLVED_EXPANSION = re.compile(r"[$`]")
 _EXPANDABLE_GLOB_CHARS = re.compile(r"[*?{\[]")
 # A plain assignment, or an append assignment (`PATH+=...`), which the shell
 # also applies to the command it prefixes rather than running as a command.
-_ASSIGNMENT_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+_CHMOD_ASSIGNMENT_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 # An append assignment arms the file just like a plain one (`BASH_ENV+=file`).
 _BASH_ENV_ASSIGNMENT = re.compile(r"^BASH_ENV\+?=")
 # The PATH assignments that decide where a bare command word resolves.
@@ -2436,7 +2448,7 @@ def _expanded_command_word_value(value: str) -> str:
     return s.replace("${PWD}", cwd).replace("$PWD", cwd)
 
 
-def _run_tokens_from(words: list[_ShellWord], index: int) -> list[str]:
+def _run_tokens_from(words: list[_ChmodShellWord], index: int) -> list[str]:
     """The command word at `index` plus its followers, up to the next
     command boundary."""
     tokens = [words[index].value]
@@ -2450,7 +2462,7 @@ def _run_tokens_from(words: list[_ShellWord], index: int) -> list[str]:
     return tokens
 
 
-def _word_could_expand(word: _ShellWord, span_source: str) -> bool:
+def _word_could_expand(word: _ChmodShellWord, span_source: str) -> bool:
     """True when a word may not be the literal the scanner folded: the
     value still carries `$`/backtick/glob/brace characters after the known
     HOME/PWD expansions (any of which bash can expand into a different
@@ -2468,7 +2480,7 @@ def _word_could_expand(word: _ShellWord, span_source: str) -> bool:
 
 
 def _unresolvable_words_could_recurse(
-    words: list[_ShellWord],
+    words: list[_ChmodShellWord],
     normalized: str | None = None,
     *,
     require_recursive_flag: bool = True,
@@ -2483,13 +2495,13 @@ def _unresolvable_words_could_recurse(
     the flag requirement is dropped (require_recursive_flag=False),
     because the whole payload could be the recursive chmod, flags and
     all, folded into the unresolvable word."""
-    head: _ShellWord | None = None
+    head: _ChmodShellWord | None = None
     for index, word in enumerate(words):
         # Substitution interiors execute inside the substitution; the run
         # head for the enclosing word is the word before it, not them.
         if word.starts_command and not _contained_in_later_word(words, index):
             head = word
-        if _ASSIGNMENT_WORD.match(word.value):
+        if _CHMOD_ASSIGNMENT_WORD.match(word.value):
             continue  # a variable assignment, not a command name
         span_source = (
             normalized[word.start : word.end] if normalized is not None else word.value
@@ -2498,7 +2510,7 @@ def _unresolvable_words_could_recurse(
             continue
         effective_command = word.starts_command
         executor_run = head is not None and (
-            _ASSIGNMENT_WORD.match(head.value)
+            _CHMOD_ASSIGNMENT_WORD.match(head.value)
             or os.path.basename(head.value) in _UNRESOLVABLE_COMMAND_EXECUTORS
         )
         if not (effective_command or executor_run):
@@ -2511,7 +2523,7 @@ def _unresolvable_words_could_recurse(
     return False
 
 
-def _path_can_shadow_command_lookup(words: list[_ShellWord], workspace: str) -> bool:
+def _path_can_shadow_command_lookup(words: list[_ChmodShellWord], workspace: str) -> bool:
     """True when the PATH this command runs under can resolve a bare command
     word inside a directory the guard cannot trust.
 
@@ -2553,13 +2565,13 @@ def _path_can_shadow_command_lookup(words: list[_ShellWord], workspace: str) -> 
     return False
 
 
-def _bash_env_words_arm_shell_code(words: list[_ShellWord]) -> bool:
+def _bash_env_words_arm_shell_code(words: list[_ChmodShellWord]) -> bool:
     """True when the scanned words arm BASH_ENV for a command:
     non-interactive bash runs that file's shell code before the command
     text, so the guard cannot scan what executes and the run is refused.
     Reading or removing BASH_ENV (`echo $BASH_ENV`, `unset BASH_ENV`,
     `env -u BASH_ENV`) stays fine."""
-    head: _ShellWord | None = None
+    head: _ChmodShellWord | None = None
     for index, word in enumerate(words):
         if word.starts_command and not _contained_in_later_word(words, index):
             head = word
@@ -2568,7 +2580,7 @@ def _bash_env_words_arm_shell_code(words: list[_ShellWord]) -> bool:
         if word.starts_command or (
             head is not None
             and (
-                _ASSIGNMENT_WORD.match(head.value)
+                _CHMOD_ASSIGNMENT_WORD.match(head.value)
                 or os.path.basename(head.value) in _ENV_ARMING_HEADS
             )
         ):
@@ -2618,7 +2630,7 @@ def _substitution_spans(command: str) -> list[tuple[int, int]]:
             elif ch == "$" and command[i + 1 : i + 2] == "(":
                 # Substitutions still execute inside double quotes: their
                 # output is shell text, so they are recorded here too.
-                close = _matching_paren(command, i + 1, n)
+                close = _chmod_matching_paren(command, i + 1, n)
                 spans.append((i, close))
                 i = close
             elif ch == "`":
@@ -2630,7 +2642,7 @@ def _substitution_spans(command: str) -> list[tuple[int, int]]:
         elif ch in ('"', "'"):
             quote = ch
         elif ch == "$" and command[i + 1 : i + 2] == "(":
-            close = _matching_paren(command, i + 1, n)
+            close = _chmod_matching_paren(command, i + 1, n)
             spans.append((i, close))
             i = close
         elif ch == "`":
@@ -2643,7 +2655,9 @@ def _substitution_spans(command: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _heredoc_bodies_hide_shell_code(raw: str, allow_destructive_chmod: bool) -> None:
+def _heredoc_bodies_hide_shell_code(
+    raw: str, allow_destructive_chmod: bool, command_prefix: str | None
+) -> None:
     """Refuse here-document bodies that execute as shell code: a shell
     wrapper directly fed by the heredoc (`bash <<EOF ... EOF`) runs the
     body as its script, so the body is scanned with the full guard
@@ -2653,7 +2667,7 @@ def _heredoc_bodies_hide_shell_code(raw: str, allow_destructive_chmod: bool) -> 
     as data by non-wrapper commands stay inert (masked), and an
     unterminated heredoc executes nothing after it."""
     substitution_spans = _substitution_spans(raw)
-    for operator in _REDIRECT_OPERATOR.finditer(raw):
+    for operator in _CHMOD_REDIRECT_OPERATOR.finditer(raw):
         op_text = operator.group(0)
         if "<<<" in op_text or not op_text.endswith("<<"):
             continue
@@ -2670,12 +2684,18 @@ def _heredoc_bodies_hide_shell_code(raw: str, allow_destructive_chmod: bool) -> 
         )
         if reader_is_wrapper or inside_substitution:
             # The body executes as shell code: run the full guard on it
-            # (operand resolution included), propagating its refusal.
-            _guard_destructive_chmod(body.strip("\n"), allow_destructive_chmod)
+            # (operand resolution included), propagating its refusal. The
+            # prefix the shell already ran applies to the body too, so the
+            # rescan sees exactly prefix + body, from the one env read.
+            _guard_destructive_chmod(
+                _prefix_command(body.strip("\n"), command_prefix),
+                allow_destructive_chmod,
+                command_prefix,
+            )
 
 
 def _process_substitution_feeds_wrapper(
-    normalized: str, words: list[_ShellWord] | None = None
+    normalized: str, words: list[_ChmodShellWord] | None = None
 ) -> bool:
     """True when a shell wrapper's first argument is a process substitution
     (`bash <(...)`, `sh >(...)`), or the wrapper's stdin is a here-string
@@ -2686,8 +2706,8 @@ def _process_substitution_feeds_wrapper(
     if "<(" not in normalized and ">(" not in normalized and "<<<" not in normalized:
         return False
     if words is None:
-        words = _scan_shell_words(normalized)
-    head: _ShellWord | None = None
+        words = _chmod_scan_shell_words(normalized)
+    head: _ChmodShellWord | None = None
     for index, word in enumerate(words):
         if word.starts_command and not _contained_in_later_word(words, index):
             head = word
@@ -2696,7 +2716,7 @@ def _process_substitution_feeds_wrapper(
         introduced = word.starts_command or (
             head is not None
             and (
-                _ASSIGNMENT_WORD.match(head.value)
+                _CHMOD_ASSIGNMENT_WORD.match(head.value)
                 or os.path.basename(head.value) in _PROC_SUB_INTRODUCERS
             )
         )
@@ -2742,18 +2762,18 @@ _SCRIPT_INPUT_WRAPPERS = ("sh", "bash", "zsh", "dash", "ksh", "source", ".")
 # A PATH assignment changes where a slash-free `source` operand resolves.
 _PATH_ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9_])PATH\+?=")
 
-_FUNCTION_DEFINITION = re.compile(r"\(\s*\)\s*[({]|function\s+[A-Za-z_]")
+_CHMOD_FUNCTION_DEFINITION = re.compile(r"\(\s*\)\s*[({]|function\s+[A-Za-z_]")
 
 
 def _function_definition_could_recurse(
-    normalized: str, words: list[_ShellWord]
+    normalized: str, words: list[_ChmodShellWord]
 ) -> bool:
     """True when a shell function definition could carry a recursive
     chmod/chown: bash forwards the call arguments into the definition
     (`f() { chmod "$@"; }; f -R 755 /`), so a chmod/chown word in the
     definition plus a recursive flag anywhere in the command are refused
     together rather than resolved apart."""
-    if not _FUNCTION_DEFINITION.search(normalized):
+    if not _CHMOD_FUNCTION_DEFINITION.search(normalized):
         return False
     has_chmod_word = any(_is_chmod_chown_word(word.value) for word in words)
     has_recursive_flag = any(
@@ -2828,7 +2848,7 @@ def _script_input_violation(
 def _unscanned_wrapper_script_reason(
     raw: str,
     normalized: str,
-    words: list[_ShellWord],
+    words: list[_ChmodShellWord],
     user_command_start: int,
 ) -> str | None:
     """Why a bare shell wrapper executes a script the guard cannot scan, or
@@ -2857,7 +2877,7 @@ def _unscanned_wrapper_script_reason(
     prefix_relocates = bool(prefix) and bool(
         re.search(r"\b(?:cd|pushd|popd)\b", prefix)
     )
-    head: _ShellWord | None = None
+    head: _ChmodShellWord | None = None
     for index, word in enumerate(words):
         if word.starts_command and not _contained_in_later_word(words, index):
             head = word
@@ -2866,7 +2886,7 @@ def _unscanned_wrapper_script_reason(
         introduced = word.starts_command or (
             head is not None
             and (
-                _ASSIGNMENT_WORD.match(head.value)
+                _CHMOD_ASSIGNMENT_WORD.match(head.value)
                 or os.path.basename(head.value) in _UNRESOLVABLE_COMMAND_EXECUTORS
                 # A grouping token or keyword in the command slot is not the
                 # command: the wrapper behind it runs with the same options
@@ -2887,7 +2907,7 @@ def _unscanned_wrapper_script_reason(
             # so the wrapper reads its script somewhere the resolver
             # cannot replay.
             return "relocation"
-        script_word: _ShellWord | None = None
+        script_word: _ChmodShellWord | None = None
         governed = False
         skip_next = False
         for follower_index in range(index + 1, len(words)):
@@ -2990,7 +3010,7 @@ def _unscanned_wrapper_script_reason(
     return None
 
 
-def _shell_wrapper_reads_pipe(normalized: str, words: list[_ShellWord]) -> bool:
+def _shell_wrapper_reads_pipe(normalized: str, words: list[_ChmodShellWord]) -> bool:
     """True when a bare shell wrapper takes its commands from a pipeline
     or a here-string/redirect: the fed script content cannot be scanned
     statically, so the wrapper form is refused. Wrappers governed by a
@@ -3263,9 +3283,9 @@ def _shell_c_payloads_hide_recursive_chmod(command: str) -> str | None:
     stays inert: `sh -c 'echo "chmod -R 755 ~"'` must not trigger, while
     `sh -c 'chmod -R 755 ~'` must. Unquoted payloads are scanned as plain
     invocations already and are skipped here."""
-    words = _scan_shell_words(command)
+    words = _chmod_scan_shell_words(command)
     for source in _wrapper_payload_sources(words, command, ("shell_c",)):
-        payload = _unquote_one_level(_expand_ansi_c_payloads(source))
+        payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
         reason = _payload_text_hides_shell_code(payload)
         if reason is not None:
             return reason
@@ -3277,9 +3297,9 @@ def _alias_payloads_hide_recursive_chmod(command: str) -> str | None:
     (truthy), or None when it does not: an alias body executes as shell
     code at use time, and a body carrying a recursive chmod/chown is
     refused because the call site shows none of it."""
-    words = _scan_shell_words(command)
+    words = _chmod_scan_shell_words(command)
     for source in _wrapper_payload_sources(words, command, ("alias",)):
-        payload = _unquote_one_level(_expand_ansi_c_payloads(source))
+        payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
         reason = _payload_text_hides_shell_code(payload)
         if reason is not None:
             return reason
@@ -3331,14 +3351,14 @@ def _env_option_values(tokens: list[str], short: str, long: str) -> list[str]:
     return values
 
 
-def _env_option_value(tokens: list[str], short: str, long: str) -> str | None:
+def _chmod_env_option_value(tokens: list[str], short: str, long: str) -> str | None:
     """The first value `env` passes for one of its value options, or None
     when the command does not use it."""
     values = _env_option_values(tokens, short, long)
     return values[0] if values else None
 
 
-def _split_env_string(value: str) -> str | None:
+def _chmod_split_env_string(value: str) -> str | None:
     """The argv text `env -S` splits its string into, or None when the string
     carries expansion.
 
@@ -3379,7 +3399,7 @@ def _split_env_string(value: str) -> str | None:
     return " ".join(parts)
 
 
-def _env_split_string_feeds(words: list[_ShellWord]) -> tuple[list[str], list[str]]:
+def _chmod_env_split_string_feeds(words: list[_ChmodShellWord]) -> tuple[list[str], list[str]]:
     """(split argv texts, refusal reasons) for every `env -S/--split-string`
     operand in already-scanned `words`.
 
@@ -3399,7 +3419,7 @@ def _env_split_string_feeds(words: list[_ShellWord]) -> tuple[list[str], list[st
         ):
             if not value.strip():
                 continue
-            split = _split_env_string(value)
+            split = _chmod_split_env_string(value)
             if split is None:
                 reasons.append(
                     f"{value!r}: names the argv env runs through shell"
@@ -3418,7 +3438,7 @@ def _env_split_string_payloads_hide_recursive_chmod(command: str) -> str | None:
     bundled in a cluster) and for every `env` word. env without -S executes
     only a literal command word and is scanned by the plain invocation scan
     already."""
-    feeds, reasons = _env_split_string_feeds(_scan_shell_words(command))
+    feeds, reasons = _chmod_env_split_string_feeds(_chmod_scan_shell_words(command))
     for feed in feeds:
         reason = _payload_text_hides_shell_code(feed)
         if reason is not None:
@@ -3433,9 +3453,9 @@ def _trap_payloads_hide_recursive_chmod(command: str) -> str | None:
     None when it does not: a trap body executes at trigger time (EXIT,
     DEBUG runs before every command), and a body carrying a recursive
     chmod/chown is refused because nothing else in the command shows it."""
-    words = _scan_shell_words(command)
+    words = _chmod_scan_shell_words(command)
     for source in _wrapper_payload_sources(words, command, ("trap",)):
-        payload = _unquote_one_level(_expand_ansi_c_payloads(source))
+        payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
         reason = _payload_text_hides_shell_code(payload)
         if reason is not None:
             return reason
@@ -3471,7 +3491,7 @@ def _wrapper_chain_groups(run_words: list[str]) -> list[tuple[str, list[str]]]:
     groups: list[tuple[str, list[str]]] = []
     index = 0
     while index < len(run_words):
-        if run_words[index] in _COMMAND_SLOT_NOISE or _ASSIGNMENT_WORD.match(
+        if run_words[index] in _COMMAND_SLOT_NOISE or _CHMOD_ASSIGNMENT_WORD.match(
             run_words[index]
         ):
             # An assignment prefix, a grouping token, or a group keyword holds
@@ -3493,7 +3513,7 @@ def _wrapper_chain_groups(run_words: list[str]) -> list[tuple[str, list[str]]]:
     return groups
 
 
-def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> None:
+def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command_prefix: str | None) -> None:
     """Refuse recursive chmod/chown commands whose operands could escape the
     kernel workspace or hit the home directory, dot-directories, dotfiles, or
     the filesystem root, and fail closed on what the scanner cannot resolve:
@@ -3506,14 +3526,15 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     and grouping tokens), unreadable `hash -p` registrations, a PATH
     entry that can shadow a bare command word, and abbreviated
     recursive flags. Pattern matching is string-only and the operand
-    resolver runs only on a match, so other commands pay nothing."""
+    resolver runs only on a match, so other commands pay nothing. `script`
+    is exactly the text the shell runs, prefix already prepended by the
+    caller from one env read, so the scan never diverges from the spawn."""
     if allow_destructive_chmod or _DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START:
         return
-    command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
-    raw = _normalize_line_continuations(_with_prefix(command))
-    resolved = _mask_shell_redirections(raw)
-    normalized, index_map = _strip_shell_escapes(resolved)
-    words = _scan_shell_words(normalized)
+    raw = _chmod_normalize_line_continuations(script)
+    resolved = _chmod_mask_shell_redirections(raw)
+    normalized, index_map = _chmod_strip_shell_escapes(resolved)
+    words = _chmod_scan_shell_words(normalized)
     # `normalized` drops backslash escapes, so the prefix boundary maps
     # through the strip index map instead of the raw prefix length.
     if command_prefix:
@@ -3534,7 +3555,7 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     # later `name` runs `pathname` whatever the word looks like: those names
     # scan as the command they run, and a registration the guard cannot read
     # is refused, because the command it hides cannot be resolved at all.
-    hash_alias_names, hash_unreadable = _hash_registered_command_names(words)
+    hash_alias_names, hash_unreadable = _chmod_hash_registered_command_names(words)
     if hash_unreadable:
         raise DestructiveChmodRefusalError(_format_chmod_hash_alias_refusal())
     # A process substitution feeding a shell wrapper executes content the
@@ -3545,7 +3566,7 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
     # heredoc, or a heredoc flowing out of a substitution) are scanned with
     # the full guard; data bodies stay masked and inert.
     if "<<" in raw:
-        _heredoc_bodies_hide_shell_code(raw, allow_destructive_chmod)
+        _heredoc_bodies_hide_shell_code(raw, allow_destructive_chmod, command_prefix)
     # The cheap gates are word-driven, not raw-text-driven: quote- and
     # ANSI-C-encoded wrapper names (`e"val"`, `$'bash'`) fold to the
     # wrapper word in the scan even though no contiguous `eval`/`bash` text
@@ -3711,7 +3732,7 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
             if wrapper == "xargs":
                 raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
             if wrapper == "env" and (
-                _env_option_value(tokens, "C", "chdir") is not None
+                _chmod_env_option_value(tokens, "C", "chdir") is not None
             ):
                 raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
             if wrapper == "find" and "-execdir" in tokens:
@@ -3720,7 +3741,7 @@ def _guard_destructive_chmod(command: str, allow_destructive_chmod: bool) -> Non
         if effective_cwd is _UNRESOLVABLE_CHMOD_CWD:
             raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
         base = workspace if effective_cwd is None else effective_cwd
-        region_words, well_formed = _shell_words(normalized[start:end])
+        region_words, well_formed = _chmod_shell_words(normalized[start:end])
         for operand in _chmod_operand_words(region_words, well_formed):
             resolved_operand = (
                 _resolve_chmod_operand(operand, base, home_env)
@@ -3768,8 +3789,13 @@ def bash(command: str, *, allow_destructive_chmod: bool = False) -> BashHandle:
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
     _install_shutdown_hook()
-    _guard_destructive_chmod(command, allow_destructive_chmod)
-    return BashHandle(command)
+    # One env read per call: the guard validates exactly the script the
+    # handle runs, so a mid-call change to the prefix cannot make the
+    # validated text differ from the executed text.
+    prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+    script = _prefix_command(command, prefix)
+    _guard_destructive_chmod(script, allow_destructive_chmod, prefix)
+    return BashHandle(command, script=script)
 
 
 def _shell() -> str:
@@ -3797,6 +3823,15 @@ def _shell() -> str:
 
 def _with_prefix(command: str) -> str:
     prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+    return _prefix_command(command, prefix)
+
+
+def _prefix_command(command: str, prefix: str | None) -> str:
+    """The shell script for `command`, `prefix` prepended as its own line.
+
+    The prefix text is threaded alongside the script so the guard scans the
+    exact text the handle runs; `_with_prefix` keeps its `str`-in, `str`-out
+    shape for existing callers, and the format itself lives in one place."""
     return f"{prefix}\n{command}" if prefix else command
 
 
@@ -3853,6 +3888,9 @@ def _child_env() -> dict[str, str]:
     same reason: bash imports them before the command text runs, so a body
     the guard never reads could run a recursive chmod/chown, and a command
     word would then not be the program the guard checked.
+    PI_BASH_ALLOW_DESTRUCTIVE_CHMOD is dropped unless it was set at kernel
+    start: a mid-session os.environ write this kernel ignores must not arm a
+    nested kernel's frozen snapshot.
     """
     env = {
         **os.environ,
@@ -3875,6 +3913,9 @@ def _child_env() -> dict[str, str]:
     env.pop("ENV", None)
     for name in [name for name in env if name.startswith("BASH_FUNC_")]:
         env.pop(name, None)
+    if not _DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START:
+        # A mid-session os.environ write must not arm a child kernel's frozen snapshot.
+        env.pop(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, None)
     return env
 
 
