@@ -1805,6 +1805,18 @@ def _find_recursive_chmod_chown_invocations(
             end = follower.end
         if _is_recursive_chmod_chown_token_run(tokens):
             invocations.append((word.start, end, index))
+            continue
+        # An expansion-carrying word in the flag region (before the mode
+        # operand) can expand to the recursive flag itself (`r=-R; chmod
+        # "$r" 755 /`), so the invocation stays in scope for the operand
+        # resolver to fail closed on. The region ends at the first token
+        # that is neither an option nor expansion-built: that is the mode.
+        for token in tokens[1:]:
+            if not token.startswith("-") and not _CHMOD_GLOB_OR_SUBSTITUTION.search(token):
+                break
+            if _CHMOD_GLOB_OR_SUBSTITUTION.search(token):
+                invocations.append((word.start, end, index))
+                break
     return invocations
 
 
@@ -3073,8 +3085,22 @@ def _unscanned_wrapper_script_reason(
             # interpreter's script operand at runtime from data the guard
             # never sees (`printf %s | xargs bash`), so that input cannot
             # be scanned: the run is refused like the other unreadable
-            # inputs. An operand-position dot or `source` stays data here.
-            if head is not None and os.path.basename(head.value) in _UNRESOLVABLE_COMMAND_EXECUTORS:
+            # inputs. The introducer may sit behind slot holders (a group
+            # or keyword: `{ xargs bash; }`, `time xargs bash`), so the
+            # walk reads the word holding the command slot, not just the
+            # run head. An operand-position dot or `source` stays data.
+            introducer = head
+            for before in reversed(words[:index]):
+                if before.starts_command:
+                    introducer = before
+                    break
+                if _CHMOD_ASSIGNMENT_WORD.match(before.value) or before.value in _COMMAND_SLOT_NOISE:
+                    continue  # the slot holder passes through
+                if before.value.startswith("-") and before.value != "-":
+                    continue  # a dispatcher or command option word
+                introducer = before
+                break
+            if introducer is not None and os.path.basename(introducer.value) in _UNRESOLVABLE_COMMAND_EXECUTORS:
                 return "unscanned_script"
             continue
         # Replay cd relocations so relative scripts resolve where the
@@ -3153,7 +3179,7 @@ def _shell_wrapper_reads_pipe(normalized: str, words: list[_ChmodShellWord]) -> 
         if "|" in before:
             # A group opener between the pipe and the wrapper still feeds it
             # (`printf ... | { bash; }` runs bash on the piped text).
-            between = before[before.rfind("|") + 1 :].replace(" ", "")
+            between = re.sub(r"\s+", "", before[before.rfind("|") + 1 :])
             if between and any(ch not in "{(" for ch in between):
                 continue
         else:

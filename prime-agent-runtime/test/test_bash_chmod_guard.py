@@ -403,6 +403,18 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(DestructiveChmodRefusalError):
                 await self._run("chmod -R -- 755 ~")
 
+    async def test_expansion_built_flag_positions_stay_in_scope(self):
+        # A flag-region word built from expansion can be `-R` itself
+        # (`r=-R; chmod "$r" 755 /`), so the invocation stays in scope and
+        # fails closed; an expansion operand after the mode is data.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        with mock.patch.dict(os.environ, {"HOME": home.name}):
+            message = await self._refused('r=-R; chmod "$r" 755 ~')
+        self.assertIn("Refusing to run", message)
+        self._make_tree()
+        self.assertEqual((await self._run('r=sub; chmod 755 "$r" sub')).exit_code, 0)
+
     async def test_non_recursive_chmod_chown_untouched(self):
         self._make_tree()
         Path(self.test_dir, ".git").mkdir()
@@ -878,12 +890,17 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         # xargs supplies the script operand at runtime; the fed run is refused.
         message = await self._refused("printf '%s\n' /tmp/evil.sh | xargs bash")
         self.assertIn("script", message)
+        # The introducer may sit behind a group or keyword, not just the head.
+        for command in ["{ xargs bash; }", "time xargs bash", "if xargs bash; then :; fi"]:
+            with self.subTest(command=command):
+                self.assertIn("Refusing to run", await self._refused(command))
 
     async def test_refuses_grouped_pipe_fed_wrappers(self):
         # A group opener between the pipe and the wrapper still feeds it.
         for command in [
             "printf 'chmod -R 755 sub\n' | { bash; }",
             "printf 'chmod -R 755 sub\n' | ( bash )",
+            "printf 'chmod -R 755 sub\n' |\t{ bash; }",
         ]:
             with self.subTest(command=command):
                 self.assertIn("Refusing to run", await self._refused(command))
