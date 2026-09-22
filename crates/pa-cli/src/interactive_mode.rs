@@ -442,6 +442,10 @@ fn print_resume_hint(hint: &Option<String>) {
 /// `/resume <selector>` chain runs its target before the loop decides again.
 async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) -> Result<()> {
     let mut anchor = anchor;
+    // The flow's roster connection (TS `AgentsViewPersistentState.rosterClient`):
+    // every view run in this loop reuses it, and a chat run hands it back,
+    // so a switch back from a chat skips the connect + hello handshake.
+    let mut roster_link: Option<pa_tui::agents_view::AgentsViewLink> = None;
     // The view/session loop's carried state (TS `AgentsViewPersistentState`):
     // a stack of scope frames (the scope plus the return chat each was
     // opened from), the typed query, the drilled-in row's ancestors to
@@ -474,11 +478,16 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             // `AgentsViewMode.keybindings`).
             keybindings: base.keybindings.clone(),
         };
-        let view = pa_tui::agents_view::run_agents_view(
+        let view_run = pa_tui::agents_view::run_agents_view(
             view_options,
             pa_tui::agents_view::AgentsViewUiMode::Terminal,
+            roster_link.take(),
         )
         .await?;
+        let view = view_run.outcome;
+        // A handoff to a chat parked the connection for this loop's next
+        // view run; a selection-less exit closed it already.
+        roster_link = view_run.link;
         // A dropped scope root or the view's parent key pops the frame (TS
         // `resolveAgentsViewScopeFrames` / the `scope_back` arm), so a later
         // agents-back lands in the parent scope; both clear the query.
@@ -506,6 +515,9 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
         anchor = Some(outcome.session_id.clone());
         if !outcome.return_to_agents_view {
             print_resume_hint(&outcome.resume_hint);
+            if let Some(link) = roster_link.take() {
+                link.close();
+            }
             return Ok(());
         }
         if let Some(scope) = outcome.agents_view_scope {
@@ -531,6 +543,9 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             anchor = Some(outcome.session_id.clone());
             if !outcome.return_to_agents_view {
                 print_resume_hint(&outcome.resume_hint);
+                if let Some(link) = roster_link.take() {
+                    link.close();
+                }
                 return Ok(());
             }
             if let Some(scope) = outcome.agents_view_scope {

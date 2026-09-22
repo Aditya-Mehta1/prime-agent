@@ -932,13 +932,30 @@ pub async fn run_interactive(
             // Paint the handled input in this iteration: the select below can
             // otherwise wait out its 50ms tick before the next draw, and
             // that wait is felt directly as keystroke-to-render lag.
+            // A handoff paints nothing: the next surface owns the pane
+            // (TS `returnToAgentsView` hands the terminal over without a
+            // final repaint — the agents view's mount clears the alt
+            // screen), so the chat's last layout is dead work that only
+            // delays the switch.
             if let Some(renderer) = renderer.is_terminal_mut() {
-                crate::app::draw(renderer, &mut view)?;
+                if !session.open_agents_view && session.pending_selection.is_none() {
+                    crate::app::draw(renderer, &mut view)?;
+                }
                 session.dirty = false;
             }
             // An exit key must not wait out the select tick before the
             // bounded shutdown path runs.
             if !running {
+                break;
+            }
+            // `exit_requested` is the same leave-now signal (agents-back,
+            // `/resume`, `/exit`): in terminal mode the teardown below must
+            // run this iteration, not after the select's 50ms idle tick
+            // parks the loop — that park reads directly as switch latency
+            // (TS's event loop leaves on the key). Headless runs keep the
+            // tail pass so captured frames stay identical.
+            if session.exit_requested && renderer.is_terminal() {
+                session.exit_reason = "session_request";
                 break;
             }
         }
@@ -1283,22 +1300,48 @@ pub async fn run_interactive(
     session.release_prompt_stash_session();
     // TS `shutdown` fetches the session stats while the connection is
     // alive, then prints the resume hint after teardown; pa-cli prints it
-    // once the terminal is restored. Bounded best-effort.
-    let resume_hint = session.exit_resume_hint().await;
+    // once the terminal is restored. Bounded best-effort. The agents-view
+    // handoff never prints it (TS `returnToAgentsView` skips the stats
+    // fetch entirely — the next surface is another view, not a process
+    // exit), so the round-trip is dead work on that path.
+    let resume_hint = if session.open_agents_view {
+        None
+    } else {
+        session.exit_resume_hint().await
+    };
     // Detach explicitly so the session's attached-client count stays honest;
     // the supervisor also detaches this connection when the socket closes.
     // Bounded hard: a wedged worker socket can never hold the exit path.
-    session.detach_for_exit().await;
+    // The agents-view handoff fires the detach in the background instead
+    // (attached-client bookkeeping must not delay the switch; the request
+    // is on the wire before the handoff returns, and the background task
+    // owns this connection until the daemon answers or the cap fires).
+    if session.open_agents_view {
+        session.detach_for_handoff();
+    } else {
+        session.detach_for_exit().await;
+    }
     // `tui exit` (schema v1): how the run ended. Bounded the same way as
     // the detach — telemetry must never hold the exit path open either.
+    // The handoff still emits the event but does not wait for the flush:
+    // the agents view keeps the process (and the runtime) alive, so the
+    // background flush completes while the user is already in the view
+    // (TS hands the pane to the next mode without any teardown await).
     let exit_reason = session.exit_reason();
     let turn_active_at_exit = session.turn_active;
-    if let Some(telemetry) = &session.telemetry {
-        let _ = tokio::time::timeout(
-            Duration::from_millis(TELEMETRY_EXIT_TIMEOUT_MS),
-            telemetry.client_exit(exit_reason, turn_active_at_exit),
-        )
-        .await;
+    if let Some(telemetry) = session.telemetry.clone() {
+        let exit_event = async move {
+            let _ = telemetry
+                .client_exit(exit_reason, turn_active_at_exit)
+                .await;
+        };
+        if session.open_agents_view {
+            tokio::spawn(exit_event);
+        } else {
+            let _ =
+                tokio::time::timeout(Duration::from_millis(TELEMETRY_EXIT_TIMEOUT_MS), exit_event)
+                    .await;
+        }
     }
     // Agents-back and `/resume` hand the pane to the agents view; the
     // alternate screen stays in place for it instead of flushing to the
@@ -1318,7 +1361,11 @@ pub async fn run_interactive(
         selection_request: session.pending_selection,
         copies: std::mem::take(&mut session.copies),
     };
-    session.client.close();
+    // The agents-view handoff's background detach owns this connection now
+    // (it closes once the daemon answers); every other exit closes it here.
+    if !preserve_alt_screen {
+        session.client.close();
+    }
     // A handoff (agents view, `/resume <selector>`) lets the process keep
     // running: retire the watchdog. Every other completion is a process
     // exit, where the deadline dies with the process — or fires when the
@@ -1482,15 +1529,22 @@ impl Renderer {
                         _ => true,
                     },
                 });
-                let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
+                let terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
                 // The adopted buffer still holds the previous view's frame;
-                // clear it so the first draw is a full repaint of the same
-                // buffer (a fresh alt screen is already blank).
-                terminal.clear()?;
-                // The handoff left the cursor hidden (TS `stop` with
-                // `preserveAltScreen` hides it); this surface wants its own
-                // visible cursor back.
-                crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+                // the first draw repaints the same buffer (a fresh alt
+                // screen is already blank). TS paints the new frame
+                // straight over the old one, so the clear escape must
+                // never reach the pane on its own: queue it with the
+                // cursor show and let the first draw's single flush carry
+                // clear + frame together — a separate clear-and-flush
+                // here shows a blank pane for the whole render gap, a
+                // visible flicker on every surface switch (the chat's own
+                // first frame is the tail render on the first event).
+                crossterm::queue!(
+                    std::io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    crossterm::cursor::Show
+                )?;
                 Ok(Renderer::Terminal {
                     term: terminal,
                     mouse,
@@ -1734,6 +1788,12 @@ impl Renderer {
             Renderer::Terminal { .. } => {
                 if preserve_alt_screen {
                     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
+                    // Flag this surface's input reader for the background
+                    // stop now (TS tears its listener down with the chat):
+                    // the next surface joins it at mount, and the already
+                    // flagged reader exits at its next poll tick instead
+                    // of making the switch wait a full timeout.
+                    crate::input::request_reader_stop();
                 } else {
                     let _ = self.flush_to_main_screen(view);
                     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);

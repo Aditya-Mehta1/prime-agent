@@ -32,7 +32,29 @@ struct Reader {
 /// The reader of the previous TUI surface in this process, if any.
 static PREVIOUS_READER: Mutex<Option<Reader>> = Mutex::new(None);
 
-const POLL_TIMEOUT_MS: u64 = 100;
+/// TS's event loop reads stdin edge-driven (a single `poll`-like wait per
+/// event); the Rust reader polls at this tick instead. The tick is also
+/// the worst-case latency of the reader handoff: a surface switch stops
+/// the previous reader's poll flag and joins it, and the join can only
+/// return when the in-flight poll expires — so 100ms here read as a
+/// ~50-100ms lag on every chat->agents switch. 10ms keeps idle wakeups
+/// cheap (one `poll` syscall per tick) while bounding the handoff.
+const POLL_TIMEOUT_MS: u64 = 10;
+
+/// Ask the previous surface's reader to stop without joining it: the
+/// handoff path flags the reader at teardown, so the flag is already set
+/// (and the thread usually gone) by the time the next surface's
+/// [`spawn_terminal_reader`] joins it. This keeps the switch off the
+/// join's worst-case poll-tick wait and closes the window where a dying
+/// reader could still steal a keypress aimed at the new surface.
+pub(crate) fn request_reader_stop() {
+    let guard = PREVIOUS_READER
+        .lock()
+        .expect("the input-reader registry lock is poisoned");
+    if let Some(reader) = guard.as_ref() {
+        reader.stop.store(true, Ordering::Relaxed);
+    }
+}
 
 /// One input unit for the paste-aware reader: a parsed terminal event, or
 /// a coalesced marker-less keystroke burst (the TS raw multiline-paste

@@ -247,9 +247,11 @@ async fn panel_expand_drill_in_and_back_re_expands_the_tree() {
         height: 36,
     };
     let options = view_options(&supervisor.socket, &session_dir, Vec::new(), None, None);
-    let view = pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan))
-        .await
-        .expect("agents view run");
+    let view =
+        pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan), None)
+            .await
+            .expect("agents view run")
+            .outcome;
 
     // Collapsed: the parent row and its `1 subagent` summary row, with the
     // child (and the grandchild under it) reachable only through the
@@ -378,10 +380,16 @@ async fn panel_expand_drill_in_and_back_re_expands_the_tree() {
         view.selected_row_identity.clone(),
         view.selected_key.clone(),
     );
-    let back = pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan))
-        .await
-        .expect("agents view re-run");
-    let returned = first_frame_of(&back.frames, "worker alpha");
+    let back =
+        pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan), None)
+            .await
+            .expect("agents view re-run")
+            .outcome;
+    // The settled frame is the one the saved-catalog scan landed in (the
+    // first frame now renders from the live roster alone — TS
+    // `applySessionList` before `armSavedSearchFetch` applies — so the
+    // mount frame predates the saved rows and their summary markers).
+    let returned = first_frame_of(&back.frames, "orchestrator chat");
     assert!(
         returned.contains("\u{25b8} 1 subagent"),
         "the resumed child's own subtree stays behind its collapsed summary row:\n{returned}"
@@ -455,9 +463,11 @@ async fn agents_view_fires_user_keybindings_from_settings() {
     };
     let mut options = view_options(&supervisor.socket, &session_dir, Vec::new(), None, None);
     options.keybindings = pa_tui::keybindings::KeybindingsManager::create(&agent_dir);
-    let view = pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan))
-        .await
-        .expect("agents view run");
+    let view =
+        pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan), None)
+            .await
+            .expect("agents view run")
+            .outcome;
     assert_eq!(
         view.selection,
         Some(SessionSelection::Resume(solo_path.clone())),
@@ -485,9 +495,11 @@ async fn agents_view_fires_user_keybindings_from_settings() {
     };
     let mut options = view_options(&supervisor.socket, &session_dir, Vec::new(), None, None);
     options.keybindings = pa_tui::keybindings::KeybindingsManager::create(&agent_dir);
-    let view = pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan))
-        .await
-        .expect("agents view run");
+    let view =
+        pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan), None)
+            .await
+            .expect("agents view run")
+            .outcome;
     assert_eq!(
         view.selection, None,
         "the default open key no longer opens after the override"

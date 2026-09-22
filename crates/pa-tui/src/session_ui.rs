@@ -1056,6 +1056,29 @@ impl SessionUi {
         .map(|_| ())
     }
 
+    /// Detach on the agents-view handoff without blocking it: the request
+    /// goes on the wire immediately and a background task owns the
+    /// connection until the daemon answers (or the exit cap fires), then
+    /// closes it. Attached-client bookkeeping must not delay the switch;
+    /// the supervisor also detaches this client when the socket closes, so
+    /// the response is not a handoff dependency.
+    pub(crate) fn detach_for_handoff(&self) {
+        let client = self.client.clone();
+        let active_session_id = self.active_session_id.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(EXIT_DETACH_TIMEOUT_MS),
+                client.request_ok(DaemonCommand::Detach {
+                    id: None,
+                    active_session_id: Some(active_session_id),
+                    rest: Default::default(),
+                }),
+            )
+            .await;
+            client.close();
+        });
+    }
+
     /// Detach during the exit path, bounded hard: a wedged worker socket can
     /// never hold the client open (the exit contract is exit-within-1s even
     /// then, so this must stay well under the bound).
