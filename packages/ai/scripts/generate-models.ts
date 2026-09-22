@@ -2247,7 +2247,7 @@ function matchesGlob(value: string, glob: string): boolean {
 		} else if (char === "?") {
 			source += ".";
 		} else {
-			source += char.replace(/[|\{}()[\]^$+?.]/g, "\\$&");
+			source += char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		}
 	}
 	return new RegExp(`${source}$`).test(value);
