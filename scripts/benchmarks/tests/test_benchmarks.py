@@ -472,7 +472,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("Waiting for contributor vouch", render(pending))
 
     def test_automatic_duplicates_skip_but_manual_runs_and_new_comparisons_do_not(self):
-        for case in ("duplicate", "manual", "attempt", "main", "harness", "config", "failed"):
+        for case in ("duplicate", "manual", "attempt", "main", "harness", "config", "failed", "rust", "rust-manual"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 event, output = root / "event.json", root / "output.txt"
@@ -482,6 +482,8 @@ class LifecycleTests(unittest.TestCase):
                 github = FakeGitHub()
                 github.comments = [{"user": {"login": "github-actions[bot]"}, "body": render(old)}]
                 report = fixture()
+                if case in ("rust", "rust-manual"):
+                    github.base_ref = "rust"
                 if case == "main":
                     report.base_sha = report.main.sha = "c" * 40
                 elif case == "harness":
@@ -500,7 +502,7 @@ class LifecycleTests(unittest.TestCase):
                             "GITHUB_EVENT_PATH": str(event),
                             "GITHUB_OUTPUT": str(output),
                             "GITHUB_EVENT_NAME": "workflow_dispatch"
-                            if case == "manual"
+                            if case in ("manual", "rust-manual")
                             else "pull_request_target",
                             "GITHUB_SHA": SHA,
                             "GITHUB_RUN_ID": "100",
@@ -509,7 +511,7 @@ class LifecycleTests(unittest.TestCase):
                     ),
                 ):
                     main()
-                self.assertIn(f"needed={'false' if case == 'duplicate' else 'true'}", output.read_text())
+                self.assertIn(f"needed={'false' if case in ('duplicate', 'rust', 'rust-manual') else 'true'}", output.read_text())
                 self.assertEqual(github.writes, [])
 
     def test_cleanup_paginates_before_deleting_and_checks_all_labels(self):

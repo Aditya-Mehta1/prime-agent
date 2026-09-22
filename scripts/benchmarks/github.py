@@ -43,6 +43,10 @@ class GitHub:
                 return
             page += 1
 
+    def pr_base_ref(self, pr: int) -> str:
+        """The PR's base branch name (the rust port's PRs are out of scope)."""
+        return self.request("GET", f"pulls/{pr}")["base"]["ref"]
+
     def resolve(
         self, pr: int, harness_sha: str, run_id: int, attempt: int, config: Config
     ) -> tuple[Report, str]:

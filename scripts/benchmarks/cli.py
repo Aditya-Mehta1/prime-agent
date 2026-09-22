@@ -124,7 +124,11 @@ def main() -> None:
         )
         write_json(args.results / "report.json", report)
         manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" or report.attempt > 1
-        needed = manual or not github.duplicate(report)
+        # A rust-branch PR is the Rust port: the TS benchmark harness cannot
+        # run it. The workflow skips the pull_request_target path; a manual
+        # workflow_dispatch (inputs.pr) lands here and must skip too.
+        rust_base = github.pr_base_ref(pr) == "rust"
+        needed = (manual or not github.duplicate(report)) and not rust_base
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
             output.write(
                 f"pr={pr}\nauthor={author}\nharness={report.harness_sha}\nneeded={str(needed).lower()}\n"
