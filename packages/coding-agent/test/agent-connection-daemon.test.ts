@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, getModel } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type {
@@ -30,6 +30,7 @@ import { DaemonRoutedClient } from "../src/modes/daemon/daemon-routed-client.js"
 import type { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../src/modes/rpc/jsonl.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 
 class FakeDaemonClient {
 	readonly requests: DaemonCommand[] = [];
@@ -204,7 +205,7 @@ class FakeDaemonClient {
 					command: command.type,
 					success: true,
 					data: {
-						models: [getModel("openai", "gpt-5.1")],
+						models: [getCodingAgentFixtureModel("openai", "gpt-5.1")],
 						configuredProviders: ["openai"],
 					},
 				};
@@ -213,7 +214,7 @@ class FakeDaemonClient {
 					type: "response",
 					command: command.type,
 					success: true,
-					data: { models: [getModel("openai", "gpt-5.1")] },
+					data: { models: [getCodingAgentFixtureModel("openai", "gpt-5.1")] },
 				};
 			case "get_session_context":
 				return {
