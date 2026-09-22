@@ -54,6 +54,7 @@ import {
 } from "../../core/agent-messages.js";
 import {
 	AGENT_OBSERVE_PREVIEW_MAX_CHARS,
+	type AgentObserveActivity,
 	type AgentObserveAgentSnapshot,
 	type AgentObserveAgentSummary,
 	type AgentObserveController,
@@ -3599,7 +3600,7 @@ export class AgentDaemon {
 		const session = state.runtime.session;
 		const messages = session.messages;
 		const latest = messages.at(-1);
-		const status = session.isStreaming
+		const activity: AgentObserveActivity = session.isStreaming
 			? session.state.pendingToolCalls.size > 0
 				? "tool"
 				: "model"
@@ -3616,7 +3617,8 @@ export class AgentDaemon {
 			...(summary.sessionName ? { sessionName: summary.sessionName } : {}),
 			...(summary.runtimeKind ? { runtimeKind: summary.runtimeKind } : {}),
 			cwd: summary.cwd,
-			status,
+			status: summary.rosterStatus ?? classifySessionRosterStatus(summary),
+			activity,
 			isCurrent: state.activeSessionId === currentState.activeSessionId,
 			isStreaming: summary.isStreaming,
 			isCompacting: summary.isCompacting,
