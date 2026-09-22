@@ -165,7 +165,7 @@ never session payload.
 
 | property | type | notes |
 |---|---|---|
-| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach`, `sessions_archived`, `worker_children_closed` |
+| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `worker_gave_up`, `attach`, `reattach`, `detach`, `sessions_archived`, `worker_children_closed` |
 | `exit_reason` | string | only for `worker_exited`: `normal` / `crash` |
 | `count` | number | only for `sessions_archived` and `worker_children_closed`: how many sessions the sweep moved to the archive / how many resident RLM children the supervisor closed with a hard-killed parent worker |
 
