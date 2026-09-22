@@ -134,6 +134,7 @@ export interface SimpleStreamOptions extends StreamOptions {
 	reasoning?: ModelThinkingLevel;
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
+	toolChoice?: "auto" | "none" | "required";
 }
 
 // Generic StreamFunction with typed options.
