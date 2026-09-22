@@ -113,12 +113,7 @@ type AuthSourceCandidateMemo = {
 	candidate: AuthSourceCandidate;
 };
 
-/**
- * Memo key marker for candidates without an eagerly hashed value fingerprint:
- * command-backed keys (whose value stays lazily resolved — the memo must never
- * force the command execution the lazy resolver exists to avoid) and static MCP
- * tokens (no provider key material at all).
- */
+/** Memo key marker for values that must never be hashed: command-backed keys (the memo must never force the exec) and static MCP tokens. */
 const AUTH_SOURCE_LAZY_VALUE_KEY = "value-lazy";
 
 type AuthApiKeyResult = {
@@ -303,7 +298,6 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
-	/** Latest memoized auth-source candidate per provider and source kind. */
 	private authCandidateMemos: Map<string, AuthSourceCandidateMemo> = new Map();
 
 	private constructor(
@@ -416,11 +410,7 @@ export class AuthStorage {
 		return `oauth:${apiKey}\0${credential.refresh}\0${credential.expires}`;
 	}
 
-	/**
-	 * Serve a cached auth-source candidate while the raw material its fingerprints
-	 * hash is unchanged. Candidates are immutable once built and stale checks run
-	 * against the candidate after this memo, so reuse only skips the SHA-256 work.
-	 */
+	/** Reuse only skips the SHA-256 work: candidates are immutable and stale checks run against the memoized candidate. */
 	private reuseAuthSourceCandidate(
 		source: ActiveAuthStatusSource,
 		provider: string,
@@ -472,11 +462,7 @@ export class AuthStorage {
 			(isCommandApiKey && !options?.resolveCommandValue
 				? undefined
 				: this.getStoredCredentialValueMaterial(provider, credential));
-		// The memo key is the fingerprint input material itself — built from
-		// credential FIELDS, never object identity, so an in-place credential
-		// mutation or a swapped equal credential produces a different key only
-		// when the hashed material differs. Command-backed keys keep their value
-		// material lazy (the marker below), so the memo never forces an exec.
+		// Keyed by credential fields, never object identity, so the key changes exactly when the hashed material does.
 		const memoKey = `${identityMaterial}\0${valueMaterial ?? AUTH_SOURCE_LAZY_VALUE_KEY}`;
 		return this.reuseAuthSourceCandidate("stored", provider, memoKey, () =>
 			this.createAuthSourceCandidate({
@@ -500,8 +486,7 @@ export class AuthStorage {
 		}
 		const label = envKey ?? "ambient credentials";
 		const identityMaterial = envKey ?? this.getAmbientEnvironmentIdentityMaterial(provider);
-		// Environment variables are deliberately NOT cached: the env is re-read
-		// per call and only the fingerprinting of the unchanged material is memoized.
+		// Env values are deliberately re-read per call; only fingerprinting of the unchanged material is memoized.
 		return this.reuseAuthSourceCandidate("environment", provider, `${identityMaterial}\0${apiKey}`, () =>
 			this.createAuthSourceCandidate({
 				configured: false,

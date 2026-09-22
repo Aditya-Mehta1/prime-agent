@@ -11858,8 +11858,6 @@ export class AgentSession {
 	}
 
 	private async _authenticatedRlmModels(): Promise<Model<Api>[]> {
-		// The provider auth status is identical for every model of a provider, so
-		// it is resolved once per provider instead of per model.
 		const selectableByProvider = new Map<string, boolean>();
 		return (await this._modelRegistry.getExecutableModels()).filter((model) => {
 			let selectable = selectableByProvider.get(model.provider);

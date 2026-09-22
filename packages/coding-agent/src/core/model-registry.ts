@@ -486,16 +486,10 @@ export class ModelRegistry {
 	private livePrimeInferenceModels: Model<"openai-completions">[] | undefined;
 	private pendingPrimeInferenceCatalogRefresh: Promise<void> | undefined;
 	private loadError: string | undefined = undefined;
-	/** Parsed private Prime Inference authorization cache, served while the file's stat identity is unchanged. */
 	private privatePrimeAuthorizationCacheSnapshot:
 		| { identity: CatalogFileIdentity; cache: PrivatePrimeAuthorizationCache | undefined }
 		| undefined;
-	/**
-	 * Stat identity of the models.json bytes the current in-memory catalog was
-	 * built from: undefined when the file was absent at both bracket stats (or
-	 * there is no path), "unstable" when the bracket stats raced a write or
-	 * the read/parse failed.
-	 */
+	/** models.json identity the current catalog was built from: undefined = absent at both bracket stats (or no path), "unstable" = raced write or failed read/parse. */
 	private modelsJsonIdentity: CatalogFileIdentity | "unstable" | undefined = "unstable";
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
@@ -564,18 +558,13 @@ export class ModelRegistry {
 		this.reapplyRegisteredProviders();
 	}
 
-	/**
-	 * Whether models.json still matches the bytes the current in-memory catalog
-	 * was built from. An in-memory registry (no models.json path) builds its
-	 * catalog from deterministic inputs only, so it always counts as unchanged.
-	 */
 	private isModelsJsonUnchangedSinceLastLoad(): boolean {
 		if (!this.modelsJsonPath) {
+			// No path means the catalog was built from deterministic inputs only.
 			return true;
 		}
 		const identity = statCatalogFileIdentity(this.modelsJsonPath);
 		if (!identity) {
-			// Absent file: unchanged only if the last load also saw it absent.
 			return this.modelsJsonIdentity === undefined;
 		}
 		return (
@@ -607,8 +596,7 @@ export class ModelRegistry {
 	}
 
 	private loadModels(): void {
-		// Bracket the models.json read with one stat identity so the next
-		// authorization refresh can tell whether the catalog inputs changed.
+		// Bracket the models.json read with one stat identity so later refreshes can tell whether the inputs changed.
 		const modelsJsonIdentity = this.modelsJsonPath ? statCatalogFileIdentity(this.modelsJsonPath) : undefined;
 		const {
 			models: customModels,
@@ -621,14 +609,12 @@ export class ModelRegistry {
 		} else {
 			const after = statCatalogFileIdentity(this.modelsJsonPath);
 			if (modelsJsonIdentity === undefined && after === undefined) {
-				// The file was absent across the whole read: the empty custom-model
-				// result is deterministic, so absence is a stable identity.
+				// Absent across the whole read: the empty custom-model result is deterministic, so absence is a stable identity.
 				this.modelsJsonIdentity = undefined;
 			} else if (!error && modelsJsonIdentity && after && isSameCatalogFileIdentity(modelsJsonIdentity, after)) {
 				this.modelsJsonIdentity = after;
 			} else {
-				// A failed read or parse must not pin its empty custom-model set:
-				// the next refresh re-reads the file.
+				// A failed read or parse must not pin its empty custom-model set.
 				this.modelsJsonIdentity = "unstable";
 			}
 		}
@@ -904,8 +890,6 @@ export class ModelRegistry {
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
 	getAvailable(): Model<Api>[] {
-		// Auth availability is identical for every model of a provider, so it is
-		// resolved once per provider instead of per model.
 		const authByProvider = new Map<string, boolean>();
 		return this.getAll().filter((model) => {
 			if (isPrivatePrimeInferenceModel(model) && !this.isAuthorizedPrivatePrimeInferenceModel(model)) {
@@ -1032,10 +1016,7 @@ export class ModelRegistry {
 		if (cached?.fingerprint === fingerprint) {
 			// Serve the credential-scoped cache so startup and model lists don't
 			// block on the network. Stale entries refresh in the background.
-			// The parsed cache is reference-stable while its file is unchanged, so
-			// a repeated hit with the same models, team, and unchanged models.json
-			// means nothing changed: skip the redundant state assignment and the
-			// full catalog rebuild it would trigger.
+			// cached.models is reference-stable while its file is unchanged, so an equal reference, same team, and unchanged models.json means nothing changed.
 			const authorizationUnchanged =
 				this.authorizedPrivatePrimeInferenceModels === cached.models &&
 				this.authorizedPrivatePrimeInferenceTeamId === teamId &&
@@ -1158,16 +1139,13 @@ export class ModelRegistry {
 	private readPrivatePrimeAuthorizationCache(): PrivatePrimeAuthorizationCache | undefined {
 		const cachePath = this.privatePrimeAuthorizationCachePath();
 		if (!cachePath) return undefined;
-		// Serve the parsed snapshot while the file's stat identity is unchanged;
-		// only a replaced inode, size, or mtime falls back to a full read+parse.
 		const identity = statCatalogFileIdentity(cachePath);
 		const snapshot = this.privatePrimeAuthorizationCacheSnapshot;
 		if (identity && snapshot && isSameCatalogFileIdentity(snapshot.identity, identity)) {
 			return snapshot.cache;
 		}
 		const cache = this.parsePrivatePrimeAuthorizationCache(cachePath);
-		// A concurrent writer can replace the file during the read; cache only a
-		// parse bracketed by one file identity.
+		// A concurrent writer can replace the file during the read; cache only a parse bracketed by one identity.
 		const after = statCatalogFileIdentity(cachePath);
 		if (identity && after && isSameCatalogFileIdentity(identity, after)) {
 			this.privatePrimeAuthorizationCacheSnapshot = { identity: after, cache };
