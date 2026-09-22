@@ -288,6 +288,7 @@ import {
 	type RlmSpawnHandle,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
+	resolveRequestedRlmSubagentCwd,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
 import {
@@ -11090,6 +11091,7 @@ export class AgentSession {
 		sessionName: string;
 		spawnCode?: string;
 		sessionDir: string;
+		cwd: string;
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
 		spawnedByRequestId?: string;
@@ -11101,6 +11103,7 @@ export class AgentSession {
 			sessionName: options.sessionName,
 			spawnCode: options.spawnCode,
 			sessionDir: options.sessionDir,
+			cwd: options.cwd,
 			model: options.model,
 			thinkingLevel:
 				options.thinkingLevel ?? (clampThinkingLevel(options.model, this.thinkingLevel) as ThinkingLevel),
@@ -11128,7 +11131,7 @@ export class AgentSession {
 	}
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
-		const childSessionManager = SessionManager.create(this._cwd, options.sessionDir);
+		const childSessionManager = SessionManager.create(options.cwd, options.sessionDir);
 		if (options.parentSession.sessionFile) {
 			childSessionManager.newSession({
 				parentSession: options.parentSession.sessionFile,
@@ -11165,7 +11168,7 @@ export class AgentSession {
 			agent: childAgent,
 			sessionManager: childSessionManager,
 			settingsManager: this.settingsManager,
-			cwd: this._cwd,
+			cwd: options.cwd,
 			agentDir: this._agentDir,
 			scopedModels: options.scopedModels,
 			resourceLoader: this._resourceLoader,
@@ -12239,7 +12242,7 @@ export class AgentSession {
 		// executing now. A spawn arriving outside an active run (a detached kernel task
 		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
 		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
-		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
+		const { name: rawName, model: rawModel, thinking: rawThinking, cwd: rawCwd, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
 			throw new Error(`Unsupported rlm.spawn kwargs: ${unsupportedKwargs.sort().join(", ")}`);
@@ -12247,6 +12250,7 @@ export class AgentSession {
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
 		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
+		const cwd = resolveRequestedRlmSubagentCwd(rawCwd, this._cwd);
 		if (requestedSessionName) assertDirectAgentMessageTarget(requestedSessionName);
 		if (this._rlmDepth >= this._rlmMaxDepth) {
 			throw new Error(
@@ -12424,6 +12428,7 @@ export class AgentSession {
 				sessionName,
 				spawnCode,
 				sessionDir: childSessionDir,
+				cwd,
 				model: modelSelection.model,
 				thinkingLevel: requestedThinkingLevel,
 				spawnedByRequestId,
@@ -12784,10 +12789,7 @@ export class AgentSession {
 				await controller.assertSessionNameAvailable({ name: sessionName, depth: 0 });
 			}
 		}
-		if (rawCwd !== undefined && (typeof rawCwd !== "string" || !rawCwd.trim())) {
-			throw new Error("rlm.create_session cwd must be a non-empty string");
-		}
-		const cwd = rawCwd === undefined ? this._cwd : resolve(this._cwd, rawCwd.trim());
+		const cwd = resolveRequestedRlmSubagentCwd(rawCwd, this._cwd, operation);
 		const modelSelection = await this._resolveRlmSubagentModel(requestedModel, "top-level session");
 		if (requestedThinkingLevel !== undefined) {
 			const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
