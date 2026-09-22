@@ -1190,8 +1190,11 @@ impl AgentView {
         let mut rows: Vec<Line> = Vec::with_capacity(7);
         rows.push(vec![Span::styled("─".repeat(width.max(1)), border)]);
         let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
-        row.push(Span::styled(spinner.to_string(), dim));
-        row.push(Span::styled(" ".to_string(), muted));
+        // TS `BorderedLoader` wraps a `Loader` with the muted spinner and
+        // muted message color fns; the gap between them is the unstyled
+        // plain space (the `Loader` pen reset — see `chat::render_loader`).
+        row.push(Span::styled(spinner.to_string(), muted));
+        row.push(Span::raw(" ".to_string()));
         row.push(Span::styled(loader.message.clone(), muted));
         rows.push(row);
         rows.push(vec![Span::raw(String::new())]);

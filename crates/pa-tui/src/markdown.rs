@@ -29,6 +29,13 @@ pub struct MarkdownStyle {
     /// The fenced-code indent string (`markdown.codeBlockIndent` in
     /// settings, TS `codeBlockIndent` on the markdown theme; default "  ").
     pub code_block_indent: String,
+    /// The `syntax*` palette for fenced-code token colors (TS
+    /// `highlightCode`, cli-highlight over the highlight.js grammar).
+    /// `None` renders every code line uniform in `code_block` — the TS
+    /// no-valid-language fallback, and the quiet thinking theme (TS
+    /// `getThinkingMarkdownTheme` replaces `highlightCode` with dim
+    /// uniform lines).
+    pub(crate) syntax: Option<crate::tool_card::highlight::SyntaxPalette>,
 }
 
 impl Default for MarkdownStyle {
@@ -69,6 +76,9 @@ impl MarkdownStyle {
             italic: Modifier::empty(),
             strikethrough: Modifier::empty(),
             code_block_indent: "  ".to_string(),
+            syntax: Some(crate::tool_card::highlight::SyntaxPalette::from_theme(
+                theme,
+            )),
         }
     }
 }
@@ -154,6 +164,15 @@ fn block_cache_key(style_tag: &str, block: &Block, next: Option<&Block>, width: 
     key.push_str(&width.to_string());
     key.push('|');
     key.push_str(block_kind_name(&block.kind));
+    if let BlockKind::Code { lang } = &block.kind {
+        // TS's key carries `token.raw`, which includes the fence info
+        // string: the same content under a different lang renders
+        // different token colors (```python vs ```json), so the lang is
+        // part of the block's identity.
+        key.push('<');
+        key.push_str(lang.as_deref().unwrap_or(""));
+        key.push('>');
+    }
     key.push('|');
     if let Some(next) = next {
         // The trailing-blank decision reads `next.sep_blank` (TS encodes
@@ -419,6 +438,44 @@ fn marker_width(t: &str) -> usize {
     }
 }
 
+/// The fence languages the port highlights. TS `highlightCode` validates
+/// through cli-highlight's `supportsLanguage` = highlight.js
+/// `getLanguage(name)`, which lowercases and matches the grammar's
+/// registered names and aliases: python 10.7.3 registers `python` with
+/// aliases `py`, `gyp`, `ipython`. `lang` here is marked's whole trimmed
+/// info string, so ```python foo=1 stays uniform (hljs has no such
+/// language); only these exact spellings highlight.
+fn is_highlighted_lang(lang: &str) -> bool {
+    matches!(
+        lang.to_ascii_lowercase().as_str(),
+        "python" | "py" | "gyp" | "ipython"
+    )
+}
+
+/// The block's highlighted lines (TS `theme.highlightCode(text, lang)`:
+/// one highlight.js pass over the whole block, so multi-line strings
+/// carry across lines; the fallback paths — no palette (the quiet
+/// thinking theme), an unsupported language, or no language — render
+/// `None` so the caller keeps the uniform `mdCodeBlock` rows).
+fn highlighted_code_lines(
+    block: &Block,
+    lang: Option<&str>,
+    style: &MarkdownStyle,
+) -> Option<Vec<Line>> {
+    let palette = style.syntax.as_ref()?;
+    if !lang.is_some_and(is_highlighted_lang) {
+        return None;
+    }
+    if block.lines.is_empty() {
+        // An empty block renders through the uniform empty-row path.
+        return None;
+    }
+    Some(crate::tool_card::highlight::highlight_python(
+        &block.lines.join("\n"),
+        palette,
+    ))
+}
+
 fn render_block(
     block: &Block,
     next: Option<&Block>,
@@ -465,7 +522,7 @@ fn render_block(
                 out.push(Vec::new());
             }
         }
-        BlockKind::Code { .. } => {
+        BlockKind::Code { lang } => {
             // TS `renderCodeBlock`: no borders in the chat markdown - the
             // block is `codeBlockIndent` (settings-driven, default "  ")
             // outside the styled code line, each source line rendered with
@@ -473,11 +530,22 @@ fn render_block(
             // in the TS MarkdownTheme too and is unused by the renderer on
             // both sides.
             let indent = style.code_block_indent.as_str();
-            for line in &block.lines {
-                out.push(vec![
-                    Span::raw(indent),
-                    Span::styled(line.clone(), style.code_block),
-                ]);
+            match highlighted_code_lines(block, lang.as_deref(), style) {
+                Some(code_lines) => {
+                    for line in code_lines {
+                        let mut row: Line = vec![Span::raw(indent)];
+                        row.extend(line);
+                        out.push(row);
+                    }
+                }
+                None => {
+                    for line in &block.lines {
+                        out.push(vec![
+                            Span::raw(indent),
+                            Span::styled(line.clone(), style.code_block),
+                        ]);
+                    }
+                }
             }
             if block.lines.is_empty() {
                 // An empty block still renders one indented empty line
@@ -971,6 +1039,111 @@ mod tests {
         let empty = render_markdown("```\n```", 40, &style);
         assert_eq!(empty.len(), 1);
         assert_eq!(empty[0][0].content, "  ");
+    }
+
+    #[test]
+    fn python_fence_renders_the_ts_token_colors() {
+        // The TS markdown theme highlights ```python fences through
+        // cli-highlight (the same highlight.js pass the expanded ipython
+        // cell uses); the fence line's spans carry the syntax palette
+        // colors, the indent stays outside them.
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let style = MarkdownStyle::from_theme(&theme);
+        let keyword = theme.fg_style(crate::theme::ThemeColor::SyntaxKeyword);
+        let number = theme.fg_style(crate::theme::ThemeColor::SyntaxNumber);
+        let string = theme.fg_style(crate::theme::ThemeColor::SyntaxString);
+        let lines = render_markdown("```python\nx = 1\nflag = 'yes'\n```", 40, &style);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0][0].content, "  ");
+        // `x = 1`: plain identifier and punctuation, then the number.
+        assert_eq!(lines[0][1].content, "x = ");
+        assert_eq!(lines[0][1].style, Style::default());
+        assert_eq!(lines[0][2].content, "1");
+        assert_eq!(lines[0][2].style, number);
+        assert_eq!(lines[1][2].content, "'yes'");
+        assert_eq!(lines[1][2].style, string);
+        // The keyword scope lands on a reserved word.
+        let keyword_lines = render_markdown("```python\nreturn x\n```", 40, &style);
+        assert_eq!(keyword_lines[0][1].content, "return");
+        assert_eq!(keyword_lines[0][1].style, keyword);
+    }
+
+    #[test]
+    fn python_fence_lang_matches_the_hljs_aliases() {
+        let style = MarkdownStyle::default();
+        // `getLanguage` lowercases; python registers py/gyp/ipython, and
+        // marked passes the whole trimmed info string, so an info string
+        // with attributes stays uniform.
+        for fence in ["py", "PYTHON", "ipython"] {
+            let lines = render_markdown(&format!("```{fence}\nx = 'y'\n```"), 40, &style);
+            assert!(
+                lines[0].iter().any(|s| s.style != Style::default()),
+                "{fence} must highlight"
+            );
+        }
+        let uniform = render_markdown("```python foo=1\nx = 'y'\n```", 40, &style);
+        assert!(uniform[0]
+            .iter()
+            .skip(1)
+            .all(|s| s.style == style.code_block));
+    }
+
+    #[test]
+    fn quiet_style_renders_python_fences_uniform() {
+        // The thinking theme replaces TS `highlightCode` with dim lines:
+        // with no palette the block keeps the uniform code_block color.
+        let style = MarkdownStyle {
+            syntax: None,
+            ..MarkdownStyle::default()
+        };
+        let lines = render_markdown("```python\nx = 1\n```", 40, &style);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0][1].content, "x = 1");
+        assert_eq!(lines[0][1].style, style.code_block);
+    }
+
+    /// The block cache must not serve one lang's token colors to another:
+    /// TS's key carries `token.raw` (the fence info string included), so
+    /// frame 2's ```json block (same content as frame 1's cached ```python
+    /// block) re-renders uniform instead of replaying python colors.
+    #[test]
+    fn block_cache_does_not_carry_token_colors_across_langs() {
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let style = MarkdownStyle::from_theme(&theme);
+        let number = theme.fg_style(crate::theme::ThemeColor::SyntaxNumber);
+        let mut cache = MarkdownBlockCache::default();
+        let first =
+            render_markdown_tagged("intro\n\n```python\nx = 1\n```", 40, &style, "", &mut cache);
+        assert_eq!(first.last().unwrap()[2].style, number);
+        let second = render_markdown_tagged(
+            "intro\n\n```python\nx = 1\n```\n\nbetween\n\n```json\nx = 1\n```",
+            40,
+            &style,
+            "",
+            &mut cache,
+        );
+        // The final ```json block: one uniform code_block span, not the
+        // cached python token spans.
+        let json_row = second.last().unwrap();
+        assert_eq!(json_row.len(), 2);
+        assert_eq!(json_row[0].content, "  ");
+        assert_eq!(json_row[1].content, "x = 1");
+        assert_eq!(json_row[1].style, style.code_block);
+    }
+
+    #[test]
+    fn python_fence_multiline_string_carries_across_rows() {
+        // One highlight.js pass over the whole block: a triple-quoted
+        // string keeps the string color on every row it spans.
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let style = MarkdownStyle::from_theme(&theme);
+        let string = theme.fg_style(crate::theme::ThemeColor::SyntaxString);
+        let lines = render_markdown("```python\ns = '''a\nb'''\n```", 40, &style);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0][2].content, "'''a");
+        assert_eq!(lines[0][2].style, string);
+        assert_eq!(lines[1][1].content, "b'''");
+        assert_eq!(lines[1][1].style, string);
     }
 
     #[test]

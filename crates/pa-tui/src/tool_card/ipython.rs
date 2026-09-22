@@ -332,7 +332,7 @@ fn render_code(lines: &mut Vec<Line>, code: &str, theme: &Theme, width: usize) -
     let highlighted = if is_bash_cell {
         Vec::new()
     } else {
-        highlight::highlight_python(code, theme)
+        highlight::highlight_python(code, &highlight::SyntaxPalette::from_theme(theme))
     };
     let statements = python_statement_lines(code);
     for (index, raw_line) in raw_lines.iter().enumerate() {

@@ -459,6 +459,9 @@ fn render_thinking_block(
 ) -> Vec<Line> {
     let mut md = md.clone();
     let dim = theme.fg_style(ThemeColor::Dim);
+    // TS `getThinkingMarkdownTheme` replaces `highlightCode` with uniform
+    // dim lines: the thinking code blocks never highlight.
+    md.syntax = None;
     md.body = dim;
     md.heading = dim;
     md.link = dim;
@@ -499,7 +502,12 @@ pub fn render_loader(
     let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
     row.push(Span::styled(spinner.to_string(), accent));
     if !message.is_empty() {
-        row.push(Span::styled(" ".to_string(), muted));
+        // The gap between the spinner and the label is unstyled (TS's
+        // `Loader` builds `${renderedFrame} ${messageColorFn(message)}`:
+        // the plain space sits between chalk's two colored runs, so the
+        // emitted row resets to default fg there instead of carrying the
+        // label color over the gap).
+        row.push(Span::raw(" ".to_string()));
         row.push(Span::styled(message, muted));
     }
     vec![spacer(), pad_to(row, width, Style::default())]
@@ -547,13 +555,14 @@ impl RetryState {
 /// The retry loader rows (TS auto_retry_start rendering: muted spinner +
 /// the retry message).
 pub fn render_retry(retry: &RetryState, frame: usize, theme: &Theme, width: usize) -> Vec<Line> {
-    let accent = theme.fg_style(ThemeColor::Accent);
     let muted = theme.fg_style(ThemeColor::Muted);
     let spinner = LOADER_FRAMES[frame % LOADER_FRAMES.len()];
     let message = retry.message();
     let mut row: Line = vec![Span::styled(" ".to_string(), Style::default())];
-    row.push(Span::styled(spinner.to_string(), accent));
-    row.push(Span::styled(" ".to_string(), muted));
+    row.push(Span::styled(spinner.to_string(), muted));
+    // The gap between the spinner and the label is unstyled (the TS
+    // `Loader` pen reset — see `render_loader`).
+    row.push(Span::raw(" ".to_string()));
     row.push(Span::styled(message, muted));
     vec![spacer(), pad_to(row, width, Style::default())]
 }
@@ -608,6 +617,32 @@ mod tests {
             .map(|s| s.content.as_str())
             .collect::<String>();
         assert!(text.contains("Retrying (1/2) in 1s..."), "got: {text}");
+    }
+
+    /// TS `retryLoader` wraps the same `Loader` with muted spinner and
+    /// message color fns: the muted pen colors the spinner, and the gap
+    /// to the label resets to default fg.
+    #[test]
+    fn retry_loader_spans_carry_the_ts_sgr_boundaries() {
+        let retry = RetryState {
+            attempt: 1,
+            max_attempts: 2,
+            ends_at: std::time::Instant::now() + std::time::Duration::from_millis(1500),
+            error_message: "provider down".to_string(),
+            reason: RetryStartReason::Quick,
+        };
+        let t = theme();
+        let muted = t.fg_style(ThemeColor::Muted);
+        let rows = render_retry(&retry, 0, &t, 60);
+        assert_eq!(
+            rows[1][..4],
+            [
+                Span::styled(" ", Style::default()),
+                Span::styled(LOADER_FRAMES[0], muted),
+                Span::raw(" "),
+                Span::styled("Retrying (1/2) in 1s...", muted),
+            ]
+        );
     }
 
     #[test]
@@ -1013,6 +1048,34 @@ mod tests {
             .map(|s| s.content.as_str())
             .collect::<String>();
         assert!(text.contains("\u{283c} Writing \u{00b7} 1s \u{00b7} \u{2193} 72 tokens"));
+    }
+
+    /// TS `Loader`: `${spinnerColorFn(frame)} ${messageColorFn(msg)}` —
+    /// the gap between the spinner and the label sits between chalk's two
+    /// colored runs, so the emitted row resets to default fg there instead
+    /// of carrying the label color over the gap.
+    #[test]
+    fn loader_gap_between_spinner_and_label_is_unstyled() {
+        let working = WorkingState {
+            activity: "Writing",
+            message: None,
+            download: true,
+            tokens: 72,
+            elapsed_secs: 1,
+        };
+        let t = theme();
+        let accent = t.fg_style(ThemeColor::Accent);
+        let muted = t.fg_style(ThemeColor::Muted);
+        let rows = render_loader(&working, 0, &t, 100);
+        assert_eq!(
+            rows[1][..4],
+            [
+                Span::styled(" ", Style::default()),
+                Span::styled(LOADER_FRAMES[0], accent),
+                Span::raw(" "),
+                Span::styled("Writing \u{00b7} 1s \u{00b7} \u{2193} 72 tokens", muted),
+            ]
+        );
     }
 
     /// While a tool owns the working message (python-kernel bootstrap), the
