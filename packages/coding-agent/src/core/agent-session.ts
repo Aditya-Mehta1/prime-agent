@@ -3145,9 +3145,8 @@ export class AgentSession {
 	}
 
 	private async _shouldStopAfterTurn(context: ShouldStopAfterTurnContext): Promise<boolean> {
-		// Drain the agent-event queue first so this turn's message_end handlers (persistence,
-		// goal accounting, plan kickoff) have landed before anything decided here is persisted;
-		// an instant model turn can otherwise outrun an async handler like the agent_start git capture.
+		// Drain the event queue first: an instant model turn can otherwise outrun an
+		// async message_end handler (e.g. the agent_start git capture).
 		await this._agentEventQueue;
 		if (this._stopGoalContinuationForTerminalMessage(context.message)) {
 			return true;

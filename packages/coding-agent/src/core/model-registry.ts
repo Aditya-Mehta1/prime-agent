@@ -1391,12 +1391,8 @@ export class ModelRegistry {
 		return source !== undefined && !this.isProviderRequestAuthStaleForStatus(provider, source);
 	}
 
-	/**
-	 * Drop the TTL-cached results of every `!command` config backing this
-	 * provider's request auth (API key, provider headers, per-model headers)
-	 * so the next request re-runs them: an auth failure means the credential
-	 * may have rotated and the stale output must not be served again.
-	 */
+	// An auth failure may mean the credential rotated: drop the cached !command
+	// results so the next request re-runs them.
 	private invalidateProviderCommandResults(provider: string): void {
 		const providerConfig = this.providerRequestConfigs.get(provider);
 		const configs = [providerConfig?.apiKey, ...Object.values(providerConfig?.headers ?? {})];

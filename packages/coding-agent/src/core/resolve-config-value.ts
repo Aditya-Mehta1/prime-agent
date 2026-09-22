@@ -8,12 +8,8 @@ import { getShellConfig } from "../utils/shell.js";
 
 const commandResultCache = new Map<string, string | undefined>();
 
-/**
- * How long a `!command` result stays cached for the per-request async path.
- * Rotation commands change their output between requests; a short TTL plus
- * auth-failure invalidation bounds staleness while removing the per-request
- * shell spawn.
- */
+// Rotation commands change their output between requests; a short TTL plus
+// auth-failure invalidation bounds staleness while removing the per-request shell spawn.
 export const COMMAND_RESULT_TTL_MS = 10_000;
 
 interface CommandTtlEntry {
@@ -161,11 +157,7 @@ async function resolveCommandConfigValueTtl(commandConfig: string): Promise<stri
 	return pending;
 }
 
-/**
- * Resolve a config value without blocking the event loop: `!command` configs
- * exec asynchronously and share one result per TTL window (plus in-flight
- * dedupe); env vars and literals resolve as in the sync path.
- */
+/** Async variant of resolveConfigValue; !command execs share one result per TTL window. */
 export function resolveConfigValueAsync(config: string): Promise<string | undefined> {
 	if (config.startsWith("!")) {
 		return resolveCommandConfigValueTtl(config);
@@ -173,11 +165,7 @@ export function resolveConfigValueAsync(config: string): Promise<string | undefi
 	return Promise.resolve(resolveEnvOrLiteral(config));
 }
 
-/**
- * Drop the cached result of a `!command` config, and disown an exec still in
- * flight (its output may predate the rotation), so the next resolution re-runs
- * the command (auth failures, rotation).
- */
+/** Drop the cached !command result and disown any exec still in flight (its output may predate the rotation). */
 export function invalidateCommandTtlCacheEntry(config: string): void {
 	if (config.startsWith("!")) {
 		commandTtlCache.delete(config);
@@ -218,7 +206,6 @@ export function resolveConfigValueOrThrow(config: string, description: string): 
 	throw new Error(`Failed to resolve ${description}`);
 }
 
-/** Async variant of resolveConfigValueOrThrow for per-request resolution on the event loop. */
 export async function resolveConfigValueOrThrowAsync(config: string, description: string): Promise<string> {
 	const resolvedValue = await resolveConfigValueAsync(config);
 	if (resolvedValue !== undefined) {
@@ -259,7 +246,6 @@ export function resolveHeadersOrThrow(
 	return Object.keys(resolved).length > 0 ? resolved : undefined;
 }
 
-/** Async variant of resolveHeadersOrThrow for per-request resolution on the event loop. */
 export async function resolveHeadersOrThrowAsync(
 	headers: Record<string, string> | undefined,
 	description: string,

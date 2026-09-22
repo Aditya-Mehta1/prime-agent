@@ -1124,9 +1124,7 @@ describe("ModelRegistry", () => {
 			const model = registry.find("custom-provider", "test-model")!;
 			const execRuns = () => readFileSync(execLog, "utf8").length;
 
-			// Two requests inside the TTL window share one execution per command
-			// (apiKey + model header); a rotated token lands on the next request
-			// once the auth failure dropped both cached results.
+			// Two requests share one exec per command (apiKey + model header): two runs total.
 			await expect(registry.getApiKeyAndHeaders(model)).resolves.toEqual({
 				ok: true,
 				apiKey: "key-1",

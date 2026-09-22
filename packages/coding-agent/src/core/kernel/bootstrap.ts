@@ -116,7 +116,6 @@ interface BootstrapMarkerIdentity {
 	mtimeMs: number;
 }
 
-/** A validation that succeeded and may be reused until the key or the marker changes. */
 interface KernelPythonSuccess {
 	key: string;
 	python: string;
@@ -1057,8 +1056,7 @@ export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Pro
 	return promise;
 }
 
-// The venv python sits one level below the venv root on every platform
-// (bin/python, Scripts/python.exe), so the marker lives next to its parent.
+// The venv python (bin/python, Scripts/python.exe) sits one level below the venv root; the marker lives next to its parent.
 function bootstrapMarkerPath(python: string): string {
 	return path.join(path.dirname(path.dirname(python)), BOOTSTRAP_VERSION_FILE);
 }
@@ -1074,7 +1072,6 @@ async function readBootstrapMarkerIdentity(
 			marker: { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs },
 		};
 	} catch {
-		// Without a readable marker there is nothing to guard a cached success with.
 		return { markerPath, marker: null };
 	}
 }
@@ -1090,31 +1087,21 @@ async function bootstrapMarkerUnchanged(success: KernelPythonSuccess): Promise<b
 			stats.mtimeMs === success.marker.mtimeMs
 		);
 	} catch {
-		// The marker is gone (or is unreadable): the venv may have been wiped or
-		// rebuilt by another process, so the cached success no longer applies.
+		// The marker may have been wiped or rebuilt by another process: the cached success no longer applies.
 		return false;
 	}
 }
 
-/**
- * Sequential kernel starts used to re-pay the warm-path validation every time,
- * including a RUNTIME_READY_CHECK interpreter spawn. A successful validation is
- * now cached for the process lifetime, keyed by env, python skills, and runtime
- * identity, and guarded by the bootstrap marker's stat identity: the next start
- * reuses it until the key changes (skills, venv override, runtime source) or the
- * marker changes (external rebuild or wipe), and any failure drops the entry so
- * the following start revalidates from scratch. The key inputs (python-skill
- * pyproject hashes, runtime source hash) are still computed on every start; they
- * are what lets a source edit in a dev checkout invalidate the entry.
- */
+// Cache a successful validation for the process lifetime, keyed by env+skills+runtime
+// identity and guarded by the marker's stat identity. Key inputs are still computed on
+// every start, so a source edit in a dev checkout invalidates the entry.
 async function ensureKernelPythonWithSuccessCache(
 	options: EnsureKernelPythonOptions,
 	pythonSkills: readonly BootstrapPythonSkill[],
 	key: string,
 ): Promise<string> {
-	// The PRIME_AGENT_KERNEL_PYTHON override has no bootstrap marker to guard a
-	// cached success with, and missing skills/imports must surface on every
-	// start: it always runs the full validation.
+	// The PRIME_AGENT_KERNEL_PYTHON override has no marker to guard a cached success
+	// with, and its missing skills/imports must surface on every start.
 	if (process.env.PRIME_AGENT_KERNEL_PYTHON) {
 		return ensureKernelPythonUncached(options, pythonSkills);
 	}

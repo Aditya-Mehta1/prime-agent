@@ -65,7 +65,6 @@ describe("resolveConfigValueAsync command TTL", () => {
 		nowSpy.mockReturnValue(Date.now() + COMMAND_RESULT_TTL_MS + 1);
 		expect(await resolveConfigValueAsync(config)).toBe("value-2");
 
-		// Invalidation skips the TTL window: the next resolution re-runs at once.
 		writeFileSync(valueFile, "value-3");
 		invalidateCommandTtlCacheEntry(config);
 		expect(await resolveConfigValueAsync(config)).toBe("value-3");
@@ -77,7 +76,6 @@ describe("resolveConfigValueAsync command TTL", () => {
 		invalidateCommandTtlCacheEntry(config);
 		expect(await pending).toBe("value-1");
 
-		// The disowned result must not open a TTL window: the next call re-runs the command.
 		writeFileSync(valueFile, "value-2");
 		expect(await resolveConfigValueAsync(config)).toBe("value-2");
 		expect(readFileSync(execLog, "utf8")).toHaveLength(2);

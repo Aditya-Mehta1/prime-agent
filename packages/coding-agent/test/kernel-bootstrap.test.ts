@@ -444,7 +444,6 @@ describe("kernel bootstrap", () => {
 		await expect(ensureKernelPython()).resolves.toBe(python);
 		expect(JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8")).runtime).toBe(runtimeIdentity);
 
-		// The override has no marker to guard a cached success: it validates every start.
 		const overridePython = join(tempDir, "override-python");
 		writeFakePython(overridePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
@@ -458,13 +457,11 @@ describe("kernel bootstrap", () => {
 		const { python } = prepareWarmVenv();
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		// A different venv override is a different key: the new venv bootstraps.
 		const otherVenv = join(tempDir, "kernel-venv-b");
 		process.env.PRIME_AGENT_KERNEL_VENV = otherVenv;
 		const otherPython = join(otherVenv, "bin", "python");
 		await expect(ensureKernelPython()).resolves.toBe(otherPython);
 
-		// New python skills are a different key too: the skill sync runs.
 		const pythonSkill = createPythonSkill();
 		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(otherPython);
 		const log = readFileSync(logPath, "utf8");

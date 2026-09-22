@@ -270,11 +270,7 @@ function runGitAsync(cwd: string, args: string[]): Promise<string | null> {
 	});
 }
 
-/**
- * Repo URL per cwd, cached for the process lifetime: remotes rarely change while a
- * process runs, and re-resolving the remote was one of the per-turn git spawns.
- * The async variant additionally dedupes concurrent first reads for the same cwd.
- */
+// Repo URL per cwd, cached for the process lifetime: remotes rarely change while a process runs.
 const repoUrlByCwd = new Map<string, string | null>();
 const repoUrlInFlightByCwd = new Map<string, Promise<string | null>>();
 
@@ -306,12 +302,8 @@ async function resolveRepoUrlAsync(cwd: string): Promise<string | null> {
 	return pending;
 }
 
-/**
- * Branch from the repo's HEAD file, without a git spawn. Mirrors `git branch
- * --show-current`: an attached HEAD yields the branch name (including unborn
- * branches), a detached HEAD yields undefined. Dot-led ref names are invalid in
- * git and make `git branch --show-current` fail, so they yield undefined too.
- */
+// Branch from the HEAD file, mirroring `git branch --show-current`: attached HEAD
+// yields the branch (incl. unborn); detached or dot-led ref names (invalid in git) yield undefined.
 function readBranchFromHead(paths: GitPaths): string | undefined {
 	try {
 		const content = readFileSync(paths.headPath, "utf8").trim();
@@ -333,13 +325,7 @@ function buildGitContext(commit: string | null, branch: string | undefined, repo
 	return context;
 }
 
-/**
- * Capture the repo identity for session headers. Cold, synchronous path: the
- * branch comes from the HEAD file and the repo URL from the per-cwd cache, so
- * only the commit costs a git spawn. Returns null outside a git repo (note:
- * unlike a raw git invocation this does not honor GIT_DIR-style env overrides
- * or bare repositories).
- */
+// Unlike a raw git invocation, this does not honor GIT_DIR-style env overrides or bare repositories.
 export function captureGitContext(cwd: string): GitContext | null {
 	const paths = findGitPaths(cwd);
 	if (!paths) return null;
@@ -348,11 +334,6 @@ export function captureGitContext(cwd: string): GitContext | null {
 	return buildGitContext(commit, branch, resolveRepoUrl(cwd));
 }
 
-/**
- * Async capture for the per-turn hot path: one git spawn (the commit) and no
- * event-loop blocking. Repo URLs and branches come from files and the per-cwd
- * cache. Outside a git repo this resolves without spawning at all.
- */
 export async function captureGitContextAsync(cwd: string): Promise<GitContext | null> {
 	const paths = findGitPaths(cwd);
 	if (!paths) return null;

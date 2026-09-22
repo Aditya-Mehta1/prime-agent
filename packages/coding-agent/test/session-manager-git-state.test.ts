@@ -63,7 +63,6 @@ describe("session git state", () => {
 			const sm = SessionManager.create(repoDir, sessionDir);
 			expect(await sm.recordGitStateIfChanged()).toBeUndefined();
 
-			// No tool ran: the repo cannot have moved, the capture is skipped.
 			commit(repoDir, "external");
 			expect(await sm.recordGitStateIfChanged()).toBeUndefined();
 			expect(gitStateEntries(sm)).toHaveLength(0);
@@ -72,13 +71,11 @@ describe("session git state", () => {
 			const sha = commit(repoDir, "tool-made");
 			expect(await sm.recordGitStateIfChanged()).toBeDefined();
 			expect(gitStateEntries(sm)[0]?.git).toMatchObject({ commit: sha, branch: "main" });
-			// The git_state entry adds no LLM context: only the tool result is a message.
 			expect(sm.buildSessionContext().messages).toHaveLength(1);
 
 			expect(await sm.recordGitStateIfChanged()).toBeUndefined();
 			expect(gitStateEntries(sm)).toHaveLength(1);
 
-			// Concurrent captures serialize: one records, the next skips.
 			sm.appendMessage(toolResult());
 			commit(repoDir, "concurrent");
 			const [first, second] = await Promise.all([sm.recordGitStateIfChanged(), sm.recordGitStateIfChanged()]);
