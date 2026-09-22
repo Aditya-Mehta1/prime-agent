@@ -1997,6 +1997,8 @@ export class AgentSession {
 
 	private _installAgentToolIntentRecoveryHook(): void {
 		this.agent.getToolIntentRecovery = (context) => {
+			// Autonomous and goal runs continue on their own after a text-only turn;
+			// recovery is for interactive runs, and never while other work is queued.
 			if (
 				this.queuedActionCount > 0 ||
 				this._goalState.status !== "idle" ||

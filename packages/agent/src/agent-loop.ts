@@ -477,7 +477,10 @@ async function runLoop(
 			}
 			if (recovery) {
 				toolIntentRecoveryUsed = true;
-				// A length finish may be ordinary truncation, so only require a tool after toolUse.
+				// `required` is standard Chat Completions and the engines that emit `tool_calls`
+				// finishes accept it; a provider that rejects it fails the retry turn visibly
+				// rather than stopping silently. A length finish may be ordinary truncation,
+				// so only require a tool after toolUse.
 				recoveryToolChoice = lastTurn.message.stopReason === "toolUse" ? "required" : undefined;
 				pendingMessages = [recovery];
 				continue;
