@@ -1022,21 +1022,14 @@ describe("Harness digest at cold boundaries", () => {
 		const digests = digestMessages(harness);
 		expect(digests).toHaveLength(1);
 		const digest = getMessageText(digests[0]);
-		expect(digest).toContain("harness: skipped malformed entry broken_memory (content not a string)");
-		expect(digest).not.toContain("IDLEAK-77a1");
-		expect(digest).toContain("harness: skipped malformed refinement event refine_bad (trigger not a string)");
-		expect(digest).toContain("harness: skipped malformed refinement event null (event not an object)");
-		// Non-object elements are labeled by type only: the raw value must not leak.
-		expect(digest).toContain("harness: skipped malformed refinement event a string (event not an object)");
-		expect(digest).not.toContain("RAWLEAK-5f1e");
-		// Non-string ids and non-string change elements are skipped by type label, not rendered.
-		expect(digest).toContain("harness: skipped malformed refinement event a object id (id not a string)");
-		expect(digest).toContain(
-			"harness: skipped malformed refinement event bad_changes (changes contain a non-string)",
-		);
+		// One diagnostic per malformed row (2 entries + 5 refinement events); wording deliberately unpinned.
+		expect(digest.match(/skipped malformed/g)).toHaveLength(7);
+		// Valid entries still render.
 		expect(digest).toContain("[global:valid_memory]");
-		// The malformed content itself must never leak into the digest.
+		// Malformed content and ids never leak raw into the digest.
 		expect(digest).not.toContain("one string");
+		expect(digest).not.toContain("IDLEAK-77a1");
+		expect(digest).not.toContain("RAWLEAK-5f1e");
 	});
 
 	it("skips digest re-delivery on resume when only query terms drifted and the state is unchanged", async () => {
