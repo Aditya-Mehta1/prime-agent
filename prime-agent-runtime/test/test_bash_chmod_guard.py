@@ -1582,41 +1582,56 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_prefix_is_computed_once_per_command(self):
         # One env read per call: the guard validates exactly the script the
-        # handle runs, so a mid-call change to the prefix cannot make the
-        # validated text differ from the executed text (the pre-fix flow
-        # read the env three times: twice in the guard, once in the handle).
+        # handle runs, so a mid-call prefix change cannot descan and respawn.
         seen: list[tuple[str, str | None]] = []
         real_prefix_command = bash_module._prefix_command
 
         def flip_then_build(command: str, prefix: str | None) -> str:
-            # A racing os.environ write landing between guard scan and spawn.
-            seen.append((command, prefix))
+            seen.append((command, prefix))  # a racing write lands mid-call
             os.environ["PRIME_AGENT_BASH_COMMAND_PREFIX"] = "cd /escaped"
             return real_prefix_command(command, prefix)
 
         with mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /safe"}):
             with mock.patch.object(bash_module, "_prefix_command", side_effect=flip_then_build):
-                with mock.patch.object(
-                    bash_module,
-                    "_guard_destructive_chmod",
-                    wraps=bash_module._guard_destructive_chmod,
-                ) as guarded:
-                    handle = bash("echo hi")
+                handle = bash("echo hi")
         try:
             self.assertEqual(seen, [("echo hi", "cd /safe")])
-            # The guard scanned exactly the text the handle runs.
-            self.assertEqual(guarded.call_args[0][0], handle._script)
             self.assertEqual(handle._script, "cd /safe\necho hi")
         finally:
             handle.kill()
 
-    async def test_direct_handle_construction_is_still_guarded(self):
-        # A handle built directly on BashHandle (script=None) is guarded at
-        # construction, so the class is not a way around bash()'s guard.
-        self._make_tree()
+    async def test_wrapper_script_gate_uses_the_captured_prefix(self):
+        # The wrapper-script relocation gate reads the captured prefix, not a
+        # second env read: a mid-call env change cannot un-relocate the spawn.
+        Path(self.test_dir, "safe-name.sh").write_text(":\n")
+        real_guard = bash_module._guard_destructive_chmod
+
+        def flip_and_guard(script, allow, prefix):
+            os.environ["PRIME_AGENT_BASH_COMMAND_PREFIX"] = ""  # mid-call write
+            return real_guard(script, allow, prefix)
+
+        with mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"}):
+            with mock.patch.object(
+                bash_module, "_guard_destructive_chmod", side_effect=flip_and_guard
+            ):
+                message = await self._refused("bash safe-name.sh")
+        self.assertIn("changes directory", message)
+
+    async def test_handle_script_argument_is_guarded(self):
+        # A caller-supplied script is guarded at construction, with no trusted
+        # prefix region: the script parameter is not a way around the guard.
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
-        Path(home.name, "keep.txt").write_text("keep\n")
+        with mock.patch.dict(
+            os.environ, {"HOME": home.name, "PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"}
+        ):
+            with self.assertRaises(DestructiveChmodRefusalError):
+                bash_module.BashHandle("echo ok", script="chmod -R 755 ~")
+
+    async def test_direct_handle_construction_is_still_guarded(self):
+        # A handle built directly (script=None) is guarded at construction.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
         with mock.patch.dict(os.environ, {"HOME": home.name}):
             with self.assertRaises(DestructiveChmodRefusalError):
                 bash_module.BashHandle("chmod -R 755 ~")
@@ -1697,7 +1712,7 @@ class FrozenBypassEnvLaunchTest(unittest.TestCase):
 
     def test_child_env_strips_late_bypass(self):
         # A mid-session os.environ write must not arm a nested kernel: the
-        # child launch env drops a bypass value this kernel never started with.
+        # child launch env drops a bypass value absent at kernel start.
         os.environ[BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV] = "1"
         self.addCleanup(os.environ.pop, BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, None)
         self.assertNotIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, bash_module._child_env())

@@ -232,7 +232,9 @@ class BashHandle:
     handle; later awaits only wait and cancelling them leaves it running.
     """
 
-    def __init__(self, command: str, script: str | None = None) -> None:
+    def __init__(
+        self, command: str, script: str | None = None, _validated: bool = False
+    ) -> None:
         # Every asyncio use in this module runs on a handle path, so bind the
         # module global here, before _schedule_background_completion_notice
         # or any await can run.
@@ -241,15 +243,21 @@ class BashHandle:
 
         # `command` is the text the caller wrote and stays the display value
         # (the completion notice and repr use it). `script` is the text the
-        # shell runs, computed once by bash() and validated by the guard
-        # before it reached this handle; without one they are the same text,
-        # so a handle built directly is guarded here instead -- the class
-        # must not be a way around the guard, and the bash() path, whose
-        # script was already validated, pays no second scan.
+        # shell runs, computed and validated once by bash(); without one they
+        # are the same text. Whatever text this constructor runs -- built
+        # from `command` or handed in as `script` -- it is guarded here, so
+        # constructing the class is not a way around the guard; bash() marks
+        # its already-validated script so the public path pays no second
+        # scan, and passing `_validated=True` for unvalidated text is the
+        # same deliberate misuse as calling the private scan helpers.
+        prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
         if script is None:
-            prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
             script = _prefix_command(command, prefix)
             _guard_destructive_chmod(script, False, prefix)
+        elif not _validated:
+            # A caller-supplied script has no trusted prefix region: scan the
+            # whole text as user text so no prefix boundary can hide words.
+            _guard_destructive_chmod(script, False, None)
         self.command = command
         self._script = script
         completion_context = _current_cell_completion_context()
@@ -1896,7 +1904,9 @@ def _wrapper_payload_sources(
     return sources
 
 
-def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
+def _payload_text_hides_shell_code(
+    text: str, depth: int = 0, command_prefix: str | None = None
+) -> str | None:
     """Why a one-level-unquoted wrapper payload hides shell code the guard
     must refuse, or None when it does not: a recursive chmod/chown
     (directly, or behind further quoted wrappers: mixed or nested eval and
@@ -1927,26 +1937,30 @@ def _payload_text_hides_shell_code(text: str, depth: int = 0) -> str | None:
         return "process_substitution"
     env_split_feeds, env_split_reasons = _chmod_env_split_string_feeds(words)
     for feed in env_split_feeds:
-        reason = _payload_text_hides_shell_code(feed, depth + 1)
+        reason = _payload_text_hides_shell_code(feed, depth + 1, command_prefix)
         if reason is not None:
             return reason
     if env_split_reasons:
         return "env_split_expansion"
     if any(os.path.basename(w.value) in _SCRIPT_INPUT_WRAPPERS for w in words):
-        script_reason = _unscanned_wrapper_script_reason(text, normalized, words, 0)
+        script_reason = _unscanned_wrapper_script_reason(
+            text, normalized, words, 0, command_prefix
+        )
         if script_reason == "startup":
             return "shell_startup"
         if script_reason is not None:
             return "unscanned_script"
     for source in _wrapper_payload_sources(words, normalized, _WRAPPER_PAYLOAD_KINDS):
         payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
-        reason = _payload_text_hides_shell_code(payload, depth + 1)
+        reason = _payload_text_hides_shell_code(payload, depth + 1, command_prefix)
         if reason is not None:
             return reason
     return None
 
 
-def _eval_payloads_hide_recursive_chmod(command: str, depth: int = 0) -> str | None:
+def _eval_payloads_hide_recursive_chmod(
+    command: str, depth: int = 0, command_prefix: str | None = None
+) -> str | None:
     """Why a quoted `eval` payload hides shell code the guard must refuse
     (truthy), or None when it does not: a recursive chmod/chown, a command
     name a variable or substitution could expand into one, a BASH_ENV
@@ -1967,7 +1981,7 @@ def _eval_payloads_hide_recursive_chmod(command: str, depth: int = 0) -> str | N
     words = _chmod_scan_shell_words(command)
     for source in _wrapper_payload_sources(words, command, ("eval",)):
         payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
-        reason = _payload_text_hides_shell_code(payload, depth)
+        reason = _payload_text_hides_shell_code(payload, depth, command_prefix)
         if reason is not None:
             return reason
     return None
@@ -2850,6 +2864,7 @@ def _unscanned_wrapper_script_reason(
     normalized: str,
     words: list[_ChmodShellWord],
     user_command_start: int,
+    command_prefix: str | None,
 ) -> str | None:
     """Why a bare shell wrapper executes a script the guard cannot scan, or
     None when it does not: a script argument or stdin redirection from a
@@ -2873,7 +2888,7 @@ def _unscanned_wrapper_script_reason(
             home_real = os.path.realpath(home_env)
         except (OSError, RuntimeError, ValueError):
             home_real = None
-    prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+    prefix = command_prefix
     prefix_relocates = bool(prefix) and bool(
         re.search(r"\b(?:cd|pushd|popd)\b", prefix)
     )
@@ -3266,7 +3281,7 @@ def _warn_once_about_late_destructive_chmod_bypass() -> None:
 _SHELL_C_INTERPRETERS = ("sh", "bash", "zsh", "dash", "ksh")
 
 
-def _shell_c_payloads_hide_recursive_chmod(command: str) -> str | None:
+def _shell_c_payloads_hide_recursive_chmod(command: str, command_prefix: str | None = None) -> str | None:
     """Why a quoted `sh -c`-style payload hides shell code the guard must
     refuse (truthy), or None when it does not: a recursive chmod/chown, a
     command name a variable or substitution could expand into one, a
@@ -3286,13 +3301,13 @@ def _shell_c_payloads_hide_recursive_chmod(command: str) -> str | None:
     words = _chmod_scan_shell_words(command)
     for source in _wrapper_payload_sources(words, command, ("shell_c",)):
         payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
-        reason = _payload_text_hides_shell_code(payload)
+        reason = _payload_text_hides_shell_code(payload, command_prefix=command_prefix)
         if reason is not None:
             return reason
     return None
 
 
-def _alias_payloads_hide_recursive_chmod(command: str) -> str | None:
+def _alias_payloads_hide_recursive_chmod(command: str, command_prefix: str | None = None) -> str | None:
     """Why a quoted alias body hides shell code the guard must refuse
     (truthy), or None when it does not: an alias body executes as shell
     code at use time, and a body carrying a recursive chmod/chown is
@@ -3300,7 +3315,7 @@ def _alias_payloads_hide_recursive_chmod(command: str) -> str | None:
     words = _chmod_scan_shell_words(command)
     for source in _wrapper_payload_sources(words, command, ("alias",)):
         payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
-        reason = _payload_text_hides_shell_code(payload)
+        reason = _payload_text_hides_shell_code(payload, command_prefix=command_prefix)
         if reason is not None:
             return reason
     return None
@@ -3430,7 +3445,7 @@ def _chmod_env_split_string_feeds(words: list[_ChmodShellWord]) -> tuple[list[st
     return feeds, reasons
 
 
-def _env_split_string_payloads_hide_recursive_chmod(command: str) -> str | None:
+def _env_split_string_payloads_hide_recursive_chmod(command: str, command_prefix: str | None = None) -> str | None:
     """Why a GNU env -S/--split-string payload hides shell code the guard
     must refuse (truthy), or None when it does not: env splits the string
     into a command line and executes it, so every split argv is scanned like
@@ -3440,7 +3455,7 @@ def _env_split_string_payloads_hide_recursive_chmod(command: str) -> str | None:
     already."""
     feeds, reasons = _chmod_env_split_string_feeds(_chmod_scan_shell_words(command))
     for feed in feeds:
-        reason = _payload_text_hides_shell_code(feed)
+        reason = _payload_text_hides_shell_code(feed, command_prefix=command_prefix)
         if reason is not None:
             return reason
     if reasons:
@@ -3448,7 +3463,7 @@ def _env_split_string_payloads_hide_recursive_chmod(command: str) -> str | None:
     return None
 
 
-def _trap_payloads_hide_recursive_chmod(command: str) -> str | None:
+def _trap_payloads_hide_recursive_chmod(command: str, command_prefix: str | None = None) -> str | None:
     """Why a trap body hides shell code the guard must refuse (truthy), or
     None when it does not: a trap body executes at trigger time (EXIT,
     DEBUG runs before every command), and a body carrying a recursive
@@ -3456,7 +3471,7 @@ def _trap_payloads_hide_recursive_chmod(command: str) -> str | None:
     words = _chmod_scan_shell_words(command)
     for source in _wrapper_payload_sources(words, command, ("trap",)):
         payload = _chmod_unquote_one_level(_expand_ansi_c_payloads(source))
-        reason = _payload_text_hides_shell_code(payload)
+        reason = _payload_text_hides_shell_code(payload, command_prefix=command_prefix)
         if reason is not None:
             return reason
     return None
@@ -3576,19 +3591,19 @@ def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command
     # pre-strip text would fold into the wrapper word's value (`ba<cont>sh`
     # scans as `ba\nsh`, not `bash`) and hide the wrapper payload entirely.
     eval_reason = (
-        _eval_payloads_hide_recursive_chmod(normalized)
+        _eval_payloads_hide_recursive_chmod(normalized, command_prefix=command_prefix)
         if any(word.value == "eval" for word in words)
         or re.search(r"\beval\b", normalized)
         else None
     )
     shell_c_reason = (
-        _shell_c_payloads_hide_recursive_chmod(normalized)
+        _shell_c_payloads_hide_recursive_chmod(normalized, command_prefix=command_prefix)
         if any(os.path.basename(word.value) in _SHELL_C_INTERPRETERS for word in words)
         or re.search(r"\b(?:sh|bash|zsh|dash|ksh)\b", normalized)
         else None
     )
     alias_reason = (
-        _alias_payloads_hide_recursive_chmod(normalized)
+        _alias_payloads_hide_recursive_chmod(normalized, command_prefix=command_prefix)
         if any(os.path.basename(word.value) == "alias" for word in words)
         or re.search(r"\balias\b", normalized)
         else None
@@ -3603,7 +3618,7 @@ def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command
         # shell code, which the guard cannot scan statically.
         raise DestructiveChmodRefusalError(_format_chmod_pipe_fed_wrapper_refusal())
     env_s_reason = (
-        _env_split_string_payloads_hide_recursive_chmod(normalized)
+        _env_split_string_payloads_hide_recursive_chmod(normalized, command_prefix=command_prefix)
         if any(os.path.basename(word.value) == "env" for word in words)
         or re.search(r"\benv\b", normalized)
         else None
@@ -3614,7 +3629,7 @@ def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command
     if env_s_reason:
         raise DestructiveChmodRefusalError(_payload_reason_message(env_s_reason))
     trap_reason = (
-        _trap_payloads_hide_recursive_chmod(normalized)
+        _trap_payloads_hide_recursive_chmod(normalized, command_prefix=command_prefix)
         if any(word.value == "trap" for word in words)
         else None
     )
@@ -3654,7 +3669,7 @@ def _guard_destructive_chmod(script: str, allow_destructive_chmod: bool, command
         # hides a recursive chmod is reported as that payload, not as the
         # wrapper around it.
         script_reason = _unscanned_wrapper_script_reason(
-            raw, normalized, words, user_command_start
+            raw, normalized, words, user_command_start, command_prefix
         )
         if script_reason == "relocation":
             raise DestructiveChmodRefusalError(_format_chmod_relocation_refusal())
@@ -3795,7 +3810,7 @@ def bash(command: str, *, allow_destructive_chmod: bool = False) -> BashHandle:
     prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
     script = _prefix_command(command, prefix)
     _guard_destructive_chmod(script, allow_destructive_chmod, prefix)
-    return BashHandle(command, script=script)
+    return BashHandle(command, script=script, _validated=True)
 
 
 def _shell() -> str:
