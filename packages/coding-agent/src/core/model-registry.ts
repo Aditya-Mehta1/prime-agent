@@ -380,8 +380,9 @@ function readOpenAICodexAccountId(token: string): string | undefined {
  * report a supported Codex client version here instead.
  *
  * Shipping a new Codex model takes two edits, and both are required:
- * 1. Add the model to `codexModels` in `packages/ai/scripts/generate-models.ts` and regenerate. That list is
- *    explicit, not fetched, so an unlisted model does not exist for Prime Agent at all.
+ * 1. Add the model to `models/manual/openai-codex.yml` in prime-agent-catalog and
+ *    regenerate (that list is explicit, not fetched, so an unlisted model does
+ *    not exist for Prime Agent at all).
  * 2. Raise this constant to a Codex CLI release whose catalog includes that model. `getExecutableModels()`
  *    below intersects the registry with the discovered catalog, so a listed model the catalog omits is
  *    dropped.

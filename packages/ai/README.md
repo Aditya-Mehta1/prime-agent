@@ -1279,11 +1279,13 @@ Create a new provider file (for example `amazon-bedrock.ts`) that exports:
 - Add credential detection in `env-api-keys.ts` for the new provider
 - Ensure `streamSimple` handles auth lookup via `getEnvApiKey()` or provider-specific auth
 
-#### 4. Model Generation (`scripts/generate-models.ts`)
+#### 4. Model Data (`prime-agent-catalog`)
 
-- Add logic to fetch and parse models from the provider's source (e.g., models.dev API)
-- Map provider model data to the standardized `Model` interface
-- Handle provider-specific quirks (pricing format, capability flags, model ID transformations)
+Model catalog data is owned by [prime-agent-catalog](https://github.com/PrimeIntellect-ai/prime-agent-catalog):
+
+- Add a provider mapping block to `exporter/generate-models.ts` there (fetch/parse logic for the provider's source, e.g. the models.dev API)
+- Admit model ids in `models/whitelist/<provider>.yml` there and regenerate; manual-only providers get `models/manual/<provider>.yml`
+- This repo carries no catalog data logic — the client fetches the generated catalog at runtime and ships compiled transport templates only
 
 #### 5. Tests (`test/`)
 
