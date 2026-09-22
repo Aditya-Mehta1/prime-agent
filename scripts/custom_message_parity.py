@@ -9,7 +9,8 @@ transcript containing every decorated custom-message row:
   - a heartbeat prompt (pulse + schedule),
   - a goal-context continuation row,
   - a restored-python-kernel row,
-  - an RLM child terminal notice,
+  - the three RLM child rows (a finished terminal notice, a failed child,
+    a cancelled terminal notice),
   - a background-shell completion,
   - a compaction outcome,
   - a refinement outcome,
@@ -36,6 +37,18 @@ that preview segment out of the Rust frames and the run separately asserts
 the preview IS present; the TS side is expected to adopt the same preview
 so the normalization can be dropped.
 
+Second documented divergence (Kevin directive 2026-09-23, product
+improvement BEYOND TS): the RLM child rows render the
+`\u25c6 Subagent <name> finished|failed|cancelled` diamond rows on the Rust
+side (accent diamond, semantic label colors, the failure error and the
+cancellation reason as the expandable body, no reply-preview anywhere),
+where the TS binary still shows the generic muted `RLM child status` label
+over the full content markdown. The diff drops the RLM child rows from
+BOTH frames and the run separately asserts the Rust diamond rows ARE
+present (collapsed labels, expanded reason bodies, no preview) and the TS
+frames show the old generic label (the baseline the TS team is expected to
+adopt).
+
 tmux rules: default socket only (`env -u TMUX`), cmparity-* session names,
 no kill-server; sessions are killed individually at the end.
 """
@@ -61,28 +74,50 @@ SIZES = [("120", "90")]
 # The transcript skeleton (entries copied from real captured sessions so
 # both binaries parse byte-identical payloads). Timestamps are re-stamped
 # sequentially; the parent chain is linear.
+# (custom_type, content, extra fields): the content lives per row so the
+# two terminal-notice shapes (finished, cancelled) and the failure row all
+# carry their own wire content.
 CUSTOM_ROWS = [
-    ("agent_message", {"display": True, "details": {
+    ("agent_message",
+     "[agent-message from child:model-probe]\n\nDecorations parity: the received row renders with the diamond, label, and participant.",
+     {"display": True, "details": {
         "id": "agentmsg_cmparity",
         "message": "Decorations parity: the received row renders with the diamond, label, and participant.",
         "from": {"sessionName": "model-probe", "sessionId": "sess-probe", "activeSessionId": "aaa111", "runtimeKind": "subagent"},
         "fromRelationship": "child",
     }}),
-    ("heartbeat_prompt", {"display": True, "details": {
+    ("heartbeat_prompt", "[heartbeat: every 10m run#3]\n\nContinue the mission.", {"display": True, "details": {
         "jobId": "job-1", "schedule": "every 10m", "status": "running", "runCount": 3,
     }}),
-    ("goal_context", {"display": True, "details": {
+    ("goal_context", "[goal: continuation]\n\nContinue the goal.", {"display": True, "details": {
         "kind": "continuation", "goalId": "goal-1",
         "objective": "Keep the parity harnesses green.",
         "status": "active", "continuationsUsed": 1,
     }}),
-    ("ipython_state_restored", {"display": True, "details": {"restored": True}}),
-    ("rlm_child_terminal_notice", {"display": True, "details": {
-        "kind": "completed_without_reply", "childId": "sub-1", "sessionName": "lane-decorations",
-    }}),
-    ("async_bash_completion", {"display": True, "details": {"pid": 4371, "command": "seq 1 3", "exitCode": 0}}),
-    ("compaction_outcome", {"display": True, "details": {"reason": "threshold", "outcome": "skipped"}}),
-    ("refinement_outcome", {"display": True, "details": {
+    ("ipython_state_restored", "[python-state-restored]\n\nKernel state revived.", {"display": True, "details": {"restored": True}}),
+    # The three RLM child rows (the product-improvement divergence): a
+    # finished child (the reply preview stays out of the row), a failed
+    # child, a cancelled child. The reasons double as the strip needles.
+    ("rlm_child_terminal_notice",
+     "[child-exited: no-reply child:lane-decorations]\n\nLast assistant text: the legacy preview that must not render",
+     {"display": True, "details": {
+         "kind": "completed_without_reply", "childId": "sub-1", "sessionName": "lane-decorations",
+         "lastAssistantTextPreview": "the legacy preview that must not render",
+     }}),
+    ("rlm_child_failure",
+     "[child-failed child:boom-worker]\n\nthe model stream died",
+     {"display": True, "details": {
+         "childId": "sub-2", "sessionName": "boom-worker", "error": "the model stream died",
+     }}),
+    ("rlm_child_terminal_notice",
+     "[child-exited: cancelled child:cancel-worker]\n\nDeleted by parent orchestrator",
+     {"display": True, "details": {
+         "kind": "cancelled", "childId": "sub-3", "sessionName": "cancel-worker",
+         "reason": "Deleted by parent orchestrator",
+     }}),
+    ("async_bash_completion", "[bash-done pid:4371 exit:0]\n\nCommand: \"seq 1 3\"", {"display": True, "details": {"pid": 4371, "command": "seq 1 3", "exitCode": 0}}),
+    ("compaction_outcome", "Compaction skipped: below the token threshold.", {"display": True, "details": {"reason": "threshold", "outcome": "skipped"}}),
+    ("refinement_outcome", "Refinement complete: Create one local memory.", {"display": True, "details": {
         "refinementId": "refine_cmparity", "summary": "Create one local memory.", "scope": "local",
         "edits": [{
             "action": "create", "kind": "memory", "id": "cmparity-memory", "applied": True,
@@ -91,7 +126,7 @@ CUSTOM_ROWS = [
                       "content": "The harness stays green.", "scope": "local"},
         }],
     }}),
-    ("autonomous_status", {"display": True, "details": {"enabled": False}}),
+    ("autonomous_status", "[autonomous-status: off]\n\nContinuations: 0/0. Turns: 0/0.", {"display": True, "details": {"enabled": False}}),
 ]
 
 MARKER_TEXT = "decorations parity transcript complete"
@@ -248,19 +283,8 @@ def build_session(path, source_header, assistant_template, cwd):
             "timestamp": base_ms,
         },
     }, base_ms))
-    for custom_type, extra in CUSTOM_ROWS:
+    for custom_type, content, extra in CUSTOM_ROWS:
         base_ms += 1
-        content = {
-            "agent_message": "[agent-message from child:model-probe]\n\nDecorations parity: the received row renders with the diamond, label, and participant.",
-            "heartbeat_prompt": "[heartbeat: every 10m run#3]\n\nContinue the mission.",
-            "goal_context": "[goal: continuation]\n\nContinue the goal.",
-            "ipython_state_restored": "[python-state-restored]\n\nKernel state revived.",
-            "rlm_child_terminal_notice": "[child-exited: no-reply child:lane-decorations]",
-            "async_bash_completion": "[bash-done pid:4371 exit:0]\n\nCommand: \"seq 1 3\"",
-            "compaction_outcome": "Compaction skipped: below the token threshold.",
-            "refinement_outcome": "Refinement complete: Create one local memory.",
-            "autonomous_status": "[autonomous-status: off]\n\nContinuations: 0/0. Turns: 0/0.",
-        }[custom_type]
         fields = {"customType": custom_type, "content": content}
         fields.update(extra)
         entries.append(entry("custom_message", fields, base_ms))
@@ -391,6 +415,94 @@ def strip_rust_agent_message_preview(frame):
     return re.sub(
         r" \u00b7 " + re.escape(AGENT_MESSAGE_BODY[:40]) + r"[^\n]*", "", frame
     )
+
+
+# The RLM child rows (the second carried divergence, see the module
+# docstring): the Rust diamond rows replace the TS generic label.
+RLM_CHILD_LABELS = [
+    ("lane-decorations", "finished"),
+    ("boom-worker", "failed"),
+    ("cancel-worker", "cancelled"),
+]
+RLM_CHILD_REASONS = ["the model stream died", "Deleted by parent orchestrator"]
+RLM_CHILD_NEEDLES = (
+    ["RLM child status", "Last assistant text", "[child-failed", "[child-exited"]
+    + RLM_CHILD_REASONS
+    + [f"Subagent {name} {outcome}" for name, outcome in RLM_CHILD_LABELS]
+)
+
+
+def strip_rlm_child_rows(frame):
+    """Drop the RLM child row lines from BOTH frames: the Rust side renders
+    the diamond rows (the headers plus the reason bodies expanded), the TS
+    side renders the generic label and the full content markdown. The
+    harness separately asserts each side's shapes.
+
+    The row-count divergence also shifts the bottom-anchored viewport: the
+    Rust window covers more of the splash region above the transcript than
+    the TS one, so background-color escapes land on different rows around
+    the first transcript row and extra visually-blank splash spacers leak
+    into the normalized frame. Both are anchor artifacts, not render
+    regressions, so background escapes drop and blank runs collapse to one
+    row (visually blank = whitespace once the ANSI codes are stripped)."""
+    def visually_blank(line):
+        return re.sub(r"\x1b\[[0-9;]*m", "", line).strip() == ""
+
+    kept = []
+    blank = False
+    for line in frame.split("\n"):
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        if any(needle in plain for needle in RLM_CHILD_NEEDLES):
+            continue
+        # Anchor artifact: background escapes whose placement shifts
+        # across the row boundary when the window anchors differently.
+        line = re.sub(r"\x1b\[4[0-9;]*m", "", line)
+        if not visually_blank(line):
+            kept.append(line)
+            blank = False
+            continue
+        # Both sides render different row counts here (the Rust rows are
+        # one line plus the reason body, the TS side the full content
+        # markdown), so blank runs collapse to one blank row before the
+        # diff; the dedicated assertions below own the row shapes.
+        if not blank:
+            kept.append(line)
+        blank = True
+    # The window-anchor shift shows as extra visually-blank spacers at
+    # the frame edges; drop them (normalize's own edge trim only sees
+    # ASCII whitespace, not ANSI-only rows).
+    while kept and visually_blank(kept[0]):
+        kept.pop(0)
+    while kept and visually_blank(kept[-1]):
+        kept.pop()
+    # Keep a trailing newline: normalize's line-boundary escape rules
+    # (the `\x1b[39m\n` / `\x1b[49m\n` cleanups) must see the same frame
+    # shape on both sides even when the trailing blank rows popped here
+    # made the last content row the frame's final line.
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+def assert_rlm_child_rows(side, collapsed, expanded):
+    """The RLM child row contract per side: the Rust frames show the three
+    diamond rows (collapsed labels, reason bodies expanded, no reply
+    preview anywhere); the TS frames show the old generic label (the
+    baseline the improvement diverges from)."""
+    if side == "rust":
+        for name, outcome in RLM_CHILD_LABELS:
+            label = f"\u25c6 Subagent {name} {outcome}"
+            assert label in collapsed, f"rust: {label!r} missing collapsed"
+            assert label in expanded, f"rust: {label!r} missing expanded"
+        for reason in RLM_CHILD_REASONS:
+            assert reason not in collapsed, f"rust: reason body visible collapsed: {reason!r}"
+            assert reason in expanded, f"rust: reason body missing expanded: {reason!r}"
+        assert "Last assistant text" not in collapsed, "rust: reply preview rendered"
+        assert "Last assistant text" not in expanded, "rust: reply preview rendered expanded"
+        assert "RLM child status" not in collapsed, "rust: old generic label rendered"
+    else:
+        assert "RLM child status" in collapsed, "ts: generic label missing (baseline)"
+        assert "RLM child status" in expanded, "ts: generic label missing expanded (baseline)"
+        for name, _outcome in RLM_CHILD_LABELS:
+            assert f"Subagent {name}" not in collapsed, "ts: diamond row rendered"
 
 
 def assert_sent_reach(side, collapsed, expanded):
@@ -574,10 +686,14 @@ def main():
                 collapsed = capture_plain_text(frames["a_collapsed"])
                 expanded = capture_plain_text(frames["b_expanded"])
                 assert_sent_reach(side, collapsed, expanded)
+                assert_rlm_child_rows(side, collapsed, expanded)
                 assert_skill_reach(side, collapsed, expanded)
             for state in ("a_collapsed", "b_expanded"):
-                ts_norm = normalize(ts_frames[state], base)
-                rust_norm = normalize(strip_rust_agent_message_preview(rust_frames[state]), base)
+                ts_norm = normalize(strip_rlm_child_rows(ts_frames[state]), base)
+                rust_norm = normalize(
+                    strip_rlm_child_rows(strip_rust_agent_message_preview(rust_frames[state])),
+                    base,
+                )
                 # The carried divergence: the Rust header shows the
                 # collapsed preview; the TS binary does not (yet).
                 rust_plain = capture_plain_text(rust_frames[state])

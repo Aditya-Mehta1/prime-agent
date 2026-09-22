@@ -707,7 +707,7 @@ impl AgentView {
                 )
             }
             ChatEntry::InjectedPrompt(row) => {
-                crate::custom_message::render::render_injected_prompt(
+                crate::custom_message::injected_prompt::render_injected_prompt(
                     row,
                     self.detail,
                     &self.theme,

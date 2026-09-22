@@ -9,8 +9,9 @@
 //! `buildConversationComponents`) picks; rendering ports each component's
 //! row geometry and theme colors.
 //!
-//! Rendering lives in the sibling `render` module (plus `refinement` for
-//! the refinement-outcome component).
+//! Rendering lives in the sibling modules (`render` for most components,
+//! `injected_prompt` for the injected-prompt rows, `refinement` for the
+//! refinement-outcome component).
 //!
 //! The dispatch follows the TS live path
 //! (`createDisplayedCustomMessageComponent`): non-display rows render
@@ -20,11 +21,15 @@
 //! drops unknown types instead; the live interactive path is the TUI ground
 //! truth, and the Rust engine persists those types with `display: false`.)
 
+pub(crate) mod injected_prompt;
 pub(crate) mod refinement;
 pub(crate) mod render;
 pub mod skill_invocation;
 
 pub use skill_invocation::{skill_invocation_entries, SkillInvocationRow};
+
+use injected_prompt::injected_prompt_row;
+pub use injected_prompt::{InjectedPromptKind, InjectedPromptRow, RlmChildOutcome};
 
 use crate::chat::{ChatEntry, StatusKind};
 use crate::theme::ThemeColor;
@@ -86,30 +91,6 @@ pub struct AgentMessageRow {
     /// `details.message` (the collapsed preview source and the body shown
     /// expanded).
     pub message: String,
-}
-
-/// One injected prompt row (TS `InjectedPromptMessageComponent`); the kind
-/// picks the header shape, `body` renders as markdown when expanded.
-#[derive(Debug, Clone, PartialEq)]
-pub struct InjectedPromptRow {
-    pub kind: InjectedPromptKind,
-    /// Markdown body (`None` renders nothing extra when expanded).
-    pub body: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum InjectedPromptKind {
-    /// `♥ Heartbeat prompt · <schedule>` (error pulse, muted label).
-    Heartbeat { schedule: Option<String> },
-    /// `<goal label>[ · <objective preview>]` (muted; TS `goalLabel`/`metaText`).
-    Goal {
-        kind: Option<String>,
-        objective: Option<String>,
-    },
-    /// `◆ Restored Python kernel state` / `◆ Started fresh Python kernel`.
-    KernelRestored { restored: bool },
-    /// `RLM child status` (muted, no diamond).
-    RlmChildStatus,
 }
 
 /// One background-shell completion row (TS `ShellCompletionComponent`,
@@ -376,46 +357,9 @@ fn shell_completion_row(message: &Value, details: &Value) -> ShellCompletionRow 
     }
 }
 
-/// One injected-prompt row (TS `isInjectedPromptMessage` kinds).
-fn injected_prompt_row(custom_type: &str, message: &Value, details: &Value) -> InjectedPromptRow {
-    let body = custom_content_text(message);
-    let kind = match custom_type {
-        HEARTBEAT_PROMPT_CUSTOM_TYPE => InjectedPromptKind::Heartbeat {
-            schedule: details
-                .get("schedule")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        },
-        GOAL_CONTEXT_CUSTOM_TYPE => InjectedPromptKind::Goal {
-            kind: details
-                .get("kind")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            objective: details
-                .get("objective")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        },
-        IPYTHON_STATE_RESTORED_CUSTOM_TYPE => InjectedPromptKind::KernelRestored {
-            restored: details.get("restored").and_then(Value::as_bool) != Some(false),
-        },
-        _ => InjectedPromptKind::RlmChildStatus,
-    };
-    let body = (kind.show_body()).then_some(body);
-    InjectedPromptRow { kind, body }
-}
-
-impl InjectedPromptKind {
-    /// Whether the expanded view renders the markdown body (the kernel-state
-    /// row never does; TS keeps `ipython_state_restored` header-only).
-    fn show_body(&self) -> bool {
-        !matches!(self, InjectedPromptKind::KernelRestored { .. })
-    }
-}
-
 /// TS `readCustomText`: content string or blocks joined with newlines
 /// (text blocks keep their text, every non-text block renders `[image]`).
-fn custom_content_text(message: &Value) -> String {
+pub(crate) fn custom_content_text(message: &Value) -> String {
     match message.get("content") {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(blocks)) => blocks
@@ -623,23 +567,51 @@ mod tests {
             [ChatEntry::InjectedPrompt(boxed)]
                 if matches!(boxed.kind, InjectedPromptKind::KernelRestored { restored: false })
         ));
-        for custom_type in [
-            RLM_CHILD_FAILURE_CUSTOM_TYPE,
-            RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+        // The RLM child rows decode the outcome and the session name (the
+        // render shapes live with the kind, in `injected_prompt`).
+        let failed = decoded(json!({
+            "role": "custom",
+            "customType": RLM_CHILD_FAILURE_CUSTOM_TYPE,
+            "content": "[child-failed child:lane]\n\nboom",
+            "display": true,
+            "details": { "childId": "sub-1", "sessionName": "lane", "error": "boom" },
+        }));
+        assert!(matches!(
+            failed.as_slice(),
+            [ChatEntry::InjectedPrompt(boxed)]
+                if matches!(
+                    &boxed.kind,
+                    InjectedPromptKind::RlmChildStatus {
+                        outcome: RlmChildOutcome::Failed,
+                        session_name,
+                    } if session_name == "lane"
+                ) && boxed.body.as_deref() == Some("boom")
+        ));
+        for (kind, outcome) in [
+            ("completed_without_reply", RlmChildOutcome::Finished),
+            ("cancelled", RlmChildOutcome::Cancelled),
         ] {
             let row = decoded(json!({
                 "role": "custom",
-                "customType": custom_type,
-                "content": "[child-failed child:lane]\n\nboom",
+                "customType": RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+                "content": "[child-exited: no-reply child:lane]",
                 "display": true,
-                "details": { "childId": "sub-1", "sessionName": "lane", "error": "boom" },
+                "details": { "childId": "sub-2", "sessionName": "lane", "kind": kind },
             }));
-            assert!(matches!(
-                row.as_slice(),
-                [ChatEntry::InjectedPrompt(boxed)]
-                    if matches!(boxed.kind, InjectedPromptKind::RlmChildStatus)
-                        && boxed.body.is_some()
-            ));
+            // Neither fixture carries a reason, so both stay
+            // header-only.
+            assert!(
+                matches!(
+                    row.as_slice(),
+                    [ChatEntry::InjectedPrompt(boxed)]
+                        if matches!(
+                            &boxed.kind,
+                            InjectedPromptKind::RlmChildStatus { outcome: decoded_outcome, .. }
+                                if decoded_outcome == &outcome
+                        ) && boxed.body.is_none()
+                ),
+                "outcome {outcome:?} of kind {kind:?} did not decode"
+            );
         }
         // The kernel-state row carries no expandable body.
         let restored = decoded(json!({
