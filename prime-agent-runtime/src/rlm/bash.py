@@ -1625,7 +1625,7 @@ def _chmod_scan_shell_words(command: str) -> list[_ChmodShellWord]:
                     j = close + 1
                     continue
                 if inner == "`":
-                    close = command.find("`", j + 1, end)
+                    close = _backtick_close(command, j + 1, end)
                     if close == -1:
                         close = end - 1
                     _mark_contained_interiors(words, scan_region, j + 1, close, depth)
@@ -1688,7 +1688,7 @@ def _chmod_scan_shell_words(command: str) -> list[_ChmodShellWord]:
                 i = close + 1
                 continue
             if ch == "`":
-                close = command.find("`", i + 1, end)
+                close = _backtick_close(command, i + 1, end)
                 if close == -1:
                     close = end - 1
                 _mark_contained_interiors(words, scan_region, i + 1, close, depth)
@@ -1737,6 +1737,25 @@ def _is_recursive_chmod_chown_token_run(tokens: list[str]) -> bool:
         if token.startswith("-") and not token.startswith("--") and "R" in token[1:]:
             return True
     return False
+
+
+def _backtick_close(command: str, start: int, end: int) -> int:
+    """Index of the backtick closing a substitution, or -1. Bash's scanner
+    consumes a backslash pair before it looks for the closer, so an escaped
+    backtick never closes the substitution; a blind find() would stop the
+    span early and hide executable text inside the substitution from the
+    interior scan (the escaped-backtick vector in the tests runs its chmod
+    in real bash and must be refused, not hidden)."""
+    i = start
+    while i < end:
+        ch = command[i]
+        if ch == "\\":
+            i += 2  # an escaped character: the pair is data, not a closer
+            continue
+        if ch == "`":
+            return i
+        i += 1
+    return -1
 
 
 def _contained_in_later_word(words: list[_ChmodShellWord], index: int) -> bool:
@@ -2458,7 +2477,9 @@ _UNRESOLVABLE_COMMAND_EXECUTORS = (
 # Words that hold a run's command slot without being the command itself:
 # grouping tokens and the keywords that introduce the simple command inside a
 # group. A wrapper behind one of them still runs (`{ bash -l -c ...; }`).
-_COMMAND_SLOT_NOISE = ("{", "}", "(", ")", "then", "do", "else", "elif", "!")
+# `command` and `builtin` dispatch the word behind them, so they hold the
+# command slot without being the command.
+_COMMAND_SLOT_NOISE = ("{", "}", "(", ")", "then", "do", "else", "elif", "!", "command", "builtin")
 # Heads whose operand arming BASH_ENV executes before the command runs.
 _ENV_ARMING_HEADS = ("env", "export", "declare", "typeset", "sudo", "nohup")
 # Wrappers that execute a process substitution's output as shell code.
@@ -2669,7 +2690,7 @@ def _substitution_spans(command: str) -> list[tuple[int, int]]:
                 spans.append((i, close))
                 i = close
             elif ch == "`":
-                close = command.find("`", i + 1)
+                close = _backtick_close(command, i + 1, n)
                 if close == -1:
                     close = n - 1
                 spans.append((i, close))
@@ -2681,7 +2702,7 @@ def _substitution_spans(command: str) -> list[tuple[int, int]]:
             spans.append((i, close))
             i = close
         elif ch == "`":
-            close = command.find("`", i + 1)
+            close = _backtick_close(command, i + 1, n)
             if close == -1:
                 close = n - 1
             spans.append((i, close))
@@ -3109,6 +3130,7 @@ def _shell_wrapper_reads_pipe(normalized: str, words: list[_ChmodShellWord]) -> 
             continue
         c_payload = False
         script_arg = False
+        skip_next = False  # the value of -o/-O/--rcfile/--init-file is not an argument
         for follower_index in range(index + 1, len(words)):
             follower = words[follower_index]
             if follower.starts_command:
@@ -3116,9 +3138,17 @@ def _shell_wrapper_reads_pipe(normalized: str, words: list[_ChmodShellWord]) -> 
                     continue
                 break
             token = follower.value
+            if skip_next:
+                skip_next = False
+                continue
             if token.startswith("-") and token != "-" and not token.startswith("--"):
                 if "c" in token[1:]:
                     c_payload = True
+                if token[-1] in "oO":
+                    skip_next = True  # `bash -o vi`: the option value follows
+                continue
+            if token in ("--rcfile", "--init-file"):
+                skip_next = True
                 continue
             if token == "--":
                 continue

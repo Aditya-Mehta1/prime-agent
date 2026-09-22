@@ -862,6 +862,13 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         result = await self._run('f() { chmod 755 sub; }; f')
         self.assertEqual(result.exit_code, 0)
 
+    async def test_pipe_fed_wrapper_option_value_is_not_a_script_arg(self):
+        # `-o vi` consumes `vi` as an option value, so the pipe stays the
+        # wrapper's input and the fed script is refused.
+        self._make_tree()
+        message = await self._refused("printf 'chmod -R 755 sub' | bash -o vi")
+        self.assertIn("Refusing to run", message)
+
     async def test_refuses_flagged_procsub_and_pipe_fed_wrappers(self):
         self._make_tree()
         home = tempfile.TemporaryDirectory()
@@ -1273,12 +1280,26 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         # `FOO=1 hash -p ...` still registers.
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
-        command = "FOO=1 hash -p /bin/chmod safe; safe -R 755 ~"
-        self.assertIn("Refusing to run", await self._refused(command, home=home.name))
+        for command in [
+            "FOO=1 hash -p /bin/chmod safe; safe -R 755 ~",
+            "command hash -p /bin/chmod safe; safe -R 755 ~",
+            "builtin hash -p /bin/chmod safe; safe -R 755 ~",
+        ]:
+            self.assertIn("Refusing to run", await self._refused(command, home=home.name))
         # Real bash runs `safe` and finds no such command: the argument
         # `hash` armed nothing, so the command reaches the shell.
         result = await self._run("echo hash -p /bin/chmod safe; safe -R 755 ~")
         self.assertNotIn("Refusing to run", result.output)
+
+    async def test_escaped_backtick_does_not_shorten_substitutions(self):
+        # Bash's scanner skips escape pairs before the closing backtick, so
+        # the span must not end at an escaped backtick: interior text stays
+        # live and the hidden chmod is refused instead of quoted data.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        with mock.patch.dict(os.environ, {"HOME": home.name}):
+            with self.assertRaises(DestructiveChmodRefusalError):
+                await self._run('echo "`echo a\\\\\\`; chmod -R 755 ~`"')
 
     async def test_refuses_hash_registered_command_names(self):
         home = tempfile.TemporaryDirectory()
