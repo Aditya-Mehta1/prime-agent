@@ -1787,7 +1787,6 @@ export class SessionManager {
 	// and must not hold it across an append.
 	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
-	// Git capture state: captures are async and serialized per session.
 	private gitCaptureChain: Promise<void> = Promise.resolve();
 	private toolsRanSinceGitCapture = false;
 	private lastGitCapture: GitContext | null | undefined = undefined;

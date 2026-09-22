@@ -108,7 +108,10 @@ const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
 
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
 
-/** Stat identity of the bootstrap marker: every writer replaces the file and bumps its mtime, so equality means the validated venv is unchanged. */
+/**
+ * Stat identity of the bootstrap marker: every writer replaces the file and bumps its mtime, so equality
+ * means the validated venv is unchanged.
+ */
 interface BootstrapMarkerIdentity {
 	dev: number;
 	ino: number;
@@ -1056,7 +1059,8 @@ export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Pro
 	return promise;
 }
 
-// The venv python (bin/python, Scripts/python.exe) sits one level below the venv root; the marker lives next to its parent.
+// The venv python (bin/python, Scripts/python.exe) sits one level below the venv root; the marker lives
+// next to its parent.
 function bootstrapMarkerPath(python: string): string {
 	return path.join(path.dirname(path.dirname(python)), BOOTSTRAP_VERSION_FILE);
 }
