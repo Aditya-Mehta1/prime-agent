@@ -1097,7 +1097,6 @@ interface RlmSubagentModelSelection {
 
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
-const SESSION_CWD_STATE_CUSTOM_TYPE = "session_cwd_state";
 /** Minimum spacing between accepted progress notes from one child session. */
 const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
 /** Bounded ring of progress notes kept per child run; the snapshot exposes the newest. */
@@ -1593,8 +1592,6 @@ export class AgentSession {
 	private _acpMcpTools: ToolDefinition[] = [];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
-	private readonly _launchCwd: string;
-	private _launchCwdOverridesBranch: boolean;
 	private _agentDir?: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -1715,13 +1712,6 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
-		this._launchCwd = config.cwd;
-		this._launchCwdOverridesBranch = config.cwd !== this.sessionManager.getHeader()?.cwd;
-		const branchCwd = this._branchCwd();
-		if (branchCwd !== this._cwd) {
-			this._cwd = branchCwd;
-			this.sessionManager.setCwd(branchCwd);
-		}
 		this._agentDir = config.agentDir;
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
@@ -2098,26 +2088,16 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/** The cwd the active branch prescribes: its latest still-existing /cwd entry, else the launch cwd; an explicit launch override wins until the first /cwd. */
-	private _branchCwd(): string {
-		if (this._launchCwdOverridesBranch) return this._launchCwd;
-		const branch = this.sessionManager.getBranch();
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const entry = branch[i];
-			if (entry.type !== "custom" || entry.customType !== SESSION_CWD_STATE_CUSTOM_TYPE) continue;
-			const cwd = (entry.data as { cwd?: unknown } | undefined)?.cwd;
-			return typeof cwd === "string" && isExistingDirectory(cwd) ? cwd : this._launchCwd;
-		}
-		return this._launchCwd;
-	}
-
+	/** SessionManager re-resolved the cwd on the leaf move; follow it and drop queued [cwd-changed] notices, which described a transition on the old leaf. */
 	private async _reloadCwdFromBranch(): Promise<void> {
-		const cwd = this._branchCwd();
-		if (cwd === this._cwd || !isExistingDirectory(cwd)) return;
-		await this._applyCwd(cwd);
 		this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter(
 			(message) => message.customType !== SESSION_CWD_CHANGED_CUSTOM_TYPE,
 		);
+		const cwd = this.sessionManager.getCwd();
+		if (cwd === this._cwd) return;
+		await this._ipythonKernelProvisioner?.setCwd(cwd);
+		this._cwd = cwd;
+		this._emit({ type: "cwd_changed", cwd });
 	}
 
 	private _resolveRlmMaxDepth(): {
@@ -14102,15 +14082,7 @@ export class AgentSession {
 		});
 	}
 
-	/** Point the kernel, the session state, and attached clients at `cwd`. */
-	private async _applyCwd(cwd: string): Promise<void> {
-		await this._ipythonKernelProvisioner?.setCwd(cwd);
-		this._cwd = cwd;
-		this.sessionManager.setCwd(cwd);
-		this._emit({ type: "cwd_changed", cwd });
-	}
-
-	/** Retarget this session's working directory; persisted on the branch so a resume restarts there. */
+	/** Retarget this session's working directory; SessionManager records it on the branch so a resume restarts there. */
 	async setCwd(input: string): Promise<string> {
 		const cwd = resolve(this._cwd, expandTildePath(input.trim()));
 		if (!isExistingDirectory(cwd)) throw new Error(`Not a directory: ${cwd}`);
@@ -14120,14 +14092,16 @@ export class AgentSession {
 			if (this.isStreaming) throw new Error("Cannot change the working directory while the agent is running.");
 			if (cwd === this._cwd) return cwd;
 			const previousCwd = this._cwd;
-			await this._applyCwd(cwd);
+			// Kernel first: a dead kernel or a refused chdir records nothing.
+			await this._ipythonKernelProvisioner?.setCwd(cwd);
 			try {
-				this.sessionManager.appendCustomEntryWithRollback(SESSION_CWD_STATE_CUSTOM_TYPE, { cwd });
+				this.sessionManager.recordCwd(cwd);
 			} catch (error) {
-				await this._applyCwd(previousCwd);
+				await this._ipythonKernelProvisioner?.setCwd(previousCwd);
 				throw error;
 			}
-			this._launchCwdOverridesBranch = false;
+			this._cwd = cwd;
+			this._emit({ type: "cwd_changed", cwd });
 			await this.sendCustomMessage(
 				{
 					customType: SESSION_CWD_CHANGED_CUSTOM_TYPE,

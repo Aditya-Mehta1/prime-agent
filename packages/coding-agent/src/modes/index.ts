@@ -30,7 +30,11 @@ export type {
 	AgentConnectionState,
 } from "./agent-connection/index.js";
 export { DaemonAgentConnection, InProcessAgentConnection } from "./agent-connection/index.js";
-export { type AgentsViewModeOptions, runAgentsViewMode } from "./agents-view/agents-view-mode.js";
+export {
+	type AgentsViewModeOptions,
+	createAgentsViewResumeConfig,
+	runAgentsViewMode,
+} from "./agents-view/agents-view-mode.js";
 export {
 	type AgentsViewRecursiveRollup,
 	type AgentsViewRow,

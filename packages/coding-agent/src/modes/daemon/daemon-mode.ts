@@ -6599,7 +6599,7 @@ export class AgentDaemon {
 			cwd: session.sessionManager.getCwd(),
 			config: {
 				...state.runtime.runtimeConfig,
-				cwd: session.sessionManager.getCwd(),
+				cwd: session.sessionManager.hasCwdOverride ? session.sessionManager.getCwd() : undefined,
 			},
 			runtimeMetadata: state.runtime.metadata,
 			...(state.clientEnv ? { clientEnv: { ...state.clientEnv } } : {}),

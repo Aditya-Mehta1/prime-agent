@@ -96,6 +96,7 @@ import {
 	type AgentConnection,
 	type AgentsViewScopeKey,
 	ClientPromptStashStore,
+	createAgentsViewResumeConfig,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
@@ -444,6 +445,7 @@ function readSessionManager(path: string, sessionDir?: string, cwdOverride?: str
 	const manager = SessionManager.inMemory(
 		cwdOverride ?? header?.cwd ?? process.cwd(),
 		sessionDir ?? dirname(resolve(path)),
+		cwdOverride !== undefined,
 	);
 	manager.setSessionFile(path, entries);
 	return manager;
@@ -1498,21 +1500,27 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 
 		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
+		const sessionPath = getInteractiveDaemonSessionPath(parsed, sessionManager);
 		// A fresh default chat opens a real but message-less session; the lifecycle
 		// axis treats it as a draft (hidden, discarded on detach if never used), so
 		// no DeferredAgentConnection is needed to avoid creating it up front.
-		const isFreshDefaultSession =
-			!activeDaemonSessionSummary && !getInteractiveDaemonSessionPath(parsed, sessionManager);
+		const isFreshDefaultSession = !activeDaemonSessionSummary && !sessionPath;
+		// The daemon reads config.cwd on a resume as an explicit override (see createAgentsViewResumeConfig); without --cwd or
+		// the missing-directory picker the session's own cwd must win.
+		const hasCwdOverride = parsed.cwd !== undefined || missingSessionCwdIssue !== undefined;
 		let connection: DaemonAgentConnection;
 		let summary: SessionSummary;
 		try {
 			({ connection, summary } = await createDaemonClientConnection({
 				socketPath: daemonSocketPath,
-				config: defaultSessionConfig,
+				config:
+					sessionPath && !hasCwdOverride
+						? createAgentsViewResumeConfig(defaultSessionConfig)
+						: defaultSessionConfig,
 				activeSessionId: activeDaemonSessionSummary
 					? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
 					: undefined,
-				sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
+				sessionPath,
 				clientOwned: parsed.noSession,
 				noSession: parsed.noSession,
 				supportsExtensionUi: true,
