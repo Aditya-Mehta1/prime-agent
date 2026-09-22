@@ -1,0 +1,88 @@
+# Architecture
+
+Prime Agent, Rust rewrite. TS reference: `~/prime-agent` (read-only ground truth for behavior).
+Parity contract = user experience + model-facing surface, not internal mechanisms.
+
+## Surface contract (must not change)
+
+- Tools exposed to the model: `bash`, `edit`, `ipython` (internal helpers: `rename`, `stdout`).
+- RLM kernel API in the persistent Python REPL: `rlm.spawn/find_models/collect/list_subagents/
+  delete_subagent/create_session/progress_note`, `rlm.harness` CRUD,
+  `agent_message.send`, `agent_observe`, `compact`, `goal`, `refine`, `attach_image`,
+  skills (markdown + Python) per the skill contract in the base system prompt.
+- System prompt structure: layered — cache-stable static layer files (core harness description
+  with the full API surface, mandatory usage rules, opinionated guidelines, per-model map)
+  followed by one dynamic tail (packages, project context, skills inventory, MCP servers,
+  environment, session role); the harness digest stays a separate `[harness-digest]` user
+  message. `prime-agent prompt` dumps the assembled prompt with its layer breakdown.
+- CLI shape: `prime-agent` with the same commands/flags as the TS product; headless modes
+  (RPC/daemon/session-worker) with identical behavior.
+
+## Crates
+
+| crate | role | TS origin |
+|---|---|---|
+| `pa-types` | shared wire & domain types, protocol messages | coding-agent core types, daemon protocol |
+| `pa-telemetry` | event schema, queueing/batching, sinks (PostHog/file/noop/mock), install id | core/telemetry.ts |
+| `pa-ai` | providers, model registry, streaming | packages/ai |
+| `pa-models` | live model catalog: fetch, no-cold-start chain, transport pinning, Prime Inference | packages/ai catalog client + coding-agent core catalog layers |
+| `pa-agent` | agent loop | packages/agent |
+| `pa-core` | session engine: tools, skills, prompts, compaction, refinement, kernel/RLM manager, subagents, session manager, settings | packages/coding-agent core/ |
+| `pa-daemon` | supervision redesign: supervisor + per-session worker processes, wire protocol, cloud sandbox attach | modes/daemon, session-worker |
+| `pa-tui` | terminal UI (ratatui) | packages/tui + modes/interactive |
+| `pa-cli` | binary `prime-agent` | coding-agent cli/main |
+
+## Reliability redesign (mechanism changes, same UX)
+
+- The daemon becomes a supervisor: it spawns one worker process per active session instead of
+  hosting sessions in-process. Workers are supervised, restarted with backoff, and sessions
+  persist on disk so reattach works even if the supervisor restarts.
+- Session state is append-only JSONL on disk (same layout as `~/.prime/sessions`) so TUI
+  reattach, checkpoint/resume, and external tooling keep working.
+
+## Conventions
+
+- No stubs, no `todo!()`, no swallowed errors (`anyhow` bubbling to UI is fine).
+- Read the TS file in full before porting its behavior. The TS product on PATH is ground truth.
+- Every crate: `cargo fmt`, `cargo clippy -D warnings`, `cargo test` green before merge.
+- Verifiers: tmux-driven UX checks and differential tests against the installed TS binary.
+
+
+## Dependency direction (hard rule)
+
+Cycle-free, one direction, enforced in Cargo.toml and at review:
+
+```
+pa-types  <-- shared vocabulary, nothing else is shared
+pa-telemetry <-- telemetry library (schema/queue/sinks); depends on no workspace crate;
+            consumers: pa-core, pa-daemon, pa-cli (pa-tui stays pa-types-only)
+   ^
+   |        pa-ai (providers/registry)
+   |           ^
+   |           |     pa-models (live catalog over the compiled transports;
+   |           |        depends on pa-ai + pa-types only)
+   |           ^
+   |           |     pa-agent (loop)
+   |           |        ^
+   |           |        |     pa-core (session engine)
+   |           |        |        ^
+   |           |        |        |     pa-daemon (supervision)
+   |           |        |        |        ^
+pa-tui --> pa-types only;  pa-cli --> everything (composition root)
+```
+
+Rules:
+- pa-types and pa-telemetry depend on nothing in the workspace.
+- A crate may depend only on crates below it in this diagram. No cycles, ever.
+- Cross-crate access goes through minimal public APIs only; internals are `pub(crate)`.
+- If a change forces edits across many crate internals, the boundary is wrong - fix the boundary, not the call sites.
+- Each crate README declares scope, non-goals, and public API. Merges are rejected if they violate it.
+
+
+## Rendering ownership decision
+
+Tool-result rendering (the model-facing result text, diff rendering, truncation output) is owned by
+pa-core and delivered as data in pa-types entries. The TUI owns display-side rendering
+(markdown, colors, layout) and re-renders pa-types content blocks itself; pa-tui must never import
+pa-core. If a shared rendering primitive is truly needed by both, it belongs in pa-types as pure
+data helpers - not behavior.
