@@ -1542,7 +1542,7 @@ export class AgentSession {
 				jobId?: string;
 				/** Pending in-process wake timer for the current park. */
 				timer?: ReturnType<typeof setTimeout>;
-				/** True from the wake until the park state clears (the resume probe is running). */
+				/** True from the wake until the park state clears: the resume probe is running, or a wake already due is owned by the durable job. */
 				waking?: boolean;
 				/** Wake re-arms consumed without a resume; bounded by QUOTA_WAKE_MAX_RETRIES. */
 				wakeRetries?: number;
@@ -13621,8 +13621,9 @@ export class AgentSession {
 	 * Restore the park this branch ended on: a restart (daemon or worker) leaves
 	 * waitForUsage.maxParks unbounded otherwise, because the park count would
 	 * start over at 1 each time. Parks recorded before the branch's last resume
-	 * entry are spent, and a park whose wake time has passed is left to the
-	 * durable wake job — only one that is still ahead re-arms the timer.
+	 * entry are spent, and a park whose wake time has passed is restored without
+	 * a timer when its durable job still owns the wake; with no job the
+	 * in-process timer wakes it at once.
 	 */
 	private _restoreQuotaPark(): void {
 		const branch = this.sessionManager.getBranch();
@@ -13638,7 +13639,7 @@ export class AgentSession {
 				continue;
 			}
 			const resumeAtMs = Date.parse(entry.data.resumeAt);
-			if (!Number.isFinite(resumeAtMs) || resumeAtMs <= Date.now()) {
+			if (!Number.isFinite(resumeAtMs)) {
 				return;
 			}
 			const jobId = this._restoreQuotaWakeJob(entry.data.jobId, resumeAtMs);
@@ -13654,11 +13655,19 @@ export class AgentSession {
 					jobId,
 				});
 			}
+			// A wake already due belongs to its durable job (the daemon delivers it,
+			// or the next turn settles it): keep the park so its count still bounds
+			// the episode, and arm no timer that would race that delivery. With no
+			// job left (a one-shot cannot be rebuilt in the past) the in-process
+			// timer wakes the park at once.
+			const pastDue = resumeAtMs <= Date.now();
 			this._quotaPark = {
 				parkCount: entry.data.parkCount,
 				resumeAtMs,
 				...(jobId !== undefined ? { jobId } : {}),
-				timer: this._scheduleQuotaResumeTimer(resumeAtMs),
+				...(pastDue && jobId !== undefined
+					? { waking: true }
+					: { timer: this._scheduleQuotaResumeTimer(resumeAtMs) }),
 			};
 			return;
 		}

@@ -1047,6 +1047,16 @@ describe("AgentSession retry and event characterization", () => {
 		await promptParked(harness, "do the work");
 		const sessionFile = harness.session.sessionFile!;
 
+		// A restart past the wake time keeps the park count and leaves the wake to the durable job: no timer.
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(quotaPark(harness)!.resumeAtMs + 1);
+		const late = await createHarness({ existingSessionFile: sessionFile, settings }).finally(() =>
+			vi.useRealTimers(),
+		);
+		harnesses.push(late);
+		expect(quotaPark(late)).toMatchObject({ parkCount: 1, jobId: quotaPark(harness)?.jobId, waking: true });
+		expect(quotaPark(late)).not.toHaveProperty("timer");
+
 		// A restart rebuilds the park, and the wake still bounds the episode.
 		const restarted = await createHarness({ existingSessionFile: sessionFile, settings });
 		harnesses.push(restarted);
@@ -1090,8 +1100,15 @@ describe("AgentSession retry and event characterization", () => {
 		harnesses.push(restarted);
 		expect(restarted.session.isQuotaParked).toBe(true);
 
-		await wakeQuotaProbe(harness)();
-		expect(harness.session.isQuotaParked).toBe(false);
+		// Past the wake time the rebuild cannot schedule a one-shot job: the in-process timer wakes the park at once.
+		const resumed = assistantTurns(harness);
+		await harness.session.navigateTree(lastUserEntryId(harness));
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(quotaPark(restarted)!.resumeAtMs + 1);
+		await harness.session.navigateTree(parkedLeaf);
+		await resumed().finally(() => vi.useRealTimers());
+		expect([harness.session.isQuotaParked, harness.faux.state.callCount]).toEqual([false, 2]);
+		expect(quotaEntries(harness, "provider_quota_resume")[0]?.outcome).toBe("wake");
 	});
 
 	it("preserves an active goal across a quota park and resumes its continuation", async () => {
