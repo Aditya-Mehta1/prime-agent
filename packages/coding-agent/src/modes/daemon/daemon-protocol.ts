@@ -77,7 +77,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 28 publishes the last recorded model on saved-session rows.
 // Revision 29 adds the capability-gated abort_and_send_queued command.
 // Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
-export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_REVISION = 31;
 export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-f908f493c9e1";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
@@ -748,6 +748,8 @@ const SESSION_INPUT_PAUSE_COMMAND = {
 	capability: "session_input_pause",
 } as const;
 const AGENT_PEER_LIST_COMMAND = { minProtocol: 7, minSchemaRevision: 23 } as const;
+/** The per-session image-model pin, introduced with schema revision 31. */
+const SET_IMAGE_MODEL_COMMAND = { minProtocol: 7, minSchemaRevision: 31 } as const;
 const DIRECT_PEER_TRANSPORT_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 25,
@@ -823,7 +825,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	set_model: LEGACY_DAEMON_COMMAND,
 	cycle_model: LEGACY_DAEMON_COMMAND,
 	set_scoped_models: LEGACY_DAEMON_COMMAND,
-	set_image_model: LEGACY_DAEMON_COMMAND,
+	set_image_model: SET_IMAGE_MODEL_COMMAND,
 	set_thinking_level: LEGACY_DAEMON_COMMAND,
 	set_service_tier: LEGACY_DAEMON_COMMAND,
 	cycle_thinking_level: LEGACY_DAEMON_COMMAND,

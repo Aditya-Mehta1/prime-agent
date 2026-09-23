@@ -14,6 +14,7 @@ import type {
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
 import type { ExtensionUIContext } from "../../core/extensions/types.js";
+import { IMAGE_MODEL_PIN_READINESS_TIMEOUT_MS } from "../../core/image-model-routing.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { CustomMessage } from "../../core/messages.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
@@ -490,6 +491,10 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async setImageModel(reference: string | null): Promise<AgentConnectionModel | undefined> {
+		// Refresh first, like setModel: a provider authenticated moments ago is
+		// not in the available list yet, and the pin would be refused as unusable.
+		await this.session.modelRegistry.refreshAvailableModels();
+		await this.session.modelRegistry.waitForPendingModelRefreshes(IMAGE_MODEL_PIN_READINESS_TIMEOUT_MS);
 		return this.session.setImageModelOverride(reference ?? undefined);
 	}
 

@@ -1322,6 +1322,8 @@ export class InteractiveMode {
 	private initialRenderPromise: Promise<void> | undefined = undefined;
 	private sessionEventGeneration = 0;
 	private serviceTierChangeQueue: Promise<void> = Promise.resolve();
+	/** Serializes /image-model pin changes so rapid commands land in order. */
+	private imageModelChangeQueue: Promise<void> = Promise.resolve();
 
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 	private ipythonToolComponents = new Map<string, ToolExecutionComponent>();
@@ -8541,20 +8543,41 @@ export class InteractiveMode {
 		await this.applyImageModelOverride(`${resolution.model.provider}/${resolution.model.id}`);
 	}
 
-	private async applyImageModelOverride(reference: string | null): Promise<void> {
-		try {
-			const model = await this.agentConnection.setImageModel(reference);
-			this.patchConnectionState({ imageModel: reference ?? undefined });
-			this.showStatus(
-				model ? `Image model: ${model.provider}/${model.id} (this session)` : this.describeImageModel(),
-			);
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-		}
+	/**
+	 * Apply one pin change. Changes are serialized through one queue so two
+	 * rapid commands land in submission order, and each resumed change checks
+	 * that it still belongs to the session it started on, so a session switch
+	 * mid-flight cannot report or clear the replacement session's pin.
+	 */
+	private applyImageModelOverride(reference: string | null): Promise<void> {
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		const applied = this.imageModelChangeQueue.then(async () => {
+			if (this.agentConnection !== connection || this.connectionState?.sessionId !== sessionId) return;
+			try {
+				const model = await connection.setImageModel(reference);
+				if (this.agentConnection !== connection || this.connectionState?.sessionId !== sessionId) return;
+				this.patchConnectionState({ imageModel: reference ?? undefined });
+				this.showStatus(
+					model ? `Image model: ${model.provider}/${model.id} (this session)` : this.describeImageModel(),
+				);
+			} catch (error) {
+				this.showError(error instanceof Error ? error.message : String(error));
+			}
+		});
+		this.imageModelChangeQueue = applied.catch(() => {});
+		return applied;
 	}
 
-	/** One-line state of the image model that serves this session's image turns. */
+	/** One-line state of the image model that reads this session's image turns. */
 	private describeImageModel(): string {
+		const sessionModel = this.getCurrentModel();
+		const sessionModelDisplay = sessionModel ? ` (${sessionModel.provider}/${sessionModel.id})` : "";
+		// A model that accepts images reads them itself, so the pin and the
+		// setting only matter for a model that cannot.
+		if (!sessionModel || sessionModel.input.includes("image")) {
+			return `Image model: same as the session model${sessionModelDisplay}`;
+		}
 		const override = this.connectionState?.imageModel;
 		if (override) return `Image model: ${override} (this session)`;
 		const configured = this.settingsManager.getImageModel();
@@ -8563,11 +8586,7 @@ export class InteractiveMode {
 			const display = resolved ? `${resolved.provider}/${resolved.id}` : configured;
 			return `Image model: ${display} (settings.imageModel)`;
 		}
-		const sessionModel = this.getCurrentModel();
-		if (sessionModel && !sessionModel.input.includes("image")) {
-			return `Image model: none set, so image turns fail on ${sessionModel.provider}/${sessionModel.id}. Set one with /image-model <model>.`;
-		}
-		return `Image model: same as the session model${sessionModel ? ` (${sessionModel.provider}/${sessionModel.id})` : ""}`;
+		return `Image model: none set, so image turns fail on ${sessionModel.provider}/${sessionModel.id}. Set one with /image-model <model>.`;
 	}
 
 	/**

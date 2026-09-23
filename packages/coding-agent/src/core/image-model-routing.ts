@@ -11,6 +11,14 @@ import {
 } from "./auth-guidance.js";
 import { findExactModelReferenceMatch } from "./model-resolver.js";
 
+/**
+ * How long a pin setter waits for the model catalog's background refresh to
+ * settle. refreshAvailableModels() resolves while its fetch keeps running, so a
+ * provider authenticated moments ago is otherwise missing from the very list a
+ * pin is validated against.
+ */
+export const IMAGE_MODEL_PIN_READINESS_TIMEOUT_MS = 5_000;
+
 /** Inputs for validating one explicit image-model reference. */
 export interface ImageModelReferenceInputs {
 	/** Reference to resolve: "provider/model-id" or a bare model id. */

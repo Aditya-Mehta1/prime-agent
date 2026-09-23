@@ -12,6 +12,7 @@ type ImageModelCommandContext = {
 	getModelSelectorRefreshPromise: () => Promise<Model<Api>[]> | undefined;
 	getCurrentModel: () => Model<Api> | undefined;
 	isModelProviderConfigured: (model: Model<Api>) => boolean;
+	imageModelChangeQueue: Promise<void>;
 	applyImageModelOverride: (reference: string | null) => Promise<void>;
 	describeImageModel: () => string;
 	resolveImageModelReferenceForCommand: (
@@ -73,6 +74,7 @@ function createContext(options: { sessionModel?: Model<Api>; imageModel?: string
 		}),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
+		imageModelChangeQueue: Promise.resolve(),
 		applyImageModelOverride: (reference) => prototype.applyImageModelOverride.call(context, reference),
 		describeImageModel: () => prototype.describeImageModel.call(context),
 		resolveImageModelReferenceForCommand: (reference) =>
@@ -159,5 +161,54 @@ describe("/image-model", () => {
 		expect(context.showError).toHaveBeenCalledWith(expect.stringMatching(refusal));
 		expect(context.agentConnection.setImageModel).not.toHaveBeenCalled();
 		expect(context.patchConnectionState).not.toHaveBeenCalled();
+	});
+	it("serializes rapid pin changes so the last submission wins", async () => {
+		const context = createContext();
+		const order: string[] = [];
+		let releaseFirst!: () => void;
+		const firstSettles = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		context.agentConnection.setImageModel = vi.fn(async (reference) => {
+			order.push(`start:${reference}`);
+			if (order.length === 1) await firstSettles;
+			order.push(`end:${reference}`);
+			return reference === null ? undefined : VISION;
+		});
+
+		const first = prototype.handleImageModelCommand.call(context, "claude-haiku-4-5");
+		const second = prototype.handleImageModelCommand.call(context, "claude-opus-4-7");
+		releaseFirst();
+		await Promise.all([first, second]);
+		expect(order).toEqual([
+			"start:anthropic/claude-haiku-4-5",
+			"end:anthropic/claude-haiku-4-5",
+			"start:anthropic/claude-opus-4-7",
+			"end:anthropic/claude-opus-4-7",
+		]);
+		expect(context.connectionState?.imageModel).toBe("anthropic/claude-opus-4-7");
+	});
+
+	it("does not apply a resumed pin to a replacement session", async () => {
+		const context = createContext();
+		const originalConnection = context.agentConnection;
+		let releasePin!: () => void;
+		const pinSettles = new Promise<void>((resolve) => {
+			releasePin = resolve;
+		});
+		originalConnection.setImageModel = vi.fn(async () => {
+			await pinSettles;
+			return VISION;
+		});
+
+		const applied = prototype.handleImageModelCommand.call(context, "claude-haiku-4-5");
+		await Promise.resolve();
+		context.connectionState = { sessionId: "session-2", model: TEXT_ONLY };
+		context.agentConnection = { setImageModel: vi.fn(async () => undefined) };
+		releasePin();
+		await applied;
+
+		expect(context.patchConnectionState).not.toHaveBeenCalled();
+		expect(context.showStatus).not.toHaveBeenCalled();
 	});
 });

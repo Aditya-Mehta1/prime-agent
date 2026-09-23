@@ -89,6 +89,7 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
+import { IMAGE_MODEL_PIN_READINESS_TIMEOUT_MS } from "../../core/image-model-routing.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
@@ -5282,8 +5283,11 @@ export class AgentDaemon {
 				const session = state.runtime.session;
 				if (command.imageModel !== null) {
 					// Refresh first so a reference authenticated since the catalog was
-					// last read still resolves, mirroring set_model.
+					// last read still resolves, mirroring set_model. The refresh
+					// resolves while its background fetch keeps running, so wait for
+					// it before the pin is validated against a stale list.
 					await session.modelRegistry.refreshAvailableModels();
+					await session.modelRegistry.waitForPendingModelRefreshes(IMAGE_MODEL_PIN_READINESS_TIMEOUT_MS);
 				}
 				const imageModel = session.setImageModelOverride(command.imageModel ?? undefined);
 				return success(command.id, "set_image_model", imageModel ?? null);

@@ -5516,27 +5516,31 @@ export class AgentSession {
 			this._imageModelOverride = undefined;
 			return undefined;
 		}
-		// The candidate list is the one image turns are served from, so a pin is
-		// accepted only when it would actually route. A bare id that several
-		// providers share stays ambiguous there; the full catalog then only
-		// classifies the failure, so the refusal can still name the real problem.
+		// A pin is accepted only when it resolves in the very list image turns are
+		// read from, so an accepted pin can never be unusable at read time. The
+		// full catalog only classifies a refusal, so it can still name the real
+		// problem (a text-only model, or a provider without credentials).
 		const available = resolveImageModelReference({
 			reference: trimmed,
 			availableModels: this._modelRegistry.getAvailable(),
 			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
 		});
-		const resolution = available.ok
-			? available
-			: resolveImageModelReference({
-					reference: trimmed,
-					availableModels: this._modelRegistry.getAll(),
-					hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
-				});
-		if (!resolution.ok) {
-			throw new Error(formatImageModelReferenceRejectedMessage(trimmed, resolution.problem));
+		if (!available.ok) {
+			const catalog = resolveImageModelReference({
+				reference: trimmed,
+				availableModels: this._modelRegistry.getAll(),
+				hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
+			});
+			const problem =
+				catalog.ok && available.problem === "unresolved"
+					? "unauthenticated"
+					: catalog.ok
+						? available.problem
+						: catalog.problem;
+			throw new Error(formatImageModelReferenceRejectedMessage(trimmed, problem));
 		}
 		this._imageModelOverride = trimmed;
-		return resolution.model;
+		return available.model;
 	}
 
 	get promptTemplates(): ReadonlyArray<PromptTemplate> {
@@ -5690,11 +5694,33 @@ export class AgentSession {
 		normalized: NormalizedSubmission,
 	): NormalizedSubmission | Promise<NormalizedSubmission> {
 		if (normalized.kind !== "prompt" || !normalized.images?.length) return normalized;
-		return this._readTurnImagesWithChild(normalized.text, normalized.images).then((reading) => {
-			if (!reading) return normalized;
-			const text = normalized.text.trim() ? `${normalized.text}\n\n${reading}` : reading;
+		// Stay synchronous unless a child really reads: the queue callers (steer,
+		// follow-up) only await normalization on the prompt path, and a session
+		// that needs no reading must not pay for one.
+		if (!this._needsVisionChildRead(normalized.images)) return normalized;
+		const reading = this._readTurnImagesWithChild(normalized.text, normalized.images).then((result) => {
+			if (!result) return normalized;
+			const text = normalized.text.trim() ? `${normalized.text}\n\n${result}` : result;
 			return { ...normalized, text, images: undefined };
 		});
+		// A caller that abandons this promise must not crash the process: the
+		// read can fail (spawn error, timeout), and an unhandled rejection exits
+		// the daemon. Awaiting callers still see the rejection.
+		reading.catch(() => {});
+		return reading;
+	}
+
+	/**
+	 * Whether this submission needs the image-turn child: images the session
+	 * model cannot see, images not blocked, and an image model that resolves.
+	 * Synchronous, so callers can keep their non-async path when none applies.
+	 */
+	private _needsVisionChildRead(images: ImageContent[]): boolean {
+		if (images.length === 0) return false;
+		const sessionModel = this.model;
+		if (!sessionModel || sessionModel.input.includes("image")) return false;
+		if (this.settingsManager.getBlockImages()) return false;
+		return this._imageTurnChildModelReference() !== undefined;
 	}
 
 	private _normalizeSubmissionInner(
@@ -6442,13 +6468,13 @@ export class AgentSession {
 			priority?: SessionActionPriority;
 		} = {},
 	): Promise<void> {
-		const normalized = this._normalizeSubmission(text, images, {
+		const normalized = await this._normalizeSubmission(text, images, {
 			parseSessionCommands: false,
 			extensionCommands: "reject",
 			expandSkills: true,
 			expandPromptTemplates: true,
 		});
-		if (normalized instanceof Promise || normalized.kind !== "prompt") {
+		if (normalized.kind !== "prompt") {
 			throw new Error("Queued prompt normalization did not produce a prompt");
 		}
 
@@ -6477,13 +6503,13 @@ export class AgentSession {
 			priority?: SessionActionPriority;
 		} = {},
 	): Promise<boolean> {
-		const normalized = this._normalizeSubmission(text, images, {
+		const normalized = await this._normalizeSubmission(text, images, {
 			parseSessionCommands: false,
 			extensionCommands: "reject",
 			expandSkills: true,
 			expandPromptTemplates: true,
 		});
-		if (normalized instanceof Promise || normalized.kind !== "prompt") {
+		if (normalized.kind !== "prompt") {
 			throw new Error("Queued prompt normalization did not produce a prompt");
 		}
 

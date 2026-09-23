@@ -37,11 +37,16 @@ interface ImageTurnHarness {
  * A session whose model cannot see images, with a spied child runtime so the
  * spawn shape is observable without a real child process.
  */
-function createImageTurnHarness(settings: Record<string, unknown>): ImageTurnHarness {
+function createImageTurnHarness(
+	settings: Record<string, unknown>,
+	options: { vision?: boolean } = {},
+): ImageTurnHarness {
 	const dir = mkdtempSync(join(tmpdir(), "pi-image-turn-child-"));
 	writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
 	const base = getCodingAgentFixtureModel("anthropic", "claude-opus-4-7");
-	const sessionModel = { ...base, id: "claude-opus-4-7-text-only", input: ["text"] } as typeof base;
+	const sessionModel = (
+		options.vision ? base : { ...base, id: "claude-opus-4-7-text-only", input: ["text"] }
+	) as typeof base;
 	const servedModelIds: string[] = [];
 	const requests: Array<{ model: string; content: unknown[] }[]> = [];
 	const agent = new Agent({
@@ -116,8 +121,8 @@ function createImageTurnHarness(settings: Record<string, unknown>): ImageTurnHar
 }
 
 const harnesses: ImageTurnHarness[] = [];
-function harnessFor(settings: Record<string, unknown>): ImageTurnHarness {
-	const harness = createImageTurnHarness(settings);
+function harnessFor(settings: Record<string, unknown>, options: { vision?: boolean } = {}): ImageTurnHarness {
+	const harness = createImageTurnHarness(settings, options);
 	harnesses.push(harness);
 	return harness;
 }
@@ -200,5 +205,61 @@ describe("image turns on a text-only session model", () => {
 			/did not finish reading the attached image\(s\).*image-model/s,
 		);
 		expect(harness.servedModelIds).toEqual([]);
+	});
+});
+
+/** Content blocks of every user message the session recorded. */
+function userContents(session: AgentSession): Array<Array<{ type: string; text?: string }>> {
+	return session.messages.flatMap((message) => {
+		const entry = message as { role?: string; content?: Array<{ type: string; text?: string }> };
+		return entry.role === "user" && Array.isArray(entry.content) ? [entry.content] : [];
+	});
+}
+
+function contentText(content: Array<{ type: string; text?: string }>): string {
+	return content.map((block) => block.text ?? "").join("\n");
+}
+
+describe("image steers and follow-ups", () => {
+	it("queues a steered image inline on a vision-capable session model", async () => {
+		const harness = harnessFor(SET, { vision: true });
+		harness.spawnChild();
+		await harness.session.steer("look at this", [IMAGE]);
+		await harness.session.prompt("continue");
+		expect(harness.spawns).toHaveLength(0);
+		const steered = userContents(harness.session).find((content) => contentText(content).includes("look at this"));
+		expect(steered?.some((block) => block.type === "image")).toBe(true);
+	});
+
+	it("reads steered images with the child on a text-only session model", async () => {
+		const harness = harnessFor(SET);
+		harness.spawnChild({ reading: "A red error banner." });
+		await harness.session.steer("look at this", [IMAGE]);
+		await harness.session.prompt("continue");
+		expect(harness.spawns).toHaveLength(1);
+		const steered = userContents(harness.session).find((content) => contentText(content).includes("look at this"));
+		expect(steered?.some((block) => block.type === "image")).toBe(false);
+		expect(contentText(steered ?? [])).toContain("A red error banner.");
+	});
+
+	it("reads follow-up images with the child on a text-only session model", async () => {
+		const harness = harnessFor(SET);
+		harness.spawnChild({ reading: "A chart trending up." });
+		await harness.session.followUp("look at this", [IMAGE]);
+		await harness.session.prompt("continue");
+		expect(harness.spawns).toHaveLength(1);
+		const queued = userContents(harness.session).find((content) => contentText(content).includes("look at this"));
+		expect(queued?.some((block) => block.type === "image")).toBe(false);
+		expect(contentText(queued ?? [])).toContain("A chart trending up.");
+	});
+
+	it("keeps a follow-up image inline on a vision-capable session model", async () => {
+		const harness = harnessFor(SET, { vision: true });
+		harness.spawnChild();
+		await harness.session.followUp("look at this", [IMAGE]);
+		await harness.session.prompt("continue");
+		expect(harness.spawns).toHaveLength(0);
+		const queued = userContents(harness.session).find((content) => contentText(content).includes("look at this"));
+		expect(queued?.some((block) => block.type === "image")).toBe(true);
 	});
 });

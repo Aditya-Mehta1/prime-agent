@@ -66,7 +66,7 @@ export function formatImageModelUnusableMessage(reference: string): string {
 	return [
 		`imageModel "${reference}" could not be resolved to an available, image-capable, authenticated model.`,
 		"",
-		"Fix the imageModel setting (settings.json) or authenticate the provider, then resend the message.",
+		"Fix it with /image-model (this session) or the imageModel setting (settings.json), and authenticate the provider, then resend the message.",
 	].join("\n");
 }
 
