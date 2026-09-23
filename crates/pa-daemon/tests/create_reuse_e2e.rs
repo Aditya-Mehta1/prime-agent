@@ -307,10 +307,7 @@ fn create_over_a_live_worker_answers_the_live_binding() {
     assert_eq!(first_text, "first scripted");
 
     // Exactly one session serves the file: the reuse launched nothing.
-    second_pane.send_command(
-        "l1",
-        json!({ "type": "list", "all": true }),
-    );
+    second_pane.send_command("l1", json!({ "type": "list", "all": true }));
     let listed = second_pane.read_response("l1");
     assert_eq!(listed["success"], true, "list failed: {listed}");
     let sessions = listed["data"]["sessions"]
@@ -319,9 +316,7 @@ fn create_over_a_live_worker_answers_the_live_binding() {
         .unwrap_or_default();
     let for_file: Vec<&Value> = sessions
         .iter()
-        .filter(|row| {
-            row.get("sessionFile").and_then(Value::as_str) == Some(session_file.as_str())
-        })
+        .filter(|row| row.get("sessionFile").and_then(Value::as_str) == Some(session_file.as_str()))
         .collect();
     assert_eq!(
         for_file.len(),

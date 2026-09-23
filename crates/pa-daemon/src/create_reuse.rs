@@ -192,13 +192,10 @@ impl Supervisor {
             Err(_) => {
                 let state = self.effective_reuse_state(resident).await;
                 let detail = {
-                    let last_error = resident
-                        .descriptor
-                        .lock()
-                        .await
-                        .last_error
-                        .clone();
-                    last_error.map(|error| format!(": {error}")).unwrap_or_default()
+                    let last_error = resident.descriptor.lock().await.last_error.clone();
+                    last_error
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
                 };
                 Err(anyhow!(
                     "Session \"{session_path}\" worker is {state}{detail}"
@@ -212,10 +209,7 @@ impl Supervisor {
     /// launch). Past the settle budget the open answers the TS `worker is
     /// stopping` shape — never the lease rejection a racing launch would
     /// surface.
-    async fn await_stop_settled(
-        self: &Arc<Self>,
-        resident: &Arc<ResidentWorker>,
-    ) -> Result<()> {
+    async fn await_stop_settled(self: &Arc<Self>, resident: &Arc<ResidentWorker>) -> Result<()> {
         let deadline = tokio::time::Instant::now() + STOP_SETTLE_WAIT;
         loop {
             if self.registry.get(&resident.worker_id).await.is_none()
@@ -238,7 +232,11 @@ impl Supervisor {
     async fn effective_reuse_state(&self, resident: &Arc<ResidentWorker>) -> &'static str {
         let connected = resident.cmd_tx.lock().await.is_some();
         let lifecycle = resident.descriptor.lock().await.lifecycle;
-        crate::peer_tickets::effective_worker_state(connected, &lifecycle, self.is_stopping(resident))
+        crate::peer_tickets::effective_worker_state(
+            connected,
+            &lifecycle,
+            self.is_stopping(resident),
+        )
     }
 }
 
@@ -275,7 +273,10 @@ async fn client_owned_conflict(
 mod tests {
     use super::*;
 
-    fn resident_with(owner_client_id: Option<&str>, root_active_session_id: &str) -> Arc<ResidentWorker> {
+    fn resident_with(
+        owner_client_id: Option<&str>,
+        root_active_session_id: &str,
+    ) -> Arc<ResidentWorker> {
         let descriptor: pa_types::daemon::DaemonWorkerDescriptor =
             serde_json::from_value(serde_json::json!({
                 "version": 2,
@@ -326,9 +327,11 @@ mod tests {
     #[tokio::test]
     async fn a_plain_create_never_conflicts_on_ownership() {
         let resident = resident_with(Some("daemon-tui:1"), "live-id");
-        assert!(client_owned_conflict(&resident, None, "daemon-tui:2", "/s.jsonl")
-            .await
-            .is_none());
+        assert!(
+            client_owned_conflict(&resident, None, "daemon-tui:2", "/s.jsonl")
+                .await
+                .is_none()
+        );
     }
 
     /// The owning client's own re-open (TS: a client-owned create whose
