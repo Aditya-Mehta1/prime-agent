@@ -188,11 +188,20 @@ impl AgentMessageController for LinkAgentMessageController {
         // remote path) whenever the direct link cannot be established -
         // but never after the delivery command was sent: the grant burns
         // on first use, so an in-flight delivery's outcome is final.
-        match self.deliver_direct(&input).await {
-            DirectDelivery::Delivered(receipt) => Ok(receipt),
-            DirectDelivery::Unavailable => self.deliver_via_supervisor(input).await,
-            DirectDelivery::Failed(error) => Err(anyhow::anyhow!(error)),
+        let receipt = match self.deliver_direct(&input).await {
+            DirectDelivery::Delivered(receipt) => receipt,
+            DirectDelivery::Unavailable => self.deliver_via_supervisor(input.clone()).await?,
+            DirectDelivery::Failed(error) => return Err(anyhow::anyhow!(error)),
+        };
+        // A message delivered to one of this session's own children starts
+        // a follow-up turn there (delayed messaging): re-arm that child's
+        // usage observation so the turn's completions attribute to the
+        // spawning parent assistant row (TS keeps the child subscription
+        // alive; the Rust task-run watcher retired at its settle).
+        if let Some(children) = &self.children {
+            children.observe_child_usage(&input.target).await;
         }
+        Ok(receipt)
     }
 }
 
