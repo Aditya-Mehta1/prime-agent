@@ -47,6 +47,11 @@ impl Supervisor {
                 return;
             }
         };
+        // Roots re-snapshot after the ledger awaits: a root that
+        // stopped while the ledger was being read must not receive
+        // seeded rows (its passivation already settled and never
+        // revisits them).
+        let roots = self.roster_seed_roots().await;
         let mut changed = Vec::new();
         for edge in &edges {
             let parent = canonical_session_path(Path::new(&edge.parent));

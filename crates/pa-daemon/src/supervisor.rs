@@ -15,9 +15,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::future::join_all;
 use pa_types::daemon::{
-    DaemonCommand, DaemonErrorInfo, DaemonOutbound, DaemonWorkerDescriptor, DaemonWorkerLifecycle,
-    DurableDaemonCreateCommand, SnapshotPurpose, UpdateId, UpdatePreparedMarker,
-    UpdateTimeoutBudget,
+    DaemonCommand, DaemonErrorInfo, DaemonOutbound, DaemonSessionLifecycle, DaemonWorkerDescriptor,
+    DaemonWorkerLifecycle, DurableDaemonCreateCommand, SnapshotPurpose, UpdateId,
+    UpdatePreparedMarker, UpdateTimeoutBudget,
 };
 use pa_types::platform::transport::{bind_transport, connect_transport, TransportStream};
 use serde_json::{json, Value};
@@ -3812,7 +3812,24 @@ impl Supervisor {
         {
             return Ok(summary);
         }
-        let (resident, create_summary) = self.launch_worker(command, Some(client_id)).await?;
+        // TS daemon-supervisor.ts: only a `client_owned`-lifecycle create
+        // is client-owned (`ownerClientId = command.lifecycle ===
+        // "client_owned" ? clientId : undefined`). Every RLM child spawn
+        // declares `Resident`, so a spawned child never inherits the
+        // spawning client's ownership: passivation deletes an owned
+        // worker's rows, and a stopped child under a surviving root must
+        // passivate instead (the walk e2e asserts the seeded passive row
+        // survives the kill). Other creates keep the port's existing
+        // owner marking.
+        let create_lifecycle = match command {
+            DaemonCommand::Create { lifecycle, .. } => *lifecycle,
+            _ => None,
+        };
+        let owner_client_id = match create_lifecycle {
+            Some(DaemonSessionLifecycle::Resident) => None,
+            _ => Some(client_id),
+        };
+        let (resident, create_summary) = self.launch_worker(command, owner_client_id).await?;
         // The launch registered its worker (the registry insert precedes
         // the spawn): the single-flight releases here so a concurrent
         // open's classification finds the freshly-launched resident.
