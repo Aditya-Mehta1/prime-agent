@@ -87,7 +87,12 @@ impl SessionNavigation {
             let mut core = self.core.lock().unwrap();
             core.store = Some(file);
         }
-        self.engine.set_session_file(new_path);
+        self.engine.set_session_file(new_path.clone());
+        // TS re-restores the moved-to session's saved model at its runtime
+        // recreation (`createRuntime` -> `createAgentSession`): the
+        // replacement session resolves to the model its own file pins,
+        // not the previous session's (an explicit flag still wins inside).
+        self.engine.restore_session_model(&new_path).await;
         // The replacement retired the runtime, so the rebuild parks on the
         // fresh, unbuilt session: its first build seeds the goal state
         // from the moved branch's own rows (the TS constructor's
@@ -98,6 +103,26 @@ impl SessionNavigation {
             pa_core::session_engine::goal_driver::GoalBranchReload::FaithfulBranch,
         )
         .await
+    }
+
+    fn target_lease(
+        &self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<Option<Arc<crate::lease::SessionLease>>> {
+        let source = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .and_then(|store| store.lease.clone());
+        match source {
+            Some(source) if source.session_path == crate::lease::canonical_session_path(path) => {
+                Ok(Some(source))
+            }
+            Some(source) => source.acquire_target(path).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// `new_session`'s prepare phase (TS `SessionManager.create` +
@@ -136,6 +161,9 @@ impl SessionNavigation {
         let mut fresh = SessionFile::create(&cwd, parent_session.as_deref(), rlm_depth);
         if let Some(session_dir) = session_dir {
             fresh.set_path(session_dir.join(session_file_name(fresh.session_id())));
+            fresh.lease = self
+                .target_lease(&fresh.path)
+                .map_err(|error| response_failure(None, "new_session", &error.to_string(), None))?;
             if let Err(error) = fresh.rewrite() {
                 return Err(response_failure(
                     None,
@@ -172,7 +200,7 @@ impl SessionNavigation {
             .get("cwdOverride")
             .and_then(Value::as_str)
             .map(str::to_string);
-        self.open_replacement(session_path, cwd_override, "switch_session")
+        self.open_replacement(session_path, cwd_override, "switch_session", None)
             .await
     }
 
@@ -232,6 +260,9 @@ impl SessionNavigation {
         std::fs::create_dir_all(target.parent().unwrap_or(std::path::Path::new(".")))
             .map_err(|error| error.to_string())
             .ok();
+        let lease = self
+            .target_lease(&target)
+            .map_err(|error| response_failure(None, "import_jsonl", &error.to_string(), None))?;
         if std::fs::canonicalize(&target).ok() != std::fs::canonicalize(resolved).ok() {
             if let Err(error) = std::fs::copy(resolved, &target) {
                 return Err(response_failure(
@@ -242,8 +273,13 @@ impl SessionNavigation {
                 ));
             }
         }
-        self.open_replacement(&target.to_string_lossy(), cwd_override, "import_jsonl")
-            .await
+        self.open_replacement(
+            &target.to_string_lossy(),
+            cwd_override,
+            "import_jsonl",
+            lease,
+        )
+        .await
     }
 
     /// Open one replacement session file and check its stored cwd exists
@@ -259,9 +295,17 @@ impl SessionNavigation {
         path: &str,
         cwd_override: Option<String>,
         command: &'static str,
+        lease: Option<Arc<crate::lease::SessionLease>>,
     ) -> Result<PreparedReplacement, DaemonResponse> {
-        let file = SessionFile::open(std::path::Path::new(path))
+        let lease = match lease {
+            Some(lease) => Some(lease),
+            None => self
+                .target_lease(std::path::Path::new(path))
+                .map_err(|error| response_failure(None, command, &error.to_string(), None))?,
+        };
+        let mut file = SessionFile::open(std::path::Path::new(path))
             .map_err(|error| response_failure(None, command, &error.to_string(), None))?;
+        file.lease = lease;
         let cwd = cwd_override
             .clone()
             .or_else(|| (!file.header.cwd.is_empty()).then(|| file.header.cwd.clone()));
@@ -336,6 +380,11 @@ impl Worker {
             // (the TS `releaseUncommittedLease` fallthrough).
             Err(response) => return response,
         };
+        // One replacement at a time: the teardown, the swap, the restore,
+        // and the rebuild below are one serialized critical section, so a
+        // concurrent replacement command never interleaves at the
+        // restore's awaits against this command's session.
+        let _replacement_gate = self.replacement_gate.lock().await;
         // TS `teardownForReplacement` rethrows: a failed retire (the
         // session's own kernel dispose, or a child close) fails the
         // replacement command with the old runtime already torn down.

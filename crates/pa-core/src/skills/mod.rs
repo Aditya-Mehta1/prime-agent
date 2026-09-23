@@ -99,6 +99,16 @@ impl Skill {
     pub fn is_python(&self) -> bool {
         self.kind == SkillKind::Python
     }
+
+    /// The kind label the prompt inventory and telemetry share
+    /// (`<type>` in `format_skills_for_prompt`, `skill_kind` in events).
+    pub fn kind_label(&self) -> &'static str {
+        if self.is_python() {
+            "python"
+        } else {
+            "markdown"
+        }
+    }
 }
 
 /// Runtime info for kernel-side Python skill preparation.
@@ -196,14 +206,7 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     for skill in visible {
         lines.push("  <skill>".to_string());
         lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!(
-            "    <type>{}</type>",
-            if skill.is_python() {
-                "python"
-            } else {
-                "markdown"
-            }
-        ));
+        lines.push(format!("    <type>{}</type>", skill.kind_label()));
         if let Some(python) = &skill.python {
             lines.push(format!(
                 "    <python_import>{}</python_import>",
@@ -233,6 +236,42 @@ pub(crate) fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Expand skill commands (`/skill:<name> [args]`) into the `<skill ...>`
+/// message block. Port of `AgentSession._expandSkillCommand`: a non-skill
+/// input passes through unchanged; an unknown skill name passes through
+/// (the surfaces show their own unknown-command notice); a skill file that
+/// fails to read passes through (TS emits an extension error event here,
+/// a seam the Rust extension runner does not have yet). Returns the skill
+/// the expansion used so the caller can report the invocation.
+pub fn expand_skill_command<'a>(text: &str, skills: &'a [Skill]) -> (String, Option<&'a Skill>) {
+    let Some((name, args)) = parse_slash_command(text) else {
+        return (text.to_string(), None);
+    };
+    let Some(skill_name) = name.strip_prefix("skill:") else {
+        return (text.to_string(), None);
+    };
+    let Some(skill) = skills.iter().find(|skill| skill.name == skill_name) else {
+        return (text.to_string(), None);
+    };
+    let Ok(content) = std::fs::read_to_string(&skill.file_path) else {
+        return (text.to_string(), None);
+    };
+    let body = frontmatter::strip_frontmatter(&content).trim().to_string();
+    let block = format!(
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+        skill.name,
+        skill.file_path.display(),
+        skill.base_dir.display(),
+        body
+    );
+    let expanded = if args.is_empty() {
+        block
+    } else {
+        format!("{block}\n\n{args}")
+    };
+    (expanded, Some(skill))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +291,89 @@ mod tests {
         assert!(validate_description("ok").is_empty());
         let long = "x".repeat(MAX_DESCRIPTION_LENGTH + 1);
         assert!(validate_description(&long).len() == 1);
+    }
+
+    fn temp_skill(name: &str, dir: &std::path::Path) -> Skill {
+        let file_path = dir.join("SKILL.md");
+        std::fs::write(
+            &file_path,
+            format!("---\nname: {name}\ndescription: test skill\n---\nUse {name} well."),
+        )
+        .expect("write skill file");
+        Skill {
+            name: name.to_string(),
+            description: "test skill".to_string(),
+            file_path: file_path.clone(),
+            base_dir: dir.to_path_buf(),
+            source_info: create_synthetic_source_info(
+                &file_path.display().to_string(),
+                "user",
+                SourceScope::User,
+                None,
+            ),
+            disable_model_invocation: false,
+            kind: SkillKind::Markdown,
+            python: None,
+        }
+    }
+
+    #[test]
+    fn expands_a_known_skill_command_with_and_without_args() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = temp_skill("web-search", dir.path());
+        let skills = [skill];
+        let (expanded, used) = expand_skill_command("/skill:web-search", &skills);
+        assert_eq!(used.map(|skill| skill.name.as_str()), Some("web-search"));
+        let parsed = pa_types::skill_blocks::parse_skill_block(&expanded).expect("parses");
+        assert_eq!(parsed.name, "web-search");
+        // TS block shape: the references note rides inside the body,
+        // ahead of the frontmatter-stripped skill content.
+        assert_eq!(
+            parsed.content,
+            format!(
+                "References are relative to {}.\n\nUse web-search well.",
+                dir.path().display()
+            )
+        );
+        assert_eq!(parsed.user_message, None);
+        assert!(parsed.location.ends_with("SKILL.md"));
+
+        let (expanded, used) = expand_skill_command("/skill:web-search find rust tuis", &skills);
+        assert_eq!(used.map(|skill| skill.name.as_str()), Some("web-search"));
+        let parsed = pa_types::skill_blocks::parse_skill_block(&expanded).expect("parses");
+        assert_eq!(
+            parsed.user_message.as_deref(),
+            Some("find rust tuis"),
+            "args follow the block after a blank line"
+        );
+    }
+
+    #[test]
+    fn non_skill_and_unknown_inputs_pass_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills = [temp_skill("web-search", dir.path())];
+        for text in [
+            "hello world",
+            "/compact",
+            "/skill:missing do something",
+            "/skill:",
+        ] {
+            let (expanded, used) = expand_skill_command(text, &skills);
+            assert_eq!(expanded, text, "{text} must pass through");
+            assert!(used.is_none(), "{text} must not report a skill");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_skill_file_passes_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut skill = temp_skill("gone", dir.path());
+        std::fs::remove_file(&skill.file_path).expect("remove skill file");
+        skill.file_path = dir.path().join("missing-SKILL.md");
+        let skills = [skill];
+        let (expanded, used) = expand_skill_command("/skill:gone", &skills);
+        assert_eq!(expanded, "/skill:gone");
+        assert!(used.is_none());
     }
 
     #[test]

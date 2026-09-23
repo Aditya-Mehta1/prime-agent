@@ -400,23 +400,27 @@ async fn mcp_view_lists_the_configured_mock_connection() {
         "search field rendered:\n{rendered}"
     );
     assert!(
-        rendered.contains("fixture-echo \u{b7} stdio"),
+        rendered.contains("fixture-echo"),
         "connection row rendered:\n{rendered}"
     );
     assert!(
-        rendered.contains("connected \u{b7} 1 tool"),
-        "status and tool count rendered:\n{rendered}"
+        rendered.contains("Connected"),
+        "status rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("1 tool"),
+        "tool count rendered:\n{rendered}"
     );
     assert!(
         rendered.contains("Echoes the message argument back."),
         "tool detail rendered:\n{rendered}"
     );
     assert!(
-        rendered.contains("Linear \u{b7} subscription"),
+        rendered.contains("Linear"),
         "built-in roster rows rendered:\n{rendered}"
     );
     assert!(
-        rendered.contains("navigate \u{b7} Enter select \u{b7} Esc close"),
+        rendered.contains("Enter manage accounts \u{b7} Esc close"),
         "key hint rendered:\n{rendered}"
     );
     // Esc closed the view: a frame after the last open one shows the

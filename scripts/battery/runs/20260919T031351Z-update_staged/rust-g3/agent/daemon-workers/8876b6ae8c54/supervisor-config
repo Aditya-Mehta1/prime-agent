@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/tmp/usw-rust-g3-20260919T031120Z/prime-agent-1000/daemon.sock",
-  "defaultSessionDir": "/tmp/usw-s5c/rust-g3/agent/sessions"
-}

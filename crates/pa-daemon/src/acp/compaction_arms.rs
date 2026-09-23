@@ -297,11 +297,7 @@ impl AcpSession {
         goal_queue: ThresholdGoalQueue,
     ) -> Option<pa_types::session::CustomMessage> {
         let engine = &mode.engine;
-        if !engine
-            .session
-            .auto_compaction_due(model.context_window)
-            .await
-        {
+        if !engine.session.auto_compaction_due(model).await {
             return None;
         }
         // TS's queue-site guard: error and aborted turns never queue the
@@ -654,7 +650,11 @@ async fn end_compaction_unsuccessfully(
     engine
         .session
         .record_compaction_outcome(reason, outcome, message)
-        .await;
+        .await
+        .inspect_err(|error| {
+            eprintln!("pa-daemon: compaction outcome persistence failed: {error:#}")
+        })
+        .ok();
     publish_compaction_end(session, None).await;
 }
 
@@ -667,6 +667,12 @@ async fn end_compaction_unsuccessfully(
 mod tests {
     use super::*;
     use crate::agent_engine::FAUX_TEST_LOCK;
+
+    /// The faux model's per-request output budget (maxTokens 16_384 under the
+    /// 32_000 request cap): threshold fixtures subtract it from the window
+    /// alongside the headroom (the combined input+output ceiling).
+    const FAUX_REQUEST_BUDGET: u64 = 16_384;
+
     use pa_core::session_engine::engine::{create_session, SessionEngineConfig};
     use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn};
     use serde_json::json;
@@ -729,6 +735,9 @@ mod tests {
         let engine = std::sync::Arc::new(
             create_session(SessionEngineConfig {
                 cron_store: None,
+                queued_steering_probe: None,
+                steering_mode: None,
+                follow_up_mode: None,
                 telemetry: None,
                 cwd: dir.path().to_path_buf(),
                 agent_dir: agent_dir.clone(),
@@ -935,7 +944,7 @@ mod tests {
                 ]
             }),
             128_000u64
-                .saturating_sub(seed_usage + crossing_delta / 4)
+                .saturating_sub(FAUX_REQUEST_BUDGET + seed_usage + crossing_delta / 4)
                 .max(1),
             10,
         )

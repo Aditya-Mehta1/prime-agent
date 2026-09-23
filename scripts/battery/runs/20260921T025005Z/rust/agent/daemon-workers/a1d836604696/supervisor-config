@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/tmp/nd-runs/20260921T025005Z/rust/daemon.sock",
-  "defaultSessionDir": "/tmp/nd-runs/20260921T025005Z/rust/agent/sessions"
-}

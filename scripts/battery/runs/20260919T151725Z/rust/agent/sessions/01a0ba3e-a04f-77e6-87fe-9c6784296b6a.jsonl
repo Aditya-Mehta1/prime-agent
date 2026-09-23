@@ -1,7 +1,0 @@
-{"cwd":"/tmp/kb-runs/20260919T151725Z/rust/work","id":"01a0ba3e-a04f-77e6-87fe-9c6784296b6a","rlmDepth":0,"timestamp":"2026-09-19T15:17:41.583Z","type":"session","version":3}
-{"type":"model_change","id":"bf89ea28","parentId":null,"timestamp":"2026-09-19T15:17:41.592Z","modelId":"mock-1","provider":"prime-inference"}
-{"type":"thinking_level_change","id":"59674394","parentId":"bf89ea28","timestamp":"2026-09-19T15:17:41.592Z","thinkingLevel":"off"}
-{"type":"service_tier_change","id":"009bcaf3","parentId":"59674394","timestamp":"2026-09-19T15:17:41.592Z","serviceTier":"default"}
-{"type":"session_state","id":"17db8d3b","parentId":"009bcaf3","timestamp":"2026-09-19T15:17:41.592Z","state":{"status":"active"}}
-{"type":"message","id":"b92132cd","parentId":"17db8d3b","timestamp":"2026-09-19T15:17:54.189Z","message":{"content":[{"text":"f23 closing turn","type":"text"}],"role":"user","timestamp":1789831074189}}
-{"type":"message","id":"26debb7c","parentId":"b92132cd","timestamp":"2026-09-19T15:17:54.222Z","message":{"api":"openai-completions","content":[{"text":"battery hello from mock","type":"text"}],"model":"mock-1","provider":"prime-inference","responseId":"chatcmpl-battery","role":"assistant","stopReason":"stop","timestamp":1789831074217,"usage":{"cacheRead":80,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":20,"output":10,"totalTokens":110}}}

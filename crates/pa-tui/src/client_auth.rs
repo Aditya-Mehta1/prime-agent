@@ -18,6 +18,10 @@ pub trait ClientAuthCommands: Send + Sync {
     /// Resolves with the status line to show (TS: `Connected <name>.`) or
     /// the error to surface.
     fn login(&self, server: &str) -> AuthFuture;
+    /// The inline paste panel's client surface: prompt for one pasted
+    /// static token, store it bound to the service endpoint, and verify.
+    /// Resolves with the status line (TS: `Connected <name>.`).
+    fn paste_token(&self, server: &str) -> AuthFuture;
     /// Remove a stored MCP credential. Resolves with the status line
     /// (TS: `<name> is not connected.` / `Disconnected <name>.`).
     fn logout(&self, server: &str) -> AuthFuture;
@@ -47,6 +51,10 @@ pub async fn run_mcp_auth_command(auth: &dyn ClientAuthCommands, args: &str) -> 
             Ok(status) => status,
             Err(error) => format!("{error:#}"),
         },
+        (Some("paste"), Some(server), true) => match auth.paste_token(server).await {
+            Ok(status) => status,
+            Err(error) => format!("{error:#}"),
+        },
         (Some("logout"), Some(server), true) => match auth.logout(server).await {
             Ok(status) => status,
             Err(error) => format!("{error:#}"),
@@ -54,10 +62,13 @@ pub async fn run_mcp_auth_command(auth: &dyn ClientAuthCommands, args: &str) -> 
         (Some("login"), _, false) | (Some("login"), None, true) => {
             "Usage: /mcp login <name> (e.g. /mcp login linear)".to_string()
         }
+        (Some("paste"), _, false) | (Some("paste"), None, true) => {
+            "Usage: /mcp paste <name> (a requires-setup token service)".to_string()
+        }
         (Some("logout"), _, false) | (Some("logout"), None, true) => {
             "Usage: /mcp logout <name>".to_string()
         }
-        _ => "Usage: /mcp login <name> | /mcp logout <name>".to_string(),
+        _ => "Usage: /mcp login <name> | /mcp paste <name> | /mcp logout <name>".to_string(),
     }
 }
 
@@ -81,6 +92,15 @@ mod tests {
             Box::pin(async move { Ok(answer) })
         }
 
+        fn paste_token(&self, server: &str) -> AuthFuture {
+            self.log
+                .lock()
+                .unwrap()
+                .push(("paste".to_string(), server.to_string()));
+            let answer = format!("Connected {server}.");
+            Box::pin(async move { Ok(answer) })
+        }
+
         fn logout(&self, server: &str) -> AuthFuture {
             self.log
                 .lock()
@@ -96,6 +116,11 @@ mod tests {
 
     impl ClientAuthCommands for FailingAuth {
         fn login(&self, server: &str) -> AuthFuture {
+            let error = anyhow::anyhow!("Unknown MCP integration: {server}");
+            Box::pin(async move { Err(error) })
+        }
+
+        fn paste_token(&self, server: &str) -> AuthFuture {
             let error = anyhow::anyhow!("Unknown MCP integration: {server}");
             Box::pin(async move { Err(error) })
         }
@@ -141,11 +166,11 @@ mod tests {
         );
         assert_eq!(
             run_mcp_auth_command(&auth, "").await,
-            "Usage: /mcp login <name> | /mcp logout <name>"
+            "Usage: /mcp login <name> | /mcp paste <name> | /mcp logout <name>"
         );
         assert_eq!(
             run_mcp_auth_command(&auth, "add http://x").await,
-            "Usage: /mcp login <name> | /mcp logout <name>"
+            "Usage: /mcp login <name> | /mcp paste <name> | /mcp logout <name>"
         );
         // Errors surface with their chain.
         assert_eq!(

@@ -24,9 +24,11 @@ use crate::event_stream::{
 };
 use crate::providers::bedrock::auth::{resolve_credentials, resolve_endpoint, sigv4_headers};
 use crate::providers::bedrock::convert::{
-    convert_messages, convert_tool_config, is_anthropic_claude_model, map_stop_reason,
-    map_thinking_level_to_effort, supports_adaptive_thinking, supports_always_on_adaptive_thinking,
-    BedrockToolChoice,
+    convert_messages, convert_tool_config, map_stop_reason, map_thinking_level_to_effort,
+    supports_always_on_adaptive_thinking, BedrockToolChoice,
+};
+pub(crate) use crate::providers::bedrock::convert::{
+    is_anthropic_claude_model, supports_adaptive_thinking,
 };
 use crate::providers::bedrock::events::{handle_event, BedrockStreamState};
 use crate::providers::bedrock::eventstream::EventStreamDecoder;
@@ -903,7 +905,7 @@ mod tests {
     }
 
     /// Connection failures surface undici's raw `TypeError` message, like the
-    /// codex raw-`fetch` path (the AWS SDK does not wrap them).
+    /// TS raw-`fetch` path (the AWS SDK does not wrap them).
     /// The in-stream exception message composition (`{prefix}: {message}`).
     #[test]
     fn bedrock_exception_message_shape() {

@@ -1,3 +1,0 @@
-supervisor started pid 1133883
-[2026-09-20T13:17:22.254Z] session worker b6ce18381eff registered (epoch 1, pid 1133890)
-[2026-09-20T13:17:22.306Z] session worker b6ce18381eff re-registered (epoch 2, pid 1133890)

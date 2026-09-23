@@ -1,3 +1,0 @@
-supervisor started pid 3510561
-[2026-09-17T15:37:16.930Z] session worker 943fb5f619ae registered (epoch 1, pid 3510568)
-[2026-09-17T15:37:16.975Z] session worker 943fb5f619ae re-registered (epoch 2, pid 3510568)

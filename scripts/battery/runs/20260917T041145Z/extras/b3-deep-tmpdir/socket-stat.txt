@@ -1,3 +1,0 @@
-/tmp/b3-rust-verify2/dddddddddddddddddddd/dddddddddddddddddddd/dddddddddddddddddddd/dddddddddddddddddddd/prime-agent-1000/worker-f8af0b58f7f4-d343d1b894cb.sock
-len=159
-size=0

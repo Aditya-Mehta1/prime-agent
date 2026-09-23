@@ -1,8 +1,0 @@
-{"activeSessionId":"ba8428dd35fa","busy":true,"operation":"create","recordedAt":"2026-09-20T22:14:50.038Z","sessionFile":"/repo/scripts/battery/runs/20260920T221429Z/rust/agent/sessions/01a0c0e2-e3a7-72c6-ab20-a9c8b52a890f.jsonl","sessionId":"01a0c0e2-e3a7-72c6-ab20-a9c8b52a890f"}
-{"active_session_id":"ba8428dd35fa","follow_up":[],"recorded_at":"2026-09-20T22:14:50.069Z","steering":["seed turn"],"type":"queue_snapshot","version":1}
-{"active_session_id":"ba8428dd35fa","follow_up":[],"recorded_at":"2026-09-20T22:14:50.126Z","steering":[],"type":"queue_snapshot","version":1}
-{"active_session_id":"ba8428dd35fa","follow_up":[],"recorded_at":"2026-09-20T22:14:50.126Z","steering":["turn two"],"type":"queue_snapshot","version":1}
-{"active_session_id":"ba8428dd35fa","follow_up":[],"recorded_at":"2026-09-20T22:14:50.185Z","steering":[],"type":"queue_snapshot","version":1}
-{"active_session_id":"ba8428dd35fa","follow_up":[],"recorded_at":"2026-09-20T22:14:50.185Z","steering":["turn three"],"type":"queue_snapshot","version":1}
-{"active_session_id":"ba8428dd35fa","follow_up":[],"recorded_at":"2026-09-20T22:14:50.238Z","steering":[],"type":"queue_snapshot","version":1}
-{"activeSessionId":"ba8428dd35fa","busy":false,"operation":"shutdown","recordedAt":"2026-09-20T22:15:50.729Z","sessionFile":"/repo/scripts/battery/runs/20260920T221429Z/rust/agent/sessions/01a0c0e2-e3a7-72c6-ab20-a9c8b52a890f.jsonl","sessionId":"01a0c0e2-e3a7-72c6-ab20-a9c8b52a890f"}

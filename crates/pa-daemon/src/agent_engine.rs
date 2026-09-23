@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
+use crate::model_allowlist::DaemonAllowlist;
 use crate::overflow_compaction::{OverflowArmRun, OverflowRecovery};
 use pa_agent::abort::AbortController;
 use pa_agent::types::StopReason;
@@ -39,7 +40,7 @@ use crate::goal_continuation::GoalBoundary;
 use crate::rlm_children::{ParentIdentity, SupervisorChildSessions, DEFAULT_RLM_MAX_DEPTH};
 
 /// Configuration for the real engine.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentEngineConfig {
     pub cwd: std::path::PathBuf,
     pub agent_dir: std::path::PathBuf,
@@ -74,6 +75,11 @@ pub struct AgentEngineConfig {
     /// The binding is enriched per build from the worker's live/durable
     /// session identity.
     pub cron_store: Option<pa_core::session_engine::runtime_wiring::KernelCronWiring>,
+    /// TS `_steeringStopPending` (the session's stop hooks): `true` while
+    /// the worker's steering lane holds a queued item, so the running turn
+    /// stops at the next turn boundary and the steer delivers as the next
+    /// input (the follow-up lane never stops the run).
+    pub queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Supervisor-link coordinates for a daemon worker.
@@ -102,9 +108,25 @@ pub(crate) struct GoalRuntimeHandles {
         std::sync::Arc<tokio::sync::Mutex<pa_core::session::manager::SessionManager>>,
 }
 
+/// The session-model restore decision for one session file (TS
+/// `createAgentSession`'s restored-from-session step): the model the
+/// session's file pins, computed once at the create/replace seam through
+/// the bounded catalog-readiness wait, or the on-the-record fallback when
+/// the window missed (TS `modelFallbackMessage`). Scoped to
+/// `session_file`: the resolution consults it only while the engine owns
+/// that file, so a replacement flow recomputes its own instead of
+/// silently keeping the previous session's pin.
+#[derive(Clone)]
+struct RestoredSessionModel {
+    session_file: std::path::PathBuf,
+    /// `None` when the restore missed after the readiness window.
+    model: Option<(String, String)>,
+    fallback_message: Option<String>,
+}
+
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
-    pub(crate) runtime: tokio::runtime::Runtime,
+    pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
     pub(crate) config: AgentEngineConfig,
     /// The session-scoped ACP MCP store (TS `session._mcpManager`): shared
     /// with the core engine's prompt gating, so admitted servers are one
@@ -144,6 +166,13 @@ pub struct AgentSessionEngine {
     /// abort request from the worker must reach the agent's run controller
     /// without locking it.
     turn_agent: std::sync::Mutex<Option<std::sync::Arc<pa_agent::agent::Agent>>>,
+    /// The session's queue delivery modes (TS `agent.steeringMode` /
+    /// `agent.followUpMode`): seeded from the start config, applied to the
+    /// built session's agent at build time, and switched live by the
+    /// `set_steering_mode`/`set_follow_up_mode` commands (TS
+    /// `setSteeringMode`/`setFollowUpMode` write the live agent). `None`
+    /// keeps the TS default ("one-at-a-time").
+    queue_modes: std::sync::Mutex<(Option<String>, Option<String>)>,
     /// The in-run autonomous consult's deadlock-free mirror (see
     /// [`crate::autonomous_continuation`]): the shared turn-boundary slot,
     /// agent, and compaction settings the consult reads without ever
@@ -158,13 +187,44 @@ pub struct AgentSessionEngine {
     /// (create config or worker env) and is re-bound when a session's create
     /// command carries explicit wire flags.
     selection: std::sync::RwLock<EngineModelSelection>,
+    /// TS `createAgentSession`'s restored-from-session decision, scoped to
+    /// the session file it was computed for: a revived session's saved
+    /// model (or, after a missed restore window, the on-the-record
+    /// fallback message — TS `modelFallbackMessage`). Computed once per
+    /// file at the create/replace seam (the bounded readiness wait) and
+    /// consulted by every unflagged resolution; a replacement flow that
+    /// moves the worker onto another file recomputes its own (TS
+    /// re-restores at every session boot), and an explicit create flag
+    /// wins end-to-end (the decision is never consulted).
+    restored_model: std::sync::Mutex<Option<RestoredSessionModel>>,
+    /// The session runtime config the reset returns to at every session
+    /// restore — TS `mergeAgentSessionRuntimeConfig(defaultSessionConfig,
+    /// command.config)`: the spawn-time fallback (create config or worker
+    /// env) folded with the create command's explicit flags. TS hands the
+    /// same merged config down through every replacement (`switchSession`
+    /// -> `createRuntime` -> `createAgentSession({ ...sessionConfig })`),
+    /// so a mid-session `/model` switch belongs to the session it
+    /// switched, never to the moved-to one, while the create's own flags
+    /// survive every replacement.
+    initial_selection: std::sync::RwLock<EngineModelSelection>,
     /// The session's resolved effective thinking level, computed once when
     /// the create command adopts the selection and reused afterwards.
     /// Resolved at create time (before any turn) so summary/state polls
     /// during a live turn stay side-effect-free.
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
-    /// Built once on the first prompt, reused across prompts.
-    pub(crate) session: tokio::sync::Mutex<Option<CoreSessionEngine>>,
+    service_tier: std::sync::RwLock<Option<pa_types::ai::ServiceTier>>,
+    /// Built once on the first prompt, reused across prompts, shared
+    /// behind an Arc: a running model turn (the admission in
+    /// `run_turn_once`), a compaction summarizer, and a refinement run
+    /// clone the Arc and release this mutex before their long awaits, so
+    /// every read seam (`system_prompt`, `tool_definition`,
+    /// `connection_commands`, `resource_snapshot`, ...) answers while a
+    /// turn streams — the TS bar, where the daemon-mode
+    /// `get_system_prompt` arm reads `session.systemPrompt` on the same
+    /// event loop that streams the turn and the provider awaits yield to
+    /// it. Short critical sections only: no model call may hold this
+    /// mutex.
+    pub(crate) session: tokio::sync::Mutex<Option<Arc<CoreSessionEngine>>>,
     /// The session-build gate: at most one `build_session` in flight. The
     /// eager create-time build (TS parity: the prewarm starts at create)
     /// races the first demand seam; the guard makes them meet at one
@@ -226,6 +286,14 @@ pub struct AgentSessionEngine {
     /// unsettled RLM descendant work (TS `_autonomousContinuationAwaitsRlmWork`):
     /// the children registry's settle hook delivers the owed continuation.
     pub(crate) autonomous_awaits_rlm_work: std::sync::atomic::AtomicBool,
+    /// The session's closed marker (TS `_disposed`/`_disposing`): set by
+    /// the worker's kill/shutdown closes. The goal and autonomous
+    /// continuation mint sites and their settle-hook retries bail instead
+    /// of continuing a stopped session — no continuation, no mint, no
+    /// goal-state churn (the zombie fix: a stopped session stays
+    /// stopped). The create path clears it: a fresh (or replaced) session
+    /// starts live.
+    pub(crate) session_closed: std::sync::atomic::AtomicBool,
     /// The engine's own arc, registered by the worker after construction:
     /// the in-run autonomous continuation hook upgrades the weak so the
     /// agent's loop never pins the engine (the goal seam's pattern, held
@@ -268,13 +336,16 @@ pub struct AgentSessionEngine {
     /// run's duration, and [`SessionEngine::abort_auto_compaction`]
     /// aborts whatever run holds it.
     pub(crate) auto_compaction_abort: std::sync::Mutex<Option<std::sync::Arc<AbortController>>>,
+    /// The daemon model-allowlist refusal telemetry (`model refused`),
+    /// shared with the RLM children host so every enforcement seam in
+    /// this worker emits through one lazily-built client.
+    pub(crate) model_refusal_telemetry:
+        std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
 }
 
 impl AgentSessionEngine {
     pub fn new(config: AgentEngineConfig) -> anyhow::Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
+        let runtime = crate::async_safe_runtime::AsyncSafeRuntime::new_multi_thread()?;
         let session_file = std::sync::Mutex::new(config.session_file.clone());
         // Process-level fallback: the create config, else the worker env
         // pair. A create command with explicit wire flags overrides both.
@@ -304,11 +375,17 @@ impl AgentSessionEngine {
                 .map(|link_config| link_config.socket_path.clone())
                 .unwrap_or_default(),
         ));
+        let model_refusal_telemetry =
+            std::sync::Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                config.agent_dir.clone(),
+                config.telemetry_disabled == Some(true),
+            ));
         let children = config.supervisor_link.as_ref().map(|link_config| {
             Arc::new(SupervisorChildSessions::new(
                 Arc::clone(&link),
                 config.agent_dir.clone(),
                 link_config.active_session_id.clone(),
+                std::sync::Arc::clone(&model_refusal_telemetry),
             ))
         });
         let autonomous_driver = std::sync::RwLock::new(std::sync::Arc::new(
@@ -327,6 +404,8 @@ impl AgentSessionEngine {
         // `mcp_gating` extraction (agentDir + project settings.json).
         let mcp_cwd = std::sync::Arc::clone(&cwd);
         let mcp_agent_dir = agent_dir.clone();
+        let catalog_cwd = std::sync::Arc::clone(&cwd);
+        let catalog_agent_dir = agent_dir.clone();
         let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: pa_core::auth::AuthStorage::create_with_oauth(
                 &agent_dir,
@@ -358,6 +437,22 @@ impl AgentSessionEngine {
                 )
             }),
             begin_login: None,
+            agent_dir: Some(agent_dir.clone()),
+            get_catalog_sources: Some(Box::new(move || {
+                // Declared local service-catalog sources (TS
+                // `settingsManager.getMcpCatalogSources()`), re-read per
+                // resolve so settings changes reach the next refresh.
+                let catalog_cwd = catalog_cwd.read().expect("engine cwd lock").clone();
+                let settings =
+                    pa_core::settings::SettingsManager::create(&catalog_cwd, &catalog_agent_dir);
+                settings
+                    .settings()
+                    .mcp_catalog_sources
+                    .clone()
+                    .unwrap_or_default()
+            })),
+            remote_source: None,
+            probe_override: None,
         });
         // The kernel's `mcp.begin_login` host request: the worker runs the
         // OAuth login (browser + local callback) and persists the
@@ -370,6 +465,11 @@ impl AgentSessionEngine {
             std::sync::Arc::new(crate::mcp_login::WorkerMcpLoginUi::from_env()),
             std::sync::Arc::new(pa_core::mcp::ReqwestOAuthHttp::new()),
         );
+        // The queue delivery modes arrive at session create (TS `sdk.ts`
+        // builds the agent with the settings modes; the worker's create
+        // seeds them through `set_queue_modes`), so the engine starts
+        // with the TS default ("one-at-a-time").
+        let queue_modes = std::sync::Mutex::new((None, None));
         Ok(Self {
             runtime,
             config,
@@ -381,10 +481,14 @@ impl AgentSessionEngine {
             goal_admission_sink: std::sync::Mutex::new(None),
             goal_queue_purge: std::sync::Mutex::new(None),
             turn_agent: std::sync::Mutex::new(None),
+            queue_modes,
             autonomous_boundary: std::sync::Mutex::new(None),
             session_file,
-            selection: std::sync::RwLock::new(selection),
+            selection: std::sync::RwLock::new(selection.clone()),
+            restored_model: std::sync::Mutex::new(None),
+            initial_selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
+            service_tier: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
             session_build: tokio::sync::Mutex::new(()),
             pending_branch: std::sync::Mutex::new(None),
@@ -400,6 +504,7 @@ impl AgentSessionEngine {
             held_autonomous_continuation: std::sync::Mutex::new(None),
             autonomous_admission: std::sync::Mutex::new(None),
             autonomous_awaits_rlm_work: std::sync::atomic::AtomicBool::new(false),
+            session_closed: std::sync::atomic::AtomicBool::new(false),
             self_weak: std::sync::Mutex::new(None),
             autonomous_queue_purge: std::sync::Mutex::new(None),
             cwd,
@@ -410,6 +515,7 @@ impl AgentSessionEngine {
             faux_model: std::sync::OnceLock::new(),
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
             auto_compaction_abort: std::sync::Mutex::new(None),
+            model_refusal_telemetry,
         })
     }
 
@@ -434,6 +540,29 @@ impl AgentSessionEngine {
         self.cwd.read().expect("engine cwd lock").clone()
     }
 
+    /// Expand a `/skill:<name>` submission for the accepted-turn user row
+    /// (TS `_normalizeSubmission` persists the expanded text as the user
+    /// message): build the core session when needed (it loads the skill
+    /// inventory), then expand against it. Non-skill inputs and build
+    /// failures pass the text through unchanged — the turn then surfaces
+    /// the failure it would have surfaced anyway.
+    pub(crate) fn expand_skill_submission(&self, text: &str) -> String {
+        let Ok(model) = self.resolve_model() else {
+            return text.to_string();
+        };
+        if let Err(error) = self.ensure_core_session(&model) {
+            eprintln!("skill submission expansion skipped: session build failed: {error:#}");
+            return text.to_string();
+        }
+        self.runtime.block_on(async {
+            let guard = self.session.lock().await;
+            match guard.as_deref() {
+                Some(engine) => engine.expand_skill_submission(text),
+                None => text.to_string(),
+            }
+        })
+    }
+
     /// The async build of the core session (the same funnel as
     /// `ensure_core_session`, awaited on the caller's runtime instead of
     /// parked on the engine's own): read seams (`get_system_prompt`)
@@ -449,7 +578,7 @@ impl AgentSessionEngine {
         }
         let built = self.build_session(model).await?;
         self.adopt_built_session(&built).await?;
-        self.session.lock().await.replace(built);
+        self.session.lock().await.replace(Arc::new(built));
         Ok(())
     }
 
@@ -514,7 +643,10 @@ impl AgentSessionEngine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            crate::goal_state_persist::persisted_goal_state(path.as_deref())
+            tokio::task::spawn_blocking(move || {
+                crate::goal_state_persist::persisted_goal_state(path.as_deref())
+            })
+            .await?
         };
         if let Some(state) = seed {
             let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
@@ -528,29 +660,44 @@ impl AgentSessionEngine {
             built.session.rebuild_branch_context(entries).await?;
             return Ok(());
         }
-        // A recovery build rebuilds its branch from the durable store (TS
-        // one-store recovery: the owned-session worker respawns with
-        // `--resume <sessionFile>` — `createRpcRecoveryArgs` — so the
-        // session's branch, and the compaction walk that reads it, see
-        // the full durable history, never a fresh empty branch). The
-        // daemon worker owns the file writes while the engine keeps an
-        // in-memory manager, so the build adopts the durable branch
-        // here: the walk and the live loop context read the same history
-        // TS's single store holds. A missing or unreadable file keeps
-        // the fresh branch (the worker create fails on a bad store
-        // before any of this runs).
+        // Restore the retained context and certified metadata without loading
+        // discarded message bodies. Unsupported files use the ordinary reader.
         let session_file = self
             .session_file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let durable_branch = session_file
-            .as_deref()
-            .and_then(|path| crate::session_store::SessionFile::open(path).ok())
-            .map(|store| store.branch_file_entries())
-            .filter(|entries| !entries.is_empty());
-        if let Some(entries) = durable_branch {
-            built.session.rebuild_branch_context(entries).await?;
+        if let Some(path) = session_file {
+            let (window, branch) = tokio::task::spawn_blocking(move || {
+                match pa_core::session::window::WindowedSessionStore::open(&path) {
+                    Ok(Some(window)) => (Some(window), None),
+                    Ok(None) | Err(_) => (
+                        None,
+                        crate::session_store::SessionFile::open(&path)
+                            .ok()
+                            .map(|store| store.branch_file_entries()),
+                    ),
+                }
+            })
+            .await?;
+            if let Some(window) = window {
+                built.session.restore_windowed_context(window).await;
+                // This worker holds the session's runtime lease for the
+                // engine's lifetime: its durable appends may certify the
+                // window cache incrementally (exactly one writer per
+                // lease), and the lease's release flushes the certified
+                // snapshot to the sidecar for the next warm open.
+                built
+                    .session
+                    .shared_persistence()
+                    .lock()
+                    .await
+                    .set_append_ownership(
+                        pa_core::session::window::AppendOwnership::SessionLeaseHeld,
+                    );
+            } else if let Some(entries) = branch.filter(|entries| !entries.is_empty()) {
+                built.session.rebuild_branch_context(entries).await?;
+            }
         }
         Ok(())
     }
@@ -578,6 +725,12 @@ impl AgentSessionEngine {
             .lock()
             .expect("autonomous boundary lock") = None;
         *self.published_goal.lock().expect("published goal lock") = None;
+        // The retired session's provider target goes with it: a demand
+        // seam before the replacement build (an immediate `/compact`)
+        // must resolve the CURRENT model through the pre-build
+        // `resolve_model` fallback, not rebuild on the retired session's
+        // target while a cwd/settings change waits for the prewarm.
+        *self.provider_target.write().expect("provider target lock") = None;
         if let Some(engine) = built {
             // The session's telemetry ends with it (the TS dispose
             // callback the replacement teardown runs); best-effort like
@@ -601,9 +754,59 @@ impl AgentSessionEngine {
     /// exit — so the kernel process never outlives the session that owns it.
     pub async fn dispose_kernel(&self) {
         let guard = self.session.lock().await;
-        if let Some(engine) = guard.as_ref() {
+        if let Some(engine) = guard.as_deref() {
             engine.dispose_kernel().await;
         }
+    }
+
+    /// Mark the session closed (TS `runtime.dispose`'s `_disposing`/`_disposed`
+    /// gates) and retire the closed runtime's continuation mirrors: the
+    /// worker's kill, shutdown, and replacement closes set it first, so
+    /// every continuation mint site and settle-hook retry bails — a stopped
+    /// session never continues (no mint, no goal-state churn, no queued
+    /// follow-up a later wake could run). The mirrors go with the marker:
+    /// the engine object outlives the close (the worker process may be
+    /// reused for a fresh create), and a stale settle callback must find
+    /// no goal runtime to mint through — the owed slot itself survives
+    /// the close in the durable state for a later resumed session.
+    pub fn mark_session_closed(&self) {
+        self.session_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.goal_runtime.lock().expect("goal runtime lock") = None;
+        *self
+            .autonomous_boundary
+            .lock()
+            .expect("autonomous boundary lock") = None;
+    }
+
+    /// The create path's live reset: a fresh (or replaced) session starts
+    /// live (TS's fresh runtime starts un-disposed).
+    pub fn clear_session_closed(&self) {
+        self.session_closed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the session is closed (TS `this._disposed || this._disposing`
+    /// in the continuation resume sites).
+    pub fn session_is_closed(&self) -> bool {
+        self.session_closed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Session-scoped kernel shell activity; never builds a new session/kernel.
+    pub async fn bash_activity(
+        &self,
+        action: &str,
+        activity_id: Option<&str>,
+        lines: usize,
+    ) -> anyhow::Result<Value> {
+        let engine = self
+            .session
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Kernel is not running"))?;
+        engine.bash_activity(action, activity_id, lines).await
     }
 
     /// Build the core session once (same once-only rule as `session_agent`),
@@ -620,7 +823,10 @@ impl AgentSessionEngine {
         &self,
         command: &pa_core::session_engine::slash_commands::SessionSlashCommand,
     ) -> anyhow::Result<SessionCommandExecution> {
-        let model = self.resolve_model()?;
+        // The session's live model (`/compact` runs a summarizer call):
+        // the provider target the turn stream reads, not a fresh
+        // startup-chain resolution (R8).
+        let model = self.session_model()?;
         self.ensure_core_session(&model)?;
         let api_key = self.resolve_request_api_key(&model);
         let mut autonomous = self.autonomous.blocking_lock();
@@ -630,13 +836,18 @@ impl AgentSessionEngine {
             global_harness_dir: self.config.agent_dir.clone(),
             autonomous: &mut autonomous,
         };
-        let guard = self.session.blocking_lock();
-        let core = guard
-            .as_ref()
+        // The lock covers the clone only (see `run_turn_once`): a
+        // session command can run a summarizer model call (`/compact`),
+        // so holding the mutex across the execution serialized every
+        // client read seam behind it.
+        let core = self
+            .session
+            .blocking_lock()
+            .clone()
             .expect("session built by ensure_core_session");
         Ok(self
             .runtime
-            .block_on(async { execute_session_command(core, &mut params, command).await }))
+            .block_on(async { execute_session_command(&core, &mut params, command).await }))
     }
 
     /// The current explicit selection (create-config flags merged over the
@@ -645,8 +856,235 @@ impl AgentSessionEngine {
         self.selection.read().expect("model selection lock").clone()
     }
 
-    /// Resolve the model through the composed registry.
+    /// The TS `createAgentSession` startup chain (the no-flagged-model
+    /// arm of [`Self::resolve_registry_model`]): the saved settings
+    /// default, then the featured default, then the first available
+    /// model — resolved against `registry`'s current view.
+    fn startup_chain_model(&self, registry: &pa_core::models::ModelRegistry) -> Option<Model> {
+        let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
+        let all: Vec<Model> = registry.get_all().to_vec();
+        let settings =
+            pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
+        pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: false,
+            default_provider: settings.get_default_provider(),
+            default_model_id: settings.get_default_model(),
+            all_models: &all,
+            available_models: &available,
+        })
+        .or_else(|| all.first().cloned())
+    }
+
+    /// The runtime-config reset at every session restore (TS
+    /// `switchSession` -> `createRuntime` -> `createAgentSession`): the
+    /// session's model selection returns to the session runtime config
+    /// (the spawn-time fallback folded with the create command's explicit
+    /// flags, TS's merged `sessionConfig`), so a mid-session `/model`
+    /// switch belongs to the session it switched and never to the
+    /// moved-to one — whose own file pins what it should run on.
+    ///
+    /// The cached thinking level is always dropped: it was computed
+    /// against the dropped selection (or the previous session's restored
+    /// model). TS `createAgentSession` resolves the model first and
+    /// clamps the thinking level against it, so the clamp must follow the
+    /// resolution the moved-to session actually runs on — the restore
+    /// re-resolves the level once it has recorded its decision, and the
+    /// first read after a flagged reset (an explicit selection the
+    /// restore returns early for) resolves lazily against that selection.
+    fn reset_selection_to_spawn_fallback(&self) {
+        *self
+            .effective_thinking
+            .write()
+            .expect("effective thinking lock") = None;
+        {
+            let initial = self
+                .initial_selection
+                .read()
+                .expect("initial selection lock")
+                .clone();
+            let mut current = self.selection.write().expect("model selection lock");
+            if current.provider == initial.provider
+                && current.model == initial.model
+                && current.api_key == initial.api_key
+                && current.thinking == initial.thinking
+            {
+                return;
+            }
+            *current = initial;
+        }
+    }
+
+    /// The create-time session-model restore (see
+    /// [`SessionEngine::restore_session_model`]): reset the selection to
+    /// the spawn-time fallback (the TS runtime-config reset), read the
+    /// session file's saved model context, give the in-flight
+    /// catalog/auth refreshes the bounded readiness window, and record
+    /// the decision for this file. Explicit spawn flags win (TS
+    /// `options.model`); a session with no saved model keeps the startup
+    /// chain; a restore that still misses after the window records the
+    /// fallback (`model_fallback_message`, never silent).
+    async fn restore_session_model_at(&self, session_path: &std::path::Path) {
+        // An unpersisted session (an in-memory fork or a no-session
+        // worker's replacement) has no file to read: TS restores its
+        // branch context, whose `model_change` row is the live branch's
+        // own — the model the session already runs on — so the
+        // runtime-config reset must not run with nothing to restore.
+        if session_path.as_os_str().is_empty() {
+            return;
+        }
+        self.reset_selection_to_spawn_fallback();
+        // TS `buildSessionContext()`: the session file pins the model it
+        // last ran on and the thinking level it last set. The scan is
+        // plain file work on a potentially large session file — park it
+        // on a blocking thread.
+        let path = session_path.to_path_buf();
+        let Ok(saved) = tokio::task::spawn_blocking(move || saved_session_context(&path)).await
+        else {
+            return;
+        };
+        let Some(saved) = saved else {
+            return;
+        };
+        // TS `createAgentSession` re-reads the session's saved thinking
+        // level at every boot (`hasThinkingEntry ?
+        // existingSession.thinkingLevel` — sdk.ts) when the runtime config
+        // carries no explicit flag: the moved-to session's pinned level
+        // wins over the settings/medium default. The level re-clamps
+        // against the model below (the reset dropped the cache).
+        if self.current_selection().thinking.is_none() {
+            if let Some(level) = saved.thinking {
+                self.configure_model(EngineModelSelection {
+                    thinking: Some(level),
+                    ..Default::default()
+                });
+            }
+        }
+        // An explicit create flag wins for the MODEL (TS `options.model`)
+        // — the saved thinking above still applies, then the restore skips
+        // the model's readiness window entirely.
+        if self.current_selection().model.is_some() {
+            return;
+        }
+        let Some((provider, model_id)) = saved.model else {
+            return;
+        };
+        let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
+        let mut registry =
+            pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
+        registry.load_private_authorization_from_cache();
+        let restored = pa_core::models::find_session_model_with_readiness_wait(
+            &mut registry,
+            &provider,
+            &model_id,
+            pa_core::models::SESSION_MODEL_RESTORE_READINESS_TIMEOUT_MS,
+        )
+        .await;
+        let (model, fallback_message) = match restored {
+            Some(restored) => (Some((restored.provider, restored.id)), None),
+            None => {
+                // The TS `modelFallbackMessage`: the restore miss is on the
+                // record — the startup chain owns the session, and the
+                // summary publishes what happened (never silent).
+                let fallback = self.startup_chain_model(&registry);
+                let message = match &fallback {
+                    Some(fallback) => format!(
+                        "Could not restore model {provider}/{model_id}. Using {}/{}",
+                        fallback.provider, fallback.id
+                    ),
+                    None => format!("Could not restore model {provider}/{model_id}"),
+                };
+                eprintln!("{message}");
+                (None, Some(message))
+            }
+        };
+        *self
+            .restored_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RestoredSessionModel {
+            session_file: session_path.to_path_buf(),
+            model,
+            fallback_message,
+        });
+        // The decision is on the record now, so the level must resolve
+        // against the model this session actually runs on (the restored
+        // pin, or the startup chain after a missed window) — TS
+        // `createAgentSession` resolves the model first and clamps the
+        // thinking level against it. A concurrent summary/roster read may
+        // have populated the cache against the startup chain while the
+        // restore was still awaiting: drop the cache once more so the
+        // post-decision resolution wins for every later reader (the reset
+        // dropped it too, but the window in between is concurrent).
+        *self
+            .effective_thinking
+            .write()
+            .expect("effective thinking lock") = None;
+        let _ = self.effective_thinking();
+    }
+
+    /// The restored-from-session resolution for the engine's current
+    /// session file (TS `createAgentSession`'s restored-from-session
+    /// step): a decision computed for this file resolves its pinned model
+    /// through the same exact-match path a flagged selection takes — a
+    /// catalog flap rebuilds the private route template on the same id
+    /// (`build_fallback_model`), never silently drifting to the featured
+    /// default. A decision for another file (a replacement flow that has
+    /// not recomputed yet) is ignored.
+    fn restored_model_resolution(
+        &self,
+        registry: &pa_core::models::ModelRegistry,
+    ) -> Option<Model> {
+        let decision = self
+            .restored_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let (provider, model_id) = decision.model?;
+        let current = self
+            .session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        if decision.session_file != current {
+            return None;
+        }
+        pa_core::models::resolve_cli_model(Some(&provider), &model_id, registry.get_all()).model
+    }
+
+    /// Emit the daemon model-allowlist refusal's adoption event (schema
+    /// v1 `model refused`) from any of this worker's enforcement seams.
+    /// The telemetry binds to the engine's live cwd, so a session that
+    /// moved directories reports through the current project scope.
+    pub(crate) fn note_model_refused(&self, surface: &str, selector: &str) {
+        self.model_refusal_telemetry
+            .note_refused(surface, selector, &self.cwd());
+    }
+
+    /// Resolve the model through the composed registry, then enforce the
+    /// settings `allowedModels` allowlist: a resolution outside the
+    /// allowlist fails loudly here (the silent-fallback guarantee — the
+    /// startup chain never lands a session on a model the daemon may not
+    /// resolve to), and the refusal emits `model refused`.
     fn resolve_registry_model(&self) -> anyhow::Result<Model> {
+        let model = self.resolve_registry_model_unchecked()?;
+        let selector = format!("{}/{}", model.provider, model.id);
+        let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
+        if let Err(refusal) = crate::model_allowlist::assert_allowed(&allowlist, &selector) {
+            if let Some(refusal) = refusal.downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+            {
+                self.note_model_refused("session_start", &refusal.selector);
+            }
+            return Err(refusal);
+        }
+        Ok(model)
+    }
+
+    /// The registry resolution before the allowlist gate: the flagged-model
+    /// arm (TS `resolveCliModel`) or the TS `createAgentSession` startup
+    /// chain.
+    fn resolve_registry_model_unchecked(&self) -> anyhow::Result<Model> {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
@@ -655,34 +1093,21 @@ impl AgentSessionEngine {
         // cache so create-time resolution can pick the session's private
         // model (e.g. internal/glm-5.3-fast).
         registry.load_private_authorization_from_cache();
-        let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
         let selection = self.current_selection();
         let Some(model_name) = selection.model.as_deref() else {
-            // No flagged model: the TS `createAgentSession` startup chain —
+            // No flagged model: the restored-from-session decision comes
+            // first (TS `createAgentSession`), then the startup chain —
             // the saved settings default, then the featured default, then
             // the first available model.
-            let all: Vec<Model> = registry.get_all().to_vec();
-            let settings =
-                pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
-            let startup =
-                pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
-                    cli_provider: None,
-                    cli_model: None,
-                    scoped_models: &[],
-                    is_continuing: false,
-                    default_provider: settings.get_default_provider(),
-                    default_model_id: settings.get_default_model(),
-                    all_models: &all,
-                    available_models: &available,
-                });
-            if let Some(model) = startup {
+            if let Some(model) = self.restored_model_resolution(&registry) {
                 return Ok(model);
             }
-            return all.first().cloned().ok_or_else(|| {
-                anyhow::anyhow!(
+            let Some(model) = self.startup_chain_model(&registry) else {
+                anyhow::bail!(
                     "No models available. Check your installation or add models to models.json."
-                )
-            });
+                );
+            };
+            return Ok(model);
         };
         // TS `resolveCliModel` resolves against `modelRegistry.getAll()`
         // — the full catalog, not the auth-configured list ("use *all*
@@ -719,12 +1144,48 @@ impl AgentSessionEngine {
         self.resolve_registry_model()
     }
 
+    /// The session's live model for summarization-side model calls
+    /// (compaction summarizers, branch summaries, side questions, and the
+    /// compaction-triggered refinement): the provider target the built
+    /// session's stream reads per call — the model the session is actually
+    /// running on. TS `_runAutoCompaction` runs its summarizer on
+    /// `this.model`, the session's live model, never a fresh resolution.
+    ///
+    /// [`Self::resolve_model`] consults a registry built from scratch each
+    /// call (startup chain over the live catalog, settings, and auth), so
+    /// two consecutive calls can resolve differently and a summarizer arm
+    /// can land on a provider the session never used — the R8 report: a
+    /// live prime-inference session whose threshold auto-compaction
+    /// resolved to `amazon-bedrock` and failed with "No AWS credentials
+    /// available for Bedrock" while the session's turns kept streaming
+    /// through the target's provider. The turn loop already follows the
+    /// target (the stream reads it per call); the summarizer arms follow
+    /// the same chain.
+    ///
+    /// Falls back to [`Self::resolve_model`] before the session's first
+    /// build (the target is set at build): the same resolution the build
+    /// itself would make, for the surfaces that can run before any turn
+    /// (the `/compact` wire command on a fresh session).
+    pub(crate) fn session_model(&self) -> anyhow::Result<Model> {
+        if let Some(target) = self
+            .provider_target
+            .read()
+            .expect("provider target lock")
+            .clone()
+        {
+            return Ok(target.model);
+        }
+        self.resolve_model()
+    }
+
     /// The effective session thinking level (the sdk.ts `createAgentSession`
     /// order): the create-config flag, then the settings default, then
-    /// "medium" — always clamped to what the model supports; a model that
-    /// cannot be resolved degrades to "off". Resolved once at create time
-    /// and cached so summary/state calls stay side-effect-free while turns
-    /// run.
+    /// "medium" — always clamped to what the model supports, where the
+    /// model is the one the session actually runs on (the restored pin
+    /// after a session-model restore, the explicit selection after a
+    /// flagged create); a model that cannot be resolved degrades to
+    /// "off". Resolved once at the create/restore seam and cached so
+    /// summary/state calls stay side-effect-free while turns run.
     fn effective_thinking(&self) -> pa_types::ai::ModelThinkingLevel {
         if let Some(level) = *self
             .effective_thinking
@@ -827,6 +1288,17 @@ impl AgentSessionEngine {
     async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
+        // The live queue-delivery modes (seeded from the start config or
+        // switched by `set_steering_mode`/`set_follow_up_mode`): read
+        // under a scoped lock — a std guard must never ride the build's
+        // awaits below.
+        let (steering_mode, follow_up_mode) = {
+            let modes = self.queue_modes.lock().expect("queue modes");
+            (
+                modes.0.as_deref().and_then(Self::queue_mode),
+                modes.1.as_deref().and_then(Self::queue_mode),
+            )
+        };
 
         // The session's stream reads its target from the engine's live slot:
         // `set_model` swaps the slot so the built session follows without a
@@ -835,6 +1307,7 @@ impl AgentSessionEngine {
         {
             let mut target = self.provider_target.write().expect("provider target lock");
             *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                 api_key: self.resolve_request_api_key(model),
                 model: model.clone(),
             });
@@ -920,6 +1393,20 @@ impl AgentSessionEngine {
             // purge, so the session engine's surfaces withdraw queued
             // minted continuations.
             queued_goal_context_purge,
+            // TS `_steeringStopPending`: the worker's steering lane owns
+            // the stop hooks (a queued steer cuts the run at the next
+            // turn boundary; the runner delivers it as the next turn).
+            queued_steering_probe: self.config.queued_steering_probe.clone(),
+            // TS `sdk.ts` seeds the Agent's queue modes from the settings
+            // manager; the worker create reads the same settings (the
+            // engine-level queues drain per the mode at the loop
+            // boundary, mirroring the worker lane's delivery modes). The
+            // live switch (`set_steering_mode`/`set_follow_up_mode`)
+            // updates the same slot ahead of any later build. The lock
+            // is scoped to the read (a guard must never ride the build's
+            // awaits).
+            steering_mode,
+            follow_up_mode,
             // The worker's shared scheduled-jobs store with the session
             // identity the kernel binding needs: the live active session
             // id the supervisor routes commands by, and the durable session
@@ -932,6 +1419,28 @@ impl AgentSessionEngine {
             }),
         })
         .await
+        .inspect(|engine| {
+            // A queue-mode switch that landed while this build was in
+            // flight wrote only the live slot (the build snapshot above
+            // predates it, and the agent handle did not exist yet): re-
+            // apply the current modes to the freshly built agent so the
+            // first build can never serve a stale mode (TS's agent is
+            // built once per session, so the race does not exist there;
+            // this port's lazy build needs the catch-up).
+            let (steering_mode, follow_up_mode) = {
+                let modes = self.queue_modes.lock().expect("queue modes");
+                (
+                    modes.0.as_deref().and_then(Self::queue_mode),
+                    modes.1.as_deref().and_then(Self::queue_mode),
+                )
+            };
+            if let Some(mode) = steering_mode {
+                engine.session.agent().set_steering_mode(mode);
+            }
+            if let Some(mode) = follow_up_mode {
+                engine.session.agent().set_follow_up_mode(mode);
+            }
+        })
     }
 }
 
@@ -957,6 +1466,35 @@ pub(crate) fn persisted_rlm_max_depth(path: Option<&str>) -> Option<u64> {
             })
             .flatten()
         })
+}
+
+/// The saved model context of a session file (TS
+/// `buildSessionContext().model`): the model the session last ran on —
+/// the last `model_change` row, else the last assistant message's
+/// provider/model. `None` when the file carries no model context (a
+/// fresh session) or cannot be read (the create flow owns that failure).
+/// The session file's saved model context (TS `buildSessionContext`): the
+/// pinned `(provider, model)` and the saved thinking level — present only
+/// when the file carries a `thinking_level_change` row (TS
+/// `hasThinkingEntry`).
+pub(crate) struct SavedSessionContext {
+    pub(crate) model: Option<(String, String)>,
+    pub(crate) thinking: Option<pa_types::ai::ModelThinkingLevel>,
+}
+
+pub(crate) fn saved_session_context(path: &std::path::Path) -> Option<SavedSessionContext> {
+    let store = crate::session_store::SessionFile::open(path).ok()?;
+    let entries = store.branch_file_entries();
+    let leaf = store.leaf_id().map(str::to_string);
+    let context = pa_core::session::build_session_context(&entries, leaf.as_deref());
+    let thinking = store
+        .has_thinking_level()
+        .then(|| pa_ai::models::thinking_level_from_str(&context.thinking_level))
+        .flatten();
+    Some(SavedSessionContext {
+        model: context.model,
+        thinking,
+    })
 }
 
 /// One artifact reference (TS `createArtifactReference` in
@@ -1046,10 +1584,12 @@ impl AgentSessionEngine {
                 let mut manager = self
                     .runtime
                     .block_on(async { handles.session.lock().await });
-                manager.append_custom_entry(
+                if let Err(error) = manager.append_custom_entry(
                     "rlm_max_depth_state",
                     Some(json!({ "maxDepth": max_depth })),
-                );
+                ) {
+                    eprintln!("pa-daemon: failed to persist rlm_max_depth_state: {error:#}");
+                }
             }
             None => {
                 *self
@@ -1082,10 +1622,12 @@ impl AgentSessionEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(max_depth) = pending {
-            manager.append_custom_entry(
+            if let Err(error) = manager.append_custom_entry(
                 "rlm_max_depth_state",
                 Some(json!({ "maxDepth": max_depth })),
-            );
+            ) {
+                eprintln!("pa-daemon: failed to flush pending rlm_max_depth_state: {error:#}");
+            }
         }
     }
 
@@ -1212,11 +1754,21 @@ impl SessionEngine for AgentSessionEngine {
             let mut session = handles.session.lock().await;
             // The mint persists the `thread_goal_state` entry (TS
             // `_setGoalState`) and consumes one continuation slot; an
-            // inactive or objective-less goal mints nothing.
-            let message = driver.next_continuation_message(&mut session)?;
+            // inactive or objective-less goal mints nothing. A failed
+            // persist ends the boundary without a continuation (TS
+            // `_maybeResumeGoalContinuationAfterRlmWork`'s catch: the
+            // hook must not reject; the unchanged count retries).
+            let message = match driver.next_continuation_message(&mut session) {
+                Ok(message) => message,
+                Err(error) => {
+                    eprintln!("pa-daemon: goal continuation mint persist failed: {error:#}");
+                    None
+                }
+            }?;
             let goal_update = self.publish_goal_state(driver.state());
             Some((
                 crate::engine::PromptRequest {
+                    batch: Vec::new(),
                     message: message.content.text().to_string(),
                     images: Vec::new(),
                     source: "user".to_string(),
@@ -1261,7 +1813,7 @@ impl SessionEngine for AgentSessionEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let session = self.session.lock().await;
-            let Some(engine) = session.as_ref() else {
+            let Some(engine) = session.as_deref() else {
                 return;
             };
             let Some(telemetry) = &engine.telemetry else {
@@ -1292,7 +1844,7 @@ impl SessionEngine for AgentSessionEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let session = self.session.lock().await;
-            let Some(engine) = session.as_ref() else {
+            let Some(engine) = session.as_deref() else {
                 return;
             };
             let Some(telemetry) = &engine.telemetry else {
@@ -1325,6 +1877,49 @@ impl SessionEngine for AgentSessionEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
     }
 
+    /// TS `createAgentSession`'s restored-from-session step (sdk.ts): a
+    /// session that already ran on a model restores it before the startup
+    /// chain — the saved model context from the session file, through the
+    /// bounded readiness wait (a revived worker races the daemon boot's
+    /// catalog fetch; without the wait a private model is missing from
+    /// the cold registry and the session silently lands on the featured
+    /// default instead of the model it was running on). The worker calls
+    /// this at create, before the create-config selection is adopted: a
+    /// successful restore pins the model into the selection (the TS
+    /// session holds its restored model), an explicit create flag still
+    /// wins, and a failed restore is never silent —
+    /// [`Self::model_fallback_message`] publishes the fallback.
+    fn restore_session_model(
+        &self,
+        session_path: &std::path::Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let path = session_path.to_path_buf();
+        Box::pin(async move {
+            self.restore_session_model_at(&path).await;
+        })
+    }
+
+    /// TS `modelFallbackMessage`: the non-silent record of a revived
+    /// session's model falling back to the startup chain after the
+    /// readiness window missed. Published on the session summary while
+    /// the engine owns the file the decision was computed for.
+    fn model_fallback_message(&self) -> Option<String> {
+        let decision = self
+            .restored_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let current = self
+            .session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        if decision.session_file != current {
+            return None;
+        }
+        decision.fallback_message
+    }
+
     /// The `compact` command path (TS `compact()`'s background
     /// `_scheduleAutoRefine("compact")` on an idle session): the round
     /// runs right after the compaction answered, through the same gated
@@ -1343,6 +1938,18 @@ impl SessionEngine for AgentSessionEngine {
             .own_summary
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary);
+    }
+
+    fn configure_service_tier(&self, tier: Option<pa_types::ai::ServiceTier>) {
+        *self.service_tier.write().expect("service tier lock") = tier;
+        if let Some(target) = self
+            .provider_target
+            .write()
+            .expect("provider target lock")
+            .as_mut()
+        {
+            target.service_tier = tier;
+        }
     }
 
     fn configure_model(&self, selection: EngineModelSelection) {
@@ -1377,7 +1984,52 @@ impl SessionEngine for AgentSessionEngine {
         // create time, before any turn.
     }
 
+    fn configure_create_model(&self, selection: EngineModelSelection) {
+        // The create command's explicit flags fold into the session
+        // runtime config (TS `mergeAgentSessionRuntimeConfig`): TS hands
+        // the merged `sessionConfig` down through every replacement, so
+        // the flags must survive the runtime-config reset a session
+        // restore performs — a later `switch_session`/`fork`/`import`
+        // keeps honoring the create's selection (it wins over the
+        // moved-to file's pin, exactly like `options.model` in
+        // `createAgentSession`).
+        {
+            let mut initial = self
+                .initial_selection
+                .write()
+                .expect("initial selection lock");
+            if selection.provider.is_some() {
+                initial.provider = selection.provider.clone();
+            }
+            if selection.model.is_some() {
+                initial.model = selection.model.clone();
+            }
+            if selection.api_key.is_some() {
+                initial.api_key = selection.api_key.clone();
+            }
+            if selection.thinking.is_some() {
+                initial.thinking = selection.thinking;
+            }
+        }
+        self.configure_model(selection);
+    }
+
     fn switch_model(&self, selection: EngineModelSelection) -> bool {
+        // The allowlist gate on the switch candidate, before the selection
+        // slot mutates: a refused model must not poison the live selection
+        // (every later resolution would fail at the same gate). The wire
+        // seams (`set_model`, `cycle_model`) check first and own the user
+        // message and refusal event; this is the engine's total guard for
+        // any other caller.
+        if let (Some(provider), Some(model)) =
+            (selection.provider.as_deref(), selection.model.as_deref())
+        {
+            let selector = format!("{provider}/{model}");
+            let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
+            if crate::model_allowlist::assert_allowed(&allowlist, &selector).is_err() {
+                return false;
+            }
+        }
         self.configure_model(selection);
         let Ok(model) = self.resolve_model() else {
             return false;
@@ -1388,17 +2040,26 @@ impl SessionEngine for AgentSessionEngine {
         {
             let mut target = self.provider_target.write().expect("provider target lock");
             *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                 api_key: self.resolve_request_api_key(&model),
                 model: model.clone(),
             });
         }
         let session = self.session.blocking_lock();
-        if let Some(core) = session.as_ref() {
+        if let Some(core) = session.as_deref() {
             let provider = model.provider.clone();
             let model_id = model.id.clone();
             let _ = self
                 .runtime
                 .block_on(core.session.set_model(&model, &provider, &model_id));
+        }
+        // The children registry's inherited parent model follows the
+        // switch (the build-time stamp alone would go stale): an inherited
+        // `rlm.spawn` resolves the model the session NOW runs, so the
+        // allowlist gate never refuses a stale selector the parent left
+        // behind.
+        if let Some(children) = &self.children {
+            children.set_model(format!("{}/{}", model.provider, model.id));
         }
         true
     }
@@ -1423,7 +2084,7 @@ impl SessionEngine for AgentSessionEngine {
         // agent follows it on the next turn.
         let effective = self.effective_thinking();
         let session = self.session.blocking_lock();
-        if let Some(core) = session.as_ref() {
+        if let Some(core) = session.as_deref() {
             let _ = self.runtime.block_on(
                 core.session
                     .set_thinking_level(map_thinking_level(effective)),
@@ -1442,7 +2103,7 @@ impl SessionEngine for AgentSessionEngine {
     /// unbuilt or busy session omits the section.
     fn export_system_prompt(&self) -> Option<String> {
         let session = self.session.try_lock().ok()?;
-        session.as_ref().map(|core| core.system_prompt.clone())
+        session.as_deref().map(|core| core.system_prompt.clone())
     }
 
     /// The built session's live tool registry mapped to the export's tools
@@ -1456,7 +2117,7 @@ impl SessionEngine for AgentSessionEngine {
             let model = self.resolve_model().ok()?;
             self.ensure_core_session_async(&model).await.ok()?;
             let session = self.session.try_lock().ok()?;
-            let state = session.as_ref()?.session.agent().state().await;
+            let state = session.as_deref()?.session.agent().state().await;
             Some(pa_core::export_html::tools_section(&state.tools))
         })
     }
@@ -1473,7 +2134,7 @@ impl SessionEngine for AgentSessionEngine {
             let model = self.resolve_model().ok()?;
             self.ensure_core_session_async(&model).await.ok()?;
             let session = self.session.try_lock().ok()?;
-            let state = session.as_ref()?.session.agent().state().await;
+            let state = session.as_deref()?.session.agent().state().await;
             let renderer = crate::session_export::ExportToolRenderer {
                 tools: &state.tools,
             };
@@ -1516,7 +2177,10 @@ impl SessionEngine for AgentSessionEngine {
         request: CompactionRequest,
         signal: &pa_agent::abort::AbortSignal,
     ) -> CompactionOutcome {
-        let model = match self.resolve_model() {
+        // The session's live model (the provider target the turn stream
+        // reads), never a fresh startup-chain resolution (R8: a
+        // re-resolution landed the summarizer on an unconfigured provider).
+        let model = match self.session_model() {
             Ok(model) => model,
             Err(error) => {
                 return CompactionOutcome::Failed {
@@ -1530,10 +2194,18 @@ impl SessionEngine for AgentSessionEngine {
             };
         }
         let custom_instructions = request.custom_instructions.clone();
-        let api_key = self.config.api_key.clone();
+        // The live target's key, the same chain every other summarizer
+        // arm reads: the config key is the startup snapshot and goes
+        // stale with the session's provider switches (the R8 seam's
+        // key arm — a summarizer with the old provider's key, or none).
+        let api_key = self.resolve_request_api_key(&model);
         let run = async {
-            let guard = self.session.lock().await;
-            let Some(engine) = guard.as_ref() else {
+            // The lock covers the clone only (see `run_turn_once`): the
+            // compaction below runs a summarizer model call, and holding
+            // the mutex across it serialized every client read seam
+            // behind the compaction.
+            let session = self.session.lock().await.clone();
+            let Some(engine) = session else {
                 anyhow::bail!("session not built");
             };
             engine
@@ -1578,8 +2250,9 @@ impl SessionEngine for AgentSessionEngine {
                 // manual wire run counts like the `/compact` command).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(telemetry) =
-                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
+                    if let Some(telemetry) = guard
+                        .as_deref()
+                        .and_then(|engine| engine.telemetry.as_ref())
                     {
                         telemetry.note_compaction();
                     }
@@ -1622,7 +2295,10 @@ impl SessionEngine for AgentSessionEngine {
         request: BranchSummaryRequest,
         signal: &pa_agent::abort::AbortSignal,
     ) -> BranchSummaryOutcome {
-        let model = match self.resolve_model() {
+        // The session's live model (the provider target the turn stream
+        // reads): the branch summarizer runs on the session model like the
+        // compaction summarizer (R8).
+        let model = match self.session_model() {
             Ok(model) => model,
             Err(error) => {
                 return BranchSummaryOutcome::Failed {
@@ -1712,7 +2388,7 @@ impl SessionEngine for AgentSessionEngine {
         }
         self.runtime.block_on(async move {
             let guard = self.session.lock().await;
-            let Some(engine) = guard.as_ref() else {
+            let Some(engine) = guard.as_deref() else {
                 return Ok(());
             };
             // TS `_invalidatePendingAutoRefineForBranchChange`: the moved
@@ -1875,7 +2551,10 @@ impl SessionEngine for AgentSessionEngine {
         signal: &pa_agent::abort::AbortSignal,
         sink: &pa_core::session_engine::side_question::SideQuestionSink,
     ) -> SideQuestionOutcome {
-        let model = match self.resolve_model() {
+        // The session's live model (the provider target the turn stream
+        // reads): the side question runs on the session model like the
+        // compaction summarizer (R8).
+        let model = match self.session_model() {
             Ok(model) => model,
             Err(error) => {
                 return SideQuestionOutcome::Failed {
@@ -1945,7 +2624,7 @@ impl SessionEngine for AgentSessionEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
         Box::pin(async move {
             let guard = self.session.lock().await;
-            let Some(engine) = guard.as_ref() else {
+            let Some(engine) = guard.as_deref() else {
                 return Vec::new();
             };
             // TS `createAgentConnectionCommands` order: extension
@@ -2003,7 +2682,7 @@ impl SessionEngine for AgentSessionEngine {
         Box::pin(async move {
             let session_id = {
                 let guard = self.session.lock().await;
-                match guard.as_ref() {
+                match guard.as_deref() {
                     Some(engine) => engine.session.session_id().await,
                     None => {
                         // The session builds lazily (first prompt); the
@@ -2015,7 +2694,7 @@ impl SessionEngine for AgentSessionEngine {
                 }
             };
             let guard = self.session.lock().await;
-            let Some(engine) = guard.as_ref() else {
+            let Some(engine) = guard.as_deref() else {
                 return crate::engine::empty_resource_snapshot();
             };
             let cwd = self.cwd().display().to_string();
@@ -2105,7 +2784,7 @@ impl SessionEngine for AgentSessionEngine {
             let model = self.resolve_model()?;
             self.ensure_core_session_async(&model).await?;
             let guard = self.session.lock().await;
-            let engine = guard.as_ref().expect("session built above");
+            let engine = guard.as_deref().expect("session built above");
             Ok(engine.system_prompt.clone())
         })
     }
@@ -2117,7 +2796,7 @@ impl SessionEngine for AgentSessionEngine {
         let name = name.to_string();
         Box::pin(async move {
             let guard = self.session.lock().await;
-            let engine = guard.as_ref()?;
+            let engine = guard.as_deref()?;
             let state = engine.session.agent().state().await;
             let tool = state.tools.iter().find(|tool| tool.name() == name)?;
             Some(json!({
@@ -2137,9 +2816,13 @@ impl SessionEngine for AgentSessionEngine {
         self.ensure_core_session(&model)?;
         let api_key = self.resolve_request_api_key(&model);
         let global_harness_dir = self.config.agent_dir.clone();
-        let guard = self.session.blocking_lock();
-        let core = guard
-            .as_ref()
+        // The lock covers the clone only (see `run_turn_once`): the
+        // refinement below runs a model call, and holding the mutex
+        // across it serialized every client read seam behind it.
+        let core = self
+            .session
+            .blocking_lock()
+            .clone()
             .expect("session built by ensure_core_session");
         let result = self.runtime.block_on(async {
             core.session
@@ -2227,7 +2910,7 @@ impl SessionEngine for AgentSessionEngine {
     fn run_prompt(
         &self,
         _prompt_index: usize,
-        request: PromptRequest,
+        mut request: PromptRequest,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
@@ -2235,6 +2918,16 @@ impl SessionEngine for AgentSessionEngine {
         // happen (kernel host requests and session-command mutations), so
         // every emit of this prompt runs through the tracking wrapper.
         let mut emit = self.goal_tracking_emit(emit);
+        // The accepted-turn row carries the skill-expanded text (TS
+        // `_normalizeSubmission` persists the expanded submission as the
+        // user message): a `/skill:<name>` command expands against the
+        // session's skill inventory before the row persists and
+        // broadcasts, so the transcript renders the skill card instead
+        // of the raw command. Everything else skips the expansion (and
+        // its on-demand session build) entirely.
+        if request.message.starts_with("/skill:") {
+            request.message = self.expand_skill_submission(&request.message);
+        }
         // Session commands (compact/refine/goal/autonomous) never admit a
         // model turn and never record a user-message row: the durable echo
         // row replaces it. Execute before admission so the idle-wait loop
@@ -2325,11 +3018,46 @@ impl SessionEngine for AgentSessionEngine {
         if !emit(accepted) {
             return;
         }
+        // The batched co-delivery rows (TS `_startPreparedTurnActions`: each
+        // batched action's primary record emits before the run): one accepted
+        // user row per batched message, in delivery order, persisted and
+        // rendered like the primary. The batch only ever rides a plain user
+        // turn (the injected-custom turns deliver solo — the queue never
+        // batches a row that replaces the user row). Each row expands a
+        // leading `/skill:` the same way the primary does, so the accepted
+        // row persists and renders the expanded submission (TS normalizes
+        // every submission at queue time).
+        for row in &request.batch {
+            let text = if row.text.starts_with("/skill:") {
+                self.expand_skill_submission(&row.text)
+            } else {
+                row.text.clone()
+            };
+            let mut content = vec![json!({ "type": "text", "text": text })];
+            for image in &row.images {
+                let mut block = match serde_json::to_value(image) {
+                    Ok(Value::Object(block)) => Value::Object(block),
+                    _ => continue,
+                };
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("type".to_string(), json!("image"));
+                }
+                content.push(block);
+            }
+            if !emit(EngineEvent::UserMessage(json!({
+                "role": "user",
+                "content": content,
+                "timestamp": now_millis(),
+            }))) {
+                return;
+            }
+        }
         let turn_prompt = match injected {
             Some(custom) => TurnPrompt::Injected(custom),
             None => TurnPrompt::User {
                 text: request.message.clone(),
                 images: request.images.clone(),
+                batch: request.batch.clone(),
             },
         };
         self.run_turns(turn_prompt, aborted, &mut emit);
@@ -2346,9 +3074,46 @@ impl SessionEngine for AgentSessionEngine {
             agent.abort();
         }
     }
+
+    /// `set_steering_mode` / `set_follow_up_mode` (TS
+    /// `session.setSteeringMode`/`setFollowUpMode`): the queue delivery
+    /// mode switches live — the slot feeds any later session build, and
+    /// the built session's agent drains by the new mode from the next
+    /// boundary (`this.agent.steeringMode = mode`).
+    fn set_queue_modes(&self, steering: Option<&str>, follow_up: Option<&str>) {
+        {
+            let mut modes = self.queue_modes.lock().expect("queue modes");
+            if let Some(mode) = steering {
+                modes.0 = Some(mode.to_string());
+            }
+            if let Some(mode) = follow_up {
+                modes.1 = Some(mode.to_string());
+            }
+        }
+        let agent = self.turn_agent.lock().expect("turn agent lock").clone();
+        if let Some(agent) = agent {
+            if let Some(mode) = steering.and_then(Self::queue_mode) {
+                agent.set_steering_mode(mode);
+            }
+            if let Some(mode) = follow_up.and_then(Self::queue_mode) {
+                agent.set_follow_up_mode(mode);
+            }
+        }
+    }
 }
 
 impl AgentSessionEngine {
+    /// Map a wire/settings queue mode ("all"/"one-at-a-time") onto the
+    /// agent's `QueueMode`; an unknown value keeps the TS default
+    /// ("one-at-a-time").
+    fn queue_mode(mode: &str) -> Option<pa_agent::agent::QueueMode> {
+        match mode {
+            "all" => Some(pa_agent::agent::QueueMode::All),
+            "one-at-a-time" => Some(pa_agent::agent::QueueMode::OneAtATime),
+            _ => None,
+        }
+    }
+
     /// Drive one admitted prompt through the retry-driver model loop and
     /// emit the turn outcome (provider-failure retries + final-row
     /// surfacing). The user row — or a goal continuation's durable context
@@ -2450,7 +3215,7 @@ impl AgentSessionEngine {
         // retries increment `retry_count`, provider switches `failover_count`.
         let telemetry = {
             let guard = self.session.blocking_lock();
-            guard.as_ref().and_then(|engine| engine.telemetry.clone())
+            guard.as_deref().and_then(|engine| engine.telemetry.clone())
         };
         let primary_state: std::cell::RefCell<
             Option<(
@@ -2575,6 +3340,7 @@ impl AgentSessionEngine {
                             let mut target =
                                 self.provider_target.write().expect("provider target lock");
                             *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                                 api_key: self.resolve_request_api_key(&next),
                                 model: next.clone(),
                             });
@@ -2585,7 +3351,7 @@ impl AgentSessionEngine {
                             .await;
                         if let Some(persistence) = persistence {
                             let mut session = persistence.lock().await;
-                            session.append_model_change(&next.provider, &next.id);
+                            session.append_model_change(&next.provider, &next.id)?;
                         }
                         Ok(())
                     }
@@ -2607,6 +3373,7 @@ impl AgentSessionEngine {
                             let mut target =
                                 self.provider_target.write().expect("provider target lock");
                             *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                                 api_key: primary_api_key,
                                 model: primary_model.clone(),
                             });
@@ -2618,7 +3385,7 @@ impl AgentSessionEngine {
                             session.append_model_change(
                                 &primary_model.provider,
                                 &primary_model.id,
-                            );
+                            )?;
                         }
                         Ok(Some(format!(
                             "{}/{}",
@@ -2672,7 +3439,7 @@ impl AgentSessionEngine {
     /// abort arm clears both the compaction and the refine request).
     fn drop_turn_boundary_requests(&self) {
         let guard = self.session.blocking_lock();
-        if let Some(engine) = guard.as_ref() {
+        if let Some(engine) = guard.as_deref() {
             self.runtime.block_on(engine.turn_boundary.clear_pending());
         }
     }
@@ -2689,7 +3456,7 @@ impl AgentSessionEngine {
         // Fast path: nothing scheduled (the common turn).
         let has_pending = {
             let guard = self.session.blocking_lock();
-            match guard.as_ref() {
+            match guard.as_deref() {
                 Some(engine) => self.runtime.block_on(async {
                     engine.turn_boundary.compaction_scheduled().await
                         || engine.turn_boundary.refine_pending().await
@@ -2700,7 +3467,10 @@ impl AgentSessionEngine {
         if !has_pending {
             return BoundaryRun::Proceed;
         }
-        let model = match self.resolve_model() {
+        // The session's live model (the provider target the turn stream
+        // reads), never a fresh startup-chain resolution (R8: a
+        // re-resolution landed the summarizer on an unconfigured provider).
+        let model = match self.session_model() {
             Ok(model) => model,
             Err(error) => {
                 eprintln!("pa-daemon: boundary request could not resolve a model: {error:#}");
@@ -2714,7 +3484,7 @@ impl AgentSessionEngine {
         // context...` loader swap), carrying the pending instructions.
         let scheduled = {
             let guard = self.session.blocking_lock();
-            match guard.as_ref() {
+            match guard.as_deref() {
                 Some(engine) => self
                     .runtime
                     .block_on(async { engine.turn_boundary.scheduled_compaction().await }),
@@ -2744,7 +3514,7 @@ impl AgentSessionEngine {
         }
         let consumption = {
             let guard = self.session.blocking_lock();
-            let Some(engine) = guard.as_ref() else {
+            let Some(engine) = guard.as_deref() else {
                 self.clear_auto_compaction_abort(&controller);
                 return BoundaryRun::Proceed;
             };
@@ -2780,8 +3550,9 @@ impl AgentSessionEngine {
                 // every completed compaction into the active run).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(telemetry) =
-                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
+                    if let Some(telemetry) = guard
+                        .as_deref()
+                        .and_then(|engine| engine.telemetry.as_ref())
                     {
                         telemetry.note_compaction();
                     }
@@ -3093,7 +3864,7 @@ impl AgentSessionEngine {
             }
         }
         let guard = self.session.blocking_lock();
-        let engine = guard.as_ref().expect("session built");
+        let engine = guard.as_deref().expect("session built");
         Ok(std::sync::Arc::clone(engine.session.agent()))
     }
 
@@ -3112,10 +3883,13 @@ impl AgentSessionEngine {
     }
 
     /// The failover chain for `model`: the other auth-configured providers
-    /// serving the same model id, in catalog order after the current one.
-    /// Faux-script sessions never fail over (their failures are
-    /// deterministic test fixtures, and a second provider would only
-    /// reroute the scripted queue).
+    /// serving the same model id, in catalog order after the current one,
+    /// filtered by the daemon model allowlist — a failover must never land
+    /// a turn on a provider the operator pinned out (the same
+    /// `allowedModels` gate as every other resolution). Faux-script
+    /// sessions never fail over (their failures are deterministic test
+    /// fixtures, and a second provider would only reroute the scripted
+    /// queue).
     fn failover_candidates(&self, model: &pa_types::ai::Model) -> Vec<pa_types::ai::Model> {
         if self.config.faux_script.is_some() {
             return Vec::new();
@@ -3126,7 +3900,22 @@ impl AgentSessionEngine {
         registry.load_private_authorization_from_cache();
         let available: Vec<pa_types::ai::Model> =
             registry.get_available().into_iter().cloned().collect();
-        pa_core::models::failover_candidates(model, &available)
+        let candidates = pa_core::models::failover_candidates(model, &available);
+        match crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir) {
+            DaemonAllowlist::Unrestricted => candidates,
+            DaemonAllowlist::Allowed(patterns) => candidates
+                .into_iter()
+                .filter(|candidate| {
+                    pa_core::models::model_allowed(
+                        &format!("{}/{}", candidate.provider, candidate.id),
+                        &patterns,
+                    )
+                })
+                .collect(),
+            // Fail closed on an unreadable policy: no failover candidate
+            // may bypass the configured allowlist.
+            DaemonAllowlist::Unreadable(_) => Vec::new(),
+        }
     }
 
     /// Run one turn, streaming assistant updates through `emit` as they
@@ -3220,17 +4009,28 @@ impl AgentSessionEngine {
                                         // `goal_update` with the next emit),
                                         // and the natural boundary mints the
                                         // budget-limit wrap-up steer.
-                                        if driver.record_assistant_usage(
-                                            &mut session,
-                                            &message_id,
-                                            &message.usage,
-                                        ) == pa_core::session_engine::goal_driver::UsageOutcome::BudgetReached
+                                        // TS `_shouldStopAfterTurn`'s catch:
+                                        // goal accounting must not interrupt
+                                        // the core agent loop; a failed
+                                        // persist only warns.
+                                        match driver
+                                            .record_assistant_usage(&mut session, &message_id, &message.usage)
                                         {
-                                            // TS `_shouldStopAfterTurn`'s budget
-                                            // arm arms the wrap-up steer: the
-                                            // natural boundary reads it.
-                                            goal_budget_crossed
-                                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                                            Ok(
+                                                pa_core::session_engine::goal_driver::UsageOutcome::BudgetReached,
+                                            ) => {
+                                                // TS `_shouldStopAfterTurn`'s budget
+                                                // arm arms the wrap-up steer: the
+                                                // natural boundary reads it.
+                                                goal_budget_crossed
+                                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                eprintln!(
+                                                    "pa-daemon: goal usage accounting persist failed: {error:#}"
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -3425,8 +4225,16 @@ impl AgentSessionEngine {
         let prompt = prompt.clone();
         let mut admitted = std::pin::pin!(async {
             if first_attempt {
-                let guard = self.session.lock().await;
-                let engine = guard.as_ref().expect("session built");
+                // The session lock covers the clone only: the turn below
+                // runs for the whole provider stream, and holding the
+                // mutex across it serialized every client read seam
+                // (`get_system_prompt` and its family waited for the turn
+                // to settle and hit the client's 10s bound — the
+                // 2026-09-22 dogfood failure). The Arc clone keeps the
+                // turn on the same built session while the mutex stays
+                // free for reads (the TS event loop interleaves both).
+                let session = self.session.lock().await.clone();
+                let engine = session.expect("session built");
                 match &prompt {
                     // A plain turn admits a user prompt (text plus
                     // images); an injected turn admits the custom row
@@ -3434,11 +4242,31 @@ impl AgentSessionEngine {
                     // context holds ONE representation of the turn —
                     // the custom row — and the provider request carries
                     // its user-role view at the loop boundary).
-                    TurnPrompt::User { text, images } => engine
-                        .session
-                        .prompt_with_images(text, images.clone(), Default::default())
-                        .await
-                        .map(|_| ()),
+                    TurnPrompt::User {
+                        text,
+                        images,
+                        batch,
+                    } => {
+                        // The batched co-delivery rows ride the same
+                        // admission (TS `_startPreparedTurnActions`'s one
+                        // `agent.prompt(preparedMessages)`): one run over
+                        // the primary plus every batched user row.
+                        let options = pa_core::session_engine::PromptOptions {
+                            batch: batch
+                                .iter()
+                                .map(|row| pa_core::session_engine::PromptBatchRow {
+                                    text: row.text.clone(),
+                                    images: row.images.clone(),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        };
+                        engine
+                            .session
+                            .prompt_with_images(text, images.clone(), options)
+                            .await
+                            .map(|_| ())
+                    }
                     TurnPrompt::Injected(message) => engine
                         .session
                         .prompt_injected_message(message)
@@ -3565,10 +4393,13 @@ enum TurnAdmission {
 /// user prompt, or an injected custom row the turn runs on.
 #[derive(Debug, Clone)]
 enum TurnPrompt {
-    /// A user prompt: text plus its image parts.
+    /// A user prompt: text plus its image parts, with the batched
+    /// co-delivery rows (same-lane, same-policy queue actions under mode
+    /// "all") riding the same run after the primary.
     User {
         text: String,
         images: Vec<pa_agent::types::ImageContent>,
+        batch: Vec<crate::engine::PromptBatchRow>,
     },
     /// An injected custom row (TS `_promptInjectedMessage` — goal
     /// continuations, RLM child terminal notices): the loop admission
@@ -3687,6 +4518,11 @@ pub(crate) mod tests {
 
     pub(crate) use super::FAUX_TEST_LOCK;
 
+    /// The faux model's per-request output budget (maxTokens 16_384 under the
+    /// 32_000 request cap): threshold fixtures subtract it from the window
+    /// alongside the headroom (the combined input+output ceiling).
+    const FAUX_REQUEST_BUDGET: u64 = 16_384;
+
     /// A models.json custom provider (name has no env-key mapping), with an
     /// apiKey the registry must resolve for request auth (the env-key map
     /// alone cannot find it).
@@ -3704,6 +4540,45 @@ pub(crate) mod tests {
                             {
                                 "id": "mock-1",
                                 "name": "Mock 1",
+                                "api": "openai-completions",
+                                "contextWindow": 128000,
+                                "maxTokens": 4096,
+                            }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A models.json custom-provider pair for the thinking clamp: a
+    /// reasoning model (supports the full level ladder up to `high`) and a
+    /// non-reasoning one (supports only `off`) — the restore must clamp
+    /// the requested level against whichever one the session file pins.
+    fn write_thinking_pair_models_json(agent_dir: &std::path::Path, base_url: &str) {
+        std::fs::create_dir_all(agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("models.json"),
+            serde_json::json!({
+                "providers": {
+                    "battery": {
+                        "api": "openai-completions",
+                        "baseUrl": base_url,
+                        "apiKey": "sk-battery",
+                        "models": [
+                            {
+                                "id": "mock-reason",
+                                "name": "Mock Reasoning",
+                                "api": "openai-completions",
+                                "contextWindow": 128000,
+                                "maxTokens": 4096,
+                                "reasoning": true,
+                            },
+                            {
+                                "id": "mock-plain",
+                                "name": "Mock Plain",
                                 "api": "openai-completions",
                                 "contextWindow": 128000,
                                 "maxTokens": 4096,
@@ -3737,6 +4612,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         // The explicit selection from the session's create config is
@@ -3774,6 +4650,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap()
     }
@@ -3811,6 +4688,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         (engine, dir)
@@ -3842,6 +4720,7 @@ pub(crate) mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message,
                 source: "user".to_string(),
@@ -3913,6 +4792,7 @@ pub(crate) mod tests {
                 supervisor_link: None,
                 telemetry_disabled: None,
                 cron_store: None,
+                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -4054,6 +4934,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         // The recovery turn builds the session; the build adopts the
@@ -4220,6 +5101,7 @@ pub(crate) mod tests {
                 supervisor_link: None,
                 telemetry_disabled: None,
                 cron_store: None,
+                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -4289,7 +5171,7 @@ pub(crate) mod tests {
         engine.runtime.block_on(async {
             let mut driver = handles.driver.lock().await;
             let mut session = handles.session.lock().await;
-            driver.complete(&mut session);
+            driver.complete(&mut session).unwrap();
         });
         let mut turn_events: Vec<EngineEvent> = Vec::new();
         admit_request(&engine, request, &mut turn_events);
@@ -4503,6 +5385,7 @@ pub(crate) mod tests {
                 }),
                 telemetry_disabled: None,
                 cron_store: None,
+                queued_steering_probe: None,
             })
             .unwrap(),
         );
@@ -4573,14 +5456,16 @@ pub(crate) mod tests {
         assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
     }
 
-    /// The engine session's entries as their persisted wire shapes.
+    /// The engine session's entries as their persisted wire shapes (the
+    /// hydrating snapshot: a windowed manager holds only the suffix).
     fn engine_session_entries(engine: &AgentSessionEngine) -> Vec<pa_types::session::FileEntry> {
         let guard = engine.session.blocking_lock();
-        let core = guard.as_ref().expect("session built");
+        let core = guard.as_deref().expect("session built");
         let persistence = core.session.shared_persistence();
-        engine
-            .runtime
-            .block_on(async { persistence.lock().await.get_all_entries().to_vec() })
+        engine.runtime.block_on(async {
+            let snapshot = persistence.lock().await.history_snapshot();
+            snapshot.await.expect("history snapshot")
+        })
     }
 
     /// An injected custom turn (wire `customMessage`, the RLM child
@@ -4616,6 +5501,7 @@ pub(crate) mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: notice_text.to_string(),
                 source: "user".to_string(),
@@ -4811,7 +5697,9 @@ pub(crate) mod tests {
                     {"text": "the summary"},
                 ],
             }),
-            128_000u64.saturating_sub(headroom).max(1),
+            128_000u64
+                .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+                .max(1),
         );
 
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -4888,6 +5776,324 @@ pub(crate) mod tests {
         assert_eq!((start_count, end_count), (1, 1));
     }
 
+    /// The compaction summarizer stays on the session's provider when a
+    /// fresh startup-chain resolution drifts mid-session (R8): the live
+    /// report was a prime-inference session whose threshold
+    /// auto-compaction re-resolved to `amazon-bedrock` and failed with
+    /// "No AWS credentials available for Bedrock" while the session's
+    /// turns kept streaming through the target's provider. The session
+    /// builds on the models.json faux model; the settings default then
+    /// changes under it (the drift a live catalog or settings edit
+    /// produces), so [`AgentSessionEngine::resolve_model`] now lands on
+    /// a dead provider — but the threshold arm follows the session's
+    /// provider target ([`AgentSessionEngine::session_model`]): the
+    /// summarizer request still hits the faux provider and the
+    /// compaction succeeds instead of failing on the drift model.
+    #[test]
+    fn threshold_compaction_stays_on_the_session_provider_after_a_resolution_drift() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // The session's provider: the process-global faux provider
+        // (api "faux"), serving the turn replies and the summarizer.
+        let script = json!({
+            "responses": [
+                {"text": "seed reply"},
+                {"text": "crossing reply"},
+                {"text": "the drifted summary"},
+            ],
+        });
+        let parsed = pa_ai::faux::script::parse_faux_script(&script).expect("faux script parses");
+        let registration = pa_ai::faux::script::register_faux_provider_from_script(&parsed);
+        // The registry catalog: the faux model the session builds on,
+        // and the drift model — an openai-completions endpoint nothing
+        // serves (the live R8 shape: Bedrock with no credentials), so a
+        // request against it fails.
+        std::fs::write(
+            agent_dir.join("models.json"),
+            json!({
+                "providers": {
+                    "faux": {
+                        "api": "faux",
+                        "baseUrl": "http://localhost:0",
+                        "apiKey": "sk-faux",
+                        "models": [{
+                            "id": "faux-1",
+                            "name": "Faux Model",
+                            "contextWindow": 128000,
+                            "maxTokens": 16384,
+                        }],
+                    },
+                    "drift": {
+                        "api": "openai-completions",
+                        "baseUrl": "http://127.0.0.1:9",
+                        "apiKey": "sk-drift",
+                        "models": [{
+                            "id": "drift-1",
+                            "name": "Drift Model",
+                            "contextWindow": 128000,
+                            "maxTokens": 16384,
+                        }],
+                    },
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let write_settings = |default_provider: &str, default_model: &str, reserve_tokens: u64| {
+            std::fs::write(
+                agent_dir.join("settings.json"),
+                json!({
+                    "defaultProvider": default_provider,
+                    "defaultModel": default_model,
+                    "compaction": {
+                        "enabled": true,
+                        "reserveTokens": reserve_tokens,
+                        "keepRecentTokens": 10,
+                    },
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let new_engine = || {
+            AgentSessionEngine::new(AgentEngineConfig {
+                cwd: dir.path().to_path_buf(),
+                agent_dir: agent_dir.clone(),
+                provider: None,
+                model: None,
+                api_key: None,
+                thinking: None,
+                session_dir: None,
+                session_file: None,
+                faux_script: None,
+                supervisor_link: None,
+                telemetry_disabled: None,
+                cron_store: None,
+                queued_steering_probe: None,
+            })
+            .unwrap()
+        };
+        // Probe: the baseline turn's total usage (the faux provider
+        // estimates usage from the serialized context, system prompt
+        // included) with the threshold far away.
+        write_settings("faux", "faux-1", 1);
+        let probe = new_engine();
+        let mut probe_events: Vec<EngineEvent> = Vec::new();
+        admit(&probe, "seed turn".to_string(), &mut probe_events);
+        let baseline = probe_events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::AssistantMessage(message) => message["usage"]["totalTokens"].as_u64(),
+                _ => None,
+            })
+            .expect("probe turn produced usage");
+        assert!(baseline < 100_000, "implausible baseline: {baseline}");
+        drop(probe);
+
+        // The threshold engine: the combined input+output ceiling sits
+        // between the seed turn's usage and the crossing turn's (the
+        // same probe margins the sibling threshold tests use; the
+        // 16_384 per-request output budget is part of the ceiling).
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let headroom = baseline + big_tokens / 2;
+        let reserve = 128_000u64
+            .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+            .max(1);
+        write_settings("faux", "faux-1", reserve);
+        registration.set_responses(parsed.responses.clone());
+        let engine = new_engine();
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "seed turn".to_string(), &mut events);
+        assert_eq!(assistant_texts(&events), vec!["seed reply".to_string()]);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                EngineEvent::CompactionStart { .. } | EngineEvent::Compaction { .. }
+            )),
+            "no compaction below the threshold"
+        );
+
+        // The mid-session resolution drift (the live R8 shape): the
+        // settings default changes under the built session, so a fresh
+        // startup-chain resolution lands on the dead provider while the
+        // session's live model stays the provider target.
+        write_settings("drift", "drift-1", reserve);
+        let drifted = engine.resolve_model().expect("the drift model resolves");
+        assert_eq!(
+            (drifted.provider.as_str(), drifted.id.as_str()),
+            ("drift", "drift-1")
+        );
+        let session = engine.session_model().expect("the session model resolves");
+        assert_eq!(
+            (session.provider.as_str(), session.id.as_str()),
+            ("faux", "faux-1")
+        );
+
+        // The threshold arm compacts on the session's provider: the
+        // crossing turn's boundary runs the summarizer through the faux
+        // provider (its queued reply is the compaction result), never
+        // the dead drift model.
+        let calls_before_crossing = registration.call_count();
+        let mut crossing_events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, big_prompt, &mut crossing_events);
+        let starts = crossing_events
+            .iter()
+            .filter(
+                |event| matches!(event, EngineEvent::CompactionStart { event } if event["reason"] == "threshold"),
+            )
+            .count();
+        let ends = crossing_events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::Compaction { .. }))
+            .count();
+        assert_eq!((starts, ends), (1, 1));
+        let summary = crossing_events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::Compaction { event, .. } => {
+                    event["result"]["summary"].as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+            .expect("the compaction end carries the summarizer's text");
+        assert_eq!(summary, "the drifted summary");
+        // The crossing turn and the summarizer both served through the
+        // session's provider — the drift model was never called.
+        assert_eq!(
+            registration.call_count(),
+            calls_before_crossing + 2,
+            "the crossing turn and the summarizer ran on the session provider"
+        );
+        assert_eq!(
+            assistant_texts(&crossing_events),
+            vec!["crossing reply".to_string()]
+        );
+        // The summarizer followed the live target's key too (the R8
+        // seam's key arm): every request against the registration carried
+        // the models.json faux key — the engine's config key is `None`,
+        // so a summarizer reading the stale config key would surface as
+        // a `None` entry here.
+        let keys = registration.received_api_keys();
+        assert_eq!(keys.len() as u64, registration.call_count());
+        assert!(
+            keys.iter().all(|key| key.as_deref() == Some("sk-faux")),
+            "every call followed the live target's key: {keys:?}"
+        );
+        assert!(matches!(
+            crossing_events.last(),
+            Some(EngineEvent::Done(Ok(())))
+        ));
+    }
+
+    /// Retirement clears the provider target with the session (the TS
+    /// replacement teardown): a demand seam before the replacement build
+    /// (an immediate `/compact` after the teardown) resolves the CURRENT
+    /// model through the pre-build `resolve_model` fallback, never the
+    /// retired session's target — a cwd/settings model change lands with
+    /// the replacement, not the stale target.
+    #[test]
+    fn retire_clears_the_provider_target_for_the_replacement_build() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let script = json!({ "responses": [{"text": "seed reply"}] });
+        let parsed = pa_ai::faux::script::parse_faux_script(&script).expect("faux script parses");
+        let _registration = pa_ai::faux::script::register_faux_provider_from_script(&parsed);
+        std::fs::write(
+            agent_dir.join("models.json"),
+            json!({
+                "providers": {
+                    "faux": {
+                        "api": "faux", "baseUrl": "http://localhost:0", "apiKey": "sk-faux",
+                        "models": [{
+                            "id": "faux-1", "name": "Faux Model",
+                            "contextWindow": 128000, "maxTokens": 16384,
+                        }],
+                    },
+                    "drift": {
+                        "api": "faux", "baseUrl": "http://localhost:0", "apiKey": "sk-drift",
+                        "models": [{
+                            "id": "drift-1", "name": "Drift Model",
+                            "contextWindow": 128000, "maxTokens": 16384,
+                        }],
+                    },
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let write_settings = |default_provider: &str, default_model: &str| {
+            std::fs::write(
+                agent_dir.join("settings.json"),
+                json!({
+                    "defaultProvider": default_provider,
+                    "defaultModel": default_model,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let new_engine = || {
+            AgentSessionEngine::new(AgentEngineConfig {
+                cwd: dir.path().to_path_buf(),
+                agent_dir: agent_dir.clone(),
+                provider: None,
+                model: None,
+                api_key: None,
+                thinking: None,
+                session_dir: None,
+                session_file: None,
+                faux_script: None,
+                supervisor_link: None,
+                telemetry_disabled: None,
+                cron_store: None,
+                queued_steering_probe: None,
+            })
+            .unwrap()
+        };
+        write_settings("faux", "faux-1");
+        let engine = new_engine();
+        // The turn builds the session and pins the provider target.
+        let mut events: Vec<EngineEvent> = Vec::new();
+        admit(&engine, "seed turn".to_string(), &mut events);
+        let model = engine.session_model().expect("the session model resolves");
+        assert_eq!(
+            (model.provider.as_str(), model.id.as_str()),
+            ("faux", "faux-1")
+        );
+
+        // The replacement teardown retires the session while the settings
+        // default moves under it (the cwd/settings change the
+        // replacement carries).
+        write_settings("drift", "drift-1");
+        engine
+            .runtime
+            .block_on(async { engine.retire_session_runtime().await });
+        assert!(engine
+            .runtime
+            .block_on(async { engine.session.lock().await.is_none() }));
+
+        // A demand seam before the replacement build (the prewarm has not
+        // rebuilt yet) resolves the CURRENT model, never the retired
+        // session's target.
+        let model = engine
+            .session_model()
+            .expect("the replacement model resolves");
+        assert_eq!(
+            (model.provider.as_str(), model.id.as_str()),
+            ("drift", "drift-1"),
+            "the retired session's provider target must not outlive it"
+        );
+    }
+
     /// End the session telemetry (flushing every queued event through the
     /// local mirror sink) and read one named event's properties: the
     /// transparency mirror is the product's own observable surface for the
@@ -4953,7 +6159,9 @@ pub(crate) mod tests {
                     {"text": "the summary"},
                 ],
             }),
-            128_000u64.saturating_sub(headroom).max(1),
+            128_000u64
+                .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+                .max(1),
         );
         let mut events: Vec<EngineEvent> = Vec::new();
         admit(&engine, "seed turn".to_string(), &mut events);
@@ -5004,7 +6212,7 @@ pub(crate) mod tests {
         );
         {
             let guard = engine.session.blocking_lock();
-            let core = guard.as_ref().expect("session built");
+            let core = guard.as_deref().expect("session built");
             engine
                 .runtime
                 .block_on(async { core.turn_boundary.schedule_compaction(None).await });
@@ -5153,7 +6361,7 @@ pub(crate) mod tests {
     /// The engine session's durable entry chain carries the outcome row.
     pub(crate) fn outcome_row_in_entries(engine: &AgentSessionEngine) -> bool {
         let guard = engine.session.blocking_lock();
-        let Some(core) = guard.as_ref() else {
+        let Some(core) = guard.as_deref() else {
             return false;
         };
         let persistence = core.session.shared_persistence();
@@ -5171,7 +6379,7 @@ pub(crate) mod tests {
     /// the provider request.
     pub(crate) fn outcome_row_in_live_context(engine: &AgentSessionEngine) -> bool {
         let guard = engine.session.blocking_lock();
-        let Some(core) = guard.as_ref() else {
+        let Some(core) = guard.as_deref() else {
             return false;
         };
         engine.runtime.block_on(async {
@@ -5216,7 +6424,9 @@ pub(crate) mod tests {
         let headroom = baseline + big_tokens / 2;
         let (engine, _engine_dir) = faux_engine_with_settings(
             serde_json::json!({ "responses": [{"text": "crossing reply"}] }),
-            128_000u64.saturating_sub(headroom).max(1),
+            128_000u64
+                .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+                .max(1),
         );
         let mut events: Vec<EngineEvent> = Vec::new();
         admit(&engine, big_prompt, &mut events);
@@ -5244,7 +6454,7 @@ pub(crate) mod tests {
         assert!(outcome_row_in_entries(&engine));
         assert!(outcome_row_in_live_context(&engine));
         let guard = engine.session.blocking_lock();
-        let core = guard.as_ref().expect("session built");
+        let core = guard.as_deref().expect("session built");
         let persistence = core.session.shared_persistence();
         let has_compaction_entry = engine.runtime.block_on(async {
             persistence
@@ -5285,6 +6495,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -5293,7 +6504,7 @@ pub(crate) mod tests {
         // the boundary consumes it after the next turn settles.
         {
             let guard = engine.session.blocking_lock();
-            let core = guard.as_ref().expect("session built");
+            let core = guard.as_deref().expect("session built");
             engine
                 .runtime
                 .block_on(async { core.turn_boundary.schedule_compaction(None).await });
@@ -5319,13 +6530,14 @@ pub(crate) mod tests {
     /// entry (an aborted run must never commit one).
     pub(crate) fn compaction_entry_in_entries(engine: &AgentSessionEngine) -> bool {
         let guard = engine.session.blocking_lock();
-        let Some(core) = guard.as_ref() else {
+        let Some(core) = guard.as_deref() else {
             return false;
         };
         let persistence = core.session.shared_persistence();
-        let entries = engine
-            .runtime
-            .block_on(async { persistence.lock().await.get_entries() });
+        let entries = engine.runtime.block_on(async {
+            let snapshot = persistence.lock().await.history_snapshot();
+            snapshot.await.expect("history snapshot")
+        });
         entries
             .iter()
             .any(|entry| matches!(entry, pa_types::session::FileEntry::Compaction { .. }))
@@ -5345,6 +6557,7 @@ pub(crate) mod tests {
             engine.run_prompt(
                 0,
                 PromptRequest {
+                    batch: Vec::new(),
                     images: Vec::new(),
                     message,
                     source: "user".to_string(),
@@ -5475,7 +6688,9 @@ pub(crate) mod tests {
                     {"text": "the summary", "delayMs": 30_000},
                 ],
             }),
-            128_000u64.saturating_sub(headroom).max(1),
+            128_000u64
+                .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+                .max(1),
         );
         let engine = std::sync::Arc::new(engine);
         let mut seed_events: Vec<EngineEvent> = Vec::new();
@@ -5550,7 +6765,7 @@ pub(crate) mod tests {
         // the boundary consumes it after the next turn settles.
         {
             let guard = engine.session.blocking_lock();
-            let core = guard.as_ref().expect("session built");
+            let core = guard.as_deref().expect("session built");
             engine
                 .runtime
                 .block_on(async { core.turn_boundary.schedule_compaction(None).await });
@@ -5598,7 +6813,7 @@ pub(crate) mod tests {
         // run).
         {
             let guard = engine.session.blocking_lock();
-            let core = guard.as_ref().expect("session built");
+            let core = guard.as_deref().expect("session built");
             assert!(!engine
                 .runtime
                 .block_on(async { core.turn_boundary.compaction_scheduled().await }));
@@ -5635,12 +6850,14 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "a small turn".to_string(),
                 source: "user".to_string(),
@@ -5674,6 +6891,7 @@ pub(crate) mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: vec![pa_agent::types::ImageContent {
                     data: "QUJD".to_string(),
                     mime_type: "image/png".to_string(),
@@ -5726,11 +6944,864 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         let model = engine.resolve_registry_model().expect("resolved model");
         assert_eq!(model.provider, "battery");
         assert_eq!(model.id, "mock-1");
+    }
+
+    /// A scripted loopback HTTP server (the pa-core tests/common pattern,
+    /// in-crate): answers from a queue of raw responses and records every
+    /// request head. Nothing leaves loopback.
+    struct MockCatalogServer {
+        port: u16,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl MockCatalogServer {
+        async fn start(responses: Vec<Vec<u8>>) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock catalog server");
+            let port = listener.local_addr().unwrap().port();
+            let requests: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(responses),
+            ));
+            let request_log = std::sync::Arc::clone(&requests);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let requests = std::sync::Arc::clone(&request_log);
+                    let queue = std::sync::Arc::clone(&queue);
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 8_192];
+                        let mut read = 0usize;
+                        loop {
+                            let Ok(n) = socket.read(&mut buffer[read..]).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            read += n;
+                            if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                            if read == buffer.len() {
+                                break;
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        requests.lock().unwrap().push(head);
+                        let response = queue.lock().unwrap().pop_front().unwrap_or_else(|| {
+                            b"HTTP/1.1 500 Drained\r\ncontent-length: 0\r\n\r\n".to_vec()
+                        });
+                        let _ = socket.write_all(&response).await;
+                        let _ = socket.flush().await;
+                    });
+                }
+            });
+            Self { port, requests }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{}", self.port, path)
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    fn catalog_ok_json(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// One auth.json with a Prime Inference key + team: the file auth the
+    /// engine's registry reads (the private-model lane's scope).
+    fn write_prime_auth(agent_dir: &std::path::Path) {
+        std::fs::create_dir_all(agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("auth.json"),
+            serde_json::json!({
+                "prime-inference": {
+                    "type": "api_key",
+                    "key": "test-key",
+                    "primeTeam": { "teamId": "team-1", "name": "Test Team" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The Prime Inference `/models` payload: every compiled offline
+    /// entry (the coverage gate keeps thin fetches out) plus the private
+    /// `internal/glm-5.3-fast` the compiled fallback lacks.
+    fn pi_payload() -> String {
+        let mut data: Vec<Value> = pa_models::transports::prime_inference_offline_entries()
+            .iter()
+            .map(|model| {
+                serde_json::json!({
+                    "id": model.id,
+                    "display_name": model.name,
+                    "pricing": {
+                        "input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0
+                    },
+                    "specs": {
+                        "context_window": model.context_window,
+                        "max_output_tokens": model.max_tokens,
+                        "supports_reasoning": model.reasoning,
+                        "modalities": { "input": ["text"], "output": ["text"] },
+                    },
+                })
+            })
+            .collect();
+        data.push(serde_json::json!({
+            "id": "internal/glm-5.3-fast",
+            "display_name": "GLM 5.3 Fast (internal)",
+            "pricing": { "input_usd_per_mtok": 0.42, "output_usd_per_mtok": 2.1 },
+            "specs": {
+                "context_window": 400_000, "max_output_tokens": 131_072,
+                "supports_reasoning": true,
+                "modalities": { "input": ["text"], "output": ["text"] },
+            },
+        }));
+        serde_json::json!({ "data": data }).to_string()
+    }
+
+    /// Install a loopback catalog for `agent_dir` (both fetch layers point
+    /// at `server`; no bundled snapshot, so the compiled fallback is the
+    /// base and only the fetches add the private team model).
+    fn install_loopback_catalog(agent_dir: &std::path::Path, server: &MockCatalogServer) {
+        let catalog = pa_models::ModelCatalog::with_urls(
+            Some(agent_dir.join("models")),
+            None,
+            &server.url("/catalog"),
+            &server.url("/api/v1"),
+        );
+        pa_core::models::install_catalog(
+            &agent_dir.join("models.json"),
+            std::sync::Arc::new(catalog),
+        );
+    }
+
+    /// A session file whose last `model_change` row pins the private team
+    /// model — what a revived worker reads at create.
+    fn session_file_pinning_private_model(dir: &std::path::Path) -> std::path::PathBuf {
+        session_file_pinning_model(dir, "prime-inference", "internal/glm-5.3-fast")
+    }
+
+    /// A session file whose last `model_change` row pins the given model —
+    /// what a revived worker reads at create (and what a replacement
+    /// flow re-restores at its session boot).
+    fn session_file_pinning_model(
+        dir: &std::path::Path,
+        provider: &str,
+        model: &str,
+    ) -> std::path::PathBuf {
+        let mut session =
+            crate::session_store::SessionFile::create(dir.to_str().unwrap_or("/tmp"), None, 0);
+        let path = dir.join(crate::session_store::session_file_name(
+            session.session_id(),
+        ));
+        session.set_path(path.clone());
+        session.append_model_change(provider, model);
+        session.rewrite().unwrap();
+        path
+    }
+
+    fn restore_test_engine(
+        dir: &std::path::Path,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> AgentSessionEngine {
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.to_path_buf(),
+            agent_dir: dir.join("agent"),
+            provider: provider.map(str::to_string),
+            model: model.map(str::to_string),
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .expect("engine")
+    }
+
+    /// The daemon model allowlist enforcement at the startup chain
+    /// (`resolve_registry_model`): a resolution outside settings
+    /// `allowedModels` fails loudly with the typed refusal — the chain
+    /// never lands a session on an off-list model (no silent fallback to
+    /// the featured default) — and an allowing allowlist keeps the
+    /// resolution.
+    #[test]
+    fn the_startup_chain_refuses_models_outside_the_allowlist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["anthropic/*"] }).to_string(),
+        )
+        .unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let error = engine
+            .resolve_registry_model()
+            .expect_err("off-allowlist model refused");
+        let refusal = error
+            .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+            .expect("typed refusal");
+        assert_eq!(refusal.selector, "battery/mock-1");
+        assert!(
+            error
+                .to_string()
+                .contains("blocked by the daemon model allowlist"),
+            "{error}"
+        );
+
+        // An allowing allowlist opens the gate: the same engine resolves.
+        std::fs::write(
+            engine.config.agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["battery/*"] }).to_string(),
+        )
+        .unwrap();
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.provider, "battery");
+        assert_eq!(model.id, "mock-1");
+    }
+
+    /// The revival race this lane fixes (the 2026-09-23 05:57 fleet kill):
+    /// a revived session (scheduled wake / update restore / worker
+    /// relaunch — a create without model flags) resolves against the cold
+    /// registry and lands on the featured default while the daemon boot's
+    /// catalog fetch is still in flight. The create-time restore pins the
+    /// session's saved model after the readiness window instead.
+    #[tokio::test]
+    async fn revived_session_restores_its_pinned_model_not_the_startup_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        let pi = pi_payload();
+        let layer_a = serde_json::json!({ "schemaVersion": 1, "models": [] }).to_string();
+        let server = MockCatalogServer::start(vec![
+            catalog_ok_json(&layer_a),
+            catalog_ok_json(&pi),
+            catalog_ok_json(&pi),
+        ])
+        .await;
+        install_loopback_catalog(&agent_dir, &server);
+        let path = session_file_pinning_private_model(dir.path());
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(path.clone());
+
+        // The premise — the silent fallback the race produced: the cold
+        // registry holds only the compiled entries, so the unflagged
+        // startup chain picks the featured default (z-ai/glm-5.3), not the
+        // model the session file pins. No fetch has run.
+        let cold = engine.resolve_registry_model().expect("cold resolution");
+        assert_eq!(cold.provider, "prime-inference");
+        assert_eq!(cold.id, "z-ai/glm-5.3");
+        assert_eq!(
+            server.request_count(),
+            0,
+            "the cold resolution never fetches"
+        );
+
+        // The create-time restore: the readiness window covers the fetch,
+        // the pinned model restores and every later unflagged resolution
+        // runs on it.
+        engine.restore_session_model(&path).await;
+        let restored = engine
+            .resolve_registry_model()
+            .expect("restored resolution");
+        assert_eq!(restored.provider, "prime-inference");
+        assert_eq!(restored.id, "internal/glm-5.3-fast");
+        assert!(
+            engine.model_fallback_message().is_none(),
+            "a successful restore leaves no fallback message"
+        );
+    }
+
+    /// A restore that misses even after the readiness window falls back to
+    /// the startup chain — on the record (TS `modelFallbackMessage`), never
+    /// silent.
+    #[tokio::test]
+    async fn revived_session_fallback_is_on_the_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        // Every fetch fails instantly (the drained queue answers 500): the
+        // restore misses fast, the startup chain owns the session.
+        let server = MockCatalogServer::start(Vec::new()).await;
+        install_loopback_catalog(&agent_dir, &server);
+        let path = session_file_pinning_private_model(dir.path());
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(path.clone());
+
+        engine.restore_session_model(&path).await;
+        assert_eq!(
+            engine.model_fallback_message().as_deref(),
+            Some("Could not restore model prime-inference/internal/glm-5.3-fast. Using prime-inference/z-ai/glm-5.3"),
+            "the fallback is published, never silent"
+        );
+        let resolved = engine.resolve_registry_model().expect("startup chain");
+        assert_eq!(resolved.provider, "prime-inference");
+        assert_eq!(resolved.id, "z-ai/glm-5.3");
+    }
+
+    /// Explicit create flags are authoritative (TS `options.model`): the
+    /// saved session model never overrides a flagged selection, and a
+    /// skipped restore records no fallback.
+    #[tokio::test]
+    async fn create_flags_beat_the_saved_session_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let path = session_file_pinning_private_model(dir.path());
+        let engine = restore_test_engine(dir.path(), Some("battery"), Some("mock-1"));
+        engine.set_session_file(path.clone());
+
+        engine.restore_session_model(&path).await;
+        let resolved = engine.resolve_registry_model().expect("flagged resolution");
+        assert_eq!(resolved.provider, "battery");
+        assert_eq!(resolved.id, "mock-1");
+        assert!(engine.model_fallback_message().is_none());
+    }
+
+    /// A session with no saved model context (a fresh file) keeps the
+    /// startup chain — the restore is a no-op, nothing is recorded.
+    #[tokio::test]
+    async fn fresh_session_without_a_saved_model_keeps_the_startup_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        let server = MockCatalogServer::start(Vec::new()).await;
+        install_loopback_catalog(&agent_dir, &server);
+        // A session file with no model rows at all.
+        let mut session = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let path = dir.path().join(crate::session_store::session_file_name(
+            session.session_id(),
+        ));
+        session.set_path(path.clone());
+        session.rewrite().unwrap();
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(path.clone());
+
+        engine.restore_session_model(&path).await;
+        assert!(engine.model_fallback_message().is_none());
+        let resolved = engine.resolve_registry_model().expect("startup chain");
+        assert_eq!(resolved.id, "z-ai/glm-5.3");
+    }
+
+    /// The restore decision is scoped to the file it was computed for: a
+    /// replacement flow that moves the worker onto another file without
+    /// recomputing keeps the startup chain — the previous session's pin
+    /// never silently overrides the moved-to session (TS re-restores at
+    /// every session boot).
+    #[tokio::test]
+    async fn a_restore_decision_is_scoped_to_its_session_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        let pi = pi_payload();
+        let layer_a = serde_json::json!({ "schemaVersion": 1, "models": [] }).to_string();
+        let server = MockCatalogServer::start(vec![
+            catalog_ok_json(&layer_a),
+            catalog_ok_json(&pi),
+            catalog_ok_json(&pi),
+        ])
+        .await;
+        install_loopback_catalog(&agent_dir, &server);
+        let pinned = session_file_pinning_private_model(dir.path());
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(pinned.clone());
+        engine.restore_session_model(&pinned).await;
+        let restored = engine
+            .resolve_registry_model()
+            .expect("restored resolution");
+        assert_eq!(restored.id, "internal/glm-5.3-fast");
+
+        // The worker moves onto another file (a replacement flow that has
+        // not recomputed yet): the decision for the old file no longer
+        // applies — the startup chain owns the resolution again.
+        let mut other = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let other_path = dir
+            .path()
+            .join(crate::session_store::session_file_name(other.session_id()));
+        other.set_path(other_path.clone());
+        other.rewrite().unwrap();
+        engine.set_session_file(other_path);
+        let moved = engine.resolve_registry_model().expect("moved resolution");
+        assert_eq!(moved.id, "z-ai/glm-5.3");
+        assert!(
+            engine.model_fallback_message().is_none(),
+            "the old file's decision does not leak into the moved-to session"
+        );
+    }
+
+    /// A mid-session `/model` switch belongs to the session it switched
+    /// (TS `switchSession` -> `createRuntime` rebuilds the runtime config
+    /// from the daemon default): a replacement onto another file drops
+    /// the switch and restores the moved-to file's own pin.
+    #[tokio::test]
+    async fn a_model_switch_never_leaks_into_the_replacement_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let pi = pi_payload();
+        let layer_a = serde_json::json!({ "schemaVersion": 1, "models": [] }).to_string();
+        let server = MockCatalogServer::start(vec![
+            catalog_ok_json(&layer_a),
+            catalog_ok_json(&pi),
+            catalog_ok_json(&pi),
+        ])
+        .await;
+        install_loopback_catalog(&agent_dir, &server);
+
+        // Session A pins the private model; the worker restores it.
+        let file_a = session_file_pinning_private_model(dir.path());
+        let engine = std::sync::Arc::new(restore_test_engine(dir.path(), None, None));
+        engine.set_session_file(file_a.clone());
+        engine.restore_session_model(&file_a).await;
+        let restored = engine.resolve_registry_model().expect("restored");
+        assert_eq!(restored.id, "internal/glm-5.3-fast");
+
+        // A mid-session /model switch on session A (the worker runs the
+        // engine's synchronous switch on the blocking pool, like the turn
+        // path — a tokio context must not block on its locks).
+        let switched_engine = std::sync::Arc::clone(&engine);
+        let switched = tokio::task::spawn_blocking(move || {
+            switched_engine.switch_model(EngineModelSelection {
+                provider: Some("battery".to_string()),
+                model: Some("mock-1".to_string()),
+                api_key: None,
+                thinking: None,
+            })
+        })
+        .await
+        .expect("blocking switch");
+        assert!(switched);
+        let switched = engine.resolve_registry_model().expect("switched");
+        assert_eq!(switched.id, "mock-1");
+
+        // The replacement (switch_session/fork/import) onto another file
+        // that pins its own model: the switch does not leak — the
+        // moved-to session restores its own pin.
+        let file_b = session_file_pinning_private_model(dir.path());
+        engine.set_session_file(file_b.clone());
+        engine.restore_session_model(&file_b).await;
+        let moved = engine.resolve_registry_model().expect("moved resolution");
+        assert_eq!(
+            moved.id, "internal/glm-5.3-fast",
+            "the moved-to session's own file pin wins over the previous session's switch"
+        );
+        assert!(engine.model_fallback_message().is_none());
+    }
+
+    /// An unpersisted session (an in-memory fork, a no-session worker's
+    /// replacement) has no file to restore from: the runtime-config reset
+    /// must not run with nothing to restore — the live selection keeps
+    /// the model the session runs on (TS restores the in-memory branch's
+    /// own context).
+    #[tokio::test]
+    async fn an_unpersisted_session_keeps_its_live_selection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = std::sync::Arc::new(restore_test_engine(dir.path(), None, None));
+        engine.configure_create_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-plain".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        // A mid-session /model switch on the live session (the worker
+        // runs the engine's synchronous switch on the blocking pool).
+        let switched_engine = std::sync::Arc::clone(&engine);
+        let switched = tokio::task::spawn_blocking(move || {
+            switched_engine.switch_model(EngineModelSelection {
+                provider: Some("battery".to_string()),
+                model: Some("mock-reason".to_string()),
+                api_key: None,
+                thinking: None,
+            })
+        })
+        .await
+        .expect("blocking switch");
+        assert!(switched);
+
+        // The in-memory fork's replacement restore: an empty path is a
+        // no-op — the switch survives (never reset to the runtime config).
+        engine.restore_session_model(std::path::Path::new("")).await;
+        let resolved = engine.resolve_registry_model().expect("live selection");
+        assert_eq!(
+            (resolved.provider.as_str(), resolved.id.as_str()),
+            ("battery", "mock-reason"),
+            "the live selection survives an unpersisted replacement"
+        );
+    }
+
+    /// A replacement re-reads the moved-to session's saved thinking level
+    /// (TS `createAgentSession`: `hasThinkingEntry ?
+    /// existingSession.thinkingLevel` when the runtime config carries no
+    /// explicit flag): the pinned level replaces the settings/medium
+    /// default and clamps against the restored model.
+    #[tokio::test]
+    async fn a_replacement_restores_the_moved_to_sessions_saved_thinking_level() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = restore_test_engine(dir.path(), None, None);
+
+        // Session A pins the reasoning model at thinking `low`.
+        let mut file_a = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let path_a = dir
+            .path()
+            .join(crate::session_store::session_file_name(file_a.session_id()));
+        file_a.set_path(path_a.clone());
+        file_a.append_model_change("battery", "mock-reason");
+        file_a.append_thinking_level_change("low");
+        file_a.rewrite().unwrap();
+        engine.set_session_file(path_a.clone());
+        engine.restore_session_model(&path_a).await;
+        assert_eq!(
+            engine.effective_thinking_level().as_deref(),
+            Some("low"),
+            "the moved-to session's saved thinking level restores, not the medium default"
+        );
+
+        // Session B pins the non-reasoning model at thinking `high`: the
+        // saved level restores and clamps against the restored model.
+        let mut file_b = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let path_b = dir
+            .path()
+            .join(crate::session_store::session_file_name(file_b.session_id()));
+        file_b.set_path(path_b.clone());
+        file_b.append_model_change("battery", "mock-plain");
+        file_b.append_thinking_level_change("high");
+        file_b.rewrite().unwrap();
+        engine.set_session_file(path_b.clone());
+        engine.restore_session_model(&path_b).await;
+        assert_eq!(
+            engine.effective_thinking_level().as_deref(),
+            Some("off"),
+            "the saved level re-clamps against the restored non-reasoning model"
+        );
+    }
+
+    /// A compacted session restores the model its post-compaction
+    /// assistant message ran on (TS `buildSessionContext().model`: the
+    /// last `model_change` row before the compaction summary is
+    /// superseded; the surviving assistant message's provider/model is
+    /// the session's model context).
+    #[tokio::test]
+    async fn a_compacted_session_restores_its_post_compaction_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        let mut session = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let path = dir.path().join(crate::session_store::session_file_name(
+            session.session_id(),
+        ));
+        session.set_path(path.clone());
+        session.append_model_change("battery", "mock-reason");
+        let kept = session.append_message(serde_json::json!({
+            "role": "assistant",
+            "provider": "battery",
+            "model": "mock-plain",
+            "api": "openai-responses",
+            "content": [],
+            "stopReason": "stop",
+            "timestamp": 0u64,
+            "usage": {
+                "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 }
+            }
+        }));
+        session.append_entry(
+            "compaction",
+            serde_json::json!({
+                "summary": "summary",
+                "firstKeptEntryId": kept,
+                "tokensBefore": 100
+            }),
+        );
+        session.rewrite().unwrap();
+
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(path.clone());
+        engine.restore_session_model(&path).await;
+        let restored = engine
+            .resolve_registry_model()
+            .expect("restored resolution");
+        assert_eq!(
+            (restored.provider.as_str(), restored.id.as_str()),
+            ("battery", "mock-plain"),
+            "the post-compaction assistant message pins the restored model, not the superseded model_change"
+        );
+        assert!(engine.model_fallback_message().is_none());
+    }
+
+    /// The create command's explicit flags survive every session
+    /// replacement (TS hands the merged `sessionConfig` down through
+    /// `switchSession`/`fork`/`import`): a later replacement honors the
+    /// create-time selection — never the previous session's `/model`
+    /// switch, and never the moved-to file's pin (a flagged selection
+    /// skips the restore entirely, so no fallback is recorded either).
+    #[tokio::test]
+    async fn create_flags_survive_a_session_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        // The worker started without an environment model; its create
+        // command carries the explicit flag.
+        let engine = std::sync::Arc::new(restore_test_engine(dir.path(), None, None));
+        engine.configure_create_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-plain".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+
+        // A mid-session /model switch on the first session (the worker
+        // runs the engine's synchronous switch on the blocking pool — a
+        // tokio context must not block on its locks).
+        let switched_engine = std::sync::Arc::clone(&engine);
+        let switched = tokio::task::spawn_blocking(move || {
+            switched_engine.switch_model(EngineModelSelection {
+                provider: Some("battery".to_string()),
+                model: Some("mock-reason".to_string()),
+                api_key: None,
+                thinking: None,
+            })
+        })
+        .await
+        .expect("blocking switch");
+        assert!(switched);
+        let switched = engine.resolve_registry_model().expect("switched");
+        assert_eq!(switched.id, "mock-reason");
+
+        // The replacement onto a file pinning its own model: the
+        // runtime-config reset returns to the create's folded selection —
+        // the switch died with the session it switched, and the file's
+        // pin never even runs.
+        let moved = session_file_pinning_model(dir.path(), "battery", "mock-reason");
+        engine.set_session_file(moved.clone());
+        engine.restore_session_model(&moved).await;
+        let resolved = engine.resolve_registry_model().expect("flagged resolution");
+        assert_eq!(
+            (resolved.provider.as_str(), resolved.id.as_str()),
+            ("battery", "mock-plain"),
+            "the create command's flags survive the replacement"
+        );
+        assert!(
+            engine.model_fallback_message().is_none(),
+            "a flagged restore never records a fallback"
+        );
+    }
+
+    /// The restore clamps the thinking level against the model the
+    /// session actually runs on (TS `createAgentSession` resolves the
+    /// model first, then `clampThinkingLevel`): a create-time `high`
+    /// request restores a non-reasoning pin and the session runs `off`,
+    /// and a later replacement onto a reasoning pin re-clamps back to
+    /// `high` — the previous session's clamp never leaks into the
+    /// moved-to one.
+    #[tokio::test]
+    async fn a_replacement_re_clamps_the_thinking_level_against_the_restored_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = restore_test_engine(dir.path(), None, None);
+        // The create command requested `high`.
+        engine.configure_create_model(EngineModelSelection {
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: Some(pa_types::ai::ModelThinkingLevel::High),
+        });
+
+        // The worker's first session pins the non-reasoning model: the
+        // restore records the pin and the level clamps against it.
+        let plain = session_file_pinning_model(dir.path(), "battery", "mock-plain");
+        engine.set_session_file(plain.clone());
+        engine.restore_session_model(&plain).await;
+        assert_eq!(
+            engine.effective_thinking_level().as_deref(),
+            Some("off"),
+            "the clamp follows the restored non-reasoning model, not the reset selection"
+        );
+
+        // The replacement onto a file pinning the reasoning model: the
+        // moved-to session re-clamps against its own restored pin.
+        let reason = session_file_pinning_model(dir.path(), "battery", "mock-reason");
+        engine.set_session_file(reason.clone());
+        engine.restore_session_model(&reason).await;
+        assert_eq!(
+            engine.effective_thinking_level().as_deref(),
+            Some("high"),
+            "the replacement re-clamps the requested level against its restored model"
+        );
+    }
+
+    /// The engine's switch guard: `switch_model` refuses an off-allowlist
+    /// candidate BEFORE the selection mutates, so a refused cycle or switch
+    /// never poisons the live selection (every later resolution would fail
+    /// at the same gate) — the session keeps resolving its current model.
+    #[test]
+    fn switch_model_never_poisons_the_selection_with_a_refused_candidate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["battery/mock-1"] }).to_string(),
+        )
+        .unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.id, "mock-1");
+        // The switched-to model does not match the allowlist: the switch is
+        // refused and the selection keeps the resolvable model.
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-2".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(!switched, "off-allowlist switch refused");
+        let model = engine.resolve_registry_model().expect("still resolvable");
+        assert_eq!(model.id, "mock-1");
+        // The allowed model still switches through.
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(switched, "allowed switch proceeds");
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.id, "mock-1");
+    }
+
+    /// A live model switch propagates to the children registry's parent
+    /// identity: an inherited `rlm.spawn` resolves the model the session
+    /// NOW runs. The build-time stamp alone would go stale after a
+    /// switch, so the allowlist gate would refuse a stale selector the
+    /// parent no longer runs once the allowlist drops it.
+    #[test]
+    fn switch_model_propagates_the_new_model_to_the_child_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: Some(SupervisorLinkConfig {
+                socket_path: dir.path().join("absent-supervisor.sock"),
+                active_session_id: "parent-live".to_string(),
+                worker_token: "test-token".to_string(),
+            }),
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let children = engine
+            .children
+            .as_ref()
+            .expect("the supervisor link wires the children registry")
+            .clone();
+        // The pre-switch identity (the build-time stamp's shape): an
+        // older selector.
+        children.set_model("battery/mock-2".to_string());
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(switched, "the switch proceeds without an allowlist");
+        assert_eq!(
+            children.parent_model().as_deref(),
+            Some("battery/mock-1"),
+            "an inherited spawn must resolve the switched-to model, not the stale build-time selector"
+        );
     }
 
     #[test]
@@ -5751,6 +7822,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         // A create config with only a model keeps the provider and key.
@@ -5806,12 +7878,14 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         let mut events: Vec<EngineEvent> = Vec::new();
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "hi".to_string(),
                 source: "user".to_string(),
@@ -5875,6 +7949,7 @@ pub(crate) mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         // Without an explicit flag the TS default applies (medium, clamped).
@@ -5940,6 +8015,7 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -5950,6 +8026,7 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
         turn_engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "hello".to_string(),
                 source: "user".to_string(),
@@ -6220,6 +8297,7 @@ fn retried_run_restarts_with_its_own_agent_frames() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();
@@ -6336,6 +8414,7 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6365,6 +8444,7 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
         turn_engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "held turn".to_string(),
                 source: "user".to_string(),
@@ -6449,6 +8529,194 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
     assert_eq!(after["continuationsUsed"], before["continuationsUsed"]);
 }
 
+/// Scoped process-env overrides for the live-kernel tests: applied on
+/// construction, restored on drop. The live-kernel tests are serialized by
+/// the faux lock, so nothing races.
+#[cfg(test)]
+struct KernelEnvOverride {
+    saved: Vec<(String, Option<String>)>,
+}
+
+#[cfg(test)]
+impl KernelEnvOverride {
+    fn apply(pairs: Vec<(&str, Option<String>)>) -> Self {
+        let saved = pairs
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        for (key, value) in &pairs {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        KernelEnvOverride { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for KernelEnvOverride {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// The kernel python for the live-kernel abort test (skipped without a live
+/// install).
+#[cfg(test)]
+fn live_kernel_python() -> Option<std::path::PathBuf> {
+    let candidate = std::path::PathBuf::from(
+        std::env::var("HOME")
+            .map(|home| format!("{home}/.prime/agent/kernel-venv/bin/python"))
+            .unwrap_or_else(|_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string()),
+    );
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    eprintln!("kernel python {candidate:?} not found; skipping live kernel test");
+    None
+}
+
+#[cfg(test)]
+fn live_release_dir() -> Option<std::path::PathBuf> {
+    let releases = std::path::PathBuf::from(
+        std::env::var("HOME")
+            .map(|home| format!("{home}/.local/share/prime-agent/releases"))
+            .unwrap_or_else(|_| "/home/ubuntu/.local/share/prime-agent/releases".to_string()),
+    );
+    let Ok(entries) = std::fs::read_dir(&releases) else {
+        eprintln!("no releases dir at {releases:?}; skipping live kernel test");
+        return None;
+    };
+    let mut candidates: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.join("prime-agent-runtime").is_dir())
+        .collect();
+    candidates.sort();
+    candidates.pop()
+}
+
+/// The abort wedge repro (dogfood P0): a turn executing a long kernel cell
+/// must unwind at `abort_in_flight_turn` (the kernel interrupt +
+/// force-abort path settles the tool race) - not keep the turn alive while
+/// the cell runs out. Red: the run thread wedged past the cell's sleep
+/// (the daemon worker's `run_turn_once` awaits the admission forever).
+#[test]
+fn abort_in_flight_turn_cancels_a_running_kernel_cell() {
+    let Some(kernel_python) = live_kernel_python() else {
+        return;
+    };
+    let Some(release) = live_release_dir() else {
+        return;
+    };
+    let _env = KernelEnvOverride::apply(vec![
+        (
+            "PRIME_AGENT_KERNEL_PYTHON",
+            Some(kernel_python.display().to_string()),
+        ),
+        ("PI_PACKAGE_DIR", Some(release.display().to_string())),
+        ("PRIME_AGENT_CODING_AGENT_DIR", None),
+        ("PRIME_API_KEY", None),
+    ]);
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(
+            json!({
+                "engine": "faux",
+                "modelId": "faux-1",
+                "modelName": "Faux",
+                "reasoning": false,
+                "contextWindow": 128000,
+                "tokensPerSecond": 30,
+                "responses": [
+                    {"content": [
+                        {"type": "text", "text": "Running the wedge cell."},
+                        {"type": "toolCall", "name": "ipython", "id": "toolu_wedge01",
+                         "arguments": {"code":
+                            "import time\nopen('wedge-started', 'w').write('1')\ntime.sleep(300)\nopen('wedge-finished', 'w').write('1')\nprint('cell completed')"}}
+                    ]},
+                    {"content": [{"type": "text", "text": "The cell completed."}]}
+                ]
+            })
+            .to_string(),
+        ),
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let engine = std::sync::Arc::new(engine);
+    engine.register_arc();
+    let marker = dir.path().join("wedge-started");
+    let finished = dir.path().join("wedge-finished");
+    let events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runner = {
+        let engine = std::sync::Arc::clone(&engine);
+        let events = std::sync::Arc::clone(&events);
+        std::thread::spawn(move || {
+            let events = events;
+            engine.run_prompt(
+                0,
+                PromptRequest {
+                    batch: Vec::new(),
+                    images: Vec::new(),
+                    message: "run the wedge cell".to_string(),
+                    source: "user".to_string(),
+                    agent_message_id: None,
+                    custom_message: None,
+                },
+                &|| false,
+                &mut move |event: EngineEvent| {
+                    events.lock().unwrap().push(event);
+                    true
+                },
+            );
+        })
+    };
+    // The cell started (bounded by the kernel boot).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !marker.exists() {
+        let events = events.lock().unwrap();
+        let wire: Vec<String> = events.iter().map(|event| format!("{event:?}")).collect();
+        panic!("the wedge cell never started; events: {wire:?}");
+    }
+    // Abort strictly mid-cell; the run must settle within the budget.
+    engine.abort_in_flight_turn();
+    let settled = runner.join();
+    match settled {
+        Ok(()) => {}
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+    // The cell died: the finish marker never appears.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        !finished.exists(),
+        "the interrupted cell must not run to completion"
+    );
+}
+
 /// A driver loop test harness: faux script + collected events. Holds the
 /// faux lock while the engine runs.
 #[cfg(test)]
@@ -6473,6 +8741,7 @@ fn run_prompts(
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -6483,6 +8752,7 @@ fn run_prompts(
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: prompt.to_string(),
                 source: "user".to_string(),
@@ -6575,7 +8845,7 @@ async fn replacement_teardown_retires_the_session_and_the_funnel_adopts_the_bran
         .expect("pending branch lock")
         .is_none());
     let session = engine.session.lock().await;
-    let built = session.as_ref().expect("rebuilt session");
+    let built = session.as_deref().expect("rebuilt session");
     let state = built.session.agent().state().await;
     let texts: Vec<String> = state
         .messages
@@ -6801,6 +9071,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let start = std::time::Instant::now();
@@ -6808,6 +9079,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
     engine.run_prompt(
         0,
         PromptRequest {
+            batch: Vec::new(),
             images: Vec::new(),
             message: "hi".to_string(),
             source: "user".to_string(),
@@ -7080,6 +9352,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap(),
     );
@@ -7091,6 +9364,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: prompt.to_string(),
                 source: "user".to_string(),
@@ -7184,6 +9458,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap(),
     );
@@ -7213,6 +9488,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
     engine.run_prompt(
         0,
         PromptRequest {
+            batch: Vec::new(),
             images: Vec::new(),
             message: "go".to_string(),
             source: "user".to_string(),
@@ -7268,12 +9544,14 @@ fn agent_engine_streams_updates_and_final_message() {
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
+        queued_steering_probe: None,
     })
     .unwrap();
     let mut events: Vec<EngineEvent> = Vec::new();
     engine.run_prompt(
         0,
         PromptRequest {
+            batch: Vec::new(),
             images: Vec::new(),
             message: "hi".to_string(),
             source: "user".to_string(),

@@ -1,4 +1,0 @@
-Prime Agent daemon supervisor 2ec774eb-ce42-40ed-a061-b72518daa690 listening on /home/ubuntu/lane-worktrees/battery-flows/scripts/battery/runs/20260918T190022Z/ts/daemon.sock
-Session worker 889148fb0a92 stderr: Prime Agent daemon listening on /tmp/vbat20260918T190022Z-ts/prime-agent-1000/worker-e89bb6aaecf8-889148fb0a92.sock
-Session worker 02f1a6d189a4 stderr: Prime Agent daemon listening on /tmp/vbat20260918T190022Z-ts/prime-agent-1000/worker-e89bb6aaecf8-02f1a6d189a4.sock
-Session worker 4acb3db2ec31 stderr: Prime Agent daemon listening on /tmp/vbat20260918T190022Z-ts/prime-agent-1000/worker-e89bb6aaecf8-4acb3db2ec31.sock

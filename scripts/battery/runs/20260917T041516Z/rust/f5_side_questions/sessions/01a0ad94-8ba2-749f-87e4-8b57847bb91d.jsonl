@@ -1,7 +1,0 @@
-{"cwd":"/home/ubuntu/lane-worktrees/thin3/scripts/battery/runs/20260917T041516Z/rust/work","id":"01a0ad94-8ba2-749f-87e4-8b57847bb91d","rlmDepth":0,"timestamp":"2026-09-17T04:16:28.578Z","type":"session","version":3}
-{"type":"session_state","id":"6f6c300a","parentId":null,"timestamp":"2026-09-17T04:16:28.579Z","state":{"status":"active"}}
-{"type":"session_info","id":"ffd6da38","parentId":"6f6c300a","timestamp":"2026-09-17T04:16:28.580Z","name":"battery-side-questions"}
-{"type":"custom","id":"f37c4e1a","parentId":"ffd6da38","timestamp":"2026-09-17T04:16:28.592Z","customType":"prime-agent-rs.queue_snapshot","followUp":["start a turn"],"steering":[]}
-{"type":"message","id":"4a99a77c","parentId":"f37c4e1a","timestamp":"2026-09-17T04:16:28.593Z","message":{"content":[{"text":"start a turn","type":"text"}],"role":"user","timestamp":1789618588593}}
-{"type":"message","id":"c3aa927b","parentId":"4a99a77c","timestamp":"2026-09-17T04:16:28.624Z","message":{"api":"openai-completions","content":[{"text":"main turn reply","type":"text"}],"model":"mock-1","provider":"prime-inference","responseId":"chatcmpl-battery","role":"assistant","stopReason":"stop","timestamp":1789618588602,"usage":{"cacheRead":80,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":20,"output":10,"totalTokens":110}}}
-{"type":"custom","id":"20af96fe","parentId":"c3aa927b","timestamp":"2026-09-17T04:16:28.625Z","customType":"prime-agent-rs.queue_snapshot","followUp":[],"steering":[]}

@@ -1,3 +1,0 @@
-supervisor started pid 2591515
-[2026-09-17T06:31:56.180Z] session worker f76fdc903b29 registered (epoch 1, pid 2591530)
-[2026-09-17T06:31:56.242Z] session worker f76fdc903b29 re-registered (epoch 2, pid 2591530)

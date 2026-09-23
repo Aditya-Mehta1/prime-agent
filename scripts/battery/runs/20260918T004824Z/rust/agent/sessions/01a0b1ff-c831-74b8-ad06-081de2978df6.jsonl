@@ -1,5 +1,0 @@
-{"cwd":"/home/ubuntu/lane-worktrees/prompt-redesign/scripts/battery/runs/20260918T004824Z/rust/work","id":"01a0b1ff-c831-74b8-ad06-081de2978df6","rlmDepth":0,"timestamp":"2026-09-18T00:52:05.297Z","type":"session","version":3}
-{"type":"model_change","id":"6cc3e770","parentId":null,"timestamp":"2026-09-18T00:52:05.319Z","modelId":"mock-1","provider":"prime-inference"}
-{"type":"thinking_level_change","id":"44771765","parentId":"6cc3e770","timestamp":"2026-09-18T00:52:05.319Z","thinkingLevel":"off"}
-{"type":"service_tier_change","id":"dea85d5e","parentId":"44771765","timestamp":"2026-09-18T00:52:05.319Z","serviceTier":"default"}
-{"type":"session_state","id":"e406a295","parentId":"dea85d5e","timestamp":"2026-09-18T00:52:05.319Z","state":{"status":"active"}}

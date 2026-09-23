@@ -1,3 +1,0 @@
-Prime Agent daemon supervisor e4c55910-0959-4386-b8d7-b59d6fbf2a46 listening on /home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T132303Z-abort/ts/daemon.sock
-Session worker 80dc143d7d50 stderr: Prime Agent daemon listening on /tmp/compaction-abort-ts-1145871/prime-agent-1000/worker-3b413f369c63-80dc143d7d50.sock
-Session worker 80dc143d7d50 stderr: shutting down (exit 0); closing 0 active session(s)

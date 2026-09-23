@@ -1,3 +1,0 @@
-supervisor started pid 303341
-[2026-09-18T00:52:05.288Z] session worker c4c5a3af49ac registered (epoch 1, pid 303352)
-[2026-09-18T00:52:05.337Z] session worker c4c5a3af49ac re-registered (epoch 2, pid 303352)

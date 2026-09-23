@@ -1,5 +1,0 @@
-{"activeSessionId":"b6ce18381eff","busy":true,"operation":"create","recordedAt":"2026-09-20T13:17:22.303Z","sessionFile":"/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131706Z-abort/rust/agent/sessions/01a0bef6-d3f0-7037-b7dd-c03f43392c70.jsonl","sessionId":"01a0bef6-d3f0-7037-b7dd-c03f43392c70"}
-{"active_session_id":"b6ce18381eff","follow_up":[],"recorded_at":"2026-09-20T13:17:22.331Z","steering":["abort parity seed turn"],"type":"queue_snapshot","version":1}
-{"active_session_id":"b6ce18381eff","follow_up":["abort parity crossing turn"],"recorded_at":"2026-09-20T13:17:22.361Z","steering":[],"type":"queue_snapshot","version":1}
-{"active_session_id":"b6ce18381eff","follow_up":["abort parity crossing turn"],"recorded_at":"2026-09-20T13:17:22.366Z","steering":[],"type":"queue_snapshot","version":1}
-{"active_session_id":"b6ce18381eff","follow_up":[],"recorded_at":"2026-09-20T13:17:22.434Z","steering":[],"type":"queue_snapshot","version":1}

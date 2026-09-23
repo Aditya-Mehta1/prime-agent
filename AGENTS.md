@@ -1,7 +1,18 @@
 # AGENTS.md
 
-Development rules for prime-agent-rs. Adapted from the codex-rs and prime-agent (TS) repo rules.
+Development rules for Prime Agent (Rust) on PrimeIntellect-ai/prime-agent, branch `rust`.
+Adapted from the Prime Agent (TS) repo rules.
 Every contributor (human or agent) must read this before working on this repo.
+
+## Repository
+
+- The repo is PrimeIntellect-ai/prime-agent; the Rust implementation lives on the `rust` branch
+  (the personal kevinjosethomas/prime-agent-rs repo is archived for provenance).
+- PRs go to the org repo with base `rust`:
+  `gh pr create --repo PrimeIntellect-ai/prime-agent --base rust`.
+- CI runs on the org's billing: `.github/workflows/continuous.yml` + `release.yml` on the
+  `rust` branch.
+- Parity ground truth is unchanged: the TS checkout at ~/prime-agent (read-only).
 
 ## Style and structure
 
@@ -35,7 +46,7 @@ Every contributor (human or agent) must read this before working on this repo.
 - If you change dependencies (`Cargo.toml`), regenerate/commit `Cargo.lock` in the same change.
 - If a change starts forcing edits across many crate internals, stop and fix the boundary instead.
 - Cache-prefix stability is first-class: never adopt a pattern without checking its effect on the
-  cacheable prompt prefix (see MISSION.md; cross-check against ~/codex).
+  cacheable prompt prefix (cross-check against ~/codex).
 
 ## Tests
 
@@ -49,8 +60,9 @@ Every contributor (human or agent) must read this before working on this repo.
 ## Merge gates
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test --workspace` must pass before every merge. Run `make check` (same gates; the GitHub
-  token lacks `workflow` scope, so CI is local/PR-review enforced until then).
+  `cargo test --workspace` must pass before every merge. Run `make check` — the local mirror of
+  the same gates; CI runs on the org's billing (`.github/workflows/continuous.yml` + `release.yml`
+  on the `rust` branch).
 - **Parity-diff evidence is a merge gate** (the port's definition, not optional polish): every PR
   that touches a user-visible surface must include a "parity-diff evidence" section in its
   description showing the TS-binary comparison for what it changed: (1) rendered output —
@@ -83,10 +95,49 @@ identifiers in the PR body so the reviewer can verify none were wrongly scrubbed
 
 EXPLICIT EXCEPTION: wire-protocol identifiers that must stay byte-compatible with the TS product (e.g. the PI_PACKAGE_DIR env var, settings keys, provider IDs like prime-inference, harness _meta namespaces like ai.primeintellect.prime-agent, lockfile names) stay until/unless the TS side renames them — PARITY BEATS BRANDING ON THE WIRE.
 
+
+
+## Surface contract (must not change)
+
+- Tools exposed to the model: `bash`, `edit`, `ipython` (internal helpers: `rename`, `stdout`).
+- RLM kernel API in the persistent Python REPL: `rlm.spawn/find_models/collect/list_subagents/delete_subagent/create_session/progress_note`, `rlm.harness` CRUD, `agent_message.send`, `agent_observe`, `compact`, `goal`, `refine`, `attach_image`, skills (markdown + Python) per the skill contract in the base system prompt.
+- System prompt structure: layered — cache-stable static layer files (core harness description with the full API surface, mandatory usage rules, opinionated guidelines, per-model map) followed by one dynamic tail (packages, project context, skills inventory, MCP servers, environment, session role); the harness digest stays a separate `[harness-digest]` user message. `prime-agent prompt` dumps the assembled prompt with its layer breakdown.
+- CLI shape: `prime-agent` with the same commands/flags as the TS product; headless modes (RPC/daemon/session-worker) with identical behavior.
+
+## Crates
+
+| crate | role |
+|---|---|
+| `pa-types` | shared wire & domain types, protocol messages |
+| `pa-telemetry` | event schema, queueing/batching, sinks |
+| `pa-ai` | providers, model registry, streaming |
+| `pa-models` | live model catalog: fetch, no-cold-start chain, transport pinning |
+| `pa-agent` | agent loop |
+| `pa-core` | session engine: tools, skills, prompts, compaction, refinement, kernel/RLM manager, subagents, session manager, settings |
+| `pa-daemon` | supervisor + per-session worker processes, wire protocol, cloud sandbox attach |
+| `pa-tui` | terminal UI (ratatui) |
+| `pa-cli` | binary `prime-agent` |
+
+Dependency direction (hard rule, cycle-free, enforced in Cargo.toml and at review):
+
+```
+pa-types  <-- shared vocabulary, nothing else is shared
+pa-telemetry <-- telemetry library; depends on no workspace crate
+pa-ai (providers/registry)
+pa-models (catalog) --> depends on pa-ai
+pa-agent (agent loop) --> depends on pa-ai, pa-types
+pa-core (session engine) --> depends on pa-agent, pa-ai, pa-models, pa-types, pa-telemetry
+pa-daemon (supervisor/workers) --> depends on pa-core
+pa-tui (terminal UI) --> depends on pa-types, pa-core (session wire)
+pa-cli (binary) --> depends on everything, the composition root
+```
+
+## Reliability model
+
+- The daemon is a supervisor: it spawns one worker process per active session instead of hosting sessions in-process. Workers are supervised, restarted with backoff, and sessions persist on disk (append-only JSONL, same layout as `~/.prime/agent/sessions`) so reattach works even if the supervisor restarts.
+- No stubs, no `todo!()`, no swallowed errors (`anyhow` bubbling to UI is fine).
+
 ## References
 
-- TS prime-agent at ~/prime-agent is the parity ground truth (read-only).
-- OpenAI Codex (~/codex, Apache 2.0) is the design reference for agent internals; attribute ports.
-
-- PRs are squash-merged: one commit per PR, subject `scope: summary (#N)` (`gh pr merge --squash`).
-  Do not rewrite merged history - the repo is append-only.
+- `docs/` contains the design documents (the parity battery, the installer CI, the extensions runner, the model surface, the session engine port, the completion matrix, the keybindings).
+- `docs/FEATURE_PARITY.md` is the exhaustive interactive-mode audit: every TS component walked and verified against the Rust implementation.

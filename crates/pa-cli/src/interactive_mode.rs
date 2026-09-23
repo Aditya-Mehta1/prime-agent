@@ -157,6 +157,43 @@ impl CliInteractionTelemetry {
 }
 
 impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
+    fn bash_shortcut_used(
+        &self,
+        excluded: bool,
+        side_conversation: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("excluded", serde_json::Value::from(excluded));
+            properties.set(
+                "side_conversation",
+                serde_json::Value::from(side_conversation),
+            );
+            client.track("tui bash shortcut used", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
+    fn bash_bang_executed(
+        &self,
+        duration_bucket: &'static str,
+        exit_class: &'static str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("duration_bucket", serde_json::Value::from(duration_bucket));
+            properties.set("exit_class", serde_json::Value::from(exit_class));
+            client.track("tui bash bang executed", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
     fn prompt_stash(
         &self,
         action: &'static str,
@@ -222,6 +259,18 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         })
     }
 
+    fn activity_opened(&self, kind: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("kind", serde_json::Value::from(kind));
+            client.track("tui activity opened", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
     fn subagents_view_opened(
         &self,
         children_total: u64,
@@ -267,14 +316,63 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         })
     }
 
-    fn queued_input(&self, lane: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn queued_input(
+        &self,
+        lane: &'static str,
+        steering_mode: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let Some(client) = self.client() else {
                 return;
             };
             let mut properties = pa_telemetry::base_properties("interactive");
             properties.set("lane", serde_json::Value::from(lane));
+            properties.set("steering_mode", serde_json::Value::from(steering_mode));
             client.track("tui input queued", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
+    fn queue_edited(&self, action: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("action", serde_json::Value::from(action));
+            client.track("tui queue edited", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
+    fn enhanced_keys(
+        &self,
+        kitty: bool,
+        modify_other_keys: bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("kitty", serde_json::Value::from(kitty));
+            properties.set(
+                "modify_other_keys",
+                serde_json::Value::from(modify_other_keys),
+            );
+            client.track("tui enhanced keys", properties);
+            let _ = client.shutdown().await;
+        })
+    }
+
+    fn hyperlinks_active(&self, enabled: bool) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(client) = self.client() else {
+                return;
+            };
+            let mut properties = pa_telemetry::base_properties("interactive");
+            properties.set("enabled", serde_json::Value::from(enabled));
+            client.track("tui hyperlinks", properties);
             let _ = client.shutdown().await;
         })
     }
@@ -357,7 +455,7 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
         let agents_view = options.session.resume_bare
             || (options.agents_view_requested && tui_options.onboarding.is_none());
         if agents_view {
-            run_agents_view_flow(tui_options, None).await
+            run_agents_view_flow(tui_options, None, None).await
         } else {
             let outcome =
                 pa_tui::interactive::run_interactive(tui_options.clone(), UiMode::Terminal).await?;
@@ -366,7 +464,11 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
             // (`launchAgentsView` anchored on the session just left); every
             // other exit (ctrl+c/ctrl+d, `/quit`) ends the process.
             if outcome.return_to_agents_view {
-                run_agents_view_flow(tui_options, Some(outcome.session_id.clone())).await
+                // A startup attach that fell back to the view has no session
+                // identity to anchor on; its notice seeds the view's status
+                // line instead.
+                let anchor = (!outcome.session_id.is_empty()).then(|| outcome.session_id.clone());
+                run_agents_view_flow(tui_options, anchor, outcome.agents_view_notice).await
             } else {
                 print_resume_hint(&outcome.resume_hint);
                 Ok(())
@@ -400,8 +502,16 @@ fn print_resume_hint(hint: &Option<String>) {
 /// session exit — ctrl+c/ctrl+d, `/quit`, `/exit` — ends the whole app (TS
 /// `shutdown()` exits the process instead of reopening the view). A
 /// `/resume <selector>` chain runs its target before the loop decides again.
-async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) -> Result<()> {
+async fn run_agents_view_flow(
+    base: InteractiveOptions,
+    anchor: Option<String>,
+    notice: Option<String>,
+) -> Result<()> {
     let mut anchor = anchor;
+    // The flow's roster connection (TS `AgentsViewPersistentState.rosterClient`):
+    // every view run in this loop reuses it, and a chat run hands it back,
+    // so a switch back from a chat skips the connect + hello handshake.
+    let mut roster_link: Option<pa_tui::agents_view::AgentsViewLink> = None;
     // The view/session loop's carried state (TS `AgentsViewPersistentState`):
     // a stack of scope frames (the scope plus the return chat each was
     // opened from), the typed query, the drilled-in row's ancestors to
@@ -414,7 +524,7 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
     let mut expanded_ancestors: Vec<String> = Vec::new();
     let mut selected_row_identity: Option<String> = None;
     let mut selected_key: Option<pa_tui::agents_view::AgentsViewSelectionKey> = None;
-    let mut status_message: Option<String> = None;
+    let mut status_message: Option<String> = notice;
     loop {
         let view_options = pa_tui::agents_view::AgentsViewOptions {
             socket_path: base.socket_path.clone(),
@@ -434,11 +544,16 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             // `AgentsViewMode.keybindings`).
             keybindings: base.keybindings.clone(),
         };
-        let view = pa_tui::agents_view::run_agents_view(
+        let view_run = pa_tui::agents_view::run_agents_view(
             view_options,
             pa_tui::agents_view::AgentsViewUiMode::Terminal,
+            roster_link.take(),
         )
         .await?;
+        let view = view_run.outcome;
+        // A handoff to a chat parked the connection for this loop's next
+        // view run; a selection-less exit closed it already.
+        roster_link = view_run.link;
         // A dropped scope root or the view's parent key pops the frame (TS
         // `resolveAgentsViewScopeFrames` / the `scope_back` arm), so a later
         // agents-back lands in the parent scope; both clear the query.
@@ -463,9 +578,17 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
         session_options.session_has_children = view.opened_has_children;
         let outcome =
             pa_tui::interactive::run_interactive(session_options, UiMode::Terminal).await?;
-        anchor = Some(outcome.session_id.clone());
+        if !outcome.session_id.is_empty() {
+            anchor = Some(outcome.session_id.clone());
+        }
+        if let Some(notice) = &outcome.agents_view_notice {
+            status_message = Some(notice.clone());
+        }
         if !outcome.return_to_agents_view {
             print_resume_hint(&outcome.resume_hint);
+            if let Some(link) = roster_link.take() {
+                link.close();
+            }
             return Ok(());
         }
         if let Some(scope) = outcome.agents_view_scope {
@@ -488,9 +611,17 @@ async fn run_agents_view_flow(base: InteractiveOptions, anchor: Option<String>) 
             let mut next = base.clone();
             next.session = selection;
             let outcome = pa_tui::interactive::run_interactive(next, UiMode::Terminal).await?;
-            anchor = Some(outcome.session_id.clone());
+            if !outcome.session_id.is_empty() {
+                anchor = Some(outcome.session_id.clone());
+            }
+            if let Some(notice) = &outcome.agents_view_notice {
+                status_message = Some(notice.clone());
+            }
             if !outcome.return_to_agents_view {
                 print_resume_hint(&outcome.resume_hint);
+                if let Some(link) = roster_link.take() {
+                    link.close();
+                }
                 return Ok(());
             }
             if let Some(scope) = outcome.agents_view_scope {
@@ -608,7 +739,7 @@ fn build_tui_options(
         // TS startup reads the settings theme (`getTheme() || "prime"`).
         theme: settings.get_theme().map(str::to_string).unwrap_or_default(),
         // The client-settings seam the interactive commands persist
-        // through (`/settings`, `/fullscreen`, the scoped-models save).
+        // through (`/settings`, `/fullscreen`).
         client_settings: Some(crate::client_settings::CliClientSettings::new(
             config.cwd.clone(),
             config.agent_dir.clone(),

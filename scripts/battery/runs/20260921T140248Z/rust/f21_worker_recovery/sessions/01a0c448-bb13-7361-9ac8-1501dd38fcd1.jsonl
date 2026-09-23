@@ -1,7 +1,0 @@
-{"cwd":"/home/ubuntu/lane-worktrees/agent-end-messages/scripts/battery/runs/20260921T140248Z/rust/work","id":"01a0c448-bb13-7361-9ac8-1501dd38fcd1","rlmDepth":0,"timestamp":"2026-09-21T14:04:55.955Z","type":"session","version":3}
-{"type":"model_change","id":"3aa8b0e1","parentId":null,"timestamp":"2026-09-21T14:04:55.973Z","modelId":"mock-1","provider":"prime-inference"}
-{"type":"thinking_level_change","id":"77aaed96","parentId":"3aa8b0e1","timestamp":"2026-09-21T14:04:55.973Z","thinkingLevel":"off"}
-{"type":"service_tier_change","id":"69fb249f","parentId":"77aaed96","timestamp":"2026-09-21T14:04:55.973Z","serviceTier":"default"}
-{"type":"session_state","id":"4ae03192","parentId":"69fb249f","timestamp":"2026-09-21T14:04:55.973Z","state":{"status":"active"}}
-{"type":"message","id":"80430dcb","parentId":"4ae03192","timestamp":"2026-09-21T14:04:58.455Z","message":{"content":[{"text":"hold the turn","type":"text"}],"role":"user","timestamp":1789999498455}}
-{"type":"message","id":"c07aff4a","parentId":"80430dcb","timestamp":"2026-09-21T14:04:58.705Z","message":{"api":"openai-completions","content":[{"text":"","type":"text"}],"errorMessage":"Request was aborted","model":"mock-1","provider":"prime-inference","role":"assistant","stopReason":"aborted","timestamp":1789999498705,"usage":{"cacheRead":0,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":0,"output":0,"totalTokens":0}}}

@@ -1,3 +1,0 @@
-
-{"version":1,"type":"received","key":"[\"ca5a0361fead\",\"sd\"]","clientId":"ca5a0361fead","commandId":"sd","commandType":"shutdown","recordedAt":"2026-09-18T00:51:29.567Z"}
-{"version":1,"type":"result","key":"[\"ca5a0361fead\",\"sd\"]","response":{"id":"sd","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-18T00:51:29.570Z"}

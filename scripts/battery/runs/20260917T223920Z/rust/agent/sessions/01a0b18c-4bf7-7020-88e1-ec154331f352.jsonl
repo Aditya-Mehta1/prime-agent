@@ -1,5 +1,0 @@
-{"cwd":"/home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T223920Z/rust/work","id":"01a0b18c-4bf7-7020-88e1-ec154331f352","rlmDepth":0,"timestamp":"2026-09-17T22:45:56.855Z","type":"session","version":3}
-{"type":"model_change","id":"7c5b2899","parentId":null,"timestamp":"2026-09-17T22:45:56.885Z","modelId":"mock-1","provider":"prime-inference"}
-{"type":"thinking_level_change","id":"ed5476e9","parentId":"7c5b2899","timestamp":"2026-09-17T22:45:56.885Z","thinkingLevel":"off"}
-{"type":"service_tier_change","id":"02e3182b","parentId":"ed5476e9","timestamp":"2026-09-17T22:45:56.886Z","serviceTier":"default"}
-{"type":"session_state","id":"af4f6f89","parentId":"02e3182b","timestamp":"2026-09-17T22:45:56.886Z","state":{"status":"active"}}

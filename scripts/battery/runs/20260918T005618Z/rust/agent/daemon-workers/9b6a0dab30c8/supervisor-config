@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/home/ubuntu/lane-worktrees/prompt-redesign/scripts/battery/runs/20260918T005618Z/rust/perf/sock-1.sock",
-  "defaultSessionDir": "/home/ubuntu/lane-worktrees/prompt-redesign/scripts/battery/runs/20260918T005618Z/rust/agent/sessions"
-}

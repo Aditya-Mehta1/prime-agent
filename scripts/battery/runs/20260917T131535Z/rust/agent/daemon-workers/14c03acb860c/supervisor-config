@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/home/ubuntu/lane-worktrees/cli-gaps/scripts/battery/runs/20260917T131535Z/rust/perf/onboard.sock",
-  "defaultSessionDir": "/home/ubuntu/lane-worktrees/cli-gaps/scripts/battery/runs/20260917T131535Z/rust/agent/sessions"
-}

@@ -7,9 +7,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 use pa_ai::models::{get_supported_thinking_levels, thinking_level_from_str};
-use pa_core::auth::AuthStorage;
 use pa_core::kernel::rlm_runtime::{find_rlm_model_matches, RlmModelInfo};
-use pa_core::models::ModelRegistry;
 
 /// Close matches listed in model-resolution errors (TS suggestion limit).
 const MODEL_ERROR_SUGGESTION_LIMIT: usize = 3;
@@ -20,10 +18,11 @@ pub const LABEL_MAX_CHARS: usize = 200;
 const ELLIPSIS: &str = "...";
 
 /// The model catalog the RLM surface resolves against: the same
-/// credential-backed list `rlm.find_models` searches.
+/// credential-backed list `rlm.find_models` searches (the worker-style
+/// registry construction: the private-authorization disk cache is adopted,
+/// so entitled `internal/*` models resolve for spawned children).
 pub fn catalog_models(agent_dir: &Path) -> Vec<RlmModelInfo> {
-    let auth = AuthStorage::create(agent_dir);
-    let registry = ModelRegistry::create(auth, agent_dir.join("models.json"));
+    let registry = crate::state_getters::worker_model_registry(agent_dir);
     registry
         .get_rlm_searchable_models()
         .into_iter()
@@ -39,11 +38,29 @@ pub fn catalog_models(agent_dir: &Path) -> Vec<RlmModelInfo> {
         .collect()
 }
 
-/// Resolve the child model reference. `None` inherits the parent model; a
-/// reference resolves exactly like the TS `_resolveRlmSubagentModel`:
-/// parent equality first, then an exact catalog selector, then a unique
-/// short-form match, else the TS unavailable-model error.
+/// Resolve the child model reference, then enforce the daemon
+/// `allowedModels` allowlist on the resolved selector (an inherited parent
+/// model included): a model outside the allowlist fails loudly with the
+/// typed refusal — never a fallback — so both `rlm.spawn` and
+/// `rlm.create_session` refuse instead of landing a child on a model the
+/// daemon may not resolve to.
 pub fn resolve_child_model(
+    agent_dir: &Path,
+    reference: Option<&str>,
+    parent_model: Option<&str>,
+    target: &str,
+    allowlist: &crate::model_allowlist::DaemonAllowlist,
+) -> Result<String> {
+    let model = resolve_child_model_unchecked(agent_dir, reference, parent_model, target)?;
+    crate::model_allowlist::assert_allowed(allowlist, &model)?;
+    Ok(model)
+}
+
+/// The TS `_resolveRlmSubagentModel` resolution before the allowlist gate.
+/// `None` inherits the parent model; a reference resolves exactly like
+/// the TS: parent equality first, then an exact catalog selector, then a
+/// unique short-form match, else the TS unavailable-model error.
+fn resolve_child_model_unchecked(
     agent_dir: &Path,
     reference: Option<&str>,
     parent_model: Option<&str>,
@@ -106,8 +123,7 @@ pub fn assert_thinking_supported(
     let Some((provider, id)) = selector.split_once('/') else {
         return Ok(());
     };
-    let auth = AuthStorage::create(agent_dir);
-    let registry = ModelRegistry::create(auth, agent_dir.join("models.json"));
+    let registry = crate::state_getters::worker_model_registry(agent_dir);
     let Some(model) = registry
         .get_rlm_searchable_models()
         .into_iter()
@@ -187,6 +203,7 @@ fn cap_text(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_allowlist::DaemonAllowlist;
     use serde_json::json;
 
     /// A models.json custom provider, like the pa-core registry tests.
@@ -217,9 +234,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         write_catalog(dir.path());
         // No reference inherits the parent model.
-        let resolved =
-            resolve_child_model(dir.path(), None, Some("test-provider/glm-5.3"), "subagent")
-                .unwrap();
+        let resolved = resolve_child_model(
+            dir.path(),
+            None,
+            Some("test-provider/glm-5.3"),
+            "subagent",
+            &DaemonAllowlist::Unrestricted,
+        )
+        .unwrap();
         assert_eq!(resolved, "test-provider/glm-5.3");
         // Parent equality short-circuits even a catalog refresh miss.
         let resolved = resolve_child_model(
@@ -227,6 +249,7 @@ mod tests {
             Some("Test-Provider/GLM-5.3"),
             Some("test-provider/glm-5.3"),
             "subagent",
+            &DaemonAllowlist::Unrestricted,
         )
         .unwrap();
         assert_eq!(resolved, "test-provider/glm-5.3");
@@ -236,6 +259,7 @@ mod tests {
             Some("test-provider/glm-5.3-turbo"),
             Some("test-provider/glm-5.3"),
             "subagent",
+            &DaemonAllowlist::Unrestricted,
         )
         .unwrap();
         assert_eq!(resolved, "test-provider/glm-5.3-turbo");
@@ -245,15 +269,87 @@ mod tests {
             Some("glm-5.3-turbo"),
             Some("test-provider/glm-5.3"),
             "subagent",
+            &DaemonAllowlist::Unrestricted,
         )
         .unwrap();
         assert_eq!(resolved, "test-provider/glm-5.3-turbo");
         // No reference and no parent model: the TS no-model error.
-        let error = resolve_child_model(dir.path(), None, None, "subagent").unwrap_err();
+        let error = resolve_child_model(
+            dir.path(),
+            None,
+            None,
+            "subagent",
+            &DaemonAllowlist::Unrestricted,
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "No model selected. Use /model to pick one."
         );
+    }
+
+    #[test]
+    fn the_allowlist_refuses_resolved_models_loudly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_catalog(dir.path());
+        let allow =
+            crate::model_allowlist::DaemonAllowlist::Allowed(vec!["prime-inference/*".to_string()]);
+        // An explicit reference that resolves but sits outside the
+        // allowlist fails with the typed refusal, never a fallback.
+        let error = resolve_child_model(
+            dir.path(),
+            Some("test-provider/glm-5.3"),
+            None,
+            "subagent",
+            &allow,
+        )
+        .unwrap_err();
+        let refusal = error
+            .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+            .expect("typed refusal");
+        assert_eq!(refusal.selector, "test-provider/glm-5.3");
+        assert!(
+            error
+                .to_string()
+                .contains("blocked by the daemon model allowlist"),
+            "{error}"
+        );
+        // An inherited parent model outside the allowlist refuses too:
+        // inheritance is a resolution, not an exemption.
+        let error = resolve_child_model(
+            dir.path(),
+            None,
+            Some("test-provider/glm-5.3"),
+            "subagent",
+            &allow,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+                .is_some(),
+            "{error}"
+        );
+        // A reference matching the allowlist passes the gate.
+        let resolved = resolve_child_model(
+            dir.path(),
+            Some("test-provider/glm-5.3"),
+            None,
+            "subagent",
+            &crate::model_allowlist::DaemonAllowlist::Allowed(vec!["test-provider/*".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(resolved, "test-provider/glm-5.3");
+        // No allowlist configured keeps the TS behavior.
+        let resolved = resolve_child_model(
+            dir.path(),
+            Some("test-provider/glm-5.3"),
+            None,
+            "subagent",
+            &DaemonAllowlist::Unrestricted,
+        )
+        .unwrap();
+        assert_eq!(resolved, "test-provider/glm-5.3");
     }
 
     #[test]
@@ -269,6 +365,7 @@ mod tests {
             Some("test-provi"),
             Some("test-provider/glm-5.3"),
             "subagent",
+            &DaemonAllowlist::Unrestricted,
         )
         .unwrap_err();
         let message = error.to_string();
@@ -289,6 +386,7 @@ mod tests {
             Some("zzz"),
             Some("test-provider/glm-5.3"),
             "subagent",
+            &DaemonAllowlist::Unrestricted,
         )
         .unwrap_err();
         assert!(!error.to_string().contains("close matches:"), "{error}");
@@ -308,6 +406,206 @@ mod tests {
         );
         // A model outside the catalog (scripted verification models) passes.
         assert_thinking_supported(dir.path(), Some("high"), "scripted/faux-1").unwrap();
+    }
+
+    /// Piece 5 (c) — the child-propagation regression: a spawned child
+    /// resolves an entitled private `internal/*` model through the same
+    /// disk caches the worker serves (auth.json + the private-authorization
+    /// cache). Before the fix, `catalog_models` built a bare registry that
+    /// never adopted the private cache, so `internal/*` was invisible to
+    /// `rlm.spawn` model resolution and `rlm.find_models`.
+    #[test]
+    fn a_spawned_child_resolves_an_entitled_private_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        // The worker-path auth (auth.json): one Prime Inference key+team.
+        std::fs::write(
+            dir.path().join("auth.json"),
+            json!({
+                "prime-inference": {
+                    "type": "api_key",
+                    "key": "child-key",
+                    "primeTeam": { "teamId": "team-7", "name": "Team 7" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The authorized private model: the compiled fallback lacks it, the
+        // fingerprint-scoped disk cache carries it.
+        let mut auth = pa_core::auth::AuthStorage::create(dir.path());
+        let api_key = auth.get_api_key("prime-inference").expect("api key");
+        let team_id = auth
+            .get_provider_headers("prime-inference")
+            .and_then(|headers| headers.get("X-Prime-Team-ID").cloned());
+        // An ambient `PRIME_API_KEY` without a `PRIME_TEAM_ID` (the dogfood
+        // box posture) makes the environment the active source, and the
+        // stored team is then suppressed — no private adoption can happen
+        // on such a box. Hermetic machines (CI, VM gate sandboxes) run the
+        // full verifier; polluted ones skip with a note.
+        let Some(team_id) = team_id else {
+            eprintln!(
+                "ambient env credentials suppress the stored team; \
+                 skipping the child private-model verifier on this box"
+            );
+            return;
+        };
+        let fingerprint =
+            pa_core::models::private_prime_authorization_fingerprint(&api_key, &team_id);
+        pa_core::models::write_private_prime_authorization_cache(
+            &dir.path().join("models.json"),
+            &pa_core::models::PrivatePrimeAuthorizationCache {
+                fingerprint,
+                models: vec![serde_json::from_value(json!({
+                    "id": "internal/glm-5.3-fast", "name": "GLM 5.3 Fast",
+                    "api": "openai-completions", "provider": "prime-inference",
+                    "baseUrl": "https://api.pinference.ai/api/v1",
+                    "reasoning": true, "input": ["text"],
+                    "cost": { "input": 0.42, "output": 2.1, "cacheRead": 0, "cacheWrite": 0 },
+                    "contextWindow": 400_000, "maxTokens": 131_072
+                }))
+                .unwrap()],
+                refreshed_at: 1,
+            },
+        );
+
+        // The catalog the RLM surface searches carries the private model.
+        assert!(catalog_models(dir.path())
+            .iter()
+            .any(|model| model.id == "internal/glm-5.3-fast"));
+        // A spawned child resolves it by full selector and by short form.
+        let resolved = resolve_child_model(
+            dir.path(),
+            Some("prime-inference/internal/glm-5.3-fast"),
+            Some("prime-inference/z-ai/glm-5.3"),
+            "subagent",
+            &DaemonAllowlist::Unrestricted,
+        )
+        .unwrap();
+        assert_eq!(resolved, "prime-inference/internal/glm-5.3-fast");
+        let resolved = resolve_child_model(
+            dir.path(),
+            Some("internal/glm-5.3-fast"),
+            Some("prime-inference/z-ai/glm-5.3"),
+            "subagent",
+            &DaemonAllowlist::Unrestricted,
+        )
+        .unwrap();
+        assert_eq!(resolved, "prime-inference/internal/glm-5.3-fast");
+        // The spawn-time thinking check follows the resolved entitlement.
+        assert_thinking_supported(
+            dir.path(),
+            Some("high"),
+            "prime-inference/internal/glm-5.3-fast",
+        )
+        .unwrap();
+        assert_thinking_supported(
+            dir.path(),
+            Some("off"),
+            "prime-inference/internal/glm-5.3-fast",
+        )
+        .unwrap();
+    }
+
+    /// The catalog-repo (layer A) child-resolution regression: a fetched
+    /// entry the compiled fallback lacks resolves for a spawned child
+    /// through the on-disk provider catalog the daemon's startup refresh
+    /// writes, once the entry's provider is auth-configured in models.json
+    /// (the same availability gate the picker's configuredProviders filter
+    /// applies — the production openai-codex picker gap was missing auth,
+    /// not missing wiring). Before the live-catalog wiring, the resolution
+    /// list was the compiled table plus a flat Prime Inference merge, so
+    /// catalog-repo entries could never resolve for `rlm.spawn` or list
+    /// in `rlm.find_models`.
+    #[test]
+    fn a_spawned_child_resolves_a_catalog_repo_entry_the_compiled_fallback_lacks() {
+        const PROBE_ID: &str = "gpt-6-probe";
+        assert!(
+            !pa_ai::models_generated::get_models("openai-codex")
+                .iter()
+                .any(|model| model.id == PROBE_ID),
+            "the probe entry is compiled in; pick another id"
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        // The provider auth the resolution filters on: a models.json
+        // provider entry (headers alone satisfy the config validation and
+        // has_configured_auth).
+        std::fs::write(
+            dir.path().join("models.json"),
+            json!({
+                "providers": {
+                    "openai-codex": {
+                        "apiKey": "codex-key",
+                        "headers": { "X-Probe": "catalog-chain" }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The layer-A disk cache the startup refresh writes beside
+        // models.json: one catalog-repo entry riding the compiled
+        // openai-codex transport tuple (the pinning invariant).
+        std::fs::write(
+            dir.path()
+                .join("models")
+                .join("provider-model-catalog.v1.json"),
+            json!({
+                "url": pa_models::fetch::MODEL_CATALOG_URL,
+                "scope": pa_models::cache::PUBLIC_SCOPE,
+                "fetchedAt": 1,
+                "payload": { "schemaVersion": 1, "models": [
+                    {
+                        "id": PROBE_ID, "name": "GPT-6 Probe",
+                        "api": "openai-codex-responses", "provider": "openai-codex",
+                        "baseUrl": "https://chatgpt.com/backend-api",
+                        "reasoning": true,
+                        "thinkingLevelMap": { "minimal": null, "xhigh": "xhigh", "max": "max" },
+                        "input": ["text"],
+                        "cost": { "input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5 },
+                        "contextWindow": 272000, "maxTokens": 128000,
+                    }
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let selector = format!("openai-codex/{PROBE_ID}");
+        // The rlm search surface (find_models) lists the fetched entry.
+        let catalog = catalog_models(dir.path());
+        let probe = catalog
+            .iter()
+            .find(|model| model.selector() == selector)
+            .expect("the fetched entry lists for find_models");
+        assert_eq!(probe.name, "GPT-6 Probe");
+        // A spawned child resolves it by full selector and by short form.
+        let resolved = resolve_child_model(
+            dir.path(),
+            Some(&selector),
+            Some("prime-inference/z-ai/glm-5.3"),
+            "subagent",
+            &DaemonAllowlist::Unrestricted,
+        )
+        .unwrap();
+        assert_eq!(resolved, selector);
+        let resolved = resolve_child_model(
+            dir.path(),
+            Some(PROBE_ID),
+            Some("prime-inference/z-ai/glm-5.3"),
+            "subagent",
+            &DaemonAllowlist::Unrestricted,
+        )
+        .unwrap();
+        assert_eq!(resolved, selector);
+        // The spawn-time thinking check follows the fetched entry's map:
+        // xhigh is explicitly mapped, minimal is explicitly nulled out.
+        assert_thinking_supported(dir.path(), Some("xhigh"), &selector).unwrap();
+        let error = assert_thinking_supported(dir.path(), Some("minimal"), &selector).unwrap_err();
+        assert!(
+            error.to_string().contains("not supported by model"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -1,4 +1,0 @@
-[2026-09-18T21:03:42.293Z] Prime Agent daemon listening on /tmp/20260918T210307Z-flicker-rust/prime-agent-1000/worker-fc4ead99eac6-899ea6dd9783.sock
-[2026-09-18T21:04:28.811Z] replacement supervisor 799556 left running without a current authenticated supervisor
-[2026-09-18T22:34:33.837Z] shutdown command received over socket; 1 active session(s) will be closed
-[2026-09-18T22:34:33.846Z] shutting down (exit 0); closing 1 active session(s)

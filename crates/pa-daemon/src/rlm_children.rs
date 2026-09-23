@@ -38,6 +38,38 @@ use crate::util::now_ms;
 /// Depth bound without an explicit override (TS `resolveRlmMaxDepth` default).
 pub const DEFAULT_RLM_MAX_DEPTH: u32 = 2;
 
+/// The close reason a parent hands its resident children (TS
+/// `closeSessionOnce`'s reason arms, cascaded through
+/// `closeChildSessions(parentState, reason)`):
+///
+/// - `Killed` — the child closes as killed: its scheduled jobs cancel and
+///   its session file archives (TS `cancelScheduledJobsForSession`).
+/// - `Shutdown` — the child keeps its resume entry: the jobs survive the
+///   close (TS `closeKeepsResumeEntry("shutdown")`), so a later scheduled
+///   wake can still fire them.
+/// - `Replaced` — the replacement teardown keeps the child's plain cron
+///   jobs but cancels its RLM heartbeats (TS
+///   `cancelSubagentRlmHeartbeats`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildCloseReason {
+    Killed,
+    Shutdown,
+    Replaced,
+}
+
+impl ChildCloseReason {
+    /// The `rlmCloseReason` rest marker of the kill command the parent
+    /// routes to the child worker (the plain client kill carries none and
+    /// stays `Killed`).
+    fn wire_marker(self) -> Option<&'static str> {
+        match self {
+            Self::Killed => None,
+            Self::Shutdown => Some("shutdown"),
+            Self::Replaced => Some("replaced"),
+        }
+    }
+}
+
 /// How long a detached child prompt waits for its spawning parent turn to
 /// complete before prompting anyway (a stuck turn must not orphan the
 /// child's task; the watcher still settles it).
@@ -62,9 +94,8 @@ const RUNTIME_METADATA_PROMPT_MAX: usize = 4096;
 const WATCH_WAIT_SLICE_MS: u64 = 60_000;
 /// Re-poll cadence after a wait slice ends without a settled child.
 const WATCH_POLL_INTERVAL_MS: u64 = 2_000;
-/// Consecutive unreachable polls before the watcher gives up (the child's
-/// worker may be restarting; a permanently unreachable child ends the
-/// watch without a notice instead of spinning forever).
+/// Consecutive failed worker polls before settling an unreachable child as
+/// errored; roster reads must never attempt their own worker recovery.
 const WATCH_MAX_UNREACHABLE_POLLS: u32 = 150;
 /// The parent identity children are spawned from: recursion bounds, the
 /// inherited model selector and thinking level, and the parent session's
@@ -197,6 +228,10 @@ struct SupervisorChildSessionsInner {
     /// The parent engine's child-settle hook (goal continuation resume);
     /// `None` until the engine wires it.
     settle_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// The worker's model-allowlist refusal telemetry (`model refused`):
+    /// spawn/create_session refusals emit through the engine's shared
+    /// lazily-built client.
+    model_refusal_telemetry: std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
 }
 
 impl Clone for SupervisorChildSessions {
@@ -213,6 +248,7 @@ impl SupervisorChildSessions {
         link: Arc<SupervisorLink>,
         agent_dir: PathBuf,
         parent_active_session_id: String,
+        model_refusal_telemetry: std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
     ) -> Self {
         Self {
             inner: Arc::new(SupervisorChildSessionsInner {
@@ -223,6 +259,7 @@ impl SupervisorChildSessions {
                 children: Mutex::new(Vec::new()),
                 turn_done: tokio::sync::watch::Sender::new(0),
                 settle_hook: std::sync::Mutex::new(None),
+                model_refusal_telemetry,
             }),
         }
     }
@@ -258,15 +295,16 @@ impl SupervisorChildSessions {
     /// Close every tracked child session with the parent session (TS
     /// `closeChildSessions`, the daemon host's
     /// `disposeRlmSubagentRuntimes` for the replacement teardown, and the
-    /// `closeSessionOnce` cascade every session close runs). The ruling:
-    /// a parent that replaces or closes its runtime disposes its
-    /// supervisor-backed children - a plain stop, not a delete (no
-    /// `rlmLedgerDelete` marker, so the spawn edge and the passive roster
-    /// row survive like TS), no terminal notice (the parent session is
-    /// going away), and each child's own close cascades to its children
-    /// through the child worker's kill handler.
-    pub async fn close_children(&self) -> Result<()> {
-        self.inner.close_children_inner().await
+    /// `closeSessionOnce(reason)` cascade every session close runs, with
+    /// the parent's own close reason). The ruling: a parent that replaces
+    /// or closes its runtime disposes its supervisor-backed children - a
+    /// plain stop, not a delete (no `rlmLedgerDelete` marker, so the spawn
+    /// edge and the passive roster row survive like TS), no terminal
+    /// notice (the parent session is going away), and each child's own
+    /// close cascades to its children through the child worker's kill
+    /// handler with the same close reason.
+    pub async fn close_children(&self, reason: ChildCloseReason) -> Result<()> {
+        self.inner.close_children_inner(reason).await
     }
 
     /// Replace the parent identity (the worker session sets it once its own
@@ -283,6 +321,22 @@ impl SupervisorChildSessions {
             .lock()
             .expect("identity lock")
             .rlm_max_depth
+    }
+
+    /// The parent identity's model selector — the source an inherited
+    /// spawn resolves; the engine keeps it in step with every live model
+    /// change (the session build stamps it, a switch follows it).
+    /// Test-only read: production spawn resolution reads the identity
+    /// field directly; this accessor exists so the switch-propagation
+    /// regression test can assert the registry's state.
+    #[cfg(test)]
+    pub(crate) fn parent_model(&self) -> Option<String> {
+        self.inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .model
+            .clone()
     }
 
     /// Wire snapshots of the tracked children (TS
@@ -466,7 +520,11 @@ impl SupervisorChildSessionsInner {
     /// Fire the settle hook off-thread (the settle sites run inside
     /// watcher tasks; the hook owns its own scheduling).
     pub(crate) fn fire_settle_hook(&self) {
-        let hook = self.settle_hook.lock().expect("settle hook lock").clone();
+        let hook = self
+            .settle_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         if let Some(hook) = hook {
             std::thread::spawn(move || hook());
         }
@@ -650,7 +708,9 @@ impl SupervisorChildSessionsInner {
         // A failed prompt tears the just-created session down (TS kills the
         // created session in the create-path catch block).
         if let Err(error) = self.prompt_child(&created.active_session_id, prompt).await {
-            let _ = self.kill_child(&created.active_session_id).await;
+            let _ = self
+                .kill_child(&created.active_session_id, ChildCloseReason::Killed)
+                .await;
             return Err(error);
         }
         Ok(created)
@@ -708,11 +768,15 @@ impl SupervisorChildSessionsInner {
         Ok(())
     }
 
-    async fn kill_child(&self, active_session_id: &str) -> Result<()> {
+    async fn kill_child(&self, active_session_id: &str, reason: ChildCloseReason) -> Result<()> {
+        let mut rest = serde_json::Map::new();
+        if let Some(marker) = reason.wire_marker() {
+            rest.insert("rlmCloseReason".to_string(), json!(marker));
+        }
         let command = DaemonCommand::Kill {
             id: None,
             active_session_id: active_session_id.to_string(),
-            rest: Default::default(),
+            rest,
         };
         self.command(&command, KILL_TIMEOUT_MS)
             .await
@@ -860,9 +924,16 @@ impl SupervisorChildSessionsInner {
                 Err(_) => {
                     unreachable_polls += 1;
                     if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS {
-                        eprintln!(
-                            "pa-daemon: RLM child settle watcher gave up on an unreachable child {active_session_id}"
-                        );
+                        {
+                            let mut state = record.lock().await;
+                            if state.closed_by_parent || state.notice_delivered {
+                                return;
+                            }
+                            state.settled_status = Some("error");
+                            state.error = Some("Child worker unreachable".to_string());
+                        }
+                        self.deliver_settle_notice(record).await;
+                        self.fire_settle_hook();
                         return;
                     }
                 }
@@ -1032,7 +1103,7 @@ impl SupervisorChildSessionsInner {
     /// returned with the remaining children still closed - TS
     /// `closeChildSessions` walks all children and rethrows the first
     /// error.
-    async fn close_children_inner(&self) -> Result<()> {
+    async fn close_children_inner(&self, reason: ChildCloseReason) -> Result<()> {
         let children = self.children.lock().await.clone();
         let mut close_error: Option<anyhow::Error> = None;
         for record in &children {
@@ -1042,7 +1113,7 @@ impl SupervisorChildSessionsInner {
                 record.notice_delivered = true;
             }
             let active_session_id = record.lock().await.active_session_id.clone();
-            if let Err(error) = self.kill_child(&active_session_id).await {
+            if let Err(error) = self.kill_child(&active_session_id, reason).await {
                 if unknown_session(&error).is_some() {
                     // Already gone: TS `closeSessionOnce`'s `sessions.has`
                     // check turns a missing child into a no-op success.
@@ -1145,6 +1216,49 @@ fn custom_message_text(message: &pa_types::session::CustomMessage) -> Option<Str
     }
 }
 
+/// Resolve the child model with the daemon `allowedModels` allowlist
+/// enforced (the parent's cwd scopes the settings read), refusing a model
+/// outside the allowlist loudly with the typed error and emitting the
+/// `model refused` adoption event through the worker's shared client. The
+/// settings read (a synchronous file lock under `with_lock`) runs on the
+/// blocking pool, so a contended settings lock never stalls this async
+/// spawn path's Tokio worker.
+async fn resolve_child_model_allowlisted(
+    this: &SupervisorChildSessionsInner,
+    reference: Option<&str>,
+    surface: &'static str,
+    target: &str,
+) -> Result<String> {
+    let identity = this.identity.lock().expect("identity lock").clone();
+    let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
+    let load_cwd = cwd.clone();
+    let agent_dir = this.agent_dir.clone();
+    let allowlist = tokio::task::spawn_blocking(move || {
+        crate::model_allowlist::load(Path::new(&load_cwd), &agent_dir)
+    })
+    .await
+    .context("the allowlist load task join failed")?;
+    match resolve_child_model(
+        &this.agent_dir,
+        reference,
+        identity.model.as_deref(),
+        target,
+        &allowlist,
+    ) {
+        Ok(model) => Ok(model),
+        Err(error) => {
+            if let Some(refusal) = error.downcast_ref::<pa_core::models::ModelAllowlistRefusal>() {
+                this.model_refusal_telemetry.note_refused(
+                    surface,
+                    &refusal.selector,
+                    Path::new(&cwd),
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
@@ -1163,12 +1277,13 @@ impl RlmSubagentHost for SupervisorChildSessions {
             });
             this.assert_name_available(&name, identity.rlm_depth + 1)
                 .await?;
-            let model = resolve_child_model(
-                &this.agent_dir,
+            let model = resolve_child_model_allowlisted(
+                &this,
                 request.model.as_deref(),
-                identity.model.as_deref(),
+                "spawn",
                 "subagent",
-            )?;
+            )
+            .await?;
             assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
             let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
             let child_dir = this.child_session_dir(&child_id, &identity)?;
@@ -1222,6 +1337,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let watcher_record = Arc::clone(&record);
             let prompt = request.prompt.clone();
             let child_active_session_id = created.active_session_id.clone();
+            let child_session_file = created.session_file.clone();
             // Capture the current turn boundary before detaching: spawn
             // admission happens mid-turn, so the parent's continuation
             // request (already issued for this turn's tool result) is
@@ -1242,12 +1358,33 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     .prompt_child(&child_active_session_id, &prompt)
                     .await
                 {
-                    eprintln!(
-                        "pa-daemon: RLM child task prompt failed for {child_active_session_id}: {error:#}"
-                    );
-                    let _ = watcher_this.kill_child(&child_active_session_id).await;
-                    watcher_record.lock().await.settled_status = Some("error");
-                    return;
+                    // The route can fail ambiguously around a worker
+                    // replacement: the frame reached a dying connection and
+                    // no reply came back. The child's durable session file
+                    // is the record the replacement replays from, so it
+                    // arbitrates the ambiguity - a prompt already in the
+                    // file landed (re-sending would duplicate the first
+                    // turn), a missing prompt provably never landed and one
+                    // retry against the replaced worker is safe.
+                    let landed =
+                        session_file_carries_prompt(child_session_file.as_deref(), &prompt);
+                    let retried = if landed {
+                        Ok(())
+                    } else {
+                        watcher_this
+                            .prompt_child(&child_active_session_id, &prompt)
+                            .await
+                    };
+                    if let Err(retry_error) = retried {
+                        eprintln!(
+                            "pa-daemon: RLM child task prompt failed for {child_active_session_id}: {error:#}; retry failed: {retry_error:#}"
+                        );
+                        let _ = watcher_this
+                            .kill_child(&child_active_session_id, ChildCloseReason::Killed)
+                            .await;
+                        watcher_record.lock().await.settled_status = Some("error");
+                        return;
+                    }
                 }
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
@@ -1270,12 +1407,13 @@ impl RlmSubagentHost for SupervisorChildSessions {
             if identity.rlm_depth != 0 {
                 bail!("rlm.create_session is available only from a depth-0 session");
             }
-            let model = resolve_child_model(
-                &this.agent_dir,
+            let model = resolve_child_model_allowlisted(
+                &this,
                 request.model.as_deref(),
-                identity.model.as_deref(),
+                "create_session",
                 "top-level session",
-            )?;
+            )
+            .await?;
             assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
             // A depth-0 resident session is created exactly like a client
             // `create`: the shared sessions dir and the requested cwd
@@ -1330,12 +1468,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let records = this.children.lock().await.clone();
             let mut entries = Vec::with_capacity(records.len());
             for record in &records {
-                this.refresh_record(record).await;
-                let entry = {
-                    let record = record.lock().await;
-                    SupervisorChildSessions::entry(&record)
-                };
-                entries.push(entry);
+                // The settle watcher owns worker refreshes. A roster read is a
+                // snapshot and must not queue behind a long supervisor request.
+                let record = record.lock().await;
+                entries.push(SupervisorChildSessions::entry(&record));
             }
             Ok(entries)
         })
@@ -1367,6 +1503,9 @@ impl RlmSubagentHost for SupervisorChildSessions {
             this.command(&command, KILL_TIMEOUT_MS)
                 .await
                 .with_context(|| format!("kill RLM child \"{target}\""))?;
+            // The watcher owns an Arc to this record; deleting the roster
+            // row alone cannot stop its polling loop.
+            record.lock().await.closed_by_parent = true;
             let entry = {
                 let record = record.lock().await;
                 SupervisorChildSessions::entry(&record)
@@ -1438,6 +1577,37 @@ impl RlmSubagentHost for SupervisorChildSessions {
             Ok(results)
         })
     }
+}
+
+/// Whether the child's durable session file already carries the task prompt
+/// as a user message. The session file is the record a worker replacement
+/// replays from, so it arbitrates an ambiguous prompt-route failure: a
+/// prompt in the file was durably processed by the dead worker (a re-send
+/// would duplicate the first turn), a missing prompt provably never landed.
+fn session_file_carries_prompt(session_file: Option<&str>, prompt: &str) -> bool {
+    let Some(path) = session_file.filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| {
+            entry.get("type").and_then(Value::as_str) == Some("message")
+                && entry.pointer("/message/role").and_then(Value::as_str) == Some("user")
+        })
+        .any(|entry| match entry.pointer("/message/content") {
+            Some(Value::String(text)) => text.contains(prompt),
+            Some(Value::Array(blocks)) => blocks.iter().any(|block| {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains(prompt))
+            }),
+            _ => false,
+        })
 }
 
 #[cfg(test)]
@@ -1590,8 +1760,15 @@ mod watch_tests {
         )
         .await;
         let link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
-        let sessions =
-            SupervisorChildSessions::new(link, std::env::temp_dir(), "parent-live".to_string());
+        let sessions = SupervisorChildSessions::new(
+            link,
+            std::env::temp_dir(),
+            "parent-live".to_string(),
+            std::sync::Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                std::env::temp_dir(),
+                /*telemetry_disabled*/ true,
+            )),
+        );
         // A live parent carries its resolved model on the identity; the
         // spawn path resolves the child's model from it.
         sessions.set_identity(ParentIdentity {
@@ -1613,6 +1790,27 @@ mod watch_tests {
             })
             .await
             .expect("spawn must succeed against the fake supervisor")
+    }
+
+    #[tokio::test]
+    async fn roster_snapshot_does_not_wait_for_a_slow_child_worker() {
+        let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+        let (sessions, _kill_rx) =
+            sessions_with_fake_supervisor(follow_up_tx, 1_000, FakeKill::Success).await;
+        sessions
+            .push_test_child(RlmChildIdentity {
+                rlm_child_id: "child-id".to_string(),
+                active_session_id: "child-live".to_string(),
+                session_id: Some("child-file".to_string()),
+                session_name: "slow-child".to_string(),
+            })
+            .await;
+        let roster = tokio::time::timeout(Duration::from_millis(10), sessions.list_subagents())
+            .await
+            .expect("roster must not make a supervisor round trip")
+            .expect("roster snapshot");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].status, "running");
     }
 
     /// A child that settles without replying delivers the no-reply terminal
@@ -1678,7 +1876,10 @@ mod watch_tests {
         sessions.notify_turn_done();
         one_running_child(&sessions).await;
 
-        sessions.close_children().await.expect("close children");
+        sessions
+            .close_children(ChildCloseReason::Killed)
+            .await
+            .expect("close children");
 
         // The stop carried no delete marker: the spawn edge survives (TS
         // `closeSessionOnce` archives; only `recordRlmSubagentDeletion`
@@ -1716,7 +1917,7 @@ mod watch_tests {
         one_running_child(&sessions).await;
 
         sessions
-            .close_children()
+            .close_children(ChildCloseReason::Killed)
             .await
             .expect("an already-gone child must not fail the close");
 
@@ -1740,7 +1941,7 @@ mod watch_tests {
         one_running_child(&sessions).await;
 
         let error = sessions
-            .close_children()
+            .close_children(ChildCloseReason::Killed)
             .await
             .expect_err("a real close failure must propagate");
         assert!(

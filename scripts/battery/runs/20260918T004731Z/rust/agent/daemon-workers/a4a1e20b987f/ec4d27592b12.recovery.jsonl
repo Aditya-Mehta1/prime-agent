@@ -1,4 +1,0 @@
-{"activeSessionId":"ec4d27592b12","busy":true,"operation":"create","recordedAt":"2026-09-18T00:48:55.923Z","sessionFile":"/home/ubuntu/lane-worktrees/kernel-packaging/scripts/battery/runs/20260918T004731Z/rust/agent/sessions/01a0b1fc-e42c-742e-88c9-a586952ec2a3.jsonl","sessionId":"01a0b1fc-e42c-742e-88c9-a586952ec2a3"}
-{"active_session_id":"ec4d27592b12","follow_up":["start a turn"],"recorded_at":"2026-09-18T00:48:55.935Z","steering":[],"type":"queue_snapshot","version":1}
-{"active_session_id":"ec4d27592b12","follow_up":[],"recorded_at":"2026-09-18T00:48:56.041Z","steering":[],"type":"queue_snapshot","version":1}
-{"activeSessionId":"ec4d27592b12","busy":false,"operation":"shutdown","recordedAt":"2026-09-18T00:50:16.339Z","sessionFile":"/home/ubuntu/lane-worktrees/kernel-packaging/scripts/battery/runs/20260918T004731Z/rust/agent/sessions/01a0b1fc-e42c-742e-88c9-a586952ec2a3.jsonl","sessionId":"01a0b1fc-e42c-742e-88c9-a586952ec2a3"}

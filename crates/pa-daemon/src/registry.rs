@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -32,6 +32,31 @@ pub(crate) struct WorkerRequest {
     pub(crate) payload: Value,
 }
 
+/// Command-route liveness for one resident worker, watched by the
+/// supervisor's replacement-aware route (`route_command_ready`):
+/// `connected` tracks the live worker socket (both supervisor-side pumps
+/// flip it false when the connection dies), `session_ready` marks the
+/// worker's session-create boundary (a fresh create and a replacement's
+/// create replay; a client command must never overtake it), and `retired`
+/// marks a worker that will not come back (restart give-up, intentional
+/// stop) so waiting routes fail fast instead of parking on the deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerRouteState {
+    pub(crate) connected: bool,
+    pub(crate) session_ready: bool,
+    pub(crate) retired: bool,
+}
+
+impl WorkerRouteState {
+    fn initial() -> Self {
+        Self {
+            connected: false,
+            session_ready: false,
+            retired: false,
+        }
+    }
+}
+
 /// One resident session worker: the durable identity (descriptor) plus the
 /// live request channel once the supervisor has connected to the worker.
 pub(crate) struct ResidentWorker {
@@ -43,9 +68,51 @@ pub(crate) struct ResidentWorker {
     pub(crate) pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<DaemonResponse>>>,
     pub(crate) intentional_stop: AtomicBool,
     pub(crate) consecutive_failures: AtomicU32,
+    /// Unix-millis timestamp of the current child's spawn (0 for an adopted
+    /// pid we never spawned): the crash path measures the child's lifetime
+    /// against it - only a lifetime past the stable window earns a counter
+    /// reset, so spawn-dies-fast churn accumulates to the give-up cap.
+    pub(crate) spawned_at_ms: AtomicU64,
     /// The worker advertised `direct_peer_transport` in its `worker_auth`
     /// response (TS `workerAuthAdvertisesPeerTransport`).
     pub(crate) peer_transport_capable: AtomicBool,
+    /// The last-good selector-less heartbeats catalog the worker answered
+    /// with (TS `worker.heartbeatSnapshot`), tagged with the catalog
+    /// generation it was read at: served when the worker is too busy to
+    /// answer a fresh list, so a slow turn cannot empty the merged catalog
+    /// while its scheduler keeps firing. Fresh only while the generation
+    /// is still current (see `heartbeat_snapshot_generation`).
+    pub(crate) heartbeat_snapshot: Mutex<Option<WorkerHeartbeatSnapshot>>,
+    /// The worker's heartbeat-catalog generation (TS
+    /// `worker.heartbeatSnapshotStale` + the queued re-read): bumped by
+    /// every `heartbeats_changed` invalidation. A snapshot is fresh only
+    /// while its generation is current, so an in-flight catalog read —
+    /// which captured an older generation — can never store itself back
+    /// as fresh over a newer invalidation.
+    pub(crate) heartbeat_snapshot_generation: AtomicU64,
+    /// Route liveness, published to waiters through a watch channel (the
+    /// replacement-aware route clones a receiver and sleeps until the
+    /// worker is route-ready or retired).
+    route_state_tx: tokio::sync::watch::Sender<WorkerRouteState>,
+    /// Monotonic connection epoch: only the pumps of the current
+    /// connection may flip `connected` false, so a superseded socket's
+    /// late EOF cannot retire a live replacement.
+    connection_epoch: AtomicU64,
+    /// The supervisor's compaction-abort token for this session's worker
+    /// (the abort supervision): armed by the forwarded
+    /// `compaction_start`, cleared by the forwarded `compaction_end`, so
+    /// an `abort_compaction` never needs the worker's own answer.
+    pub(crate) compaction: crate::compaction_supervision::CompactionSupervision,
+}
+
+/// The last-good heartbeats rows a worker answered with, tagged with the
+/// catalog generation they were read at (TS `worker.heartbeatSnapshot`):
+/// the rows are only trustworthy while their generation is still current
+/// (TS `worker.heartbeatSnapshotStale !== true`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerHeartbeatSnapshot {
+    pub(crate) rows: Vec<Value>,
+    pub(crate) generation: u64,
 }
 
 impl ResidentWorker {
@@ -54,6 +121,7 @@ impl ResidentWorker {
         descriptor: DaemonWorkerDescriptor,
         descriptor_path: PathBuf,
     ) -> Arc<Self> {
+        let (route_state_tx, _) = tokio::sync::watch::channel(WorkerRouteState::initial());
         Arc::new(ResidentWorker {
             worker_id,
             descriptor: Mutex::new(descriptor),
@@ -62,8 +130,92 @@ impl ResidentWorker {
             pending: Mutex::new(HashMap::new()),
             intentional_stop: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
+            spawned_at_ms: AtomicU64::new(0),
             peer_transport_capable: AtomicBool::new(false),
+            heartbeat_snapshot: Mutex::new(None),
+            heartbeat_snapshot_generation: AtomicU64::new(0),
+            route_state_tx,
+            connection_epoch: AtomicU64::new(0),
+            compaction: crate::compaction_supervision::CompactionSupervision::default(),
         })
+    }
+
+    pub(crate) fn route_state(&self) -> WorkerRouteState {
+        *self.route_state_tx.borrow()
+    }
+
+    /// A receiver that follows every route-state transition (the
+    /// replacement-aware route waits on it).
+    pub(crate) fn route_state_watcher(&self) -> tokio::sync::watch::Receiver<WorkerRouteState> {
+        self.route_state_tx.subscribe()
+    }
+
+    fn publish_route_state(&self, edit: impl FnOnce(&mut WorkerRouteState)) {
+        self.route_state_tx.send_if_modified(|state| {
+            let mut next = *state;
+            edit(&mut next);
+            if next == *state {
+                false
+            } else {
+                *state = next;
+                true
+            }
+        });
+    }
+
+    /// The supervisor wired a live worker socket (a fresh launch, a
+    /// replacement relaunch, or an adoption): connections become routable
+    /// from this moment. Returns the connection's epoch, which the
+    /// reader/writer pumps carry so only this connection can retire it.
+    pub(crate) fn note_connection_live(&self) -> u64 {
+        let epoch = self
+            .connection_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.publish_route_state(|state| state.connected = true);
+        epoch
+    }
+
+    /// Whether `epoch` is still the live connection's epoch: the abort
+    /// supervision's end-of-stream handling acts only on the current
+    /// connection's word.
+    pub(crate) fn connection_is_current(&self, epoch: u64) -> bool {
+        epoch
+            == self
+                .connection_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A connection's pumps ended (worker death or socket close). Stale
+    /// epochs (a superseded connection ending late) never flip the state.
+    pub(crate) fn note_connection_lost(&self, epoch: u64) {
+        if epoch
+            != self
+                .connection_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.publish_route_state(|state| state.connected = false);
+    }
+
+    /// The worker's session create completed (the fresh create response or
+    /// the replacement's create replay): client commands may now be routed
+    /// to it without overtaking the session into existence.
+    pub(crate) fn note_session_ready(&self) {
+        self.publish_route_state(|state| state.session_ready = true);
+    }
+
+    /// A replacement started: the create replay is pending, so routed
+    /// commands must wait for the replayed session.
+    pub(crate) fn note_session_replaying(&self) {
+        self.publish_route_state(|state| state.session_ready = false);
+    }
+
+    /// The worker will not come back (restart give-up or an intentional
+    /// stop): waiting routes fail fast instead of parking.
+    pub(crate) fn note_retired(&self) {
+        self.publish_route_state(|state| state.retired = true);
     }
 
     /// Selector labels: root active session id, session-file stem, name.
@@ -82,6 +234,25 @@ impl ResidentWorker {
             .unwrap_or_default()
             .to_string();
         (descriptor.root_active_session_id.clone(), file_stem, name)
+    }
+
+    /// Store a catalog read as the worker's last-good heartbeat snapshot.
+    ///
+    /// The store is generation-monotonic: a read whose captured generation
+    /// is older than the stored snapshot's never replaces it, so a late
+    /// in-flight read cannot retag a newer snapshot as stale (freshness is
+    /// `stored.generation == current`) or drop the last-good rows a
+    /// busy-worker fallback serves. A read in the stored generation still
+    /// refreshes the rows, because the catalog is constant within a
+    /// generation.
+    pub(crate) async fn store_heartbeat_snapshot(&self, rows: Vec<Value>, generation: u64) {
+        let mut snapshot = self.heartbeat_snapshot.lock().await;
+        if snapshot
+            .as_ref()
+            .is_none_or(|stored| generation >= stored.generation)
+        {
+            *snapshot = Some(WorkerHeartbeatSnapshot { rows, generation });
+        }
     }
 }
 
@@ -277,7 +448,7 @@ impl SessionRegistry {
     }
 }
 
-fn selector_matches(candidate: &str, suffix: &str) -> bool {
+pub(crate) fn selector_matches(candidate: &str, suffix: &str) -> bool {
     let normalize = |value: &str| -> String { value.replace('-', "").to_lowercase() };
     let candidate = normalize(candidate);
     let suffix = normalize(suffix);
@@ -414,5 +585,43 @@ mod tests {
             "second guard waited for the first"
         );
         let _ = first.await;
+    }
+
+    #[tokio::test]
+    async fn an_older_catalog_read_never_poisons_the_stored_snapshot() {
+        use serde_json::json;
+
+        let worker = resident("poison");
+        worker
+            .store_heartbeat_snapshot(vec![json!({"job": {"id": "first"}})], 5)
+            .await;
+        worker
+            .store_heartbeat_snapshot(vec![json!({"job": {"id": "second"}})], 6)
+            .await;
+        // A late read that captured generation 5 returning after the
+        // generation-6 store must not retag the newer snapshot as stale.
+        worker
+            .store_heartbeat_snapshot(vec![json!({"job": {"id": "late"}})], 5)
+            .await;
+        let snapshot = worker.heartbeat_snapshot.lock().await.clone();
+        assert_eq!(
+            snapshot,
+            Some(WorkerHeartbeatSnapshot {
+                rows: vec![json!({"job": {"id": "second"}})],
+                generation: 6,
+            })
+        );
+        // A read in the stored generation refreshes the rows.
+        worker
+            .store_heartbeat_snapshot(vec![json!({"job": {"id": "refreshed"}})], 6)
+            .await;
+        let snapshot = worker.heartbeat_snapshot.lock().await.clone();
+        assert_eq!(
+            snapshot,
+            Some(WorkerHeartbeatSnapshot {
+                rows: vec![json!({"job": {"id": "refreshed"}})],
+                generation: 6,
+            })
+        );
     }
 }

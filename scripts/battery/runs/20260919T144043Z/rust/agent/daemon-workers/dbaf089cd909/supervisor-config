@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T144043Z/rust/daemon.sock",
-  "defaultSessionDir": "/home/ubuntu/lane-worktrees/model-selector/scripts/battery/runs/20260919T144043Z/rust/agent/sessions"
-}

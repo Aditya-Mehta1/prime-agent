@@ -1,3 +1,0 @@
-supervisor started pid 132761
-[2026-09-19T14:16:48.946Z] session worker 0c7bd23c7600 registered (epoch 1, pid 132779)
-[2026-09-19T14:16:49.003Z] session worker 0c7bd23c7600 re-registered (epoch 2, pid 132779)

@@ -1,8 +1,0 @@
-[2026-09-21T17:16:16.574Z] Prime Agent daemon listening on /tmp/vbat20260921T171410Z-ts/prime-agent-1000/worker-2824c601e057-52ad784a1318.sock
-[2026-09-21T17:16:32.332Z] daemon command "compact" failed: Error: Already compacted
-    at _performCompaction (/$bunfs/root/prime-agent:2256:2461)
-    at compact (/$bunfs/root/prime-agent:2256:941)
-    at async handleCommand (/$bunfs/root/prime-agent:2181:89202)
-    at async handleLine (/$bunfs/root/prime-agent:2181:62568)
-    at processTicksAndRejections (native:7:39)
-[2026-09-21T17:16:49.504Z] shutting down (exit 0); closing 0 active session(s)

@@ -1,3 +1,0 @@
-supervisor started pid 159670
-[2026-09-18T10:32:23.323Z] session worker 1a24f6b76863 registered (epoch 1, pid 159726)
-[2026-09-18T10:32:23.426Z] session worker 1a24f6b76863 re-registered (epoch 2, pid 159726)

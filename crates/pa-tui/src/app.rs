@@ -53,6 +53,9 @@ pub fn run_app(
     crossterm::style::force_color_output(true);
     terminal::enable_raw_mode()?;
     crossterm::execute!(stdout(), EnterAlternateScreen)?;
+    // The replay surface owns the same enhanced-key modes as the session
+    // (TS `ProcessTerminal.start`): bracketed pastes arrive as one chunk.
+    crate::enhanced_keys::enable(&mut std::io::stdout())?;
     let mut terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
 
     let theme = load_theme(&options.theme);
@@ -119,6 +122,8 @@ pub fn run_app(
         }
     }
 
+    let mut out = stdout();
+    let _ = crate::enhanced_keys::disable(&mut out);
     terminal::disable_raw_mode()?;
     crossterm::execute!(stdout(), LeaveAlternateScreen)?;
     Ok(())

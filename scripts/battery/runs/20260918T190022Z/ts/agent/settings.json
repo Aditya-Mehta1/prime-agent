@@ -1,8 +1,0 @@
-{
-  "compaction": {
-    "enabled": true
-  },
-  "telemetry": {
-    "noticeShown": true
-  }
-}

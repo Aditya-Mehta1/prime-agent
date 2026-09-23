@@ -14,6 +14,33 @@ pub struct PrimeTeamCredential {
     pub created_at: Option<String>,
 }
 
+/// The team half of a Prime Inference key write (TS `setPrimeInferenceApiKey`'s
+/// `primeTeam?: PrimeTeam | null`): an absent argument preserves the stored
+/// team when the key is unchanged, `null` is the personal account.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrimeTeamAssignment {
+    /// TS `undefined`: keep the stored team, but only on the same key.
+    PreserveWhenKeyMatches,
+    /// TS `null`: the personal account.
+    PersonalAccount,
+    /// TS `PrimeTeam`: this team.
+    Team(PrimeTeamCredential),
+}
+
+/// The stored Prime team selection (TS `getPrimeInferenceTeamSelection`'s
+/// `PrimeTeamCredential | null | undefined`): `undefined` means no stored
+/// selection applies (`PRIME_TEAM_ID` is set, or the active auth source is
+/// not the stored credential).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoredPrimeTeam {
+    /// TS `undefined`.
+    NotSelected,
+    /// TS `null`: the personal account.
+    PersonalAccount,
+    /// TS `PrimeTeamCredential`.
+    Team(PrimeTeamCredential),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthCredential {
@@ -22,6 +49,16 @@ pub enum AuthCredential {
         key: String,
         #[serde(rename = "primeTeam", default, skip_serializing_if = "Option::is_none")]
         prime_team: Option<PrimeTeamCredential>,
+    },
+    /// A pasted MCP static token (the inline paste flow for
+    /// `requires-setup` token services): the literal bearer value plus the
+    /// endpoint it is bound to. No expiry — usable until removed or replaced.
+    /// Setup field ids are metadata, never environment variables to read.
+    #[serde(rename = "mcp_static_token")]
+    McpStaticToken {
+        bearer: String,
+        #[serde(rename = "endpoint", default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
     },
     #[serde(rename = "oauth")]
     Oauth {
@@ -57,6 +94,7 @@ impl AuthCredential {
     pub fn credential_type(&self) -> &'static str {
         match self {
             AuthCredential::ApiKey { .. } => "api_key",
+            AuthCredential::McpStaticToken { .. } => "mcp_static_token",
             AuthCredential::Oauth { .. } => "oauth",
         }
     }

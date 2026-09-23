@@ -1,8 +1,0 @@
-{"cwd":"/home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/rust/work","id":"01a0b711-84c5-7706-9071-a28d6bcd266e","rlmDepth":0,"timestamp":"2026-09-19T00:29:33.765Z","type":"session","version":3}
-{"type":"model_change","id":"74734ad7","parentId":null,"timestamp":"2026-09-19T00:29:33.784Z","modelId":"mock-1","provider":"prime-inference"}
-{"type":"thinking_level_change","id":"85757ea9","parentId":"74734ad7","timestamp":"2026-09-19T00:29:33.784Z","thinkingLevel":"off"}
-{"type":"service_tier_change","id":"aa58cef4","parentId":"85757ea9","timestamp":"2026-09-19T00:29:33.784Z","serviceTier":"default"}
-{"type":"session_state","id":"2cc8177a","parentId":"aa58cef4","timestamp":"2026-09-19T00:29:33.784Z","state":{"status":"active"}}
-{"type":"message","id":"7728b389","parentId":"2cc8177a","timestamp":"2026-09-19T00:29:34.270Z","message":{"content":[{"text":"hold the turn","type":"text"}],"role":"user","timestamp":1789777774270}}
-{"type":"session_state","id":"00b23ed0","parentId":"7728b389","timestamp":"2026-09-19T00:29:35.871Z","state":{"status":"active"}}
-{"type":"message","id":"4f5393c8","parentId":"00b23ed0","timestamp":"2026-09-19T00:29:35.891Z","message":{"content":[{"text":"hold the turn","type":"text"}],"role":"user","timestamp":1789777775891}}

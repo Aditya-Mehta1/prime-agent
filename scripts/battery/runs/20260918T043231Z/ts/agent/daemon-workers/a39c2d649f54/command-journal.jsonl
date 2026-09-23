@@ -1,3 +1,0 @@
-
-{"version":1,"type":"received","key":"[\"ec94088d4c44\",\"sd\"]","clientId":"ec94088d4c44","commandId":"sd","commandType":"shutdown","recordedAt":"2026-09-18T04:34:03.050Z"}
-{"version":1,"type":"result","key":"[\"ec94088d4c44\",\"sd\"]","response":{"id":"sd","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-18T04:34:03.055Z"}

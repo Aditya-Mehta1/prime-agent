@@ -1,7 +1,0 @@
-{
- "id": "g21r",
- "type": "response",
- "command": "get_state",
- "success": false,
- "error": "Session worker is failed"
-}

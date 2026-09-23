@@ -1,20 +1,5 @@
-# Release pipeline for the prime-agent Rust rewrite.
+# Release pipeline for Prime Agent (Rust).
 #
-# This workflow is byte-final but staged at ci/workflows/ (not
-# .github/workflows/) because the dev box's GitHub token has no `workflow`
-# scope; see ci/workflows/README.md for the promotion step
-# (`make activate-workflows`). It is INERT until then. The equivalent
-# end-to-end check runs locally via `make release-dry-run`. When enabling:
-# configure the `release` environment protection rules (required reviewers,
-# tag-pattern restriction) — that is an operator step.
-#
-# Publish/build separation (docs/installer-ci-design.md §6):
-#   - trigger: `v<semver>` tags only; PRs can never reach this workflow.
-#   - tag-check + build jobs: `contents: read`, no secrets, no publish rights.
-#   - promotion job: protected `release` environment, `contents: write` +
-#     `id-token: write`; downloads build artifacts only, never rebuilds.
-# When enabling: configure the `release` environment protection rules
-# (required reviewers, tag-pattern restriction) — that is an operator step.
 
 name: release
 

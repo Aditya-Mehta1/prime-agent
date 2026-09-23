@@ -1,3 +1,0 @@
-supervisor started pid 125197
-[2026-09-18T10:06:07.117Z] session worker 7196a734cfd4 registered (epoch 1, pid 125213)
-[2026-09-18T10:06:07.186Z] session worker 7196a734cfd4 re-registered (epoch 2, pid 125213)

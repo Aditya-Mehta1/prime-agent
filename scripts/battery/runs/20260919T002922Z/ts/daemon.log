@@ -1,3 +1,0 @@
-Prime Agent daemon supervisor 6c8749e0-26a0-4d78-aefc-ac9d2c2861e8 listening on /home/ubuntu/lane-worktrees/exit-hang/scripts/battery/runs/20260919T002922Z/ts/daemon.sock
-Session worker aa3b911a0a95 stderr: Prime Agent daemon listening on /tmp/vbat20260919T002922Z-ts/prime-agent-1000/worker-6adaefafaef4-aa3b911a0a95.sock
-Session worker aa3b911a0a95 stderr: shutting down (exit 0); closing 0 active session(s)

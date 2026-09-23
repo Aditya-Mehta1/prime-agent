@@ -1,6 +1,0 @@
-{"activeSessionId":"4b34c22ca3ff","busy":true,"operation":"create","recordedAt":"2026-09-21T02:51:00.030Z","sessionFile":"/tmp/nd-runs/20260921T025005Z/rust/agent/sessions/01a0c1df-ba2b-71af-9792-87618f31efc3.jsonl","sessionId":"01a0c1df-ba2b-71af-9792-87618f31efc3"}
-{"active_session_id":"4b34c22ca3ff","follow_up":[],"recorded_at":"2026-09-21T02:51:00.080Z","steering":["start the kernel and define notice_var"],"type":"queue_snapshot","version":1}
-{"active_session_id":"4b34c22ca3ff","follow_up":[],"recorded_at":"2026-09-21T02:51:03.417Z","steering":["history turn for the summary"],"type":"queue_snapshot","version":1}
-{"active_session_id":"4b34c22ca3ff","follow_up":[],"recorded_at":"2026-09-21T02:51:03.418Z","steering":["history turn for the summary"],"type":"queue_snapshot","version":1}
-{"active_session_id":"4b34c22ca3ff","follow_up":[],"recorded_at":"2026-09-21T02:51:03.466Z","steering":[],"type":"queue_snapshot","version":1}
-{"activeSessionId":"4b34c22ca3ff","busy":false,"operation":"shutdown","recordedAt":"2026-09-21T02:51:36.597Z","sessionFile":"/tmp/nd-runs/20260921T025005Z/rust/agent/sessions/01a0c1df-ba2b-71af-9792-87618f31efc3.jsonl","sessionId":"01a0c1df-ba2b-71af-9792-87618f31efc3"}

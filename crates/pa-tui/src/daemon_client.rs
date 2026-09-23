@@ -33,7 +33,9 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// timeout so a long turn cannot expire the request.
 pub const LONG_RUNNING_REQUEST_TIMEOUT_MS: u64 = 600_000;
 const CONNECT_TIMEOUT_MS: u64 = 3_000;
-const HELLO_TIMEOUT_MS: u64 = 3_000;
+/// Hello handshake budget. A daemon loading a very large session can take
+/// well over the 3s TS default to greet.
+const HELLO_TIMEOUT_MS: u64 = 15_000;
 
 /// A non-response frame forwarded to the UI event loop. Payloads that are
 /// owned by the session engine stay raw JSON (`Value`) so the client keeps
@@ -95,6 +97,14 @@ pub enum DaemonClientEvent {
     /// when the heartbeat catalog changes (TS `broadcastGlobal`). The
     /// session view refreshes its open `/heartbeats` picker on it.
     HeartbeatsChanged,
+    /// `session_binding`: the supervisor rebound a session to a new active
+    /// id (a worker replacement) and the id this client holds is
+    /// superseded. The session view re-attaches to the current id so its
+    /// event routing follows the session.
+    SessionBinding {
+        previous_active_session_id: String,
+        active_session_id: String,
+    },
 }
 
 /// One non-response frame, parsed from a supervisor JSONL line or a direct
@@ -186,6 +196,18 @@ pub(crate) fn client_event_from_value(value: &Value) -> Option<DaemonClientEvent
             resync: value.get("resync") == Some(&Value::Bool(true)),
         }),
         "heartbeats_changed" => Some(DaemonClientEvent::HeartbeatsChanged),
+        "session_binding" => Some(DaemonClientEvent::SessionBinding {
+            previous_active_session_id: value
+                .get("previousActiveSessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            active_session_id: value
+                .get("activeSessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
         _ => None,
     }
 }
@@ -409,6 +431,20 @@ impl DaemonClient {
     }
 
     /// The full `daemon_hello` frame the supervisor sent on connect.
+    /// Whether the daemon's `daemon_hello` advertised `capability` (TS
+    /// `supportsServerCapability`): capability-gated commands fall back to
+    /// their older shape without it.
+    pub fn supports_server_capability(&self, capability: &str) -> bool {
+        self.hello
+            .get("serverCapabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(capability))
+            })
+    }
+
     pub fn hello(&self) -> &Value {
         &self.hello
     }
@@ -454,6 +490,29 @@ impl DaemonClient {
                 Err(DirectRequestError::Wait(error)) => return Err(error),
             }
         }
+        self.request_supervisor(command, timeout_ms).await
+    }
+
+    /// Send one command envelope to the supervisor, bypassing any direct
+    /// worker link, and require `success: true`. The supervisor-owned arms
+    /// (`abort_compaction`) must reach the supervisor even when a direct
+    /// link serves the session: the direct link IS the wedged worker in
+    /// the case the supervisor arm exists for.
+    pub async fn request_ok_via_supervisor(&self, command: DaemonCommand) -> Result<Value> {
+        let name = command_type_debug(&command);
+        let response = self
+            .request_supervisor(command, DEFAULT_REQUEST_TIMEOUT_MS)
+            .await?;
+        response_data_or_error(&name, response)
+    }
+
+    /// The supervisor leg of [`Self::request_with_timeout`]: one JSONL
+    /// envelope on the supervisor connection.
+    async fn request_supervisor(
+        &self,
+        command: DaemonCommand,
+        timeout_ms: u64,
+    ) -> Result<DaemonResponse> {
         let id = format!(
             "daemon_{}",
             self.next_request_id.fetch_add(1, Ordering::SeqCst) + 1
@@ -493,15 +552,7 @@ impl DaemonClient {
     pub async fn request_ok(&self, command: DaemonCommand) -> Result<Value> {
         let name = command_type_debug(&command);
         let response = self.request(command).await?;
-        if !response.success {
-            return Err(anyhow!(
-                "the daemon rejected the {name} request: {}",
-                response
-                    .error
-                    .unwrap_or_else(|| "unknown error".to_string())
-            ));
-        }
-        Ok(response.data.unwrap_or(Value::Null))
+        response_data_or_error(&name, response)
     }
 
     /// Whether a session-plane command for the direct link's session may
@@ -663,6 +714,20 @@ impl DaemonClient {
 enum DirectRequestError {
     NotSent,
     Wait(anyhow::Error),
+}
+
+/// Unwrap a settled response into its `data`, surfacing the daemon error
+/// string on failure.
+fn response_data_or_error(name: &str, response: DaemonResponse) -> Result<Value> {
+    if !response.success {
+        return Err(anyhow!(
+            "the daemon rejected the {name} request: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+    Ok(response.data.unwrap_or(Value::Null))
 }
 
 /// Wire `type` tag of a command, for error messages.

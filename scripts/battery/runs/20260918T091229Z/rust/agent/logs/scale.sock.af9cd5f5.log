@@ -1,3 +1,0 @@
-supervisor started pid 72872
-[2026-09-18T09:12:57.316Z] session worker aec44f1a55ff registered (epoch 1, pid 72878)
-[2026-09-18T09:12:58.792Z] session worker aec44f1a55ff re-registered (epoch 2, pid 72878)

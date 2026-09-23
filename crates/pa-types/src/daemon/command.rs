@@ -423,6 +423,17 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// `abort_and_send_queued` (schema 29, capability-gated in TS): abort
+    /// the active run and deliver the visible queued steering batch at the
+    /// turn boundary; a plain abort when no steering is queued (TS
+    /// `AgentSession.abortAndSendQueued`).
+    AbortAndSendQueued {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     StartSideQuestion {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -466,6 +477,32 @@ pub enum DaemonCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Rust-native extension, advertised by the `kernel_bash_activity` capability.
+    ListKernelBash {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    TailKernelBash {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        activity_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<u32>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    KillKernelBash {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        activity_id: String,
         #[serde(flatten)]
         rest: JsonMap,
     },
@@ -568,6 +605,28 @@ pub enum DaemonCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// The inline paste flow: install a pasted static token for one
+    /// pasteable catalog service (`server`), binding it to the service
+    /// endpoint and verifying with a real MCP handshake.
+    SetMcpStaticToken {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        server: String,
+        token: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Remove one MCP connection: its credential and its connection record
+    /// (the durable endpoint pin), in one step.
+    RemoveMcpConnection {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        server: String,
         #[serde(flatten)]
         rest: JsonMap,
     },

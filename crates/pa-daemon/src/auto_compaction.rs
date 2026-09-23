@@ -6,7 +6,8 @@
 //! (`agent_end`) and before the next admitted prompt
 //! (`_runPreTurnCompaction`, `beforeModelSelection` for queued prompts).
 //! The check itself is the pa-core decision ([`AgentSession::
-//! auto_compaction_due`]: the live context over the reserve headroom);
+//! auto_compaction_due`]: the live context against the effective
+//! threshold);
 //! this module owns the daemon flow around it — the `compaction_start` /
 //! `compaction_end` event pair with the `threshold` reason (TS
 //! `_runAutoCompaction`), the worker's persist-and-broadcast contract
@@ -47,21 +48,24 @@ impl AgentSessionEngine {
         &self,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> AutoCompactionRun {
-        // TS reads `this.model?.contextWindow ?? 0`: a session without a
-        // resolvable model never crosses a threshold.
-        let model = match self.resolve_model() {
+        // TS reads `this.model?.contextWindow ?? 0` and runs the
+        // summarizer on `this.model` — the session's live model. The Rust
+        // equivalent is the provider target the turn stream reads; a fresh
+        // startup-chain resolution can land the summarizer on a provider
+        // the session never used (R8: "No AWS credentials available for
+        // Bedrock" in a prime-inference session), so the arm follows the
+        // target. A session without a resolvable model never crosses a
+        // threshold.
+        let model = match self.session_model() {
             Ok(model) => model,
             Err(_) => return AutoCompactionRun::NotDue,
         };
         let due = {
             let guard = self.session.blocking_lock();
-            match guard.as_ref() {
-                Some(engine) => self.runtime.block_on(async {
-                    engine
-                        .session
-                        .auto_compaction_due(model.context_window)
-                        .await
-                }),
+            match guard.as_deref() {
+                Some(engine) => self
+                    .runtime
+                    .block_on(async { engine.session.auto_compaction_due(&model).await }),
                 // No built session: the live context is empty (nothing to
                 // compact), matching the TS pre-turn check on a fresh
                 // session whose first turn has not run yet.
@@ -92,7 +96,7 @@ impl AgentSessionEngine {
         let api_key = self.resolve_request_api_key(&model);
         let outcome = {
             let guard = self.session.blocking_lock();
-            let Some(engine) = guard.as_ref() else {
+            let Some(engine) = guard.as_deref() else {
                 self.clear_auto_compaction_abort(&controller);
                 return AutoCompactionRun::NotDue;
             };
@@ -128,8 +132,9 @@ impl AgentSessionEngine {
                 // every completed compaction into the active run).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(telemetry) =
-                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
+                    if let Some(telemetry) = guard
+                        .as_deref()
+                        .and_then(|engine| engine.telemetry.as_ref())
                     {
                         telemetry.note_compaction();
                     }

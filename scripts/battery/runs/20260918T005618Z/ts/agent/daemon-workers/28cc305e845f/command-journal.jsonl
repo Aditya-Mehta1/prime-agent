@@ -1,3 +1,0 @@
-
-{"version":1,"type":"received","key":"[\"ccfa50282169\",\"sd\"]","clientId":"ccfa50282169","commandId":"sd","commandType":"shutdown","recordedAt":"2026-09-18T00:59:15.842Z"}
-{"version":1,"type":"result","key":"[\"ccfa50282169\",\"sd\"]","response":{"id":"sd","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-18T00:59:15.845Z"}

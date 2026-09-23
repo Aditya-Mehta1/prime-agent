@@ -1,5 +1,0 @@
-{
- "command": "abort_and_clear_queue",
- "command_seconds": 0.019,
- "hold_seconds": 15
-}

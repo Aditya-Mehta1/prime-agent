@@ -1,3 +1,0 @@
-[2026-09-17T22:45:52.382Z] supervisor: Prime Agent daemon supervisor 14be88db-cc26-4917-948d-1242a1be2b07 listening on /home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T223920Z/ts/perf/sock-0.sock
-[2026-09-17T22:45:53.500Z] supervisor: Session worker 0f32b8fb7f0d stderr: Prime Agent daemon listening on /tmp/vbat20260917T223920Z-ts/prime-agent-1000/worker-080eb878fedc-0f32b8fb7f0d.sock
-[2026-09-17T22:45:56.497Z] supervisor: Session worker 0f32b8fb7f0d stderr: shutting down (exit 0); closing 0 active session(s)

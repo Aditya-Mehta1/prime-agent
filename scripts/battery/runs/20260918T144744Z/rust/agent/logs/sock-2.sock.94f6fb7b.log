@@ -1,3 +1,0 @@
-supervisor started pid 400689
-[2026-09-18T14:51:44.822Z] session worker 1ed81d1a7ee3 registered (epoch 1, pid 400698)
-[2026-09-18T14:51:44.941Z] session worker 1ed81d1a7ee3 re-registered (epoch 2, pid 400698)

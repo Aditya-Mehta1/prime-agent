@@ -46,6 +46,7 @@ const TS_DAEMON_COMMAND_TYPES: &[&str] = &[
     "agent_messages_resume",
     "agent_messages_clear",
     "abort",
+    "abort_and_send_queued",
     "start_side_question",
     "abort_side_question",
     "execute_bash",
@@ -549,6 +550,11 @@ fn known_command_types_match_the_ts_list() {
                     | "commit_update_restart"
                     | "update_restore_status"
                     | "get_mcp_connections"
+                    | "set_mcp_static_token"
+                    | "remove_mcp_connection"
+                    | "list_kernel_bash"
+                    | "tail_kernel_bash"
+                    | "kill_kernel_bash"
             ),
             "unexpected non-TS command type: {extra}"
         );

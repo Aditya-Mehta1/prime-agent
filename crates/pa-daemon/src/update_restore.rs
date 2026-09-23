@@ -57,6 +57,19 @@ const RESTORE_ATTACH_WAIT_MS: u64 = 120_000;
 struct RestoreTarget {
     active_session_id: String,
     session_file: String,
+    /// The row's session name: `SessionRegistry::resolve` accepts name
+    /// selectors, so the restore queue must own them too (the waiter
+    /// settles by the same row the registry will resolve once it is up).
+    name: Option<String>,
+    /// The row needs the TS-parity continuation treatment (§10.5):
+    /// an early settle (adoption or a live re-registration) must not
+    /// wake this row's waiters ahead of the pass routing the
+    /// restart-continuation prompt - the pass settles it right before.
+    needs_continuation: bool,
+    /// Set the moment the pass finishes this row (or the adoption pass
+    /// brings the worker up): the per-target waiters wake immediately
+    /// instead of queueing behind the rest of the recovery.
+    settled: bool,
     failure: Option<String>,
 }
 
@@ -74,6 +87,10 @@ pub(crate) struct RestoreProgress {
 #[derive(Debug, Default)]
 struct RestoreInner {
     done: bool,
+    /// Bumped on every row settle: the per-row waiters' budget re-arms
+    /// while the pass keeps making progress, so a large capped recovery
+    /// cannot starve a healthy late row's waiter out of its queue.
+    settled_generation: u64,
     targets: BTreeMap<String, RestoreTarget>,
     counts: UpdateStatusCounts,
     failures: Vec<UpdateStatusFailure>,
@@ -85,9 +102,16 @@ impl RestoreProgress {
     }
 
     /// Record the boot's update identity (spec §6 step 2) before serving,
-    /// so hellos report the resume contract from the first connection.
-    pub(crate) fn begin(&self, update_id: Option<UpdateId>) {
-        *self.update_id.lock().unwrap() = update_id;
+    /// so hellos report the resume contract from the first connection,
+    /// and register the roster rows: a client that reconnects while the
+    /// recovery is still working queues behind its own session's row
+    /// (spec §10.4) instead of failing with the plain unknown-session
+    /// error, from the first adoption onward.
+    pub(crate) fn begin(&self, roster: Option<&UpdateRoster>) {
+        *self.update_id.lock().unwrap() = roster.map(|roster| roster.update_id.clone());
+        if let Some(roster) = roster {
+            self.register_targets(roster);
+        }
     }
 
     pub(crate) fn update_id(&self) -> Option<UpdateId> {
@@ -103,10 +127,6 @@ impl RestoreProgress {
         }
     }
 
-    fn is_in_flight(&self) -> bool {
-        !self.state.lock().unwrap().done
-    }
-
     /// Register the roster rows the restore pass will settle (attach
     /// queuing matches selectors against these).
     fn register_targets(&self, roster: &UpdateRoster) {
@@ -117,10 +137,64 @@ impl RestoreProgress {
                 RestoreTarget {
                     active_session_id: row.active_session_id.clone(),
                     session_file: row.session_file.clone(),
+                    name: row.name.clone(),
+                    needs_continuation: row.should_resume && row.in_flight.streaming,
+                    settled: false,
                     failure: None,
                 },
             );
         }
+    }
+
+    /// Record one row's settle outcome the moment the recovery finishes
+    /// it (the restore pass's per-row outcome, or a descriptor adoption
+    /// that brought the worker up): the row's waiters wake immediately
+    /// instead of queueing behind the rest of the recovery (spec §10.4:
+    /// the attach streams "once the session comes up"). Idempotent; a
+    /// no-op for a selector no in-flight pass owns.
+    pub(crate) fn settle_target(&self, selector: &str, failure: Option<String>) {
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(target) = restore_target_mut(&mut state.targets, selector) else {
+                return;
+            };
+            if target.settled {
+                return;
+            }
+            target.settled = true;
+            target.failure = failure;
+            state.settled_generation += 1;
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// Settle a row an adoption or a live (re-)registration brought up,
+    /// not the restore pass itself. A row still pending its TS-parity
+    /// continuation treatment (§10.5) stays queued: the pass settles it
+    /// right before it routes the restart-continuation prompt, so a woken
+    /// client's prompt cannot land ahead of the required continuation.
+    /// The skip is still settle progress — the generation bump keeps the
+    /// other waiters' quiet budgets re-armed (a healthy adoption of
+    /// streaming rows must not look idle) — but the row's own waiters
+    /// stay parked until the pass reaches it. Idempotent; a no-op for a
+    /// selector no in-flight pass owns.
+    pub(crate) fn settle_adopted(&self, selector: &str) {
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(target) = restore_target_mut(&mut state.targets, selector) else {
+                return;
+            };
+            if target.settled {
+                return;
+            }
+            if target.needs_continuation {
+                state.settled_generation += 1;
+            } else {
+                target.settled = true;
+                state.settled_generation += 1;
+            }
+        }
+        self.notify.notify_waiters();
     }
 
     /// Mark the pass settled: per-row outcomes, counts, and the waiters'
@@ -138,10 +212,12 @@ impl RestoreProgress {
                 by_file.insert(failure.session_file.as_str(), failure.message.as_str());
             }
             for target in state.targets.values_mut() {
+                target.settled = true;
                 target.failure = by_file
                     .get(target.session_file.as_str())
                     .map(|message| message.to_string());
             }
+            state.settled_generation += 1;
             state.failures = failures;
         }
         self.notify.notify_waiters();
@@ -158,25 +234,53 @@ impl RestoreProgress {
             .map(|message| (target.session_file.clone(), message.clone()))
     }
 
-    /// Whether an in-flight pass owns the selector (a roster row: durable
-    /// id, transient active id, or session-file stem).
+    /// Whether an in-flight pass owns the selector: any roster row the
+    /// registry-shaped selector resolves to (durable id, transient active
+    /// id, session-file stem or its normalized suffix, session name), so
+    /// a command that will resolve once the row is up queues behind that
+    /// row instead of failing fast.
     fn owns_target(&self, selector: &str) -> bool {
         let state = self.state.lock().unwrap();
         !state.done && restore_target(&state.targets, selector).is_some()
     }
 
-    /// Wait for the restore pass to settle if one is in flight (spec §10.4:
-    /// attaches queue server-side behind the pass).
-    async fn wait_for_settle(&self) {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(RESTORE_ATTACH_WAIT_MS.max(1));
+    /// Wait for one target's settle outcome, not the whole pass (spec
+    /// §10.4: the attach queues server-side and streams "once the session
+    /// comes up" — a slow recovery of unrelated sessions must not hold
+    /// this request). The §10.4 deadline bounds the queue's quiet time:
+    /// every settle progress re-arms it, so a large capped adoption holds
+    /// its waiters only while rows keep coming up, while a pass wedged
+    /// with no progress for the budget cannot hold a client longer.
+    async fn wait_for_settle_target(&self, selector: &str) {
+        let quiet = std::time::Duration::from_millis(RESTORE_ATTACH_WAIT_MS.max(1));
+        let (mut last_generation, mut deadline) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.settled_generation,
+                tokio::time::Instant::now() + quiet,
+            )
+        };
         loop {
             // Register interest before re-checking: a settle that runs
             // between the check and the registration must still wake us.
             let notified = self.notify.notified();
-            if !self.is_in_flight() {
-                // Settled (or no pass at all): the caller re-resolves.
+            let (settled, generation) = {
+                let state = self.state.lock().unwrap();
+                (
+                    state.done
+                        || restore_target(&state.targets, selector)
+                            .is_none_or(|target| target.settled),
+                    state.settled_generation,
+                )
+            };
+            if settled {
+                // This row settled (or the whole pass did): the caller
+                // re-resolves.
                 return;
+            }
+            if generation != last_generation {
+                last_generation = generation;
+                deadline = tokio::time::Instant::now() + quiet;
             }
             if tokio::time::Instant::now() >= deadline {
                 return;
@@ -189,28 +293,62 @@ impl RestoreProgress {
     }
 }
 
-/// The roster row a selector addresses: by durable id, transient active id,
-/// or session-file stem (the same selectors `SessionRegistry::resolve`
-/// accepts).
+/// Whether one target answers the registry-shaped selector (the durable id
+/// is the map key, checked first by the key resolver): the transient
+/// active id, the session-file stem (both exact or a normalized suffix,
+/// `SessionRegistry`'s `selector_matches`), or the session name (exact) —
+/// the same shapes `SessionRegistry::resolve` accepts, so a command the
+/// registry will resolve once the row is up queues behind that row now.
+fn matches_selector(target: &RestoreTarget, selector: &str) -> bool {
+    if target.active_session_id == selector {
+        return true;
+    }
+    let stem = Path::new(&target.session_file)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if crate::registry::selector_matches(&target.active_session_id, selector)
+        || (!stem.is_empty() && crate::registry::selector_matches(&stem, selector))
+    {
+        return true;
+    }
+    target
+        .name
+        .as_deref()
+        .is_some_and(|name| !name.is_empty() && name == selector)
+}
+
+/// The map key a selector addresses: the exact durable id, or the key of
+/// the single row the registry-shaped selector matches — an ambiguous
+/// suffix or name matches nothing, the same way the registry errors an
+/// ambiguous selector instead of picking one row to serve it.
+fn restore_target_key(targets: &BTreeMap<String, RestoreTarget>, selector: &str) -> Option<String> {
+    if targets.contains_key(selector) {
+        return Some(selector.to_string());
+    }
+    let mut matches = targets
+        .iter()
+        .filter(|(_, target)| matches_selector(target, selector));
+    let (key, _) = matches.next()?;
+    matches.next().is_none().then(|| key.clone())
+}
+
+/// The roster row a selector addresses: any selector shape the registry
+/// accepts, resolved to exactly one row.
 fn restore_target<'a>(
     targets: &'a BTreeMap<String, RestoreTarget>,
     selector: &str,
 ) -> Option<&'a RestoreTarget> {
-    let file_stem = |file: &str| {
-        Path::new(file)
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().to_string())
-            .unwrap_or_default()
-    };
-    targets
-        .values()
-        .find(|target| {
-            target.active_session_id == selector || {
-                let stem = file_stem(&target.session_file);
-                !stem.is_empty() && stem == selector
-            }
-        })
-        .or_else(|| targets.get(selector))
+    restore_target_key(targets, selector).and_then(|key| targets.get(&key))
+}
+
+/// The mutable counterpart of [`restore_target`]: resolve the key, then
+/// borrow it mutably.
+fn restore_target_mut<'a>(
+    targets: &'a mut BTreeMap<String, RestoreTarget>,
+    selector: &str,
+) -> Option<&'a mut RestoreTarget> {
+    restore_target_key(targets, selector).and_then(|key| targets.get_mut(&key))
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +442,6 @@ pub(crate) async fn restore_pass(
             .settle(UpdateStatusCounts::default(), Vec::new());
         return;
     };
-    supervisor.restore.register_targets(&roster);
     let mut rows: Vec<&UpdateRosterSession> = roster.sessions.iter().collect();
     sort_rows_bottom_up(&mut rows);
     let mut counts = UpdateStatusCounts::default();
@@ -320,23 +457,34 @@ pub(crate) async fn restore_pass(
             // already brought the session up.
             Some(resident) => {
                 counts.restored += 1;
+                // Settle the row before the continuation treatment: the
+                // waiters attach to the live worker now, while the
+                // continuation prompt is this session's own stream.
+                supervisor.restore.settle_target(&row.session_id, None);
                 continuation_treatment(supervisor, &resident, row, &mut counts).await;
             }
             None => match restore_session(supervisor, row).await {
                 Ok(resident) => {
                     counts.restored += 1;
+                    supervisor.restore.settle_target(&row.session_id, None);
                     continuation_treatment(supervisor, &resident, row, &mut counts).await;
                 }
                 Err(error) => {
                     // Restore never fails the boot (spec §9): record the
-                    // row and leave the session on disk.
+                    // row and leave the session on disk. The row's waiters
+                    // get the typed failure now, not behind the rest of
+                    // the pass.
+                    let message = format!("{error:#}");
                     supervisor.log_line(&format!(
-                        "update restore: could not restore {}: {error:#}",
+                        "update restore: could not restore {}: {message}",
                         row.session_file
                     ));
+                    supervisor
+                        .restore
+                        .settle_target(&row.session_id, Some(message.clone()));
                     failures.push(UpdateStatusFailure {
                         session_file: row.session_file.clone(),
-                        message: format!("{error:#}"),
+                        message,
                     });
                     counts.failed += 1;
                 }
@@ -433,6 +581,13 @@ async fn continuation_treatment(
 async fn rearm_scheduled_wake(supervisor: &std::sync::Arc<Supervisor>) -> usize {
     let jobs = crate::update_roster::scan_scheduled_jobs(&supervisor.options.agent_dir);
     let now = crate::util::now_ms();
+    // The wake-scan target verification (TS `collectPassiveScheduledJobs`'s
+    // scan gates): a due job may only wake a session that still exists —
+    // the file present, still the job's session, still carrying the
+    // `active` state — and that no live worker covers (a covered tree's
+    // scheduler owns the fire itself). A killed (state `archived`) or
+    // deleted session is never revived (TS parity; the zombie fix).
+    let live = supervisor.live_session_files().await;
     let mut woke = 0usize;
     for job in jobs {
         if job.status != pa_core::cron::JobStatus::Active {
@@ -444,13 +599,7 @@ async fn rearm_scheduled_wake(supervisor: &std::sync::Arc<Supervisor>) -> usize 
         if job.session_file.is_empty() {
             continue;
         }
-        if supervisor
-            .registry
-            .find_by_session_file(&job.session_file)
-            .await
-            .is_some()
-        {
-            // The session is live: its own scheduler claims the due job.
+        if !crate::stop_cleanup::due_job_target_alive(&job, &live) {
             continue;
         }
         match wake_saved_session(supervisor, &job.session_file).await {
@@ -518,7 +667,10 @@ impl Supervisor {
             // fail immediately, not wait out the restore).
             return;
         }
-        self.restore.wait_for_settle().await;
+        // Queue behind this session's own row only, never behind the
+        // whole recovery (spec §10.4): an unrelated slow restore must not
+        // hold a control-plane request.
+        self.restore.wait_for_settle_target(selector).await;
     }
 
     /// Spec §10.4: the settled per-row failure for one selector, as the
@@ -559,11 +711,63 @@ mod tests {
     use super::*;
     use pa_types::daemon::update_flow::UpdateStatusCounts;
 
+    /// A two-row roster (update `u-1`): row `a-1`, and row `durable-b`
+    /// whose session-file stem (`b-2`) differs from its durable id (the
+    /// selector shapes the attach queue and the adoption settle both use).
+    fn two_row_roster() -> UpdateRoster {
+        serde_json::from_value(serde_json::json!({
+            "format_version": 1,
+            "update_id": "u-1",
+            "socket_path": "/tmp/s.sock",
+            "created_at": "2026-01-01T00:00:00Z",
+            "supervisor": { "pid": 1, "process_start_id": "p", "generation": "g" },
+            "binary": { "from_version": "0.1", "to_version": "0.2" },
+            "sessions": [
+                {
+                    "session_id": "a-1",
+                    "active_session_id": "active-a",
+                    "session_file": "/sessions/a-1.jsonl",
+                    "name": "alpha",
+                    "kind": "top-level",
+                    "rlm_depth": 0,
+                    "cwd": "/w",
+                    "runtime_config": {},
+                    "queue": { "next_turn": [], "actions": {} },
+                    "in_flight": {
+                        "streaming": false, "compacting": false, "bash_running": false,
+                        "rlm_children": false, "retrying": false, "prompt_in_flight": false
+                    },
+                    "should_resume": false
+                },
+                {
+                    "session_id": "durable-b",
+                    "active_session_id": "active-b",
+                    "session_file": "/sessions/b-2.jsonl",
+                    "kind": "top-level",
+                    "rlm_depth": 0,
+                    "cwd": "/w",
+                    "runtime_config": {},
+                    "queue": { "next_turn": [], "actions": {} },
+                    "in_flight": {
+                        "streaming": false, "compacting": false, "bash_running": false,
+                        "rlm_children": false, "retrying": false, "prompt_in_flight": false
+                    },
+                    "should_resume": false
+                }
+            ],
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn hello_resume_reports_progress_before_and_after_settle() {
         let progress = RestoreProgress::new();
-        progress.begin(Some(UpdateId::from("u-1".to_string())));
+        progress.begin(Some(&two_row_roster()));
         assert!(!progress.hello_resume().complete);
+        assert_eq!(
+            progress.hello_resume().update_id,
+            Some(UpdateId::from("u-1".to_string()))
+        );
         progress.settle(
             UpdateStatusCounts {
                 total: 2,
@@ -585,19 +789,181 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn queued_attach_waits_for_settle_then_unblocks() {
+    async fn queued_attach_unblocks_when_only_its_target_settles() {
         let progress = std::sync::Arc::new(RestoreProgress::new());
-        progress.begin(None);
-        let settler = {
-            let progress = std::sync::Arc::clone(&progress);
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                progress.settle(UpdateStatusCounts::default(), Vec::new());
-            })
+        progress.begin(Some(&two_row_roster()));
+        let waiter = |progress: &std::sync::Arc<RestoreProgress>, selector: &str| {
+            let progress = std::sync::Arc::clone(progress);
+            let selector = selector.to_string();
+            tokio::spawn(async move { progress.wait_for_settle_target(&selector).await })
         };
-        progress.wait_for_settle().await;
-        assert!(progress.hello_resume().complete);
-        settler.await.unwrap();
+        let mut queued_a = waiter(&progress, "a-1");
+        let mut queued_b = waiter(&progress, "durable-b");
+        // Neither row settled: both waiters queue behind their own rows
+        // (the deadline, not this test's ticks, bounds the queue).
+        let tick = std::time::Duration::from_millis(1);
+        assert!(tokio::time::timeout(tick, &mut queued_a).await.is_err());
+        assert!(tokio::time::timeout(tick, &mut queued_b).await.is_err());
+        // One row settles (an adoption brought `durable-b` up; a client
+        // may address it by stem): only that row's waiter wakes, while
+        // the other row's keeps queueing behind the rest of the pass.
+        progress.settle_target("b-2", None);
+        assert!(tokio::time::timeout(tick, queued_b).await.is_ok());
+        assert!(tokio::time::timeout(tick, &mut queued_a).await.is_err());
+        // The whole pass settling unblocks the remaining row's waiter.
+        progress.settle(UpdateStatusCounts::default(), Vec::new());
+        assert!(tokio::time::timeout(tick, queued_a).await.is_ok());
+    }
+
+    #[test]
+    fn settle_target_failure_answers_the_typed_attach_error_per_row() {
+        let progress = RestoreProgress::new();
+        progress.begin(Some(&two_row_roster()));
+        progress.settle_target("durable-b", Some("worker create failed".to_string()));
+        // Every selector shape for the failed row resolves the failure;
+        // the still-queued row has none yet (its attach waits, it does
+        // not fail early).
+        for selector in ["durable-b", "active-b", "b-2"] {
+            let (file, message) = progress.settled_failure(selector).unwrap();
+            assert_eq!(file, "/sessions/b-2.jsonl");
+            assert_eq!(message, "worker create failed");
+        }
+        assert!(progress.settled_failure("a-1").is_none());
+        assert!(progress.settled_failure("unknown-id").is_none());
+    }
+
+    #[test]
+    fn registry_shaped_selectors_own_their_row_and_ambiguous_ones_own_nothing() {
+        let progress = RestoreProgress::new();
+        progress.begin(Some(&two_row_roster()));
+        // Every selector shape SessionRegistry::resolve accepts owns the
+        // row: the durable id (the registry's exact-key lookup), the
+        // transient active id, the session-file stem, the session name,
+        // and normalized suffixes of the active id and stem (the durable
+        // id is exact-key only, exactly like the registry's map lookup).
+        for selector in ["a-1", "active-a", "alpha", "ve-a", "IVEA", "b-2", "e-b"] {
+            assert!(progress.owns_target(selector), "owns {selector}");
+        }
+        assert!(!progress.owns_target("unknown"));
+        assert!(!progress.owns_target(""));
+
+        // An ambiguous selector owns nothing: like the registry, the
+        // queue refuses to pick one of several matching rows.
+        let mut roster = two_row_roster();
+        roster.sessions[1].active_session_id = "xx-active-a".to_string();
+        let ambiguous = RestoreProgress::new();
+        ambiguous.begin(Some(&roster));
+        assert!(!ambiguous.owns_target("active-a"));
+        ambiguous.settle_target("active-a", Some("never lands".to_string()));
+        assert!(ambiguous.settled_failure("active-a").is_none());
+        // The rows settle by their own selectors all the same.
+        ambiguous.settle_target("alpha", None);
+        assert!(ambiguous.settled_failure("alpha").is_none());
+        assert!(ambiguous.hello_resume().update_id.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_adoption_settle_skips_a_row_pending_its_continuation() {
+        let mut roster = two_row_roster();
+        roster.sessions[0].should_resume = true;
+        roster.sessions[0].in_flight.streaming = true;
+        let progress = std::sync::Arc::new(RestoreProgress::new());
+        progress.begin(Some(&roster));
+        let waiter = |progress: &std::sync::Arc<RestoreProgress>, selector: &str| {
+            let progress = std::sync::Arc::clone(progress);
+            let selector = selector.to_string();
+            tokio::spawn(async move { progress.wait_for_settle_target(&selector).await })
+        };
+        let tick = std::time::Duration::from_millis(1);
+        let mut queued_a = waiter(&progress, "a-1");
+        let queued_b = waiter(&progress, "durable-b");
+        // The adoption settles skip the continuation row but settle the
+        // ordinary one: only the ordinary row's waiter wakes.
+        progress.settle_adopted("a-1");
+        progress.settle_adopted("durable-b");
+        assert!(tokio::time::timeout(tick, queued_b).await.is_ok());
+        assert!(tokio::time::timeout(tick, &mut queued_a).await.is_err());
+        // The pass's own settle is unconditional: it wakes the
+        // continuation row's waiters the moment the pass reaches it,
+        // right before it routes the restart-continuation prompt.
+        progress.settle_target("a-1", None);
+        assert!(tokio::time::timeout(tick, queued_a).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_continuation_skip_is_still_progress_for_the_other_waiters() {
+        let mut roster = two_row_roster();
+        roster.sessions[0].should_resume = true;
+        roster.sessions[0].in_flight.streaming = true;
+        roster.sessions[1].should_resume = true;
+        roster.sessions[1].in_flight.streaming = true;
+        let progress = std::sync::Arc::new(RestoreProgress::new());
+        progress.begin(Some(&roster));
+        let waiter = |progress: &std::sync::Arc<RestoreProgress>, selector: &str| {
+            let progress = std::sync::Arc::clone(progress);
+            let selector = selector.to_string();
+            tokio::spawn(async move { progress.wait_for_settle_target(&selector).await })
+        };
+        let mut queued_a = waiter(&progress, "a-1");
+        let tick = std::time::Duration::from_millis(1);
+        assert!(tokio::time::timeout(tick, &mut queued_a).await.is_err());
+        // Quiet for 110s, then an adoption brings a continuation row up:
+        // that row's settle is skipped (its waiters stay parked for the
+        // pass's continuation) but still counts as progress, re-arming
+        // this waiter's quiet budget.
+        tokio::time::advance(std::time::Duration::from_secs(110)).await;
+        progress.settle_adopted("durable-b");
+        // Past the original absolute deadline: only the re-arm keeps the
+        // waiter queued, and its own row is still owned (still pending
+        // its continuation prompt).
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        assert!(
+            tokio::time::timeout(tick, &mut queued_a).await.is_err(),
+            "the skipped settle did not re-arm the other waiters"
+        );
+        // The pass settles the row itself: the waiter wakes.
+        progress.settle_target("a-1", None);
+        assert!(tokio::time::timeout(tick, queued_a).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settle_progress_rearms_a_waiters_quiet_budget_past_the_first_deadline() {
+        let progress = std::sync::Arc::new(RestoreProgress::new());
+        progress.begin(Some(&two_row_roster()));
+        let waiter = |progress: &std::sync::Arc<RestoreProgress>, selector: &str| {
+            let progress = std::sync::Arc::clone(progress);
+            let selector = selector.to_string();
+            tokio::spawn(async move { progress.wait_for_settle_target(&selector).await })
+        };
+        let mut queued_a = waiter(&progress, "a-1");
+        let tick = std::time::Duration::from_millis(1);
+        assert!(tokio::time::timeout(tick, &mut queued_a).await.is_err());
+        // Quiet for 110s (the budget is 120s), then one unrelated settle:
+        // the pass is healthy and making progress, so the waiter's budget
+        // re-arms instead of expiring on the original absolute deadline.
+        tokio::time::advance(std::time::Duration::from_secs(110)).await;
+        progress.settle_target("b-2", None);
+        // Past the original absolute deadline: only the re-arm keeps the
+        // waiter queued.
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        assert!(
+            tokio::time::timeout(tick, &mut queued_a).await.is_err(),
+            "the waiter expired on the original deadline instead of the re-armed one"
+        );
+        // Its own row settles well past that deadline: the waiter wakes.
+        tokio::time::advance(std::time::Duration::from_secs(40)).await;
+        progress.settle_target("alpha", None);
+        assert!(tokio::time::timeout(tick, queued_a).await.is_ok());
+    }
+
+    #[test]
+    fn settle_target_without_a_registered_pass_is_a_no_op() {
+        let progress = RestoreProgress::new();
+        // No pass began: the adoption settle on a normal boot (no
+        // roster) must be a silent no-op.
+        progress.settle_target("a-1", None);
+        progress.settle_target("a-1", Some("never happens".to_string()));
+        assert!(progress.settled_failure("a-1").is_none());
     }
 
     #[test]

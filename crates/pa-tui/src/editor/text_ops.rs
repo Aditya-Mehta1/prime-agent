@@ -8,7 +8,11 @@ impl Editor {
         self.history_index = -1;
         self.last_action = None;
         let line = self.lines[self.cursor_line].clone();
-        if self.cursor_col > 0 {
+        // The hidden bang prefix protects the line's head (TS
+        // `handleBackspace`): deleting at the prefix end clears the whole
+        // line (the bang prefix included) instead of joining lines.
+        let line_start = self.line_start_col(self.cursor_line);
+        if self.cursor_col > line_start {
             self.push_undo_snapshot();
             let before_cursor = char_prefix(&line, self.cursor_col);
             let graphemes = self.segment(&before_cursor);
@@ -20,6 +24,10 @@ impl Editor {
             let before = char_prefix(&before, before.chars().count() - last_len);
             self.lines[self.cursor_line] = format!("{}{}", before, after);
             self.set_cursor_col(self.cursor_col.saturating_sub(last_len));
+        } else if line_start > 0 && line.chars().count() == line_start {
+            self.push_undo_snapshot();
+            self.lines[self.cursor_line] = String::new();
+            self.set_cursor_col(0);
         } else if self.cursor_line > 0 {
             self.push_undo_snapshot();
             let current_line = self.lines[self.cursor_line].clone();
@@ -45,7 +53,11 @@ impl Editor {
                 .first()
                 .map(|g| g.segment.chars().count())
                 .unwrap_or(1);
-            let (before, after) = split_at_char(&current_line, self.cursor_col + first_len);
+            // Drop the first atomic segment after the cursor (TS
+            // `handleForwardDelete`: before + after with the segment
+            // removed — an atomic marker goes whole).
+            let (before, after) = split_at_char(&current_line, self.cursor_col);
+            let after = char_suffix(&after, first_len);
             self.lines[self.cursor_line] = format!("{}{}", before, after);
         } else if self.cursor_line < self.lines.len() - 1 {
             self.push_undo_snapshot();
@@ -60,17 +72,22 @@ impl Editor {
     pub(crate) fn delete_to_start_of_line(&mut self) {
         self.history_index = -1;
         let current_line = self.lines[self.cursor_line].clone();
-        if self.cursor_col > 0 {
+        // The kill starts after the hidden bang prefix (TS
+        // `deleteToStartOfLine` kills from the line start, prefix kept).
+        let line_start = self.line_start_col(self.cursor_line);
+        if self.cursor_col > line_start {
             self.push_undo_snapshot();
-            let (deleted, rest) = split_at_char(&current_line, self.cursor_col);
+            let deleted = char_suffix(&char_prefix(&current_line, self.cursor_col), line_start);
             self.kill_ring.push(
                 &deleted,
                 true,
                 self.last_action.as_ref() == Some(&LastAction::Kill),
             );
             self.last_action = Some(LastAction::Kill);
-            self.lines[self.cursor_line] = rest;
-            self.set_cursor_col(0);
+            let before = char_prefix(&current_line, line_start);
+            let after = char_suffix(&current_line, self.cursor_col);
+            self.lines[self.cursor_line] = format!("{}{}", before, after);
+            self.set_cursor_col(line_start);
         } else if self.cursor_line > 0 {
             self.push_undo_snapshot();
             self.kill_ring.push(
@@ -301,5 +318,27 @@ mod tests {
         // Ring holds one entry: yank-pop is a no-op.
         e.handle_input("alt+y");
         assert_eq!(e.get_text(), "hello world");
+    }
+
+    /// Forward delete drops the grapheme after the cursor (found red by
+    /// the paste-marker suite: the pre-fix split kept the deleted span, so
+    /// delete was a no-op everywhere).
+    #[test]
+    fn forward_delete_drops_the_next_grapheme() {
+        let mut e = ed();
+        for c in ["a", "b", "c"] {
+            e.handle_input(c);
+        }
+        e.handle_input("home");
+        e.handle_input("right");
+        assert_eq!(e.get_cursor(), (0, 1));
+        e.handle_input("delete");
+        assert_eq!(e.get_text(), "ac");
+        // At line end it merges with the next line (TS parity).
+        e.set_text("ac\nxy");
+        e.handle_input("up");
+        assert_eq!(e.get_cursor(), (0, 2));
+        e.handle_input("delete");
+        assert_eq!(e.get_lines(), vec!["acxy"]);
     }
 }

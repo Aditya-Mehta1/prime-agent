@@ -1,5 +1,0 @@
-{"type":"session","version":3,"id":"01a0b186-f194-76bf-abf8-0f1eae60f2c4","timestamp":"2026-09-17T22:40:06.036Z","cwd":"/home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T223920Z/ts/work","rlmDepth":0,"git":{"repoUrl":"https://github.com/kevinjosethomas/prime-agent-rs.git","commit":"763d2780f2c013a4877fd4d9a61f13d519f8e792","branch":"lane/fd-leak-audit"}}
-{"type":"model_change","id":"81ede510","parentId":null,"timestamp":"2026-09-17T22:40:06.341Z","provider":"prime-inference","modelId":"z-ai/glm-5.3"}
-{"type":"thinking_level_change","id":"10caa81e","parentId":"81ede510","timestamp":"2026-09-17T22:40:06.341Z","thinkingLevel":"high"}
-{"type":"service_tier_change","id":"c21cded2","parentId":"10caa81e","timestamp":"2026-09-17T22:40:06.341Z","serviceTier":"default"}
-{"type":"session_state","id":"ee92eebc","parentId":"c21cded2","timestamp":"2026-09-17T22:40:06.431Z","state":{"status":"active"}}

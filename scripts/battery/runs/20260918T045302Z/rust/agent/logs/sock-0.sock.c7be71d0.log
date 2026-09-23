@@ -1,3 +1,0 @@
-supervisor started pid 991704
-[2026-09-18T04:56:54.200Z] session worker 136f5a47c331 registered (epoch 1, pid 991712)
-[2026-09-18T04:56:54.260Z] session worker 136f5a47c331 re-registered (epoch 2, pid 991712)

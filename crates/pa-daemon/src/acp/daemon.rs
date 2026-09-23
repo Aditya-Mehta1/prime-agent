@@ -735,7 +735,26 @@ async fn handle_session_prompt(
     };
     // The worker answers the response before its post-turn marker; wait
     // for the marker so every turn frame is published before the settle
-    // (the event relay may otherwise trail the response).
+    // (the event relay may otherwise trail the response). A prompt that
+    // failed before any run started (the aborted-before-delivery cancel:
+    // no agent_start/agent_end ever follows) resolves the marker now -
+    // the settle must not pay the full marker window for a turn that
+    // never ran.
+    let marker_resolved = {
+        let mut guard = state.lock().await;
+        matches!(
+            guard.session.as_mut(),
+            Some(hosted) if hosted.agent_runs_started == 0
+        )
+    };
+    if !response.success && marker_resolved {
+        let mut guard = state.lock().await;
+        if let Some(hosted) = guard.session.as_mut() {
+            if let Some(emitted) = hosted.turn_emitted.take() {
+                let _ = emitted.send(());
+            }
+        }
+    }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), emitted_rx).await;
     // Read-and-take the flag (TS clears `entry.cancelling` when the
     // cancel settles): this turn settles as cancelled, the next starts clean.

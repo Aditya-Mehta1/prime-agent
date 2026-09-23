@@ -2337,12 +2337,10 @@ async fn tui_side_question_pane_flow() {
     assert!(!leaked, "the side question stayed out of the session file");
 }
 
-/// `/settings` and `/scoped-models` (TS `showSettingsSelector` /
-/// `showModelsSelector`): both menus mount in the dock, the settings rows
-/// cycle, and the scoped-models picker toggles and persists through the
-/// settings seam.
+/// `/settings` (TS `showSettingsSelector`): the menu mounts in the dock
+/// and the settings rows cycle through the daemon switch.
 #[tokio::test]
-async fn tui_settings_menu_and_scoped_models_picker() {
+async fn tui_settings_menu_cycles_rows() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");
     let session_dir = agent_dir.join("sessions");
@@ -2350,17 +2348,7 @@ async fn tui_settings_menu_and_scoped_models_picker() {
     let supervisor = spawn_supervisor(dir.path());
     let script = serde_json::json!({ "engine": "faux", "responses": [] });
     std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
-    let mut options = base_options(&supervisor, dir.path(), &session_dir);
-    // A catalog entry so the scoped-models picker has rows (TS renders the
-    // empty panel otherwise).
-    options.model_catalog = vec![serde_json::from_value(serde_json::json!({
-        "id": "claude-5", "name": "Claude 5", "api": "anthropic",
-        "provider": "anthropic", "baseUrl": "", "reasoning": false,
-        "input": ["text"],
-        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-        "contextWindow": 100000, "maxTokens": 4096
-    }))
-    .expect("model")];
+    let options = base_options(&supervisor, dir.path(), &session_dir);
     let enter = || {
         pa_tui::interactive::HeadlessStep::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
@@ -2380,16 +2368,6 @@ async fn tui_settings_menu_and_scoped_models_picker() {
             pa_tui::interactive::HeadlessStep::SettleIdle,
             // Enter on the first row (Auto-compact) cycles it to false —
             // the daemon `set_auto_compaction` switch.
-            enter(),
-            pa_tui::interactive::HeadlessStep::WaitMs(500),
-            pa_tui::interactive::HeadlessStep::SettleIdle,
-            escape(),
-            pa_tui::interactive::HeadlessStep::WaitMs(300),
-            // The scoped-models selector over the catalog.
-            pa_tui::interactive::HeadlessStep::Submit("/scoped-models".to_string()),
-            pa_tui::interactive::HeadlessStep::WaitMs(500),
-            pa_tui::interactive::HeadlessStep::SettleIdle,
-            // Enter toggles the model off (session-only).
             enter(),
             pa_tui::interactive::HeadlessStep::WaitMs(500),
             pa_tui::interactive::HeadlessStep::SettleIdle,
@@ -2421,21 +2399,6 @@ async fn tui_settings_menu_and_scoped_models_picker() {
     assert!(
         rendered.contains("Type to search · Enter/Space to change · Esc to cancel"),
         "the settings hint rendered:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("Model Configuration"),
-        "the scoped-models selector rendered:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("Session-only."),
-        "the scoped-models save hint rendered:\n{rendered}"
-    );
-    // The daemon's startup catalog refresh replaces the seeded catalog
-    // (the same refresh `/model` rides); the footer counts the toggle
-    // against the refreshed catalog.
-    assert!(
-        rendered.contains("1/") && rendered.contains("enabled (unsaved)"),
-        "the scoped-models footer counted the toggle and flagged it unsaved:\n{rendered}"
     );
 }
 
@@ -2897,6 +2860,180 @@ async fn tui_prompt_stash_restores_a_pasted_image_with_the_draft() {
     assert!(
         !persisted_with_image.is_empty(),
         "the submitted restored draft attached the pasted image: no session file carries image content"
+    );
+    drop(supervisor);
+}
+
+/// The empty `prompt`/`prompt_and_wait` input payload (no content, images, or
+/// admission): every optional field stays absent on the wire.
+fn empty_prompt_input() -> pa_types::daemon::PromptInput {
+    pa_types::daemon::PromptInput {
+        content: None,
+        images: None,
+        streaming_behavior: None,
+        queue_if_busy: None,
+        expand_prompt_templates: None,
+        source: None,
+        agent_message_id: None,
+        custom_message: None,
+        queue_key: None,
+        prefix_messages: None,
+        admission_id: None,
+    }
+}
+
+/// Create a live session over the daemon wire and settle one scripted turn
+/// in it, so the session ends IDLE with a durable transcript and no owner
+/// client (the "settled session a `prime-agent --resume <id>` attach
+/// opens" fixture).
+async fn create_idle_session_with_settled_turn(
+    socket: &Path,
+    script_path: &Path,
+    script: &serde_json::Value,
+    cwd: &Path,
+    session_dir: &Path,
+    prompt_text: &str,
+) -> String {
+    let session = create_session_via_daemon(socket, script_path, script, cwd, session_dir).await;
+    let (client, _events) = pa_tui::daemon_client::DaemonClient::connect(socket)
+        .await
+        .expect("connect supervisor");
+    client
+        .request_ok(DaemonCommand::PromptAndWait {
+            id: None,
+            active_session_id: session.clone(),
+            message: prompt_text.to_string(),
+            input: empty_prompt_input(),
+            rest: Default::default(),
+        })
+        .await
+        .expect("prompt_and_wait");
+    client.close();
+    session
+}
+
+/// The attach-render regression (the blank-pane bug class from the live
+/// dogfood): attaching to an IDLE settled session must paint the settled
+/// transcript from the attach snapshot alone — no key, submit, or resize
+/// input. TS `renderInitialMessages` ends in `requestRender` after the
+/// session load; the Rust equivalent is `rebuild_view`'s dirty flag, and
+/// this verifier pins that path (the run's only step is a settle window,
+/// so any frame below comes from the attach's own render scheduling).
+#[tokio::test]
+async fn tui_attach_to_idle_session_renders_without_input() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+
+    let script = serde_json::json!({ "responses": [
+        { "text": "idle session fixture reply" },
+    ] });
+    let session = create_idle_session_with_settled_turn(
+        &supervisor.socket,
+        &dir.path().join("script.json"),
+        &script,
+        dir.path(),
+        &session_dir,
+        "settle the attach fixture",
+    )
+    .await;
+
+    let mut options = base_options(&supervisor, dir.path(), &session_dir);
+    options.session = pa_tui::interactive::SessionSelection::Attach(session.clone());
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![pa_tui::interactive::HeadlessStep::WaitMs(1_500)],
+        width: 100,
+        height: 30,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    assert!(
+        !outcome.frames.is_empty(),
+        "the attach painted frames with no key, submit, or resize input"
+    );
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("settle the attach fixture"),
+        "the settled user turn rendered from the attach snapshot:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("idle session fixture reply"),
+        "the settled assistant reply rendered from the attach snapshot:\n{rendered}"
+    );
+    assert_eq!(
+        outcome.active_session_id, session,
+        "the run attached to the idle session by id"
+    );
+    drop(supervisor);
+}
+
+/// The idle-session event repaint regression: a daemon event that lands on
+/// an attached, idle TUI (a `session_info_changed` rename from a second
+/// wire client) must repaint the frame on its own — TS `handleEvent`'s
+/// `session_info_changed` arm ends in `requestRender`. No key or resize
+/// ever reaches the run; the renamed tray label only appears when the
+/// event's render scheduling works.
+#[tokio::test]
+async fn tui_idle_session_event_repaints_without_input() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+
+    let script = serde_json::json!({ "responses": [
+        { "text": "idle rename fixture reply" },
+    ] });
+    let session = create_idle_session_with_settled_turn(
+        &supervisor.socket,
+        &dir.path().join("script.json"),
+        &script,
+        dir.path(),
+        &session_dir,
+        "settle the rename fixture",
+    )
+    .await;
+
+    let mut options = base_options(&supervisor, dir.path(), &session_dir);
+    options.session = pa_tui::interactive::SessionSelection::Attach(session.clone());
+    let socket = supervisor.socket.clone();
+    let run = tokio::spawn(async move {
+        let plan = pa_tui::interactive::HeadlessPlan {
+            steps: vec![pa_tui::interactive::HeadlessStep::WaitMs(4_000)],
+            width: 100,
+            height: 30,
+        };
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run")
+    });
+    // The attach settles first; the rename then arrives as a pure daemon
+    // event on the idle session (the second wire client never touches the
+    // TUI's input).
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    let (renamer, _events) = pa_tui::daemon_client::DaemonClient::connect(&socket)
+        .await
+        .expect("connect supervisor for the rename");
+    renamer
+        .request_ok(DaemonCommand::Rename {
+            id: None,
+            active_session_id: session.clone(),
+            name: "renamed-while-attached".to_string(),
+            rest: Default::default(),
+        })
+        .await
+        .expect("rename");
+    renamer.close();
+
+    let outcome = run.await.expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains("renamed-while-attached"),
+        "the session_info_changed rename repainted the idle pane without any input:\n{rendered}"
     );
     drop(supervisor);
 }

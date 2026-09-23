@@ -1,3 +1,0 @@
-{"type":"session_registered","session_id":"01a0b7c0-a04e-76b7-8372-1889c92cf40b","parent_session_id":"01a0b7c0-7b18-713d-951e-d63cb858485a","spawned_by_request_id":"605aaea4e8e249068271f4c4c5b5717c"}
-{"type":"request_started","request_id":"688987dceef749b8b8c0f211cbb277da","session_id":"01a0b7c0-a04e-76b7-8372-1889c92cf40b"}
-{"type":"request_finished","request_id":"688987dceef749b8b8c0f211cbb277da"}

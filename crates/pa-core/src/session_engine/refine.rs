@@ -192,7 +192,7 @@ pub fn load_refinement_history(
     global_harness_dir: &Path,
 ) -> Vec<RefinementResult> {
     let global = load_global_refinement_history(global_harness_dir);
-    let session_entries = session_refinement_history(session.get_all_entries());
+    let session_entries = session.refinement_history();
     crate::refinement::merge_refinement_history(&global, &session_entries)
 }
 
@@ -219,18 +219,29 @@ fn strip_display_prefixes(plan: RefinementPlan) -> RefinementPlan {
     plan
 }
 
+/// The transcript feeding the refinement planner: the conversation messages
+/// plus the (possibly pre-window) history rows the audit scan reads.
+pub struct RefinementTranscript<'a> {
+    pub messages: &'a [AgentMessage],
+    pub historical_entries: &'a [FileEntry],
+}
+
 /// Run the full refinement flow: plan (LLM or rollback), re-read the target
 /// store, apply, persist state + history, and append the audit, outcome, and
 /// notice entries to the session. `refine_call` performs the model request.
 pub async fn execute_refinement(
     session: &mut SessionManager,
-    messages: &[AgentMessage],
+    transcript: RefinementTranscript<'_>,
     global_harness_dir: &Path,
     model: &pa_types::ai::Model,
     options: &RefineOptions,
     source: RefinementSource,
     refine_call: crate::refinement::executor::RefinerFn,
 ) -> anyhow::Result<RefinementResult> {
+    let RefinementTranscript {
+        messages,
+        historical_entries,
+    } = transcript;
     let local_harness_dir = local_harness_state_dir(session);
     let core_options = CoreRefineOptions {
         global: options.global,
@@ -258,7 +269,9 @@ pub async fn execute_refinement(
         let local_state = load_harness_state(&local_harness_dir, HarnessScope::Local);
         merge_harness_states(&global_state, Some(&local_state))
     };
-    let history = load_refinement_history(session, global_harness_dir);
+    let global = load_global_refinement_history(global_harness_dir);
+    let session_history = session_refinement_history(historical_entries);
+    let history = crate::refinement::merge_refinement_history(&global, &session_history);
     // Baseline captured before the (slow) LLM pass, so concurrent kernel
     // writes are rejected instead of clobbered.
     let baseline_scope = options
@@ -298,19 +311,31 @@ pub async fn execute_refinement(
     if target_scope == HarnessScope::Global {
         append_global_refinement(global_harness_dir, &result)?;
     }
-    // Audit entry first; failures there abort the whole refinement.
-    session.append_custom_entry(
+    // Session rows follow the TS refine arm's write choreography: the audit
+    // append is attempted first and a failed write is caught (the row stays
+    // live-indexed, so the in-process history sees the refinement), the
+    // outcome row still records, and only then does the audit error surface
+    // — the harness edits are already durable, and reporting the audit
+    // failure after the outcome keeps the user's view and the durable stores
+    // from diverging on the next retry.
+    let (_, audit_write) = session.append_custom_entry_retained(
         REFINEMENT_AUDIT_CUSTOM_TYPE,
         Some(serde_json::to_value(&result)?),
     );
     // Outcome for the TUI; notice for the model (only when edits applied).
     let outcome = create_refinement_outcome_message(&result);
-    session.append_custom_message(
+    let (_, outcome_write) = session.append_custom_message_retained(
         &outcome.custom_type,
         outcome.content.clone(),
         outcome.display,
         outcome.details.clone(),
     );
+    if let Some(error) = audit_write {
+        anyhow::bail!("refinement audit row not persisted: {error}");
+    }
+    if let Some(error) = outcome_write {
+        anyhow::bail!("refinement outcome row not persisted: {error}");
+    }
     if result.applied_edits.iter().any(|edit| edit.applied) {
         let notice = create_refinement_notice_message(&result, source);
         session.append_custom_message(
@@ -318,7 +343,7 @@ pub async fn execute_refinement(
             notice.content.clone(),
             notice.display,
             notice.details.clone(),
-        );
+        )?;
     }
     Ok(result)
 }
@@ -350,25 +375,31 @@ impl AgentSession {
         // The review reads the same planning inputs the refinement run
         // plans against (TS `_reviewAutoRefine`: the live conversation,
         // `_loadMergedHarnessState`, `_loadRefinementHistory`).
-        let (messages, merged_state, history) = {
+        let (snapshot, merged_state, history) = {
             let session = self.session_handle().lock().await;
-            let messages: Vec<AgentMessage> = session
-                .get_all_entries()
-                .iter()
-                .filter_map(|entry| match entry {
-                    FileEntry::Message { message, .. } => Some(message.clone()),
-                    _ => None,
-                })
-                .collect();
             let local_state =
                 load_harness_state(&local_harness_state_dir(&session), HarnessScope::Local);
             let global_state = load_harness_state(&global_harness_dir, HarnessScope::Global);
             (
-                messages,
+                session.history_snapshot(),
                 merge_harness_states(&global_state, Some(&local_state)),
-                load_refinement_history(&session, &global_harness_dir),
+                load_global_refinement_history(&global_harness_dir),
             )
         };
+        // Refinement deliberately reviews historical messages, unlike ordinary
+        // turns. Await its snapshot after releasing the session mutex.
+        let entries = snapshot.await?;
+        let history = crate::refinement::merge_refinement_history(
+            &history,
+            &session_refinement_history(&entries),
+        );
+        let messages: Vec<AgentMessage> = entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                FileEntry::Message { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
         let review = review_auto_refine(
             &messages,
             &merged_state,
@@ -593,12 +624,17 @@ Reviewer instructions: record it"
     async fn execute_refinement_persists_state_and_entries() {
         let dir = TempDir::new().unwrap();
         let mut session = persisted_session(&dir);
-        session.append_message(user_message("do a thing twice"));
+        session
+            .append_message(user_message("do a thing twice"))
+            .unwrap();
         let global_dir = dir.path().join("harness");
         let reply = r#"{"summary":"note it","rationale":"repeated","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m1","title":"Tactic","content":"Use tactic A"}]}"#;
         let result = execute_refinement(
             &mut session,
-            &[user_message("do a thing twice")],
+            RefinementTranscript {
+                messages: &[user_message("do a thing twice")],
+                historical_entries: &[],
+            },
             &global_dir,
             &test_model(),
             &RefineOptions::default(),
@@ -633,6 +669,63 @@ Reviewer instructions: record it"
         assert_eq!(load_refinement_history(&session, &global_dir).len(), 1);
     }
 
+    /// A failed audit write still reports the refinement error after the
+    /// durable writes (the TS refine arm's catch/rethrow choreography), and
+    /// the failed rows stay live-indexed so the in-process history sees the
+    /// refinement that the harness store already applied.
+    #[tokio::test]
+    async fn audit_write_failure_reports_after_durable_edits() {
+        let dir = TempDir::new().unwrap();
+        let mut session = persisted_session(&dir);
+        // Bootstrap the flush rule: rows only persist after the first
+        // assistant entry (persist_entry defers them until then).
+        session
+            .append_message(AgentMessage::Assistant(text_assistant("seed")))
+            .unwrap();
+        let global_dir = dir.path().join("harness");
+        let reply = r#"{"summary":"lesson","edits":[{"action":"create","kind":"memory","id":"m9","title":"Lesson","content":"durable"}]}"#;
+        // Fail every session-file write: the path becomes a directory (the
+        // harness stores live under a sibling dir and stay writable).
+        let file = session.get_session_file().unwrap().to_path_buf();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let error = execute_refinement(
+            &mut session,
+            RefinementTranscript {
+                messages: &[user_message("x")],
+                historical_entries: &[],
+            },
+            &global_dir,
+            &test_model(),
+            &RefineOptions::default(),
+            RefinementSource::User,
+            seam(reply),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("audit row not persisted"),
+            "the audit error surfaces after the durable writes: {error:#}"
+        );
+        // The harness edits are durable.
+        let harness_dir =
+            crate::refinement::get_local_harness_state_dir(Some(session.get_session_dir()))
+                .unwrap();
+        let state = load_harness_state(&harness_dir, HarnessScope::Local);
+        assert!(state.entries[&crate::refinement::RefinementKind::Memory].contains_key("m9"));
+        // The audit + outcome rows stay live-indexed for the in-process
+        // history; the notice is ordered after the audit rethrow in TS.
+        let entries = session.get_all_entries().to_vec();
+        assert_eq!(session_refinement_history(&entries).len(), 1);
+        assert!(
+            !entries.iter().any(
+                |entry| matches!(entry, FileEntry::CustomMessage { payload, .. }
+                    if payload.custom_type == REFINEMENT_NOTICE_CUSTOM_TYPE)
+            ),
+            "the notice is ordered after the audit rethrow in TS"
+        );
+    }
+
     #[tokio::test]
     async fn global_refinement_appends_history() {
         let dir = TempDir::new().unwrap();
@@ -641,7 +734,10 @@ Reviewer instructions: record it"
         let reply = r#"{"summary":"global lesson","edits":[{"action":"create","kind":"memory","id":"g1","title":"Lesson","content":"durable"}]}"#;
         let result = execute_refinement(
             &mut session,
-            &[user_message("x")],
+            RefinementTranscript {
+                messages: &[user_message("x")],
+                historical_entries: &[],
+            },
             &global_dir,
             &test_model(),
             &RefineOptions {
@@ -665,7 +761,10 @@ Reviewer instructions: record it"
         // Rollback by id works through the merged history.
         let rolled = execute_refinement(
             &mut session,
-            &[],
+            RefinementTranscript {
+                messages: &[],
+                historical_entries: &[],
+            },
             &global_dir,
             &test_model(),
             &RefineOptions {

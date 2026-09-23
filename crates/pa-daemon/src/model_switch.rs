@@ -17,7 +17,9 @@ const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "x
 
 impl Worker {
     /// `set_model { provider, modelId }`: resolve the model through the
-    /// registry's available catalog, switch the engine, record the durable
+    /// registry's available catalog, enforce the daemon model allowlist
+    /// (settings `allowedModels`: a model outside the allowlist fails
+    /// loudly, never a fallback), switch the engine, record the durable
     /// `model_change` row, and persist the settings default (TS
     /// `session.setModel`). Unknown models fail with the TS message. The
     /// engine switch parks the engine's runtime, so it runs on the blocking
@@ -36,6 +38,31 @@ impl Worker {
             Ok(model) => model,
             Err(error) => return response_failure(None, "set_model", &error.to_string(), None),
         };
+        // The daemon model allowlist (settings `allowedModels`): a switch
+        // to a model outside the allowlist fails loudly — the daemon never
+        // falls back to a different route — and the refusal emits the
+        // adoption event (`model refused`) through the worker engine.
+        let selector = format!("{provider}/{model_id}");
+        let cwd = {
+            let core = self.core.lock().unwrap();
+            core.cwd.clone()
+        };
+        let allowlist =
+            crate::model_allowlist::load(std::path::Path::new(&cwd), &self.config.agent_dir);
+        if let Err(refusal) = crate::model_allowlist::assert_allowed(&allowlist, &selector) {
+            // The event rides the typed refusal only (the other seams'
+            // rule): a fail-closed unreadable-allowlist error is a
+            // settings problem, not an allowlist refusal.
+            if refusal
+                .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+                .is_some()
+            {
+                if let Some(agent_engine) = &self.agent_engine {
+                    agent_engine.note_model_refused("set_model", &selector);
+                }
+            }
+            return response_failure(None, "set_model", &refusal.to_string(), None);
+        }
         let engine = std::sync::Arc::clone(&self.engine);
         let core = std::sync::Arc::clone(&self.core);
         let agent_dir = self.config.agent_dir.clone();
@@ -55,8 +82,10 @@ impl Worker {
                 if let Some(store) = core.store.as_mut() {
                     // TS `appendModelChange` records every switch, even to
                     // the current model.
-                    let _ = store.append_model_change(&provider, &model_id);
-                    let _ = store.rewrite();
+                    let _ = store.persist_entry(
+                        "model_change",
+                        serde_json::json!({ "provider": provider, "modelId": model_id }),
+                    );
                 }
                 core.cwd.clone()
             };
@@ -136,8 +165,10 @@ impl Worker {
             let cwd = {
                 let mut core = core.lock().unwrap();
                 if let Some(store) = core.store.as_mut() {
-                    let _ = store.append_thinking_level_change(&effective);
-                    let _ = store.rewrite();
+                    let _ = store.persist_entry(
+                        "thinking_level_change",
+                        serde_json::json!({ "thinkingLevel": effective }),
+                    );
                 }
                 core.cwd.clone()
             };
@@ -193,6 +224,116 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn worker_config(dir: &std::path::Path) -> crate::worker::WorkerConfig {
+        crate::worker::WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "allowlist-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        }
+    }
+
+    /// A models.json fixture the `set_model` resolution reads (same shape
+    /// as the setting-switches tests).
+    fn models_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("agent")).expect("agent dir");
+        std::fs::write(
+            dir.join("agent").join("models.json"),
+            json!({
+                "providers": {
+                    "prime-inference": {
+                        "api": "openai-completions",
+                        "baseUrl": "http://127.0.0.1:9/v1",
+                        "apiKey": "sk-test",
+                        "models": [
+                            { "id": "mock-1", "name": "Mock 1", "api": "openai-completions",
+                              "baseUrl": "http://127.0.0.1:9/v1", "contextWindow": 128000,
+                              "maxTokens": 4096 }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write models.json");
+    }
+
+    /// The daemon model allowlist enforcement point: `set_model` refuses a
+    /// resolvable model outside settings `allowedModels` loudly (never a
+    /// fallback), and an allowing allowlist (or none) keeps the switch
+    /// path — the scripted harness then fails past the gate with its own
+    /// non-switching refusal, proving the gate opened.
+    #[tokio::test]
+    async fn set_model_refuses_models_outside_the_allowlist() {
+        async fn dispatch_set_model(
+            worker: &std::sync::Arc<crate::worker::Worker>,
+        ) -> crate::protocol::DaemonResponse {
+            worker
+                .dispatch(
+                    "set_model",
+                    &json!({
+                        "activeSessionId": "allowlist-session",
+                        "provider": "prime-inference",
+                        "modelId": "mock-1"
+                    }),
+                )
+                .await
+        }
+
+        // An allowlist that pins a different provider refuses the switch
+        // with the loud message.
+        let dir = std::env::temp_dir().join(format!("pa-worker-al-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        models_fixture(&dir);
+        std::fs::write(
+            dir.join("agent").join("settings.json"),
+            json!({ "allowedModels": ["anthropic/*"] }).to_string(),
+        )
+        .unwrap();
+        let worker = std::sync::Arc::new(crate::worker::Worker::new(worker_config(&dir), None));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": dir }))
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let response = dispatch_set_model(&worker).await;
+        assert!(!response.success);
+        assert_eq!(response.command, "set_model");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Model \"prime-inference/mock-1\" is blocked by the daemon model allowlist (settings \"allowedModels\"); the daemon never falls back to a different model. Allow it in the settings or pick an allowed model.")
+        );
+
+        // An allowing allowlist (a matching glob) opens the gate: the
+        // scripted engine then fails with its own non-switching message.
+        std::fs::write(
+            dir.join("agent").join("settings.json"),
+            json!({ "allowedModels": ["prime-inference/*"] }).to_string(),
+        )
+        .unwrap();
+        let response = dispatch_set_model(&worker).await;
+        assert!(
+            !response.success,
+            "the scripted harness does not switch models"
+        );
+        assert_eq!(
+            response.error.as_deref(),
+            Some("This session does not support model switching")
+        );
+
+        // No allowlist configured: the TS behavior (the gate is a no-op).
+        std::fs::remove_file(dir.join("agent").join("settings.json")).unwrap();
+        let response = dispatch_set_model(&worker).await;
+        assert_eq!(
+            response.error.as_deref(),
+            Some("This session does not support model switching")
+        );
+    }
+
     #[test]
     fn thinking_levels_wire_names_match_the_enum() {
         // Every wire name must parse; the list is the exact TS `ThinkingLevel`
@@ -211,7 +352,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("models.json"),
-            json!({
+            serde_json::json!({
                 "providers": {
                     "prime-inference": {
                         "api": "openai-completions",

@@ -67,6 +67,8 @@ struct ExitInfo {
 struct ExecBuffers {
     stdout: String,
     stderr: String,
+    stdout_chars: usize,
+    stderr_chars: usize,
     stdout_truncated: bool,
     stderr_truncated: bool,
     result: Option<String>,
@@ -75,6 +77,7 @@ struct ExecBuffers {
     attachment_oversized: bool,
     sent_agent_messages: Vec<KernelSentAgentMessage>,
     background_output: String,
+    background_output_chars: usize,
     background_output_truncated: bool,
     error: Option<KernelError>,
     status: ExecuteStatus,
@@ -205,6 +208,7 @@ struct Guarded {
     pending_restore: bool,
     /// Unattributed stream text that arrived between cells; surfaced on the next execution.
     pending_background_output: String,
+    pending_background_output_chars: usize,
     pending_background_output_truncated: bool,
     flushing_snapshot_for_dispose: bool,
     protocol_repair: Option<Arc<RepairHandle>>,
@@ -215,6 +219,7 @@ struct Guarded {
     late_handlers: VecDeque<(String, LateSentAgentMessageCallback)>,
     /// Resolvers for done events outside the active execution (the shutdown reply).
     pending_done_waiters: HashMap<String, oneshot::Sender<()>>,
+    bash_activity_waiters: HashMap<String, oneshot::Sender<Value>>,
     host_inflight: Vec<tokio::task::JoinHandle<()>>,
     active_execution: Option<Arc<ActiveExecution>>,
     /// Source of the most recently started cell, retained after it finishes so
@@ -313,6 +318,7 @@ impl ReplKernelManager {
                 pending_rebootstrap: false,
                 pending_restore: false,
                 pending_background_output: String::new(),
+                pending_background_output_chars: 0,
                 pending_background_output_truncated: false,
                 flushing_snapshot_for_dispose: false,
                 protocol_repair: None,
@@ -321,6 +327,7 @@ impl ReplKernelManager {
                 handled_host_request_ids: (HashSet::new(), VecDeque::new()),
                 late_handlers: VecDeque::new(),
                 pending_done_waiters: HashMap::new(),
+                bash_activity_waiters: HashMap::new(),
                 host_inflight: Vec::new(),
                 active_execution: None,
                 last_cell_code: None,
@@ -466,6 +473,66 @@ impl ReplKernelManager {
             execution_timeout_ms,
         )
         .await
+    }
+
+    /// Inspect or stop a kernel-owned bash handle without waiting behind a cell.
+    /// Does not boot an idle kernel. The caller scopes this manager to its session.
+    pub async fn bash_activity(
+        &self,
+        action: &str,
+        activity_id: Option<&str>,
+        lines: usize,
+    ) -> anyhow::Result<Value> {
+        if !self.is_running() {
+            return Err(anyhow!("Kernel is not running"));
+        }
+        // The runtime's pre-validation answers with a protocol error that
+        // carries no request id (so the waiter could only time out);
+        // mirror the contract locally and fail fast instead.
+        if !matches!(action, "list" | "tail" | "kill") {
+            return Err(anyhow!("unknown bash activity action"));
+        }
+        let requires_id = action != "list" && activity_id.map(str::trim).unwrap_or("").is_empty();
+        if requires_id {
+            return Err(anyhow!(
+                "bash activity tail/kill requires string activityId"
+            ));
+        }
+        if action == "tail" && !(1..=200).contains(&lines) {
+            return Err(anyhow!("lines must be an integer between 1 and 200"));
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        lock(&self.inner.guarded)
+            .bash_activity_waiters
+            .insert(request_id.clone(), tx);
+        let frame = json!({"type": "bash_activity", "id": request_id, "action": action,
+                           "activityId": activity_id, "lines": lines});
+        if let Err(error) = self.inner.write_line(&frame).await {
+            lock(&self.inner.guarded)
+                .bash_activity_waiters
+                .remove(&request_id);
+            return Err(error);
+        }
+        let fields = match tokio::time::timeout(Duration::from_secs(3), rx).await {
+            Ok(Ok(fields)) => fields,
+            _ => {
+                lock(&self.inner.guarded)
+                    .bash_activity_waiters
+                    .remove(&request_id);
+                return Err(anyhow!("Kernel bash activity request did not settle"));
+            }
+        };
+        if fields.get("status").and_then(Value::as_str) != Some("ok") {
+            return Err(anyhow!(
+                "{}",
+                fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Kernel bash activity failed")
+            ));
+        }
+        Ok(fields)
     }
 
     // -------------------------------------------------------- state ops API

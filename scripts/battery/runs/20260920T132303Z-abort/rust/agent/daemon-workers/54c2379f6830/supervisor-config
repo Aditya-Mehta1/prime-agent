@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T132303Z-abort/rust/daemon.sock",
-  "defaultSessionDir": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T132303Z-abort/rust/agent/sessions"
-}

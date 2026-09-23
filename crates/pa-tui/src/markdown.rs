@@ -3,6 +3,9 @@
 //! paragraphs, fenced code, lists, blockquotes, hr, and inline emphasis,
 //! code, and links). Emits styled `Line`s for ratatui instead of ANSI strings.
 
+mod geometry;
+pub(crate) use geometry::markdown_row_count;
+
 use crate::width::str_width;
 use crate::{Line, Span};
 use ratatui::style::{Modifier, Style};
@@ -29,6 +32,13 @@ pub struct MarkdownStyle {
     /// The fenced-code indent string (`markdown.codeBlockIndent` in
     /// settings, TS `codeBlockIndent` on the markdown theme; default "  ").
     pub code_block_indent: String,
+    /// The `syntax*` palette for fenced-code token colors (TS
+    /// `highlightCode`, cli-highlight over the highlight.js grammar).
+    /// `None` renders every code line uniform in `code_block` — the TS
+    /// no-valid-language fallback, and the quiet thinking theme (TS
+    /// `getThinkingMarkdownTheme` replaces `highlightCode` with dim
+    /// uniform lines).
+    pub(crate) syntax: Option<crate::tool_card::highlight::SyntaxPalette>,
 }
 
 impl Default for MarkdownStyle {
@@ -69,12 +79,28 @@ impl MarkdownStyle {
             italic: Modifier::empty(),
             strikethrough: Modifier::empty(),
             code_block_indent: "  ".to_string(),
+            syntax: Some(crate::tool_card::highlight::SyntaxPalette::from_theme(
+                theme,
+            )),
         }
     }
 }
 
 /// Rendered markdown document as styled lines.
 pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<Line> {
+    render_markdown_tagged(text, width, style, "", &mut MarkdownBlockCache::default())
+}
+
+/// Cached render with a style discriminator (see [`MarkdownBlockCache`]):
+/// the same raw text rendered under different styles (the dim thinking
+/// block) must not hit the other style's rows.
+pub fn render_markdown_tagged(
+    text: &str,
+    width: usize,
+    style: &MarkdownStyle,
+    style_tag: &str,
+    cache: &mut MarkdownBlockCache,
+) -> Vec<Line> {
     let content_width = width.max(1);
     if text.trim().is_empty() {
         return Vec::new();
@@ -82,6 +108,9 @@ pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<L
     let normalized = text.replace('\t', "   ");
     let mut lines: Vec<Line> = Vec::new();
     let blocks = parse_blocks(&normalized);
+    // The next render's cache: starts from the current map (a hit keeps
+    // its entry alive) and drops everything this document did not use.
+    let mut next_cache = std::mem::take(&mut cache.0);
     for (i, block) in blocks.iter().enumerate() {
         let next = blocks.get(i + 1);
         // A blank source line separates blocks: TS's lexer emits one `space`
@@ -92,9 +121,88 @@ pub fn render_markdown(text: &str, width: usize, style: &MarkdownStyle) -> Vec<L
         if block.sep_blank {
             lines.push(Vec::new());
         }
-        render_block(block, next, content_width, style, &mut lines);
+        let is_final = i == blocks.len() - 1;
+        let key = is_final.then(|| block_cache_key(style_tag, block, next, content_width));
+        let mut block_lines: Option<Vec<Line>> = None;
+        if let Some(key) = &key {
+            if let Some(cached) = next_cache.get(key) {
+                lines.extend(cached.iter().cloned());
+                block_lines = Some(cached.clone());
+            }
+        }
+        if block_lines.is_none() {
+            let mut rendered = Vec::new();
+            render_block(block, next, content_width, style, &mut rendered);
+            lines.extend(rendered.iter().cloned());
+            if let Some(key) = &key {
+                rendered.shrink_to_fit();
+                next_cache.insert(key.clone(), rendered);
+            }
+        }
     }
+    cache.0 = next_cache;
     lines
+}
+
+/// Per-block render cache (TS `Markdown.blockCache`, markdown.ts): a
+/// streaming append re-renders only the changing final block — every
+/// earlier block replays its rendered rows by `(width, kind, next kind,
+/// raw)` key instead of re-running inline styling and wrapping. The map
+/// is rebuilt on every render (TS swaps `nextCache` in), so it stays
+/// bounded to the current document's blocks, and the final block is
+/// never cached: while streaming, appended text can reinterpret an open
+/// block (unterminated fences, growing lists); once a block is no longer
+/// last, its raw text is final.
+#[derive(Default)]
+pub struct MarkdownBlockCache(std::collections::HashMap<String, Vec<Line>>);
+
+/// The cache key (TS: `${width}|${token.type}|${nextTokenType}|${token.raw}`):
+/// the style discriminator (the dim thinking block), width, this block's
+/// kind, the following kind (a block's trailing blank row depends on it),
+/// and the raw block lines.
+fn block_cache_key(style_tag: &str, block: &Block, next: Option<&Block>, width: usize) -> String {
+    let mut key = String::with_capacity(64);
+    key.push_str(style_tag);
+    key.push('|');
+    key.push_str(&width.to_string());
+    key.push('|');
+    key.push_str(block_kind_name(&block.kind));
+    if let BlockKind::Code { lang } = &block.kind {
+        // TS's key carries `token.raw`, which includes the fence info
+        // string: the same content under a different lang renders
+        // different token colors (```python vs ```json), so the lang is
+        // part of the block's identity.
+        key.push('<');
+        key.push_str(lang.as_deref().unwrap_or(""));
+        key.push('>');
+    }
+    key.push('|');
+    if let Some(next) = next {
+        // The trailing-blank decision reads `next.sep_blank` (TS encodes
+        // it as the next token being a `space` token, part of its key).
+        if next.sep_blank {
+            key.push_str("space|");
+        }
+        key.push_str(block_kind_name(&next.kind));
+    }
+    key.push('|');
+    for line in &block.lines {
+        key.push_str(line);
+        key.push('\n');
+    }
+    key
+}
+
+fn block_kind_name(kind: &BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Heading => "heading",
+        BlockKind::Paragraph => "paragraph",
+        BlockKind::Code { .. } => "code",
+        BlockKind::List { .. } => "list",
+        BlockKind::Quote => "quote",
+        BlockKind::Hr => "hr",
+        BlockKind::Table { .. } => "table",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -333,6 +441,44 @@ fn marker_width(t: &str) -> usize {
     }
 }
 
+/// The fence languages the port highlights. TS `highlightCode` validates
+/// through cli-highlight's `supportsLanguage` = highlight.js
+/// `getLanguage(name)`, which lowercases and matches the grammar's
+/// registered names and aliases: python 10.7.3 registers `python` with
+/// aliases `py`, `gyp`, `ipython`. `lang` here is marked's whole trimmed
+/// info string, so ```python foo=1 stays uniform (hljs has no such
+/// language); only these exact spellings highlight.
+fn is_highlighted_lang(lang: &str) -> bool {
+    matches!(
+        lang.to_ascii_lowercase().as_str(),
+        "python" | "py" | "gyp" | "ipython"
+    )
+}
+
+/// The block's highlighted lines (TS `theme.highlightCode(text, lang)`:
+/// one highlight.js pass over the whole block, so multi-line strings
+/// carry across lines; the fallback paths — no palette (the quiet
+/// thinking theme), an unsupported language, or no language — render
+/// `None` so the caller keeps the uniform `mdCodeBlock` rows).
+fn highlighted_code_lines(
+    block: &Block,
+    lang: Option<&str>,
+    style: &MarkdownStyle,
+) -> Option<Vec<Line>> {
+    let palette = style.syntax.as_ref()?;
+    if !lang.is_some_and(is_highlighted_lang) {
+        return None;
+    }
+    if block.lines.is_empty() {
+        // An empty block renders through the uniform empty-row path.
+        return None;
+    }
+    Some(crate::tool_card::highlight::highlight_python(
+        &block.lines.join("\n"),
+        palette,
+    ))
+}
+
 fn render_block(
     block: &Block,
     next: Option<&Block>,
@@ -340,16 +486,7 @@ fn render_block(
     style: &MarkdownStyle,
     out: &mut Vec<Line>,
 ) {
-    // TS pushes a blank line between blocks only when no `space` token sits
-    // between them, i.e. when the blocks are adjacent (no blank source line).
-    let blank_after = |exclude_lists: bool| -> bool {
-        match next {
-            Some(nb) => {
-                !nb.sep_blank && !(exclude_lists && matches!(nb.kind, BlockKind::List { .. }))
-            }
-            None => false,
-        }
-    };
+    let blank_after = |exclude_lists| geometry::blank_after(next, exclude_lists);
     match &block.kind {
         BlockKind::Heading => {
             // The TS source tapers headings by level (h1 bold+underline,
@@ -379,7 +516,7 @@ fn render_block(
                 out.push(Vec::new());
             }
         }
-        BlockKind::Code { .. } => {
+        BlockKind::Code { lang } => {
             // TS `renderCodeBlock`: no borders in the chat markdown - the
             // block is `codeBlockIndent` (settings-driven, default "  ")
             // outside the styled code line, each source line rendered with
@@ -387,11 +524,22 @@ fn render_block(
             // in the TS MarkdownTheme too and is unused by the renderer on
             // both sides.
             let indent = style.code_block_indent.as_str();
-            for line in &block.lines {
-                out.push(vec![
-                    Span::raw(indent),
-                    Span::styled(line.clone(), style.code_block),
-                ]);
+            match highlighted_code_lines(block, lang.as_deref(), style) {
+                Some(code_lines) => {
+                    for line in code_lines {
+                        let mut row: Line = vec![Span::raw(indent)];
+                        row.extend(line);
+                        out.push(row);
+                    }
+                }
+                None => {
+                    for line in &block.lines {
+                        out.push(vec![
+                            Span::raw(indent),
+                            Span::styled(line.clone(), style.code_block),
+                        ]);
+                    }
+                }
             }
             if block.lines.is_empty() {
                 // An empty block still renders one indented empty line
@@ -442,14 +590,32 @@ fn render_block(
 
 /// Inline rendering: bold, italic, strikethrough, code, links.
 pub fn render_inline(text: &str, style: &MarkdownStyle) -> Line {
+    render_inline_ctx(text, style, false)
+}
+
+/// `in_link` mirrors marked's `lexer.state.inLink`: set while a link
+/// label's tokens are produced, and the gfm bare-url rule is skipped
+/// inside one (the angle `autolink` rule is not).
+fn render_inline_ctx(text: &str, style: &MarkdownStyle, in_link: bool) -> Line {
     let mut spans: Vec<Span> = Vec::new();
     let bytes: Vec<char> = text.chars().collect();
+    // Byte offset per char index: the autolink rules run on a slice of the
+    // original text (zero-copy) instead of a copy of the remaining tail,
+    // so a candidate-heavy line stays linear in its attempts.
+    let byte_offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
     let mut buf = String::new();
     let mut i = 0usize;
     let base = style.body;
     let mut bold = false;
     let mut italic = false;
     let strike = false;
+    // The bare-url email alternative only exists when the line carries an
+    // `@` at all; the gate keeps the per-position regex attempts rare.
+    let line_has_at = bytes.contains(&'@');
+    // `bare_candidate` gates every autolink attempt on the literal prefix
+    // the marked rules require, so the attempt regexes only ever run on
+    // actual urls/emails - plain text (even `history history ...` floods
+    // of `h` starts) never reaches the regex or the tail-string copy.
 
     macro_rules! flush {
         () => {
@@ -515,8 +681,8 @@ pub fn render_inline(text: &str, style: &MarkdownStyle) -> Line {
                     // the link color is shadowed by the body color applied
                     // inside the label, and the underline wrapper never
                     // reaches the wire. `m` carries the emphasis context.
-                    let href = crate::hyperlinks::rewrite_drive_path(&url);
-                    let mut label_spans = render_inline(&label, style);
+                    let href = crate::hyperlinks::resolve_link_href(&url);
+                    let mut label_spans = render_inline_ctx(&label, style, true);
                     for s in label_spans.iter_mut() {
                         s.style = s.style.add_modifier(m);
                     }
@@ -577,7 +743,7 @@ pub fn render_inline(text: &str, style: &MarkdownStyle) -> Line {
                 flush!();
                 if doubled {
                     bold = !bold;
-                    let mut inner_spans = render_inline(&inner, style);
+                    let mut inner_spans = render_inline_ctx(&inner, style, in_link);
                     for s in inner_spans.iter_mut() {
                         s.style = s.style.add_modifier(style.bold);
                     }
@@ -585,7 +751,7 @@ pub fn render_inline(text: &str, style: &MarkdownStyle) -> Line {
                     bold = !bold;
                 } else {
                     italic = !italic;
-                    let mut inner_spans = render_inline(&inner, style);
+                    let mut inner_spans = render_inline_ctx(&inner, style, in_link);
                     for s in inner_spans.iter_mut() {
                         s.style = s.style.add_modifier(style.italic);
                     }
@@ -601,7 +767,7 @@ pub fn render_inline(text: &str, style: &MarkdownStyle) -> Line {
                 let inner: String = bytes[i + 2..close].iter().collect();
                 if !inner.trim().is_empty() {
                     flush!();
-                    let mut inner_spans = render_inline(&inner, style);
+                    let mut inner_spans = render_inline_ctx(&inner, style, in_link);
                     for s in inner_spans.iter_mut() {
                         s.style = s.style.add_modifier(style.strikethrough);
                     }
@@ -611,6 +777,51 @@ pub fn render_inline(text: &str, style: &MarkdownStyle) -> Line {
                 }
             }
         }
+        // marked inline `autolink` (angle form) then `url` (gfm bare
+        // links): the last two inline rules, tried once every other
+        // construct failed at this position. The two rules are disjoint on
+        // their first character, so the order collapses to this split.
+        let autolink_hit = if c == '<' {
+            autolink_token_at(&text[byte_offsets[i]..], true)
+        } else if !in_link && crate::autolink::bare_candidate(&bytes, i, line_has_at) {
+            autolink_token_at(&text[byte_offsets[i]..], false)
+        } else {
+            None
+        };
+        if let Some(token) = autolink_hit {
+            flush!();
+            // The token carries one plain text token, so the label is a
+            // single body-colored run carrying the current emphasis (the
+            // theme.link/underline wrapper never reaches the wire in the
+            // deployed binary, like explicit link labels).
+            let mut m = Modifier::empty();
+            if bold {
+                m |= style.bold;
+            }
+            if italic {
+                m |= style.italic;
+            }
+            let label = Span::styled(token.text.clone(), base.add_modifier(m));
+            if crate::hyperlinks::hyperlinks_enabled() {
+                // OSC 8: the label is clickable, the URL never printed
+                // inline (TS `hyperlink()`).
+                let href = crate::hyperlinks::resolve_link_href(&token.href);
+                let mut content = label.content;
+                content.insert_str(0, &crate::hyperlinks::osc8_open(&href));
+                content.push_str(crate::hyperlinks::OSC8_CLOSE);
+                spans.push(Span::styled(content, label.style));
+            } else {
+                spans.push(label);
+                // Legacy form: the URL shows after the label unless the
+                // label already is it (mailto stripped), TS token.href.
+                let comparison = token.href.strip_prefix("mailto:").unwrap_or(&token.href);
+                if token.text != token.href && token.text != comparison {
+                    spans.push(Span::styled(format!(" ({})", token.href), style.link_url));
+                }
+            }
+            i += token.raw.chars().count();
+            continue;
+        }
         buf.push(c);
         i += 1;
     }
@@ -619,6 +830,18 @@ pub fn render_inline(text: &str, style: &MarkdownStyle) -> Line {
         spans.push(Span::raw(""));
     }
     spans
+}
+
+/// Run the marked autolink rules on the text starting at `rest` (the
+/// caller's slice of the original line, so no per-candidate tail copy;
+/// `angle` selects the `<...>` rule, otherwise the gfm bare-url rule).
+/// Returns the token; the caller advances by its `raw` char count.
+fn autolink_token_at(rest: &str, angle: bool) -> Option<crate::autolink::AutolinkToken> {
+    if angle {
+        crate::autolink::angle_token(rest)
+    } else {
+        crate::autolink::bare_token(rest)
+    }
 }
 
 fn find_closing(chars: &[char], from: usize, delim: char, len: usize) -> Option<usize> {
@@ -636,13 +859,37 @@ fn find_closing(chars: &[char], from: usize, delim: char, len: usize) -> Option<
 /// dropped after a wrap break. Adjacent same-style output pieces merge.
 pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>) {
     let _ = base;
+    wrap_spans_into(spans, width, &mut geometry::WrapOutput::render(out));
+}
+
+pub(crate) fn wrapped_span_count(spans: &[Span], width: usize) -> usize {
+    let mut output = geometry::WrapOutput::count();
+    wrap_spans_into(spans, width, &mut output);
+    output.rows
+}
+
+fn wrap_spans_into(spans: &[Span], width: usize, out: &mut geometry::WrapOutput<'_>) {
     if width == 0 {
-        out.push(spans.to_vec());
+        for span in spans {
+            out.push(&span.content, span.style);
+        }
+        out.finish_row(/*trim*/ false);
         return;
     }
-    // tokens: (text, style); alternating words and single-space gaps. A gap
-    // at a span boundary must survive (bold text followed by " plain"), so
-    // whitespace runs collapse to one gap token across the whole line.
+    // TS `wrapSingleLine` returns a fitting line UNCHANGED (`visibleLength
+    // <= width`), so its spacing never re-tokenizes.
+    let joined_width: usize = spans.iter().map(|s| str_width(&s.content)).sum();
+    if joined_width <= width {
+        for span in spans {
+            out.push(&span.content, span.style);
+        }
+        out.finish_row(/*trim*/ false);
+        return;
+    }
+    // tokens: (text, style); alternating words and whitespace-run gaps. TS
+    // `splitIntoTokensWithAnsi` keeps each whitespace RUN whole (a run at a
+    // span boundary joins the previous gap token), never collapsing it to a
+    // single space.
     let mut tokens: Vec<(String, Style)> = Vec::new();
     for span in spans {
         let mut word = String::new();
@@ -651,9 +898,9 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
                 if !word.is_empty() {
                     tokens.push((std::mem::take(&mut word), span.style));
                 }
-                let gap_already_emitted = tokens.last().is_some_and(|(text, _)| text == " ");
-                if !gap_already_emitted {
-                    tokens.push((" ".to_string(), span.style));
+                match tokens.last_mut() {
+                    Some((text, _)) if text.chars().all(|c| c == ' ') => text.push(' '),
+                    _ => tokens.push((" ".to_string(), span.style)),
                 }
             } else {
                 word.push(ch);
@@ -664,23 +911,16 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
         }
     }
 
-    let mut current: Line = Vec::new();
     let mut col = 0usize;
     let mut i = 0usize;
     while i < tokens.len() {
         let (text, style) = &tokens[i];
         let w = str_width(text);
-        if col + w > width && !current.is_empty() {
+        if col + w > width && out.has_content {
             // A wrapped row never carries its trailing gap: TS
             // wrapTextWithAnsi drops the boundary space, so the styled
             // content ends at the last word and the plain padding follows.
-            while current
-                .last()
-                .is_some_and(|span| span.content.trim().is_empty())
-            {
-                current.pop();
-            }
-            out.push(std::mem::take(&mut current));
+            out.finish_row(/*trim*/ true);
             col = 0;
             // drop leading whitespace at the new line start
             if text.trim().is_empty() {
@@ -714,16 +954,16 @@ pub fn wrap_spans(spans: &[Span], width: usize, base: Style, out: &mut Vec<Line>
             if take.is_empty() {
                 break;
             }
-            current.push(Span::styled(take.clone(), style));
-            out.push(std::mem::take(&mut current));
+            out.push(&take, style);
+            out.finish_row(/*trim*/ false);
             col = 0;
             rest = rest[taken..].to_string();
         }
         col += str_width(&rest);
-        current.push(Span::styled(rest, style));
+        out.push(&rest, style);
         i += 1;
     }
-    out.push(current);
+    out.finish_row(/*trim*/ false);
 }
 
 fn wrap_list_item(
@@ -769,9 +1009,11 @@ pub fn to_ratatui_line(line: &Line) -> rt::Line<'static> {
     let mut stripped = line.clone();
     crate::osc133::strip(&mut stripped);
     crate::hyperlinks::strip_osc8(&mut stripped);
+    // TS `applyLineResets` normalizes every painted line right before the
+    // differential paint (Thai/Lao AM decomposition, tabs to three spaces).
     let spans: Vec<rt::Span<'static>> = stripped
         .iter()
-        .map(|s| rt::Span::styled(s.content.clone(), s.style))
+        .map(|s| rt::Span::styled(crate::width::normalize_terminal_output(&s.content), s.style))
         .collect();
     rt::Line::from(spans)
 }
@@ -888,6 +1130,111 @@ mod tests {
     }
 
     #[test]
+    fn python_fence_renders_the_ts_token_colors() {
+        // The TS markdown theme highlights ```python fences through
+        // cli-highlight (the same highlight.js pass the expanded ipython
+        // cell uses); the fence line's spans carry the syntax palette
+        // colors, the indent stays outside them.
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let style = MarkdownStyle::from_theme(&theme);
+        let keyword = theme.fg_style(crate::theme::ThemeColor::SyntaxKeyword);
+        let number = theme.fg_style(crate::theme::ThemeColor::SyntaxNumber);
+        let string = theme.fg_style(crate::theme::ThemeColor::SyntaxString);
+        let lines = render_markdown("```python\nx = 1\nflag = 'yes'\n```", 40, &style);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0][0].content, "  ");
+        // `x = 1`: plain identifier and punctuation, then the number.
+        assert_eq!(lines[0][1].content, "x = ");
+        assert_eq!(lines[0][1].style, Style::default());
+        assert_eq!(lines[0][2].content, "1");
+        assert_eq!(lines[0][2].style, number);
+        assert_eq!(lines[1][2].content, "'yes'");
+        assert_eq!(lines[1][2].style, string);
+        // The keyword scope lands on a reserved word.
+        let keyword_lines = render_markdown("```python\nreturn x\n```", 40, &style);
+        assert_eq!(keyword_lines[0][1].content, "return");
+        assert_eq!(keyword_lines[0][1].style, keyword);
+    }
+
+    #[test]
+    fn python_fence_lang_matches_the_hljs_aliases() {
+        let style = MarkdownStyle::default();
+        // `getLanguage` lowercases; python registers py/gyp/ipython, and
+        // marked passes the whole trimmed info string, so an info string
+        // with attributes stays uniform.
+        for fence in ["py", "PYTHON", "ipython"] {
+            let lines = render_markdown(&format!("```{fence}\nx = 'y'\n```"), 40, &style);
+            assert!(
+                lines[0].iter().any(|s| s.style != Style::default()),
+                "{fence} must highlight"
+            );
+        }
+        let uniform = render_markdown("```python foo=1\nx = 'y'\n```", 40, &style);
+        assert!(uniform[0]
+            .iter()
+            .skip(1)
+            .all(|s| s.style == style.code_block));
+    }
+
+    #[test]
+    fn quiet_style_renders_python_fences_uniform() {
+        // The thinking theme replaces TS `highlightCode` with dim lines:
+        // with no palette the block keeps the uniform code_block color.
+        let style = MarkdownStyle {
+            syntax: None,
+            ..MarkdownStyle::default()
+        };
+        let lines = render_markdown("```python\nx = 1\n```", 40, &style);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0][1].content, "x = 1");
+        assert_eq!(lines[0][1].style, style.code_block);
+    }
+
+    /// The block cache must not serve one lang's token colors to another:
+    /// TS's key carries `token.raw` (the fence info string included), so
+    /// frame 2's ```json block (same content as frame 1's cached ```python
+    /// block) re-renders uniform instead of replaying python colors.
+    #[test]
+    fn block_cache_does_not_carry_token_colors_across_langs() {
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let style = MarkdownStyle::from_theme(&theme);
+        let number = theme.fg_style(crate::theme::ThemeColor::SyntaxNumber);
+        let mut cache = MarkdownBlockCache::default();
+        let first =
+            render_markdown_tagged("intro\n\n```python\nx = 1\n```", 40, &style, "", &mut cache);
+        assert_eq!(first.last().unwrap()[2].style, number);
+        let second = render_markdown_tagged(
+            "intro\n\n```python\nx = 1\n```\n\nbetween\n\n```json\nx = 1\n```",
+            40,
+            &style,
+            "",
+            &mut cache,
+        );
+        // The final ```json block: one uniform code_block span, not the
+        // cached python token spans.
+        let json_row = second.last().unwrap();
+        assert_eq!(json_row.len(), 2);
+        assert_eq!(json_row[0].content, "  ");
+        assert_eq!(json_row[1].content, "x = 1");
+        assert_eq!(json_row[1].style, style.code_block);
+    }
+
+    #[test]
+    fn python_fence_multiline_string_carries_across_rows() {
+        // One highlight.js pass over the whole block: a triple-quoted
+        // string keeps the string color on every row it spans.
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let style = MarkdownStyle::from_theme(&theme);
+        let string = theme.fg_style(crate::theme::ThemeColor::SyntaxString);
+        let lines = render_markdown("```python\ns = '''a\nb'''\n```", 40, &style);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0][2].content, "'''a");
+        assert_eq!(lines[0][2].style, string);
+        assert_eq!(lines[1][1].content, "b'''");
+        assert_eq!(lines[1][1].style, string);
+    }
+
+    #[test]
     fn list_render() {
         let style = MarkdownStyle::default();
         let lines = render_markdown("- one\n- two", 40, &style);
@@ -968,6 +1315,196 @@ mod tests {
     }
 
     #[test]
+    fn bare_url_autolinks_osc8() {
+        crate::hyperlinks::set_hyperlinks_override(Some(true));
+        let style = MarkdownStyle::default();
+        let spans = render_inline("see https://x.dev/a?b=1 now", &style);
+        let joined: String = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(
+            joined,
+            format!(
+                "see {}https://x.dev/a?b=1{} now",
+                crate::hyperlinks::osc8_open("https://x.dev/a?b=1"),
+                crate::hyperlinks::OSC8_CLOSE
+            )
+        );
+        // The label is one zero-width-wrapped run; the URL never prints
+        // twice and no legacy suffix appears.
+        assert_eq!(str_width(&joined), str_width("see https://x.dev/a?b=1 now"));
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn bare_url_autolink_trims_trailing_punctuation() {
+        crate::hyperlinks::set_hyperlinks_override(Some(false));
+        let style = MarkdownStyle::default();
+        // Trailing punctuation is backpedaled out of the link and stays in
+        // the text stream.
+        let spans = render_inline("go to https://x.dev/pull/182. now", &style);
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(texts, vec!["go to ", "https://x.dev/pull/182", ". now"]);
+        // Balanced paren groups survive; the peeled trailing run re-renders
+        // so the visible row is unchanged.
+        let spans = render_inline("(see https://x.dev/a(b)) ok", &style);
+        let joined: String = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "(see https://x.dev/a(b)) ok");
+        // A comma separates the link from the sentence tail.
+        let spans = render_inline("(visit https://x.dev/page, thanks)", &style);
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(texts, vec!["(visit ", "https://x.dev/page", ", thanks)"]);
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn bare_url_autolink_forms() {
+        crate::hyperlinks::set_hyperlinks_override(Some(false));
+        let style = MarkdownStyle::default();
+        let joined = |md: &str| -> String {
+            render_inline(md, &style)
+                .iter()
+                .map(|s| s.content.as_str())
+                .collect()
+        };
+        // ftp and case-insensitive schemes link; uppercase targets pass
+        // through unresolved (target == token href, like TS).
+        assert_eq!(joined("ftp://files.x.io/x"), "ftp://files.x.io/x");
+        assert_eq!(joined("HTTPS://UPPER.COM/PATH"), "HTTPS://UPPER.COM/PATH");
+        // A bare url starts mid-word, like marked's text-rule break.
+        assert_eq!(
+            joined("midhttps://word.com/break"),
+            "midhttps://word.com/break"
+        );
+        // Entity-ish runs survive the backpedal.
+        assert_eq!(joined("https://x.dev/a&#39;b"), "https://x.dev/a&#39;b");
+        // Explicit links win over the bare rule at the same position.
+        assert_eq!(joined("[https://x.dev](https://x.dev)"), "https://x.dev");
+        // Two links in one line tokenize independently.
+        assert_eq!(
+            joined("https://x.dev, and https://y.dev; done"),
+            "https://x.dev, and https://y.dev; done"
+        );
+        // Not an email: only the domain-shaped tail links.
+        assert_eq!(
+            joined("not an email: @host, a@b, x@y.z"),
+            "not an email: @host, a@b, x@y.z"
+        );
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn www_autolink_gains_scheme_and_legacy_suffix() {
+        // Legacy form: token.text != token.href for a www autolink, so the
+        // resolved href shows after the label (TS legacy branch).
+        crate::hyperlinks::set_hyperlinks_override(Some(false));
+        let style = MarkdownStyle::default();
+        let spans = render_inline("www.example.com/path", &style);
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["www.example.com/path", " (http://www.example.com/path)"]
+        );
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn email_autolinks_with_mailto_href() {
+        // Legacy form: the mailto-stripped href equals the label, so no
+        // suffix prints (autolinked emails).
+        crate::hyperlinks::set_hyperlinks_override(Some(false));
+        let style = MarkdownStyle::default();
+        let spans = render_inline("mail foo.bar+baz@example.co.uk ok", &style);
+        let joined: String = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(joined, "mail foo.bar+baz@example.co.uk ok");
+        // OSC 8 form: the href carries mailto:.
+        crate::hyperlinks::set_hyperlinks_override(Some(true));
+        let spans = render_inline("mail foo@example.co.uk ok", &style);
+        let joined: String = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(
+            joined,
+            format!(
+                "mail {}foo@example.co.uk{} ok",
+                crate::hyperlinks::osc8_open("mailto:foo@example.co.uk"),
+                crate::hyperlinks::OSC8_CLOSE
+            )
+        );
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn angle_autolinks_become_links() {
+        crate::hyperlinks::set_hyperlinks_override(Some(true));
+        let style = MarkdownStyle::default();
+        // The brackets are consumed; the label is the inner target.
+        let spans = render_inline("x <https://angle.dev/a> y", &style);
+        let joined: String = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(
+            joined,
+            format!(
+                "x {}https://angle.dev/a{} y",
+                crate::hyperlinks::osc8_open("https://angle.dev/a"),
+                crate::hyperlinks::OSC8_CLOSE
+            )
+        );
+        // Angle email: href gains mailto:.
+        let spans = render_inline("<foo.bar@example.org>", &style);
+        let joined: String = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(
+            joined,
+            format!(
+                "{}foo.bar@example.org{}",
+                crate::hyperlinks::osc8_open("mailto:foo.bar@example.org"),
+                crate::hyperlinks::OSC8_CLOSE
+            )
+        );
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn bare_url_is_not_autolinked_inside_a_link_label() {
+        // marked's state.inLink guard: the gfm url rule does not run while
+        // a link label is tokenized, so the inner url stays plain text.
+        crate::hyperlinks::set_hyperlinks_override(Some(false));
+        let style = MarkdownStyle::default();
+        let spans = render_inline("[see https://in.dev/x](https://out.dev/y)", &style);
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(texts, vec!["see https://in.dev/x", " (https://out.dev/y)"]);
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
+    fn angle_autolink_inside_link_label_yields_the_terminal_ranges() {
+        // marked tokenizes angle autolinks even inside an explicit link
+        // label (only the gfm bare rule is inLink-guarded), so the TS byte
+        // stream carries the outer wrap around a label that itself embeds
+        // an inner OSC 8 pair. Terminals keep no region stack: the inner
+        // close ends the active region, so the outer label's tail after
+        // it is NOT linked - exactly the ranges the frame scan produces
+        // (the outer range closes at the inner open, and never resumes).
+        crate::hyperlinks::set_hyperlinks_override(Some(true));
+        let style = MarkdownStyle::default();
+        let spans = render_inline("[pre <https://inner.dev> post](https://outer.dev)", &style);
+        let ranges = crate::hyperlinks::frame_link_ranges(&[spans]);
+        assert_eq!(
+            ranges,
+            vec![
+                crate::hyperlinks::LinkRange {
+                    row: 0,
+                    start_col: 0,
+                    end_col: 4,
+                    url: "https://outer.dev/".to_string(),
+                },
+                crate::hyperlinks::LinkRange {
+                    row: 0,
+                    start_col: 4,
+                    end_col: 21,
+                    url: "https://inner.dev/".to_string(),
+                },
+            ]
+        );
+        crate::hyperlinks::set_hyperlinks_override(None);
+    }
+
+    #[test]
     fn table_block_renders_boxed_rows() {
         let style = MarkdownStyle::default();
         let lines = render_markdown("| a | b |\n| --- | --- |\n| 1 | 2 |\n\nafter", 40, &style);
@@ -996,10 +1533,14 @@ mod tests {
         let lines = render_markdown("**Hello.** I can render", 80, &style);
         let joined: String = lines[0].iter().map(|s| s.content.as_str()).collect();
         assert_eq!(joined, "Hello. I can render");
-        // Whitespace runs still collapse to a single gap across spans.
+        // Whitespace runs keep their length across spans: TS
+        // `splitIntoTokensWithAnsi` holds each run as ONE token and a
+        // fitting line passes through unchanged (wrapSingleLine's
+        // visibleLength early return) — verified against the TS dist
+        // (wrapTextWithAnsi renders "a b   c ...").
         let spans = render_inline("a **b**   c", &style);
         let wrapped = wrap_spans_to_text(&spans, 40);
-        assert_eq!(wrapped, "a b c");
+        assert_eq!(wrapped, "a b   c");
     }
 
     fn wrap_spans_to_text(spans: &[Span], width: usize) -> String {

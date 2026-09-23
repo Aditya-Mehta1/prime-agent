@@ -1,3 +1,0 @@
-supervisor started pid 72819
-[2026-09-18T09:12:55.027Z] session worker 7d85a7160cdd registered (epoch 1, pid 72824)
-[2026-09-18T09:12:55.125Z] session worker 7d85a7160cdd re-registered (epoch 2, pid 72824)

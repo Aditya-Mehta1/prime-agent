@@ -1,7 +1,0 @@
-supervisor started pid 2749794
-[2026-09-21T20:21:02.315Z] session worker 4234ea275fae registered (epoch 1, pid 2749799)
-[2026-09-21T20:21:02.378Z] session worker 4234ea275fae re-registered (epoch 2, pid 2749799)
-[2026-09-21T20:21:08.169Z] session worker c68ee4ce5a47 registered (epoch 1, pid 2750119)
-[2026-09-21T20:21:08.247Z] session worker c68ee4ce5a47 re-registered (epoch 2, pid 2750119)
-[2026-09-21T20:21:08.271Z] RLM ledger: skipped record with unknown op on line 1
-[2026-09-21T20:22:31.343Z] session worker c68ee4ce5a47 stopped intentionally (status Ok(ExitStatus(unix_wait_status(0))))

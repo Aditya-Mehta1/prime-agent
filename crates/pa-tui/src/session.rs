@@ -45,6 +45,10 @@ pub enum TranscriptItem {
         command: String,
         output: String,
         exit_code: Option<i64>,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+        excluded: bool,
     },
     AgentStatus {
         summary: String,
@@ -171,12 +175,23 @@ fn custom_message_wire_value(payload: &pa_types::session::CustomMessageEntry) ->
 
 fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
     match message {
-        AgentMessage::User(u) => vec![TranscriptItem::UserMessage {
+        AgentMessage::User(u) => {
             // TS `readUserText` + the image-only placeholder: a prompt
             // with content but no text shows `[image]` instead of
             // rendering nothing.
-            text: user_display_text(&u.content),
-        }],
+            let text = user_display_text(&u.content);
+            // TS `addMessageToChat`'s user case: a skill block parses into
+            // the skill-invocation card (+ its trailing argument text as a
+            // user block); both ride the custom-row channel so the replay
+            // renders them exactly like the live path.
+            match crate::custom_message::skill_invocation_entries(&text) {
+                Some(entries) => entries
+                    .into_iter()
+                    .map(|entry| TranscriptItem::CustomRow { entry })
+                    .collect(),
+                None => vec![TranscriptItem::UserMessage { text }],
+            }
+        }
         // TS `buildConversationComponents`: one assistant component per
         // message (text and thinking blocks together, in wire order), then
         // the message's tool cards. Thinking blocks keep their type —
@@ -237,6 +252,10 @@ fn message_to_items(message: &AgentMessage) -> Vec<TranscriptItem> {
             command: b.command.clone(),
             output: b.output.clone(),
             exit_code: b.exit_code,
+            cancelled: b.cancelled,
+            truncated: b.truncated,
+            full_output_path: b.full_output_path.clone(),
+            excluded: b.exclude_from_context.unwrap_or(false),
         }],
         // Custom/branch/compaction messages carry UI-specific payloads; the
         // standard agent view skips non-displayed ones.
@@ -345,6 +364,49 @@ mod tests {
             other => panic!("agent row: {other:?}"),
         }
         assert!(entry_to_items(&entry(false)).is_empty());
+    }
+
+    #[test]
+    fn a_skill_block_user_message_replays_as_the_card() {
+        // TS `addMessageToChat`'s user case parses a `<skill>` block out
+        // of the persisted user message: the replay renders the card plus
+        // the trailing argument text as a user block, never the raw
+        // block text.
+        let entry = FileEntry::Message {
+            message: AgentMessage::User(pa_types::ai::UserMessage {
+                content: pa_types::ai::UserContent::Text(
+                    "<skill name=\"websearch\" location=\"/s/SKILL.md\">\nRun one query.\n</skill>\n\nfind parity tuis"
+                        .to_string(),
+                ),
+                timestamp: 1,
+                rest: serde_json::Map::new(),
+            }),
+            base: pa_types::session::EntryBase {
+                id: Some("e1".to_string()),
+                parent_id: None,
+                timestamp: None,
+                rest: serde_json::Map::new(),
+            },
+        };
+        let items = entry_to_items(&entry);
+        let [TranscriptItem::CustomRow { entry: card }, TranscriptItem::CustomRow { entry: args }] =
+            items.as_slice()
+        else {
+            panic!("skill items: {items:?}");
+        };
+        match card {
+            crate::chat::ChatEntry::SkillInvocation(row) => {
+                assert_eq!(row.name, "websearch");
+                assert_eq!(row.content, "Run one query.");
+            }
+            other => panic!("card: {other:?}"),
+        }
+        assert_eq!(
+            args,
+            &crate::chat::ChatEntry::User {
+                text: "find parity tuis".to_string()
+            }
+        );
     }
 
     #[test]

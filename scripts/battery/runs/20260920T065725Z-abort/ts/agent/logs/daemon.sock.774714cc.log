@@ -1,4 +1,0 @@
-[2026-09-20T06:57:26.451Z] supervisor: Prime Agent daemon supervisor a9b0a378-2018-4df7-abc9-fcd972da2a35 listening on /home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T065725Z-abort/ts/daemon.sock
-[2026-09-20T06:57:26.716Z] supervisor: Session worker 402abcb8ea08 stderr: Prime Agent daemon listening on /tmp/compaction-abort-ts-819104/prime-agent-1000/worker-774714cc53fa-402abcb8ea08.sock
-[2026-09-20T06:58:15.463Z] supervisor: Could not adopt worker 402abcb8ea08: Error: Timed out connecting to daemon session worker: Error: connect ENOENT /tmp/compaction-abort-ts-819104/prime-agent-1000/worker-774714cc53fa-402abcb8ea08.sock
-[2026-09-20T06:58:15.466Z] supervisor: Prime Agent daemon supervisor d25b0edf-a52c-4296-9030-7796bc5b5aef listening on /home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T065725Z-abort/ts/daemon.sock

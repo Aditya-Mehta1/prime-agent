@@ -1,3 +1,0 @@
-supervisor started pid 302635
-[2026-09-18T00:51:55.410Z] session worker db7dd5ab5d86 registered (epoch 1, pid 302645)
-[2026-09-18T00:51:55.541Z] session worker db7dd5ab5d86 re-registered (epoch 2, pid 302645)

@@ -1,9 +1,0 @@
-Prime Agent daemon supervisor 61a99dbe-caef-47dd-a3c4-8587c0c0d432 listening on /home/ubuntu/lane-worktrees/av-selection/scripts/battery/runs/20260921T191753Z/ts/daemon.sock
-Prime Agent daemon supervisor 44851bd6-5124-49a0-b78a-75ddd131d02d listening on /home/ubuntu/lane-worktrees/av-selection/scripts/battery/runs/20260921T191753Z/ts/daemon.sock
-Session worker 150c2c6b5e80 stderr: Prime Agent daemon listening on /tmp/vbat20260921T191753Z-ts/prime-agent-1000/worker-023c53e1f080-150c2c6b5e80.sock
-Session worker 7e9baf4b2e20 stderr: Prime Agent daemon listening on /tmp/vbat20260921T191753Z-ts/prime-agent-1000/worker-023c53e1f080-7e9baf4b2e20.sock
-Session worker 7e9baf4b2e20 stderr: shutdown command received over socket; 1 active session(s) will be closed
-Session worker 7e9baf4b2e20 stderr: shutting down (exit 0); closing 1 active session(s)
-Session worker eb5ffcd564f7 stderr: Prime Agent daemon listening on /tmp/vbat20260921T191753Z-ts/prime-agent-1000/worker-023c53e1f080-eb5ffcd564f7.sock
-Session worker eb5ffcd564f7 stderr: shutting down (exit 0); closing 0 active session(s)
-Session worker 150c2c6b5e80 stderr: shutting down (exit 0); closing 0 active session(s)

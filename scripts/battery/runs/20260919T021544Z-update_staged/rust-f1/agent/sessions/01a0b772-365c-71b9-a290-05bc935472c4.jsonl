@@ -1,6 +1,0 @@
-{"cwd":"/tmp/usw-s4/rust-f1/work","id":"01a0b772-365c-71b9-a290-05bc935472c4","rlmDepth":0,"timestamp":"2026-09-19T02:15:10.684Z","type":"session","version":3}
-{"type":"model_change","id":"e5cdd570","parentId":null,"timestamp":"2026-09-19T02:15:10.711Z","modelId":"z-ai/glm-5.3","provider":"prime-inference"}
-{"type":"thinking_level_change","id":"477fd4ff","parentId":"e5cdd570","timestamp":"2026-09-19T02:15:10.711Z","thinkingLevel":"high"}
-{"type":"service_tier_change","id":"4833ca66","parentId":"477fd4ff","timestamp":"2026-09-19T02:15:10.711Z","serviceTier":"default"}
-{"type":"session_state","id":"be69f13f","parentId":"4833ca66","timestamp":"2026-09-19T02:15:10.711Z","state":{"status":"active"}}
-{"type":"session_state","id":"8ee24436","parentId":"be69f13f","timestamp":"2026-09-19T02:15:14.905Z","state":{"status":"active"}}

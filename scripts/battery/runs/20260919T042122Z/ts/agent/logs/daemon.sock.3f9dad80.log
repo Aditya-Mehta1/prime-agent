@@ -1,5 +1,0 @@
-[2026-09-19T04:21:23.041Z] supervisor: Prime Agent daemon supervisor ebcc65cf-3a23-4605-a1a0-9ef0c74e33d9 listening on /home/ubuntu/lane-worktrees/model-picker-2/scripts/battery/runs/20260919T042122Z/ts/daemon.sock
-[2026-09-19T04:21:23.660Z] supervisor: Session worker 5304737efb19 stderr: Prime Agent daemon listening on /tmp/vbat20260919T042122Z-ts/prime-agent-1000/worker-3f9dad80ecff-5304737efb19.sock
-[2026-09-19T04:21:35.663Z] supervisor: Session worker 5304737efb19 stderr: shutdown command received over socket; 1 active session(s) will be closed
-[2026-09-19T04:21:35.664Z] supervisor: Session worker 5304737efb19 stderr: shutting down (exit 0); closing 1 active session(s)
-[2026-09-19T04:21:35.741Z] supervisor: Evicted empty session worker 5304737efb19 root=01a0b7e5-c450-710a-aeb2-d7bb9e771d2a on last client detach

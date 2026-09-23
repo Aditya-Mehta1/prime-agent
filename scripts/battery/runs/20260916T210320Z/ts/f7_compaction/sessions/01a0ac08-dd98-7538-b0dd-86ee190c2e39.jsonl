@@ -1,5 +1,0 @@
-{"type":"session","version":3,"id":"01a0ac08-dd98-7538-b0dd-86ee190c2e39","timestamp":"2026-09-16T21:04:17.304Z","cwd":"/home/ubuntu/lane-worktrees/battery/scripts/battery/runs/20260916T210320Z/ts/work","rlmDepth":0,"git":{"repoUrl":"https://github.com/kevinjosethomas/prime-agent-rs.git","commit":"a93c0edae329af9a29cc52dbb9f0c2d90dfd3139","branch":"lane/battery"}}
-{"type":"model_change","id":"e02dcb52","parentId":null,"timestamp":"2026-09-16T21:04:17.594Z","provider":"prime-inference","modelId":"z-ai/glm-5.3"}
-{"type":"thinking_level_change","id":"450b36c1","parentId":"e02dcb52","timestamp":"2026-09-16T21:04:17.594Z","thinkingLevel":"high"}
-{"type":"service_tier_change","id":"3da06752","parentId":"450b36c1","timestamp":"2026-09-16T21:04:17.594Z","serviceTier":"default"}
-{"type":"session_state","id":"a354a55c","parentId":"3da06752","timestamp":"2026-09-16T21:04:17.656Z","state":{"status":"active"}}

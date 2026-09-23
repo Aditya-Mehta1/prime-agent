@@ -1,3 +1,0 @@
-[2026-09-19T03:13:45.740Z] Prime Agent daemon listening on /tmp/upw-ts-live/prime-agent-1000/worker-d350589379a2-f569fe612746.sock
-[2026-09-19T03:13:46.236Z] shutdown command received over socket; 0 active session(s) will be closed
-[2026-09-19T03:13:46.236Z] shutting down (exit 0); closing 0 active session(s)

@@ -1,2 +1,0 @@
-[2026-09-19T14:22:09.453Z] supervisor: Prime Agent daemon supervisor 67fc9ee5-e7f5-4472-8f87-4d76a7770b79 listening on /home/ubuntu/lane-worktrees/keybindings/scripts/battery/runs/20260919T142209Z/ts/work/scripts/battery/runs/20260919T142209Z/ts/daemon.sock
-[2026-09-19T14:22:39.216Z] supervisor: Daemon catalog exited (SIGTERM)

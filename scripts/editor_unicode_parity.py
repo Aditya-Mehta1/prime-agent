@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Editor Unicode/grapheme wrap parity verifier (the `editor-wrap-unicode`
-lane, docs/parity-next-wave.md section 1): frame-diff the Rust interactive
+lane, FEATURE_PARITY.md tier-0): frame-diff the Rust interactive
 TUI against the installed TS binary in tmux over a golden Unicode corpus.
 
 Two tmux sessions per binary (each pane its own transcript):
@@ -217,56 +217,65 @@ def run_session(
     vp.tmux("send-keys", "-t", session, f"{env} {command}", "Enter")
 
     frames = {}
-    # (a) fresh start: splash + empty editor.
-    vp.wait_for(session, "Collapsed mode", timeout=40)
-    time.sleep(1.0)
-    frames["a_fresh_start"] = vp.capture(session)
+    try:
+        # (a) fresh start: splash + empty editor.
+        vp.wait_for(session, "Collapsed mode", timeout=40)
+        time.sleep(1.0)
+        frames["a_fresh_start"] = vp.capture(session)
 
-    # (b) the corpus: type each row, capture the editor wrap mid-edit,
-    # then submit and capture the settled post-turn frame (user echo +
-    # assistant render).
-    for idx, (name, text) in enumerate(prompts):
-        type_text(session, text)
+        # (b) the corpus: type each row, capture the editor wrap mid-edit,
+        # then submit and capture the settled post-turn frame (user echo +
+        # assistant render).
+        for idx, (name, text) in enumerate(prompts):
+            type_text(session, text)
+            if exact_settle:
+                wait_for_typed(session, text[-6:])
+            else:
+                wait_for_stability(session)
+            time.sleep(0.5)
+            frames[f"b_{name}_editor"] = vp.capture(session)
+            vp.tmux("send-keys", "-t", session, "Enter")
+            wait_for_settled(session, f"ack {idx + 1}:")
+            time.sleep(1.0)
+            frames[f"c_{name}_settled"] = vp.capture(session)
+
+        # (d) editing behavior over clusters: cursor-left steps across
+        # cluster boundaries, a backspace over a whole cluster, a word-kill
+        # over the run, then deleteToLineStart clears the draft.
+        type_text(session, edit_line)
         if exact_settle:
-            wait_for_typed(session, text[-6:])
+            wait_for_typed(session, edit_line[-6:])
         else:
             wait_for_stability(session)
         time.sleep(0.5)
-        frames[f"b_{name}_editor"] = vp.capture(session)
-        vp.tmux("send-keys", "-t", session, "Enter")
-        wait_for_settled(session, f"ack {idx + 1}:")
-        time.sleep(1.0)
-        frames[f"c_{name}_settled"] = vp.capture(session)
+        frames["d_edit_typed"] = vp.capture(session)
+        for _ in range(LEFT_STEPS):
+            vp.tmux("send-keys", "-t", session, "Left")
+        time.sleep(0.6)
+        frames["e_cursor_left"] = vp.capture(session)
+        vp.tmux("send-keys", "-t", session, "BSpace")
+        time.sleep(0.6)
+        frames["f_backspace_cluster"] = vp.capture(session)
+        for _ in range(WORD_KILLS):
+            vp.tmux("send-keys", "-t", session, "C-w")
+        time.sleep(0.6)
+        frames["g_word_kill"] = vp.capture(session)
+        vp.tmux("send-keys", "-t", session, "C-u")
+        time.sleep(0.6)
+        frames["h_line_cleared"] = vp.capture(session)
 
-    # (d) editing behavior over clusters: cursor-left steps across
-    # cluster boundaries, a backspace over a whole cluster, a word-kill
-    # over the run, then deleteToLineStart clears the draft.
-    type_text(session, edit_line)
-    if exact_settle:
-        wait_for_typed(session, edit_line[-6:])
-    else:
-        wait_for_stability(session)
-    time.sleep(0.5)
-    frames["d_edit_typed"] = vp.capture(session)
-    for _ in range(LEFT_STEPS):
-        vp.tmux("send-keys", "-t", session, "Left")
-    time.sleep(0.6)
-    frames["e_cursor_left"] = vp.capture(session)
-    vp.tmux("send-keys", "-t", session, "BSpace")
-    time.sleep(0.6)
-    frames["f_backspace_cluster"] = vp.capture(session)
-    for _ in range(WORD_KILLS):
-        vp.tmux("send-keys", "-t", session, "C-w")
-    time.sleep(0.6)
-    frames["g_word_kill"] = vp.capture(session)
-    vp.tmux("send-keys", "-t", session, "C-u")
-    time.sleep(0.6)
-    frames["h_line_cleared"] = vp.capture(session)
-
-    for state, frame in frames.items():
-        with open(os.path.join(out_dir, f"{binary}-{width}x{height}-{state}.ansi"), "w") as f:
-            f.write(frame)
-    vp.tmux("kill-session", "-t", session)
+        for state, frame in frames.items():
+            with open(
+                os.path.join(out_dir, f"{binary}-{width}x{height}-{state}.ansi"), "w"
+            ) as f:
+                f.write(frame)
+    finally:
+        # A wait timeout must not leak the detached pane (and the shell and
+        # daemon inside it) past the run (Macroscope, PR #2600). The kill is
+        # idempotent cleanup: a session that already died (binary crash, or
+        # the settle timeout fired after the pane vanished) must not raise
+        # and mask the original error.
+        vp.tmux("kill-session", "-t", session, check=False)
     return frames
 
 

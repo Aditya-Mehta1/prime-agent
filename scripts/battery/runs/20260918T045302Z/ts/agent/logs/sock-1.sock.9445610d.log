@@ -1,3 +1,0 @@
-[2026-09-18T04:57:06.873Z] supervisor: Prime Agent daemon supervisor 7833a99f-7fec-4fdc-9d58-bf9b051fe5aa listening on /home/ubuntu/lane-worktrees/streaming-render/scripts/battery/runs/20260918T045302Z/ts/perf/sock-1.sock
-[2026-09-18T04:57:09.424Z] supervisor: Session worker 87c2a4c5a07e stderr: Prime Agent daemon listening on /tmp/vbat20260918T045302Z-ts/prime-agent-1000/worker-9445610d061d-87c2a4c5a07e.sock
-[2026-09-18T04:57:14.254Z] supervisor: Session worker 87c2a4c5a07e stderr: shutting down (exit 0); closing 0 active session(s)

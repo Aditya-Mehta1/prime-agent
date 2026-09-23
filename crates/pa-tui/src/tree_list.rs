@@ -863,7 +863,7 @@ impl TreeList {
             let entry_id = node.data.entry.id().unwrap_or_default();
             let is_selected = position == self.selected;
             // TS renders the selected row's cursor and path markers inside
-            // the selection background with no accent foreground: the pi-tui
+            // the selection background with no accent foreground: the the TS TUI
             // row writer drops those interior colors, and the capture shows
             // only the background escape before `› `.
             let cursor = if is_selected {
@@ -959,7 +959,7 @@ impl TreeList {
             let mut content = tree_display::entry_display_text(theme, &node.data, &self.tool_calls);
             if is_selected {
                 // TS `theme.bold(getEntryDisplayText(...))` wraps the whole
-                // display text; the pi-tui writer then re-emits the inner
+                // display text; the the TS TUI writer then re-emits the inner
                 // fg reset between the role label and the content, so the
                 // capture shows only the role run bold.
                 if let Some(first) = content.first_mut() {
@@ -974,7 +974,7 @@ impl TreeList {
             row.extend(content);
             if is_selected {
                 // The selected row keeps only the bold modifier over the
-                // selection background: the pi-tui writer drops interior
+                // selection background: the the TS TUI writer drops interior
                 // foreground colors under the selection wrap, so the
                 // capture shows `› • ` and the bold role without their
                 // accent escapes.

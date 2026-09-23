@@ -1,8 +1,0 @@
-{"activeSessionId":"3dd98939f941","sessionId":"01a0c4cc-2376-75c7-83ed-c0eac2db00fa","sessionFile":"/home/ubuntu/lane-worktrees/wire-order/scripts/battery/runs/20260921T162802Z/rust/agent/sessions/01a0c4cc-2376-75c7-83ed-c0eac2db00fa.jsonl","busy":true,"operation":"create","recordedAt":"2026-09-21T16:28:27.948Z"}
-{"version":1,"type":"queue_snapshot","active_session_id":"3dd98939f941","steering":["history turn one to be summarized by the first compact"],"follow_up":[],"recorded_at":"2026-09-21T16:28:28.070Z"}
-{"version":1,"type":"queue_snapshot","active_session_id":"3dd98939f941","steering":[],"follow_up":[],"recorded_at":"2026-09-21T16:28:28.247Z"}
-{"version":1,"type":"queue_snapshot","active_session_id":"3dd98939f941","steering":["history turn two kept by the first compact"],"follow_up":[],"recorded_at":"2026-09-21T16:28:28.254Z"}
-{"version":1,"type":"queue_snapshot","active_session_id":"3dd98939f941","steering":[],"follow_up":[],"recorded_at":"2026-09-21T16:28:28.380Z"}
-{"version":1,"type":"queue_snapshot","active_session_id":"3dd98939f941","steering":["turn three after the first compaction"],"follow_up":[],"recorded_at":"2026-09-21T16:28:28.440Z"}
-{"version":1,"type":"queue_snapshot","active_session_id":"3dd98939f941","steering":[],"follow_up":[],"recorded_at":"2026-09-21T16:28:28.538Z"}
-{"activeSessionId":"3dd98939f941","sessionId":"01a0c4cc-2376-75c7-83ed-c0eac2db00fa","sessionFile":"/home/ubuntu/lane-worktrees/wire-order/scripts/battery/runs/20260921T162802Z/rust/agent/sessions/01a0c4cc-2376-75c7-83ed-c0eac2db00fa.jsonl","busy":false,"operation":"shutdown","recordedAt":"2026-09-21T16:30:01.378Z"}

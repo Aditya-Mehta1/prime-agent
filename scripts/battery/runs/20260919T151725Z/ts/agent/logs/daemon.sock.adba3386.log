@@ -1,3 +1,0 @@
-[2026-09-19T15:17:25.611Z] supervisor: Prime Agent daemon supervisor f27cfece-5b4e-4e88-ab02-9b21fcd2a8ed listening on /tmp/kb-runs/20260919T151725Z/ts/daemon.sock
-[2026-09-19T15:17:26.037Z] supervisor: Session worker 76c3b34d5679 stderr: Prime Agent daemon listening on /tmp/vbat20260919T151725Z-ts/prime-agent-1000/worker-adba33869f7f-76c3b34d5679.sock
-[2026-09-19T15:17:57.228Z] supervisor: Session worker 76c3b34d5679 stderr: shutting down (exit 0); closing 0 active session(s)

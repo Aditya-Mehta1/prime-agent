@@ -1,8 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131706Z-abort/ts/daemon.sock",
-  "defaultSessionConfig": {
-    "cwd": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131706Z-abort/ts/work",
-    "agentDir": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131706Z-abort/ts/agent"
-  }
-}

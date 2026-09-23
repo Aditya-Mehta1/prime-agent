@@ -40,7 +40,7 @@ impl AgentSessionEngine {
         // against a built session, so the guard is structural.
         let row = {
             let guard = self.session.blocking_lock();
-            guard.as_ref().map(|engine| {
+            guard.as_deref().map(|engine| {
                 self.runtime.block_on(async {
                     engine
                         .session
@@ -50,8 +50,19 @@ impl AgentSessionEngine {
             })
         };
         if let Some(row) = row {
-            if !emit(EngineEvent::CustomMessage(custom_message_value(&row))) {
-                return false;
+            // A failed durable row skips only the custom-message emit; the
+            // terminal `compaction_end` below still fires so clients that saw
+            // `compaction_start` never stay pending. `false` is reserved for
+            // emitter cancellation.
+            match row {
+                Ok(row) => {
+                    if !emit(EngineEvent::CustomMessage(custom_message_value(&row))) {
+                        return false;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("pa-daemon: compaction outcome persistence failed: {error:#}");
+                }
             }
         }
         let (aborted, error_message, error_severity) = match outcome {

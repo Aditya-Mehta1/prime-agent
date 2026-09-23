@@ -125,7 +125,7 @@ impl AgentSessionEngine {
     /// shape (TS `_findLastAssistantMessage`).
     fn last_loop_assistant_message(&self) -> Option<pa_agent::types::AssistantMessage> {
         let guard = self.session.blocking_lock();
-        let engine = guard.as_ref()?;
+        let engine = guard.as_deref()?;
         let wire = self
             .runtime
             .block_on(async { engine.session.last_assistant_message().await })?;
@@ -144,9 +144,15 @@ impl AgentSessionEngine {
         assistant: &pa_agent::types::AssistantMessage,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> OverflowAttempt {
-        // TS reads `this.model?.contextWindow ?? 0`: without a resolvable
-        // model no overflow check runs.
-        let Ok(model) = self.resolve_model() else {
+        // TS reads `this.model?.contextWindow ?? 0`, checks `sameModel`
+        // against `this.model`, and runs the compact-and-retry summarizer on
+        // `this.model` — the session's live model. The Rust equivalent is
+        // the provider target the turn stream reads; a fresh startup-chain
+        // resolution can land the summarizer on a provider the session
+        // never used (R8: "No AWS credentials available for Bedrock" in a
+        // prime-inference session), so the arm follows the target. Without
+        // a resolvable model no overflow check runs.
+        let Ok(model) = self.session_model() else {
             return OverflowAttempt::None;
         };
         // Skip the overflow check when the message came from a different
@@ -161,23 +167,32 @@ impl AgentSessionEngine {
         // Skip the check when the message predates the latest compaction
         // boundary (TS `assistantIsFromBeforeCompaction`): a stale
         // pre-compaction overflow must not retrigger.
-        if self.session.blocking_lock().as_ref().is_some_and(|engine| {
-            self.runtime
-                .block_on(engine.session.latest_compaction_timestamp())
-                .is_some_and(|timestamp| wire.timestamp <= timestamp)
-        }) {
+        if self
+            .session
+            .blocking_lock()
+            .as_deref()
+            .is_some_and(|engine| {
+                self.runtime
+                    .block_on(engine.session.latest_compaction_timestamp())
+                    .is_some_and(|timestamp| wire.timestamp <= timestamp)
+            })
+        {
             return OverflowAttempt::None;
         }
         // Enablement: the compaction settings gate, or a pending model
         // request (the run below consumes it and honors its instructions).
-        let pending_scheduled = self.session.blocking_lock().as_ref().is_some_and(|engine| {
-            self.runtime
-                .block_on(async { engine.turn_boundary.compaction_scheduled().await })
-        });
+        let pending_scheduled = self
+            .session
+            .blocking_lock()
+            .as_deref()
+            .is_some_and(|engine| {
+                self.runtime
+                    .block_on(async { engine.turn_boundary.compaction_scheduled().await })
+            });
         let enabled = self
             .session
             .blocking_lock()
-            .as_ref()
+            .as_deref()
             .is_some_and(|engine| engine.session.auto_compaction_enabled());
         if !enabled && !pending_scheduled {
             return OverflowAttempt::None;
@@ -217,7 +232,7 @@ impl AgentSessionEngine {
         // the session history, but the retry must not re-send it).
         {
             let guard = self.session.blocking_lock();
-            if let Some(engine) = guard.as_ref() {
+            if let Some(engine) = guard.as_deref() {
                 self.runtime.block_on(async {
                     engine
                         .session
@@ -231,7 +246,7 @@ impl AgentSessionEngine {
         let custom_instructions = self
             .session
             .blocking_lock()
-            .as_ref()
+            .as_deref()
             .and_then(|engine| {
                 self.runtime
                     .block_on(async { engine.turn_boundary.take_compaction().await })
@@ -259,7 +274,7 @@ impl AgentSessionEngine {
         let api_key = self.resolve_request_api_key(&model);
         let outcome = {
             let guard = self.session.blocking_lock();
-            let Some(engine) = guard.as_ref() else {
+            let Some(engine) = guard.as_deref() else {
                 self.clear_auto_compaction_abort(&controller);
                 return OverflowAttempt::None;
             };
@@ -286,8 +301,9 @@ impl AgentSessionEngine {
                 // every completed compaction into the active run).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(telemetry) =
-                        guard.as_ref().and_then(|engine| engine.telemetry.as_ref())
+                    if let Some(telemetry) = guard
+                        .as_deref()
+                        .and_then(|engine| engine.telemetry.as_ref())
                     {
                         telemetry.note_compaction();
                     }
@@ -327,7 +343,7 @@ impl AgentSessionEngine {
                 // of it (TS will-retry branch).
                 {
                     let guard = self.session.blocking_lock();
-                    if let Some(engine) = guard.as_ref() {
+                    if let Some(engine) = guard.as_deref() {
                         self.runtime.block_on(async {
                             engine
                                 .session
@@ -411,6 +427,21 @@ mod tests {
         entry
     }
 
+    /// The combined input+output limit 400 (the live Prime Inference
+    /// shape): no single-part context-window wording, only the combined
+    /// ceiling text.
+    fn combined_limit_error(delay_ms: u64) -> Value {
+        let mut entry = json!({
+            "text": "",
+            "stopReason": "error",
+            "errorMessage": "Error: 400 This model configuration accepts at most 1048576 combined input and output tokens. However, your request has 1017457 input tokens and asks for 32000 output tokens (1049457 tokens total). Please reduce the input length or requested output length and try again.",
+        });
+        if delay_ms > 0 {
+            entry["delayMs"] = json!(delay_ms);
+        }
+        entry
+    }
+
     /// One faux-driven engine over its own tempdir with explicit compaction
     /// settings (the `keepRecentTokens` cut decides whether the overflow
     /// recovery can actually compact).
@@ -435,6 +466,7 @@ mod tests {
             supervisor_link: None,
             telemetry_disabled: None,
             cron_store: None,
+            queued_steering_probe: None,
         })
         .unwrap();
         (engine, dir)
@@ -659,6 +691,58 @@ mod tests {
         assert!(outcome_rows(&probe_events).is_empty());
         // The retry re-issued without re-adding the user message.
         assert_eq!(user_messages(&probe_events).len(), 1);
+    }
+
+    /// The live combined-limit 400 classifies as overflow: the arm
+    /// compacts and retries (the recovered turn settles the run) instead
+    /// of surfacing the raw 400 — before the fix this text matched no
+    /// overflow pattern and the error reached the user directly.
+    #[test]
+    fn combined_limit_overflow_compacts_and_retries() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (engine, _dir) = faux_engine_with_settings(
+            json!({
+                "responses": [
+                    {"text": "seed reply"},
+                    combined_limit_error(0),
+                    {"text": "the summary"},
+                    {"text": "recovered reply"},
+                ]
+            }),
+            1,
+        );
+        let mut events: Vec<EngineEvent> = Vec::new();
+        // A large seed turn, so the overflow recovery has pre-cut history
+        // to summarize (the `keepRecentTokens` cut keeps ~10 tokens).
+        admit(
+            &engine,
+            format!("seed turn {}", "x".repeat(48_000)),
+            &mut events,
+        );
+        let mut probe_events: Vec<EngineEvent> = Vec::new();
+        admit(
+            &engine,
+            format!("overflow probe {}", "x".repeat(48_000)),
+            &mut probe_events,
+        );
+        // The overflow arm fired: one compact-and-retry with the overflow
+        // reason.
+        let starts = compaction_starts(&probe_events);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["reason"], "overflow");
+        let ends = compaction_ends(&probe_events);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0]["willRetry"], true);
+        assert_eq!(ends[0]["result"]["summary"], "the summary");
+        // The retried turn's reply is the run's settled outcome: no
+        // failure rows, no surfaced raw error.
+        let assistant = assistant_messages(&probe_events);
+        assert_eq!(assistant.len(), 2);
+        assert_eq!(assistant[1]["content"][0]["text"], "recovered reply");
+        assert_eq!(done_result(&probe_events), Some(&Ok(())));
+        assert!(outcome_rows(&probe_events).is_empty());
     }
 
     /// A skipped overflow recovery does not re-issue (TS excludes overflow

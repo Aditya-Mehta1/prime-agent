@@ -114,6 +114,19 @@ commands (`model`, `effort`, `tree`, `fork`, `clone`, `export`, `share`,
 |---|---|---|
 | `command_name` | string | canonical builtin command name |
 
+### `skill used`
+
+A `/skill:<name>` submission expanded into its skill block (the
+skill-command execution seam, TS `_expandSkillCommand`). Emitted once per
+expanded invocation from the session's prompt admission; never carries
+prompt or skill content.
+
+| property | type | notes |
+|---|---|---|
+| `skill_name` | string | the invoked skill's name |
+| `skill_kind` | string | `markdown` / `python` |
+| `source` | string | `prompt` (admitted fresh) / `steer` / `follow_up` (queued during a run) |
+
 ### `onboarding completed`
 
 | property | type | notes |
@@ -148,23 +161,50 @@ emitted and flushed before the TUI starts.
 ### `daemon event`
 
 Supervision lifecycle, emitted by the supervisor process. Counts only,
-never session payload.
+never session payload. `session_rebound`: a client command addressed a
+superseded active session id and the supervisor rebound it to the
+session's current worker (the stale-id rebind).
 
 | property | type | notes |
 |---|---|---|
-| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach`, `sessions_archived`, `worker_children_closed` |
+| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach`, `sessions_archived`, `worker_children_closed`, `session_rebound`, `catalog_refresh`, `compaction_abort_declared`, `worker_adoption` |
 | `exit_reason` | string | only for `worker_exited`: `normal` / `crash` |
-| `count` | number | only for `sessions_archived` and `worker_children_closed`: how many sessions the sweep moved to the archive / how many resident RLM children the supervisor closed with a hard-killed parent worker |
+| `count` | number | only for `sessions_archived`, `worker_children_closed`, `catalog_refresh`, and `compaction_abort_declared` (always 1): how many sessions the sweep moved to the archive / how many resident RLM children the supervisor closed with a hard-killed parent worker / how many models the resolved no-cold-start chain serves after the daemon's startup catalog refresh / one wedged-worker compaction the supervisor declared aborted |
+| `boot` | string | only for `worker_adoption`: `plain` / `update` — the boot the descriptor-adoption pass ran under |
+| `adopted_live` | number | only for `worker_adoption`: descriptors whose live socket the pass adopted |
+| `revived` | number | only for `worker_adoption`: dead descriptors relaunched (busy evidence on a plain boot, kept worker on an update boot) |
+| `skipped_idle` | number | only for `worker_adoption`: dead descriptors the durable busy-evidence filter parked (idle at exit; plain boots only) |
+| `stopped` | number | only for `worker_adoption`: descriptors whose durable stop tombstone the boot re-finalized instead of adopting or reviving |
+| `failed` | number | only for `worker_adoption`: descriptors whose adoption or relaunch failed |
+
+
+### `model refused`
+
+A daemon model resolution refused a model outside the settings
+`allowedModels` allowlist (Rust-only guardrail; the refusal surfaces as an
+error, never a fallback). Seams: the `set_model` and `cycle_model` command
+handlers, the RLM spawn/create_session child-model resolution, and the
+worker's startup model chain. Emitted once per distinct `(surface,
+selector)` per worker — a connection-state getter re-resolving the same
+refused model never repeats the event (the user-facing error still fires
+every time). Categories and surface only — never the refused selector or
+the configured patterns (the `catalog_refresh` rule: no model ids).
+
+| property | type | notes |
+|---|---|---|
+| `surface` | string | `set_model` / `cycle_model` / `spawn` / `create_session` / `session_start` |
+| `provider_category` | string | the refused model's provider category (`prime`, `anthropic`, ...) |
+| `model_category` | string | the refused model's category (`glm`, `claude`, ...) |
 
 ### `mcp connector used`
 
-`mcp.*` host-request activity. Server name ONLY — never tool names,
-arguments, or results.
+`mcp.*` host-request activity and the connector install flows. Server name
+ONLY — never tool names, arguments, results, or pasted credential material.
 
 | property | type | notes |
 |---|---|---|
-| `action` | string | `config` / `refresh` |
-| `server_name` | string | server id from settings / ACP admission |
+| `action` | string | `config` / `refresh` / `paste-install` |
+| `server_name` | string | server id from settings / ACP admission / the resolved service catalog |
 
 ### `tool executed`
 
@@ -216,6 +256,26 @@ client run (adoption; later copies in the same run are not reported).
 | property | type | notes |
 |---|---|---|
 | `lines` | number | the copied text's line count |
+
+### `tui enhanced keys`
+
+The terminal enhanced-key modes settled for an interactive run (adoption:
+emitted once per client run when the kitty keyboard protocol answer lands).
+
+| property | type | notes |
+|---|---|---|
+| `kitty` | boolean | the kitty keyboard protocol is active (flags `1\|2\|4`) |
+| `modify_other_keys` | boolean | always `false` in this port: the xterm modifyOtherKeys mode-2 fallback is never armed (crossterm cannot parse the resulting `CSI 27;mods;key~` sequences — the whole input buffer drops on the parse error, the shift-modified-printable bug class); every surface start instead resets the mode. The property keeps the TS event shape. |
+
+### `tui hyperlinks`
+
+The terminal hyperlink (OSC 8) capability resolved for an interactive run
+(adoption: emitted once per client run, terminal runs only — headless runs
+never paint a tty).
+
+| property | type | notes |
+|---|---|---|
+| `enabled` | boolean | clickable link rendering is active (the `detectCapabilities` gate: on in terminals positively known to implement OSC 8 — kitty/ghostty/wezterm/iTerm2/VS Code/Alacritty — and off under tmux/screen and in unknown terminals) |
 
 ### `tui image pasted`
 
@@ -282,6 +342,20 @@ parked submission, not per rendered row).
 | property | type | notes |
 |---|---|---|
 | `lane` | string | `steering` (Enter while a turn runs) / `follow_up` (the follow-up key) |
+| `steering_mode` | string | the session's queue delivery mode at the submission (TS `steeringMode`): `all` = the parked steering prefix delivers as one batched turn at the boundary, `one-at-a-time` = one steer per turn — exposure under batched delivery is the multi-steer batch feature's adoption signal |
+
+### `tui queue edited`
+
+A parked queued message was touched through the browse/edit affordance
+(adoption of queue editing, TS `QueueSelection`): selecting a parked
+message, re-queueing an edited one (moving its lane), deleting it with an
+empty edit, or reordering it with ctrl+alt+arrows. Emitted once per
+completed user action, and only when the mutation was applied; never
+carries the message text.
+
+| property | type | notes |
+|---|---|---|
+| `action` | string | `select` (a browse opened a selection) / `edit` (the edited text re-queued, possibly to the other lane) / `delete` (empty edit) / `reorder` (ctrl+alt+arrow move) |
 
 ### `tui suspend used`
 
@@ -302,6 +376,19 @@ subagent inspection surface; emitted once per open action).
 |---|---|---|
 | `children_total` | number | live RLM descendant count at open time |
 
+### `tui activity opened`
+
+The user opened an activity surface from the session view: the unified
+panel itself (dock Enter, a second Alt+A, or a dock group's Enter) or a
+group's management view from the panel (the scoped agents view, the
+heartbeats view, a bash output tail). The goal indicator is read-only and
+does not emit this event. No command, output, prompt, or goal content is
+collected.
+
+| property | type | notes |
+|---|---|---|
+| `kind` | string | `panel` / `subagents` / `heartbeats` / `bash` |
+
 ### `tui prompt stash`
 
 A prompt-stash transition (adoption of the session-switch draft stash, TS
@@ -314,14 +401,33 @@ transition; never carries prompt content.
 | `action` | string | `agents_view` / `session_switch` (a draft stashed on the way out) / `restored` (a stashed draft returned to the editor) |
 | `had_images` | boolean | the draft carried pasted images |
 
+### `tui bash shortcut used`
+
+The `!`/`!!` bash-from-chat shortcut ran a command from the input editor
+(adoption of the bash-mode surface; emitted once per dispatched run, never
+carrying the command or its output).
+
+| property | type | notes |
+|---|---|---|
+| `excluded` | boolean | the `!!` variant: the run stays out of the session context |
+| `side_conversation` | boolean | the run executed inside a side-question pane (transient, pane-rendered) |
+
+### `tui bash bang executed`
+
+A dispatched bang run settled (adoption settle signal for the bash-mode
+surface; primitives only — never the command, its output, or its spill path).
+
+| property | type | notes |
+|---|---|---|
+| `duration_bucket` | string | `lt_5s` / `5_to_30s` / `30s_plus` / `unknown` (unknown when the client never observed the run's start) |
+| `exit_class` | string | `zero` / `nonzero` / `cancelled` / `failed` (spawn failure) / `unknown` |
+
 ## Planned events (seams not yet in the product)
 
-These stay in the catalog as planned schema v1 additions; they are NOT
-emitted yet. Each lands in the same PR as its product seam (see the
-adoption convention below):
-
-- `skill used` (`skill_name`, `skill_kind`, `source`): the product has no
-  skill-command execution seam yet.
+Planned events stay in this catalog as schema v1 placeholders until
+their product seam lands (each in the same PR as the seam, per the
+adoption convention below). None are pending right now: the former
+`skill used` placeholder shipped with its seam (the `/skill:` expansion).
 
 ## Cohorts and breakdowns
 

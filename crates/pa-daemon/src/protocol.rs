@@ -60,6 +60,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "agent_messages_resume",
     "agent_messages_clear",
     "abort",
+    "abort_and_send_queued",
     "start_side_question",
     "abort_side_question",
     "execute_bash",
@@ -136,12 +137,17 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "retry_worker",
     "restart",
     "shutdown",
+    "list_kernel_bash",
+    "tail_kernel_bash",
+    "kill_kernel_bash",
     "worker_register",
     "worker_roster_delta",
     "get_worker_peer_transport",
     "commit_update_restart",
     "update_restore_status",
     "get_mcp_connections",
+    "set_mcp_static_token",
+    "remove_mcp_connection",
 ];
 
 /// Parsed client command envelope.
@@ -176,10 +182,16 @@ impl EnvelopeParseError {
 pub fn parse_daemon_command_line(line: &str) -> Result<DaemonCommandEnvelope, EnvelopeParseError> {
     let value: Value = serde_json::from_str(line)
         .map_err(|e| EnvelopeParseError::Invalid(format!("invalid JSON: {e}")))?;
+    parse_daemon_command_value(value)
+}
+
+fn parse_daemon_command_value(
+    mut value: Value,
+) -> Result<DaemonCommandEnvelope, EnvelopeParseError> {
     // Bare commands (no `type: "command"` envelope) are accepted directly.
     let (envelope_id, protocol, client_id, command_value) =
         if value.get("type").and_then(Value::as_str) == Some("command") {
-            let obj = value.as_object().ok_or_else(|| {
+            let obj = value.as_object_mut().ok_or_else(|| {
                 EnvelopeParseError::Invalid("command line is not an object".into())
             })?;
             let id = obj
@@ -204,6 +216,10 @@ pub fn parse_daemon_command_line(line: &str) -> Result<DaemonCommandEnvelope, En
                     DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
                 ));
             }
+            let protocol = DaemonProtocolInfo {
+                name: name.to_string(),
+                version,
+            };
             let client_id = match obj.get("clientId") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(s)) => Some(s.clone()),
@@ -213,38 +229,27 @@ pub fn parse_daemon_command_line(line: &str) -> Result<DaemonCommandEnvelope, En
                     ))
                 }
             };
-            let command_value = obj.get("command").cloned().ok_or_else(|| {
+            let command_value = obj.remove("command").ok_or_else(|| {
                 EnvelopeParseError::Invalid("command envelope is missing command".into())
             })?;
-            (
-                id,
-                DaemonProtocolInfo {
-                    name: name.to_string(),
-                    version,
-                },
-                client_id,
-                command_value,
-            )
+            (id, protocol, client_id, command_value)
         } else {
-            (
-                value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                current_protocol_info(),
-                None,
-                value.clone(),
-            )
+            let id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (id, current_protocol_info(), None, value)
         };
-    let command = match serde_json::from_value::<DaemonCommand>(command_value.clone()) {
+    let type_name = command_value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    // Keep the tag for the error after deserialization consumes the command value.
+    let type_name = type_name.to_string();
+    let command = match serde_json::from_value::<DaemonCommand>(command_value) {
         Ok(command) => command,
         Err(_) => {
-            let type_name = command_value
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
             if !KNOWN_COMMAND_TYPES.contains(&type_name.as_str()) {
                 return Err(EnvelopeParseError::UnknownCommand(type_name));
             }
@@ -305,6 +310,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "model_catalog",
                 "side_question_transcript",
                 "transient_bash",
+                "kernel_bash_activity",
                 "session_input_admission",
                 "prompt_admission_cancellation",
                 "owned_prompt_cancellation",
@@ -314,6 +320,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "rlm_quiescence_barrier",
                 "session_input_pause",
                 "acp_mcp_servers",
+                "abort_and_send_queued",
                 "agent_roster",
                 "direct_peer_transport",
             ]
@@ -337,7 +344,7 @@ pub fn parse_supervisor_command_line(
             DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
         ));
     }
-    parse_daemon_command_line(line)
+    parse_daemon_command_value(value)
 }
 
 /// `proc:<start_time>` identity of a process (shared platform contract).
@@ -550,6 +557,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::Abort {
             active_session_id, ..
         }
+        | DaemonCommand::AbortAndSendQueued {
+            active_session_id, ..
+        }
         | DaemonCommand::StartSideQuestion {
             active_session_id, ..
         }
@@ -560,6 +570,15 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
             active_session_id, ..
         }
         | DaemonCommand::AbortBash {
+            active_session_id, ..
+        }
+        | DaemonCommand::ListKernelBash {
+            active_session_id, ..
+        }
+        | DaemonCommand::TailKernelBash {
+            active_session_id, ..
+        }
+        | DaemonCommand::KillKernelBash {
             active_session_id, ..
         }
         | DaemonCommand::CancelRlmChild {
@@ -602,6 +621,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
             active_session_id, ..
         }
         | DaemonCommand::GetMcpConnections {
+            active_session_id, ..
+        }
+        | DaemonCommand::SetMcpStaticToken {
+            active_session_id, ..
+        }
+        | DaemonCommand::RemoveMcpConnection {
             active_session_id, ..
         }
         | DaemonCommand::ReplaceAcpMcpServers {
@@ -841,10 +866,14 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::AgentMessagesResume { .. } => "agent_messages_resume",
         DaemonCommand::AgentMessagesClear { .. } => "agent_messages_clear",
         DaemonCommand::Abort { .. } => "abort",
+        DaemonCommand::AbortAndSendQueued { .. } => "abort_and_send_queued",
         DaemonCommand::StartSideQuestion { .. } => "start_side_question",
         DaemonCommand::AbortSideQuestion { .. } => "abort_side_question",
         DaemonCommand::ExecuteBash { .. } => "execute_bash",
         DaemonCommand::AbortBash { .. } => "abort_bash",
+        DaemonCommand::ListKernelBash { .. } => "list_kernel_bash",
+        DaemonCommand::TailKernelBash { .. } => "tail_kernel_bash",
+        DaemonCommand::KillKernelBash { .. } => "kill_kernel_bash",
         DaemonCommand::CancelRlmChild { .. } => "cancel_rlm_child",
         DaemonCommand::DeleteRlmSubagent { .. } => "delete_rlm_subagent",
         DaemonCommand::WaitForIdle { .. } => "wait_for_idle",
@@ -859,6 +888,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::GetCommands { .. } => "get_commands",
         DaemonCommand::GetResourceSnapshot { .. } => "get_resource_snapshot",
         DaemonCommand::GetMcpConnections { .. } => "get_mcp_connections",
+        DaemonCommand::SetMcpStaticToken { .. } => "set_mcp_static_token",
+        DaemonCommand::RemoveMcpConnection { .. } => "remove_mcp_connection",
         DaemonCommand::ReplaceAcpMcpServers { .. } => "replace_acp_mcp_servers",
         DaemonCommand::GetModelCatalog { .. } => "get_model_catalog",
         DaemonCommand::GetAvailableModels { .. } => "get_available_models",
@@ -931,11 +962,78 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn kernel_bash_activity_commands_are_session_scoped() {
+        for (command, kind) in [
+            (
+                serde_json::json!({"type":"list_kernel_bash","activeSessionId":"session"}),
+                "list_kernel_bash",
+            ),
+            (
+                serde_json::json!({"type":"tail_kernel_bash","activeSessionId":"session","activityId":"opaque","lines":20}),
+                "tail_kernel_bash",
+            ),
+            (
+                serde_json::json!({"type":"kill_kernel_bash","activeSessionId":"session","activityId":"opaque"}),
+                "kill_kernel_bash",
+            ),
+        ] {
+            let line = serde_json::json!({"type":"command","id":"c1", "protocol":current_protocol_info(), "command":command}).to_string();
+            let parsed = parse_daemon_command_line(&line).unwrap();
+            assert_eq!(command_type_name(&parsed.command), kind);
+            assert_eq!(command_active_session_id(&parsed.command), Some("session"));
+            assert!(pa_types::daemon::is_session_plane_daemon_command(kind));
+        }
+        assert!(default_server_capabilities().contains(&"kernel_bash_activity".to_string()));
+    }
+
+    #[test]
     fn envelope_round_trips() {
         let line = r#"{"type":"command","id":"c1","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"list","all":true}}"#;
         let envelope = parse_daemon_command_line(line).expect("envelope parses");
         assert_eq!(envelope.id, "c1");
         assert!(matches!(envelope.command, DaemonCommand::List { .. }));
+    }
+
+    #[test]
+    fn supervisor_parser_preserves_envelope_and_bare_error_shapes() {
+        let cases = [
+            (
+                r#"{"type":"list"}"#,
+                "Daemon commands require protocol 7 or newer",
+            ),
+            (
+                r#"{"type":"command","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"list"}}"#,
+                "Invalid daemon command: command envelope is missing id",
+            ),
+            (
+                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":7},"clientId":42,"command":{"type":"list"}}"#,
+                "Invalid daemon command: clientId must be a string",
+            ),
+            (
+                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":7}}"#,
+                "Invalid daemon command: command envelope is missing command",
+            ),
+            (
+                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"not-real"}}"#,
+                "Unknown daemon command: not-real",
+            ),
+            (
+                r#"{"type":"command","id":"x","protocol":{"name":"prime-agent.daemon","version":7},"command":{"type":"prompt"}}"#,
+                "Invalid daemon command: malformed prompt command",
+            ),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(
+                parse_supervisor_command_line(line).unwrap_err().to_string(),
+                expected
+            );
+        }
+        let command = json!({"type":"prompt", "activeSessionId":"s", "message":"hello", "content":{"blocks":[{"text":"nested"}]}});
+        let line = json!({"type":"command", "id":"x", "clientId":"client", "protocol":{"name":"prime-agent.daemon","version":7}, "command":command}).to_string();
+        let parsed = parse_supervisor_command_line(&line).unwrap();
+        assert_eq!(parsed.id, "x");
+        assert_eq!(parsed.client_id.as_deref(), Some("client"));
+        assert_eq!(serde_json::to_value(parsed.command).unwrap(), command);
     }
 
     #[test]

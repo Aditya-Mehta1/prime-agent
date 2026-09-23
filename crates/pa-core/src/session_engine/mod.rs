@@ -77,6 +77,19 @@ pub struct PromptOptions {
     pub expand_prompt_templates: Option<bool>,
     /// Queue instead of erroring when the session is busy (agent messages).
     pub queue_if_busy: bool,
+    /// Co-delivered user rows of a batched turn (TS
+    /// `_startPreparedTurnActions`: same-lane, same-policy queued
+    /// actions delivered as ONE run under queue mode "all" or a forced
+    /// steering batch). Each row rides the turn after the primary, with
+    /// its own text and images, like the primary.
+    pub batch: Vec<PromptBatchRow>,
+}
+
+/// One co-delivered user row of a batched prompt admission.
+#[derive(Debug, Clone)]
+pub struct PromptBatchRow {
+    pub text: String,
+    pub images: Vec<pa_agent::types::ImageContent>,
 }
 
 /// Which trailing assistant messages [`AgentSession::drop_trailing_assistant`]
@@ -141,6 +154,13 @@ pub struct AgentSession {
     /// continuation context, pushed at construction; taken by the next
     /// prompt or injected turn, exactly like the TS prepared-messages take).
     pending_next_turn_rows: std::sync::Arc<std::sync::Mutex<Vec<pa_types::session::CustomMessage>>>,
+    /// The skill inventory `/skill:<name>` submissions expand against (TS
+    /// reads `resourceLoader.getSkills()` at expansion time; the engine
+    /// wiring installs the loaded list once the session is assembled).
+    skills: Vec<crate::skills::Skill>,
+    /// The telemetry handle for the `skill used` adoption event the
+    /// prompt path owns (`None` in sessions without telemetry).
+    skill_telemetry: Option<std::sync::Arc<telemetry::SessionTelemetry>>,
 }
 
 impl AgentSession {
@@ -173,7 +193,7 @@ impl AgentSession {
             .subscribe(move |event, _signal| {
                 let persistence = persistence.clone();
                 Box::pin(async move {
-                    persist_event(&persistence, event).await;
+                    persist_event(&persistence, event).await?;
                     Ok(())
                 })
             })
@@ -191,6 +211,8 @@ impl AgentSession {
             compact_auto_refine: std::sync::Mutex::default(),
             kernel_state: None,
             pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            skills: Vec::new(),
+            skill_telemetry: None,
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -202,6 +224,20 @@ impl AgentSession {
     /// like the TS product instead of the defaults.
     pub fn set_compaction_settings(&mut self, settings: compaction::CompactionSettings) {
         self.compaction = settings;
+    }
+
+    /// Install the skill inventory `/skill:<name>` submissions expand
+    /// against (TS reads the resource loader at expansion time; the Rust
+    /// session snapshots the engine's loaded list here).
+    pub fn set_skills(&mut self, skills: Vec<crate::skills::Skill>) {
+        self.skills = skills;
+    }
+
+    /// Bind the telemetry handle the `skill used` adoption event reports
+    /// through (the engine wiring owns the telemetry lifetime and
+    /// installs it once the session telemetry is assembled).
+    pub fn set_skill_telemetry(&mut self, telemetry: std::sync::Arc<telemetry::SessionTelemetry>) {
+        self.skill_telemetry = Some(telemetry);
     }
 
     /// Bind the auto-refine surface for this session (the engine wiring
@@ -272,9 +308,11 @@ impl AgentSession {
     /// Whether an automatic threshold compaction is due at a turn boundary
     /// (the TS `_checkCompaction` threshold arm, fired at `agent_end` and
     /// before the next admitted prompt): the live loop context over the
-    /// model's context window and the compaction reserve headroom. Usage
+    /// model's context window against the effective threshold
+    /// (`compaction::compaction_threshold`: the percentage ceiling or the
+    /// combined input+output ceiling, whichever comes first). Usage
     /// from before the latest compaction never re-triggers.
-    pub async fn auto_compaction_due(&self, context_window: u64) -> bool {
+    pub async fn auto_compaction_due(&self, model: &pa_types::ai::Model) -> bool {
         let state = self.agent.state().await;
         // The live loop context is the agent's message list (the same JSON
         // round-trip `compact` uses for its rebuilt context).
@@ -284,7 +322,17 @@ impl AgentSession {
             .filter_map(|message| serde_json::to_value(message).ok())
             .filter_map(|value| serde_json::from_value(value).ok())
             .collect();
-        compaction::threshold_compaction_due(&messages, context_window, &self.compaction)
+        compaction::threshold_compaction_due(
+            &messages,
+            model.context_window,
+            // The live thinking level decides whether the request folds a
+            // thinking budget on top of the base output budget.
+            compaction::request_output_budget(
+                model,
+                provider_adapter::model_thinking_level(state.thinking_level),
+            ),
+            &self.compaction,
+        )
     }
 
     /// Remove the trailing assistant message from the loop context (TS retry:
@@ -389,7 +437,7 @@ impl AgentSession {
         let kernel_state = match self.kernel_state.as_ref() {
             Some(probe) => {
                 ipython_state::sync_after_compaction(probe.as_ref(), &self.session, &self.agent)
-                    .await
+                    .await?
             }
             None => None,
         };
@@ -416,18 +464,21 @@ impl AgentSession {
         reason: crate::session_engine::messages::CompactionOutcomeReason,
         outcome: crate::session_engine::messages::CompactionOutcomeKind,
         content: &str,
-    ) -> pa_types::session::CustomMessage {
+    ) -> anyhow::Result<pa_types::session::CustomMessage> {
         let row = crate::session_engine::messages::create_compaction_outcome_message(
             content, reason, outcome,
         );
         {
             let mut session = self.session.lock().await;
-            session.append_custom_message(
+            let (_, write_error) = session.append_custom_message_retained(
                 &row.custom_type,
                 row.content.clone(),
                 row.display,
                 row.details.clone(),
             );
+            if let Some(error) = write_error {
+                eprintln!("pa-core: compaction outcome row not persisted: {error}");
+            }
         }
         // TS pushes the row onto `agent.state.messages` after the append:
         // the live context owns the disclosure; the loop's converter filters
@@ -440,7 +491,7 @@ impl AgentSession {
             messages.push(loop_message);
             self.agent.set_messages(messages).await;
         }
-        row
+        Ok(row)
     }
 
     /// Rebuild the live loop context from a durable branch (TS
@@ -479,19 +530,23 @@ impl AgentSession {
         api_key: Option<String>,
         global_harness_dir: std::path::PathBuf,
     ) -> anyhow::Result<crate::refinement::RefinementResult> {
+        let snapshot = self.session.lock().await.history_snapshot();
+        let entries = snapshot.await?;
+        let messages: Vec<SessionAgentMessage> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                FileEntry::Message { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
         let result = {
             let mut session = self.session.lock().await;
-            let messages: Vec<SessionAgentMessage> = session
-                .get_all_entries()
-                .iter()
-                .filter_map(|entry| match entry {
-                    FileEntry::Message { message, .. } => Some(message.clone()),
-                    _ => None,
-                })
-                .collect();
             refine::execute_refinement(
                 &mut session,
-                &messages,
+                refine::RefinementTranscript {
+                    messages: &messages,
+                    historical_entries: &entries,
+                },
                 &global_harness_dir,
                 model,
                 options,
@@ -598,10 +653,17 @@ impl AgentSession {
         options: PromptOptions,
     ) -> anyhow::Result<PromptOutcome> {
         let expand = options.expand_prompt_templates.unwrap_or(true);
-        let normalized = if expand {
-            crate::skills::expand_prompt_template(text, &self.prompt_templates)
+        // TS `_finishSubmissionNormalization` order: skill commands expand
+        // first (`/skill:<name>` into its `<skill>` block), prompt templates
+        // second; both are gated by the same policy flag.
+        let (normalized, used_skill) = if expand {
+            let (skill_expanded, used_skill) =
+                crate::skills::expand_skill_command(text, &self.skills);
+            let normalized =
+                crate::skills::expand_prompt_template(&skill_expanded, &self.prompt_templates);
+            (normalized, used_skill)
         } else {
-            text.to_string()
+            (text.to_string(), None)
         };
 
         if let Some(command) = parse_session_command(&self.slash_commands, &normalized) {
@@ -610,6 +672,31 @@ impl AgentSession {
 
         let state = self.agent.state().await;
         let busy = state.is_streaming;
+        // The `skill used` adoption event reports from the admission seam:
+        // an admitted user turn whose text IS a skill block reports once,
+        // with how the invocation arrived (a fresh admission, or a queued
+        // steering/follow-up submission). A pre-expanded block (the daemon
+        // emits the accepted row before admission) reports here too — the
+        // block parse carries the skill identity.
+        if let Some(skill) = used_skill.or_else(|| {
+            pa_types::skill_blocks::parse_skill_block(&normalized)
+                .and_then(|block| self.skills.iter().find(|skill| skill.name == block.name))
+        }) {
+            if let Some(telemetry) = &self.skill_telemetry {
+                let source = if busy {
+                    match options.streaming_behavior {
+                        Some(StreamingBehavior::Steer) => "steer",
+                        Some(StreamingBehavior::FollowUp) => "follow_up",
+                        // The busy-without-behavior case errors below; the
+                        // queued label is the honest fallback.
+                        None => "follow_up",
+                    }
+                } else {
+                    "prompt"
+                };
+                telemetry.note_skill_used(&skill.name, skill.kind_label(), source);
+            }
+        }
         if busy && options.streaming_behavior.is_none() {
             anyhow::bail!(
                 "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
@@ -638,6 +725,21 @@ impl AgentSession {
             }
             prompt_messages.extend(self.take_next_turn_rows().await);
             prompt_messages.push(user_prompt_message(&normalized, &images));
+            // The batched co-delivery rows (TS `_startPreparedTurnActions`'s
+            // `turns.flatMap(records)`): each batched action contributes its
+            // user row after the primary, through the same admission
+            // normalization (TS normalizes each submission at queue time;
+            // this engine normalizes every row at the shared admission).
+            for row in &options.batch {
+                let row_text = if expand {
+                    let (skill_expanded, _) =
+                        crate::skills::expand_skill_command(&row.text, &self.skills);
+                    crate::skills::expand_prompt_template(&skill_expanded, &self.prompt_templates)
+                } else {
+                    row.text.clone()
+                };
+                prompt_messages.push(user_prompt_message(&row_text, &row.images));
+            }
             self.agent
                 .prompt(pa_agent::agent::AgentPromptInput::Messages(prompt_messages))
                 .await?;
@@ -702,9 +804,36 @@ impl AgentSession {
         self.session.lock().await.get_session_id().to_string()
     }
 
+    /// Restore a verified retained context without loading older transcript bodies.
+    pub async fn restore_windowed_context(
+        &self,
+        window: crate::session::window::WindowedSessionStore,
+    ) {
+        let messages = {
+            let mut session = self.session.lock().await;
+            session.adopt_window(window);
+            session.active_context().messages
+        };
+        self.agent
+            .set_messages(
+                messages
+                    .iter()
+                    .filter_map(session_message_to_loop)
+                    .collect(),
+            )
+            .await;
+    }
+
     /// Persisted entries (for UI resume and inspection).
     pub async fn entries(&self) -> Vec<FileEntry> {
-        self.session.lock().await.get_entries().to_vec()
+        self.session
+            .lock()
+            .await
+            .retained_entries()
+            .iter()
+            .filter(|entry| !matches!(entry, FileEntry::Header { .. }))
+            .cloned()
+            .collect()
     }
 
     /// Model change bookkeeping (mirrors appendModelChange). The resolved
@@ -722,7 +851,7 @@ impl AgentSession {
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         self.agent.set_model(wire).await;
         let mut session = self.session.lock().await;
-        session.append_model_change(provider, model_id);
+        session.append_model_change(provider, model_id)?;
         Ok(())
     }
 
@@ -730,30 +859,44 @@ impl AgentSession {
     pub async fn set_thinking_level(&self, level: ThinkingLevel) -> anyhow::Result<()> {
         self.agent.set_thinking_level(level).await;
         let mut session = self.session.lock().await;
-        session.append_thinking_level_change(&format!("{level:?}").to_lowercase());
+        session.append_thinking_level_change(&format!("{level:?}").to_lowercase())?;
         Ok(())
     }
 }
 
-async fn persist_event(session: &Arc<tokio::sync::Mutex<SessionManager>>, event: AgentEvent) {
+async fn persist_event(
+    session: &Arc<tokio::sync::Mutex<SessionManager>>,
+    event: AgentEvent,
+) -> std::io::Result<()> {
     match event {
         AgentEvent::MessageEnd { message, .. } => {
             let Some(session_message) = loop_message_to_session(&message) else {
-                return;
+                return Ok(());
             };
             let mut session = session.lock().await;
-            match session_message {
+            // TS `_processAgentEvent` runs on `_agentEventQueue`, whose
+            // `.catch(() => {})` swallows persistence failures, and its
+            // `_appendEntry` keeps the row in the in-memory session when the
+            // disk write throws. The loop has already reduced this event into
+            // live agent state, so a failed write must retain the row here
+            // too: propagating would fail the run, append an error assistant
+            // row that exists in neither store, and leave live context that
+            // disappears on reopen.
+            let write_error = match session_message {
                 SessionAgentMessage::Custom(custom) => {
-                    session.append_custom_message(
-                        &custom.custom_type,
-                        custom.content.clone(),
-                        custom.display,
-                        custom.details.clone(),
-                    );
+                    session
+                        .append_custom_message_retained(
+                            &custom.custom_type,
+                            custom.content.clone(),
+                            custom.display,
+                            custom.details.clone(),
+                        )
+                        .1
                 }
-                other => {
-                    session.append_message(other);
-                }
+                other => session.append_message_retained(other).1,
+            };
+            if let Some(error) = write_error {
+                eprintln!("pa-core: message row not persisted: {error}");
             }
         }
         // Git state is captured at both run boundaries, exactly like the TS
@@ -766,6 +909,7 @@ async fn persist_event(session: &Arc<tokio::sync::Mutex<SessionManager>>, event:
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Convert a loop message to its persisted form via the shared wire shape.
@@ -877,6 +1021,79 @@ mod tests {
             roles,
             vec!["user:hi there".to_string(), "assistant:m".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_skill_command_prompt_expands_into_the_skill_block() {
+        // TS `_expandSkillCommand`: a `/skill:<name> [args]` submission
+        // persists as the `<skill>` block plus the argument text; the
+        // renderer parses that block back out (TS `parseSkillBlock`).
+        let mut session = scripted_session().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("SKILL.md");
+        std::fs::write(&file_path, "---\nname: web-search\n---\nRun a web search.").unwrap();
+        session.set_skills(vec![crate::skills::Skill {
+            name: "web-search".to_string(),
+            description: "search the web".to_string(),
+            file_path: file_path.clone(),
+            base_dir: dir.path().to_path_buf(),
+            source_info: crate::skills::create_synthetic_source_info(
+                &file_path.display().to_string(),
+                "user",
+                crate::skills::SourceScope::User,
+                None,
+            ),
+            disable_model_invocation: false,
+            kind: crate::skills::SkillKind::Markdown,
+            python: None,
+        }]);
+        session
+            .prompt("/skill:web-search find rust tuis", PromptOptions::default())
+            .await
+            .unwrap();
+        session.agent().wait_for_idle().await;
+        let entries = session.entries().await;
+        let user_text = entries
+            .iter()
+            .find_map(|entry| match entry {
+                FileEntry::Message {
+                    message: SessionAgentMessage::User(user),
+                    ..
+                } => Some(user.content.text()),
+                _ => None,
+            })
+            .expect("user message persisted");
+        let parsed = pa_types::skill_blocks::parse_skill_block(&user_text)
+            .expect("the persisted user message is a skill block");
+        assert_eq!(parsed.name, "web-search");
+        assert_eq!(
+            parsed.user_message.as_deref(),
+            Some("find rust tuis"),
+            "args persist as the trailing user message"
+        );
+        assert!(parsed.content.contains("Run a web search."));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_skill_command_passes_through() {
+        let session = scripted_session().await;
+        session
+            .prompt("/skill:missing do a thing", PromptOptions::default())
+            .await
+            .unwrap();
+        session.agent().wait_for_idle().await;
+        let entries = session.entries().await;
+        let user_text = entries
+            .iter()
+            .find_map(|entry| match entry {
+                FileEntry::Message {
+                    message: SessionAgentMessage::User(user),
+                    ..
+                } => Some(user.content.text()),
+                _ => None,
+            })
+            .expect("user message persisted");
+        assert_eq!(user_text, "/skill:missing do a thing");
     }
 
     /// A scripted session wired like the engine wires production sessions:
@@ -1141,6 +1358,76 @@ mod tests {
             user_rows, 0,
             "the injected turn must not persist a user row"
         );
+    }
+
+    /// A delivered agent message's custom row produces the byte-identical
+    /// provider context to the plain-prompt delivery (TS
+    /// `acceptAgentMessagePrompt`: the custom message replaces the turn's
+    /// user row while its prompt content still runs the model). The
+    /// comparison covers the whole request - system prompt, tools, and
+    /// every message row - with only the per-run timestamps normalized.
+    #[tokio::test]
+    async fn an_agent_message_custom_row_matches_the_plain_prompt_context() {
+        let prompt = "[agent-message from child:research-lane]\n\nthe research is done";
+
+        // The plain delivery: the prompt text as the accepted user row.
+        let plain_provider = Arc::new(ScriptedProvider::new(test_model()));
+        plain_provider.push_text_turn("ack");
+        let (plain_session, _plain_tmp) = digest_session(Arc::clone(&plain_provider)).await;
+        plain_session
+            .prompt(prompt, PromptOptions::default())
+            .await
+            .unwrap();
+        plain_session.agent().wait_for_idle().await;
+
+        // The delivered shape: the `agent_message` custom row whose content
+        // is the same prompt (TS `createAgentSessionMessage`).
+        let row_provider = Arc::new(ScriptedProvider::new(test_model()));
+        row_provider.push_text_turn("ack");
+        let (row_session, _row_tmp) = digest_session(Arc::clone(&row_provider)).await;
+        let row = pa_types::session::CustomMessage {
+            custom_type: crate::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE
+                .to_string(),
+            content: pa_types::ai::UserContent::Text(prompt.to_string()),
+            display: true,
+            details: Some(serde_json::json!({
+                "id": "agentmsg_golden",
+                "message": "the research is done",
+                "from": {
+                    "activeSessionId": "child-1",
+                    "sessionName": "research-lane",
+                },
+                "fromRelationship": "child",
+                "target": { "activeSessionId": "parent-1" },
+            })),
+            timestamp: 0,
+            rest: Default::default(),
+        };
+        row_session.prompt_injected_message(&row).await.unwrap();
+        row_session.agent().wait_for_idle().await;
+
+        let plain_calls = plain_provider.calls();
+        let row_calls = row_provider.calls();
+        assert_eq!(plain_calls.len(), 1);
+        assert_eq!(row_calls.len(), 1);
+        assert_eq!(
+            normalized_context(&plain_calls[0]),
+            normalized_context(&row_calls[0]),
+            "the agent_message row must not change the provider request"
+        );
+    }
+
+    /// The provider request with the per-run message timestamps zeroed
+    /// (each delivery mints its own runtime stamp; every other byte is
+    /// compared).
+    fn normalized_context(context: &pa_agent::stream::LlmContext) -> serde_json::Value {
+        let mut value = serde_json::to_value(context).unwrap();
+        for message in value["messages"].as_array_mut().unwrap() {
+            if let Some(timestamp) = message.get_mut("timestamp") {
+                *timestamp = serde_json::json!(0);
+            }
+        }
+        value
     }
 
     #[tokio::test]
@@ -1569,7 +1856,8 @@ mod compaction_outcome_tests {
                 CompactionOutcomeKind::Failed,
                 "Requested compaction failed: Summarization failed",
             )
-            .await;
+            .await
+            .unwrap();
         // The entry chain owns the row (context rebuilds read it).
         let entries = session.entries().await;
         let outcome_entries: Vec<_> = entries
@@ -1630,7 +1918,7 @@ mod compaction_outcome_tests {
         let sessions = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         let mut manager = SessionManager::persisted(tmp.path(), &sessions);
-        manager.append_message(seeded_assistant());
+        manager.append_message(seeded_assistant()).unwrap();
         let file = manager.get_session_file().unwrap().to_path_buf();
         assert!(file.exists(), "the session file materialized");
         // Replace the session file with a directory at the same path: every
@@ -1645,7 +1933,8 @@ mod compaction_outcome_tests {
                 CompactionOutcomeKind::Skipped,
                 "Auto-compaction skipped: Already compacted",
             )
-            .await;
+            .await
+            .unwrap();
         // The write failed (the file path is a directory) — but the entry
         // chain and a context rebuild keep the disclosure.
         let entries = session.entries().await;
@@ -1666,6 +1955,65 @@ mod compaction_outcome_tests {
                 .iter()
                 .any(|message| matches!(message, SessionAgentMessage::Custom(custom) if custom.custom_type == "compaction_outcome")),
             "a rebuild cannot drop the disclosure"
+        );
+    }
+
+    /// The subscriber arm (TS `_processAgentEvent` on `_agentEventQueue`
+    /// whose `.catch(() => {})` swallows persistence failures) never fails
+    /// the run for a write error: the loop already owns the row in live
+    /// state, so the session retains it and the error only logs — no error
+    /// assistant row lands in either store.
+    #[tokio::test]
+    async fn message_end_persist_failure_retains_the_row_and_swallows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut manager = SessionManager::persisted(tmp.path(), &sessions);
+        manager.append_message(seeded_assistant()).unwrap();
+        let file = manager.get_session_file().unwrap().to_path_buf();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let session = scripted_session_over(manager).await;
+        let before = session
+            .session
+            .lock()
+            .await
+            .get_all_entries()
+            .to_vec()
+            .len();
+        persist_event(
+            &session.session,
+            AgentEvent::MessageEnd {
+                message: AgentMessage::user("retained after the failed write"),
+            },
+        )
+        .await
+        .expect("a failed disk write must not fail the event queue");
+        let guard = session.session.lock().await;
+        let entries = guard.get_all_entries().to_vec();
+        drop(guard);
+        assert_eq!(entries.len(), before + 1, "the row stays live-indexed");
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry, FileEntry::Message {
+                    message: SessionAgentMessage::Assistant(assistant),
+                    ..
+                } if assistant.error_message.is_some())),
+            "no phantom error row for a persistence failure"
+        );
+        let context = crate::session::build_session_context(
+            &entries,
+            entries
+                .last()
+                .and_then(|entry| entry.id().map(str::to_owned))
+                .as_deref(),
+        );
+        assert!(
+            serde_json::to_string(&context.messages)
+                .unwrap()
+                .contains("retained after the failed write"),
+            "a context rebuild keeps the retained row"
         );
     }
 }

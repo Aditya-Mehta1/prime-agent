@@ -223,9 +223,11 @@ async fn search_narrows_the_roster_and_escape_restores_it() {
         width: 120,
         height: 36,
     };
-    let outcome = pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan))
-        .await
-        .expect("agents view run");
+    let outcome =
+        pa_tui::agents_view::run_agents_view(options, AgentsViewUiMode::Headless(plan), None)
+            .await
+            .expect("agents view run")
+            .outcome;
     assert!(!outcome.frames.is_empty(), "frames were captured");
     let all = outcome.frames.join("\n---frame---\n");
     assert!(

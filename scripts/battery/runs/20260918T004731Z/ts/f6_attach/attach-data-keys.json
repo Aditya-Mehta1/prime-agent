@@ -1,9 +1,0 @@
-[
- "activeSessionId",
- "client",
- "lastEventCursor",
- "lastEventSequence",
- "protocol",
- "replay",
- "snapshot"
-]

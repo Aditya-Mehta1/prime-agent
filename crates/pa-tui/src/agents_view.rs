@@ -44,8 +44,10 @@ pub struct AgentsViewOptions {
     pub session_dir: Option<PathBuf>,
     pub theme: String,
     pub version: String,
-    /// The session the view was opened from: keeps its recency slot and
-    /// survives the empty-catalog filter.
+    /// The session the view was opened from: keeps its recency slot,
+    /// survives the empty-catalog filter, and anchors a fresh open's entry
+    /// selection on its row (the agents-back handoff selects the session
+    /// just left, not the first row).
     pub anchor_session_id: Option<String>,
     /// Open scoped to one session's subtree (the subagent summary line's
     /// open action; TS `scoped_agents_view`): the root lists its
@@ -157,8 +159,52 @@ const PULSE_INTERVAL_MS: u64 = 250;
 
 enum UiInput {
     Key(String),
+    Resize,
     Settled,
     Done,
+    /// The saved-catalog fetch landed (TS `armSavedSearchFetch` applying
+    /// its result while the view already runs): the Inactive section
+    /// rebuilds from these rows.
+    SavedLoaded {
+        sessions: Vec<Value>,
+    },
+    /// The saved-catalog fetch failed; the status line reports it.
+    SavedFailed {
+        error: String,
+    },
+}
+
+/// The flow's roster connection (TS `AgentsViewPersistentState.rosterClient`):
+/// the agents-view loop keeps one daemon connection alive across its view
+/// runs, so a handoff back from a chat reuses the live connection instead
+/// of reconnecting (the hello handshake and auth never run twice for the
+/// same flow). The connection stays unattached to any session; roster
+/// subscriptions come and go with the individual view runs.
+pub struct AgentsViewLink {
+    client: DaemonClient,
+    events: mpsc::UnboundedReceiver<DaemonClientEvent>,
+}
+
+impl AgentsViewLink {
+    async fn connect(socket_path: &std::path::Path) -> Result<Self> {
+        let (client, events) = DaemonClient::connect(socket_path).await?;
+        Ok(Self { client, events })
+    }
+
+    /// Release the connection; the supervisor drops the roster subscription
+    /// with the socket (TS `runAgentsViewMode` closes the persistent client
+    /// when its loop ends).
+    pub fn close(&self) {
+        self.client.close();
+    }
+}
+
+/// One agents-view run plus the roster connection it kept alive for the
+/// next run in the same flow (`None` when the run exited fully and closed
+/// it).
+pub struct AgentsViewRun {
+    pub outcome: AgentsViewOutcome,
+    pub link: Option<AgentsViewLink>,
 }
 
 /// The agents view state: roster + catalog data, search, selection, and
@@ -194,6 +240,13 @@ struct AgentsViewMode {
     /// The selection key that survives an identity flip (TS
     /// `persistentState.selectedSessionKey`).
     selected_key: Option<SelectionKey>,
+    /// Whether the entry selection still waits on the anchor session's row:
+    /// a fresh open (the agents-back handoff opens the view on the session
+    /// just left) lands the selection there once the row appears — a nested
+    /// anchor arrives with its ancestors' lists expanded — and the first
+    /// user move cancels the wait. A scoped view never lists the anchor
+    /// (the scope root is excluded), so the first-row default stands there.
+    anchor_selection_pending: bool,
     /// First ctrl+c shows the exit hint; the second exits.
     exit_armed: bool,
     /// The double-Ctrl+C force-quit guard (the run's shared instance is
@@ -227,6 +280,23 @@ impl AgentsViewMode {
         let selected_identity = options.selected_row_identity.clone();
         let selected_key = options.selected_key.clone();
         let keybindings = options.keybindings.clone();
+        // A fresh open (no carried identity or usable key — the scope-back
+        // handoff leaks an empty identity and a key with no session ids,
+        // neither restores anything) waits on the anchor: the session the
+        // view was opened from, the agents-back handoff's anchor.
+        let carried_selection = options
+            .selected_row_identity
+            .as_deref()
+            .is_some_and(|identity| !identity.is_empty())
+            || options
+                .selected_key
+                .as_ref()
+                .is_some_and(|key| key.session_id.is_some() || key.active_session_id.is_some());
+        let anchor_selection_pending = !carried_selection
+            && options
+                .anchor_session_id
+                .as_deref()
+                .is_some_and(|anchor| !anchor.is_empty());
         AgentsViewMode {
             options,
             theme,
@@ -245,6 +315,7 @@ impl AgentsViewMode {
             pending_ancestors,
             selected_identity,
             selected_key,
+            anchor_selection_pending,
             exit_armed: false,
             exit_guard: crate::exit_guard::ExitGuard::new(),
             pulse: 0,
@@ -324,6 +395,25 @@ impl AgentsViewMode {
             &rollups,
             self.options.anchor_session_id.as_deref(),
         );
+        // The entry anchor's row may be nested: arm the same ancestor
+        // expansion below so this pass reveals it (a top-level anchor has
+        // no ancestors, and a scoped view never lists the anchor at all —
+        // the scope root is excluded — so the wait just stands by).
+        if let (true, Some(anchor)) = (
+            self.anchor_selection_pending
+                && self.options.scope.is_none()
+                && self.pending_ancestors.is_none(),
+            self.options.anchor_session_id.as_deref(),
+        ) {
+            self.pending_ancestors = Some(scope_ancestors(
+                &records,
+                &AgentsViewScope {
+                    session_id: Some(anchor.to_string()),
+                    active_session_id: None,
+                    session_name: None,
+                },
+            ));
+        }
         // Re-expand the drilled-in row's ancestors (TS
         // `applyPendingAncestorExpansion`): a nested ancestor's row only
         // appears once its own parent is expanded, so expand-and-rebuild
@@ -362,6 +452,23 @@ impl AgentsViewMode {
             identity.as_deref().or(self.selected_identity.as_deref()),
             self.selected_key.as_ref(),
         );
+        // The entry anchor lands the selection on the anchor session's row
+        // once it appears (the agents-back handoff: the view opens on the
+        // session just left); until then the rebuild's default holds. The
+        // sync below then pins the anchor row, so later rebuilds restore
+        // onto it through the carried identity/key alone.
+        if let (true, Some(anchor)) = (
+            self.anchor_selection_pending,
+            self.options.anchor_session_id.as_deref(),
+        ) {
+            if let Some(index) = rows.iter().position(|row| {
+                row.selectable()
+                    && row.summary.get("sessionId").and_then(Value::as_str) == Some(anchor)
+            }) {
+                self.selected = index;
+                self.anchor_selection_pending = false;
+            }
+        }
         self.rows = rows;
         self.sync_selected_row_state();
     }
@@ -413,8 +520,11 @@ impl AgentsViewMode {
     /// Move the selection by `delta` selectable rows (TS `moveSelection`,
     /// which ends with `syncSelectedRowState`): the move refreshes the
     /// carried identity/key so the next roster rebuild resolves the
-    /// selection back onto the row the user actually landed on.
+    /// selection back onto the row the user actually landed on. The first
+    /// move is an explicit user choice: it cancels the entry anchor's wait,
+    /// which must never override it.
     fn move_selection(&mut self, delta: isize) {
+        self.anchor_selection_pending = false;
         let selectable: Vec<usize> = self
             .rows
             .iter()
@@ -1210,6 +1320,11 @@ impl Renderer {
                 // surface of the process enters it, so a view switch never
                 // flashes the primary screen.
                 crate::altscreen::enter()?;
+                // The enhanced-key modes come up with the raw-mode
+                // bracket (TS `ProcessTerminal.start`): pastes arrive as
+                // one chunk, the kitty probe runs before the reader
+                // thread starts polling.
+                crate::enhanced_keys::enable(&mut std::io::stdout())?;
                 // One reader thread feeds the view; the reader registry
                 // joins the previous surface's reader (the chat it opened)
                 // before this one starts polling. The reader also observes
@@ -1219,20 +1334,36 @@ impl Renderer {
                 crate::input::spawn_terminal_reader(move |event| match event {
                     crossterm::event::Event::Key(key) => {
                         exit_guard.observe_key(&key);
-                        let id = crate::keys::key_event_to_id(&key).unwrap_or_default();
+                        // The id door filters the way every session handler
+                        // does (`let Some(id) = key_event_to_id(&key)`): kitty
+                        // Release events and unmappable keys map to no id, and
+                        // a forwarded empty id would run handle_key's "any
+                        // other key" arm — clearing the armed exit hint
+                        // between the presses of a double Ctrl+C, so the
+                        // second press re-arms instead of exiting.
+                        let Some(id) = crate::keys::key_event_to_id(&key) else {
+                            return true;
+                        };
                         ui_tx.send(UiInput::Key(id)).is_ok()
                     }
+                    crossterm::event::Event::Resize(..) => ui_tx.send(UiInput::Resize).is_ok(),
                     _ => true,
                 });
-                let mut terminal = ratatui::Terminal::new(crate::hyperlinks::stdout_backend())?;
+                let terminal = ratatui::Terminal::new(crate::hyperlinks::stdout_backend())?;
                 // The adopted buffer still holds the previous view's frame;
-                // clear it so the first draw is a full repaint of the same
-                // buffer (a fresh alt screen is already blank).
-                terminal.clear()?;
-                // The handoff left the cursor hidden (TS `stop` with
-                // `preserveAltScreen` hides it); this surface wants its own
-                // visible cursor back.
-                crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+                // the first draw repaints the same buffer (a fresh alt
+                // screen is already blank). TS paints the new frame
+                // straight over the old one, so the clear escape must
+                // never reach the pane on its own: queue it with the
+                // cursor show and let the first draw's single flush carry
+                // clear + frame together. A separate clear-and-flush here
+                // shows a blank pane for the whole render gap — a visible
+                // flicker on every surface switch.
+                crossterm::queue!(
+                    std::io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    crossterm::cursor::Show
+                )?;
                 Ok(Renderer::Terminal(terminal))
             }
             AgentsViewUiMode::Headless(plan) => {
@@ -1321,6 +1452,10 @@ impl Renderer {
     fn finish(self, preserve_alt_screen: bool) -> Vec<String> {
         match self {
             Renderer::Terminal(_) => {
+                // The enhanced-key modes release with the raw-mode bracket
+                // (TS `stop` on every exit, handoffs included).
+                let mut out = std::io::stdout();
+                let _ = crate::enhanced_keys::disable(&mut out);
                 if preserve_alt_screen {
                     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
                 } else {
@@ -1336,29 +1471,46 @@ impl Renderer {
 }
 
 /// Run the agents view until the user exits or opens a session.
-pub async fn run_agents_view(
-    options: AgentsViewOptions,
-    ui: AgentsViewUiMode,
-) -> Result<AgentsViewOutcome> {
-    crossterm::style::force_color_output(true);
-    let (client, mut events) = DaemonClient::connect(&options.socket_path)
-        .await
-        .with_context(|| "the agents view could not attach to the daemon")?;
-
-    // The double-Ctrl+C force-quit guard: same contract as the session
-    // loop (see `interactive::run_interactive`).
-    let exit_guard = crate::exit_guard::ExitGuard::new();
-    let mut mode = AgentsViewMode::new(options.clone());
-    mode.exit_guard = exit_guard.clone();
-
-    // The roster snapshot precedes streaming pushes; updates that race the
-    // snapshot apply on top (idempotent by agent id, TS roster-store).
-    let snapshot = client
-        .request(DaemonCommand::RosterSubscribe {
-            id: None,
-            rest: Default::default(),
-        })
-        .await?;
+/// Open the roster connection and pull the first snapshot (TS
+/// `AgentsViewRosterStore` connect plus the `roster_subscribe`
+/// round-trip). The flow's parked connection comes first (TS
+/// `persistentState.rosterClient` staying connected across the loop); a
+/// fresh run connects its own, and a parked connection that died (daemon
+/// update) reconnects once. The roster snapshot precedes streaming
+/// pushes; updates that race the snapshot apply on top (idempotent by
+/// agent id, TS roster-store). Errors leave any opened connection closed.
+async fn open_roster_link(
+    options: &AgentsViewOptions,
+    link: Option<AgentsViewLink>,
+) -> Result<(
+    DaemonClient,
+    mpsc::UnboundedReceiver<DaemonClientEvent>,
+    Vec<Value>,
+)> {
+    let (mut client, mut events) = match link {
+        Some(AgentsViewLink { client, events }) => (client, events),
+        None => {
+            let link = AgentsViewLink::connect(&options.socket_path)
+                .await
+                .with_context(|| "the agents view could not attach to the daemon")?;
+            (link.client, link.events)
+        }
+    };
+    let roster_subscribe = || DaemonCommand::RosterSubscribe {
+        id: None,
+        rest: Default::default(),
+    };
+    let mut snapshot = client.request(roster_subscribe()).await;
+    if snapshot.is_err() {
+        client.close();
+        let link = AgentsViewLink::connect(&options.socket_path)
+            .await
+            .with_context(|| "the agents view could not attach to the daemon")?;
+        client = link.client;
+        events = link.events;
+        snapshot = client.request(roster_subscribe()).await;
+    }
+    let snapshot = snapshot?;
     if !snapshot.success {
         client.close();
         anyhow::bail!(
@@ -1366,111 +1518,191 @@ pub async fn run_agents_view(
             snapshot.error.unwrap_or_default()
         );
     }
-    mode.roster = snapshot
+    let roster = snapshot
         .data
         .as_ref()
         .and_then(|data| data.get("roster"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    Ok((client, events, roster))
+}
 
-    // The saved catalog feeds the Inactive section (cwd + sessionDir scope).
-    let saved = client
-        .request(DaemonCommand::ListSavedSessions {
-            id: None,
-            cwd: Some(mode.options.cwd.to_string_lossy().to_string()),
-            session_dir: mode
-                .options
-                .session_dir
-                .as_ref()
-                .map(|dir| dir.to_string_lossy().to_string()),
-            active_session_id: None,
-            scope: Value::Null,
-            rest: Default::default(),
-        })
-        .await?;
-    if saved.success {
-        mode.saved = saved
-            .data
-            .as_ref()
-            .and_then(|data| data.get("sessions"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-    } else if let Some(error) = saved.error {
-        mode.status = Some(format!("Saved sessions unavailable: {error}"));
-    }
+pub async fn run_agents_view(
+    options: AgentsViewOptions,
+    ui: AgentsViewUiMode,
+    link: Option<AgentsViewLink>,
+) -> Result<AgentsViewRun> {
+    crossterm::style::force_color_output(true);
+    // The connection and its first snapshot precede every surface state:
+    // this pane was handed over already in TUI state (raw mode on, the
+    // alternate screen up, the cursor hidden — the chat's teardown
+    // preserves them for this view), so a failure here must hand the
+    // terminal back before the error escapes (TS `returnToAgentsView`'s
+    // `finally` runs the same release on a failed handoff); nothing below
+    // runs to do it.
+    let (client, mut events, roster) = match open_roster_link(&options, link).await {
+        Ok(open) => open,
+        Err(error) => {
+            if matches!(ui, AgentsViewUiMode::Terminal) {
+                crate::exit_guard::restore_terminal_best_effort();
+            }
+            return Err(error);
+        }
+    };
+
+    // The double-Ctrl+C force-quit guard: same contract as the session
+    // loop (see `interactive::run_interactive`).
+    let exit_guard = crate::exit_guard::ExitGuard::new();
+    let mut mode = AgentsViewMode::new(options.clone());
+    mode.exit_guard = exit_guard.clone();
+
+    mode.roster = roster;
     mode.rebuild_rows();
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
-    let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone())?;
+    let mut renderer = Renderer::setup(ui, ui_tx.clone(), exit_guard.clone())?;
+    // The first frame renders from the live roster the moment the surface
+    // mounts (TS `applySessionList(this.rosterStore.summaries(), true)`
+    // before its first `requestRender`): the saved-catalog fetch below
+    // applies as an input when it lands instead of holding the frame.
+    renderer.draw(&mut mode);
+    // The saved catalog feeds the Inactive section (cwd + sessionDir
+    // scope). TS `armSavedSearchFetch` runs the scan while the view is
+    // already interactive, so a large catalog never delays the first
+    // frame; the result (or its failure) re-enters the loop as an input.
+    {
+        let client = client.clone();
+        let cwd = mode.options.cwd.clone();
+        let session_dir = mode.options.session_dir.clone();
+        let ui_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let saved = client
+                .request(DaemonCommand::ListSavedSessions {
+                    id: None,
+                    cwd: Some(cwd.to_string_lossy().to_string()),
+                    session_dir: session_dir.map(|dir| dir.to_string_lossy().to_string()),
+                    active_session_id: None,
+                    scope: Value::Null,
+                    rest: Default::default(),
+                })
+                .await;
+            let input = match saved {
+                Ok(response) if response.success => UiInput::SavedLoaded {
+                    sessions: response
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("sessions"))
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+                Ok(response) => UiInput::SavedFailed {
+                    error: response.error.unwrap_or_else(|| "unknown error".into()),
+                },
+                Err(error) => UiInput::SavedFailed {
+                    error: error.to_string(),
+                },
+            };
+            let _ = ui_tx.send(input);
+        });
+    }
+    // Broadcast frames that landed on the parked connection while the view
+    // was closed (heartbeats): the fresh roster snapshot supersedes them.
+    while events.try_recv().is_ok() {}
     let mut pending: Vec<UiInput> = Vec::new();
     let mut last_pulse = tokio::time::Instant::now();
 
     while mode.running {
+        let mut redraw = false;
         if let Some(input) = first_input(&mut pending) {
             match input {
                 UiInput::Key(key) => mode.handle_key(&key),
-                UiInput::Settled => {}
+                UiInput::Resize | UiInput::Settled => {}
+                // The saved-catalog scan landed (TS `armSavedSearchFetch`
+                // applying its result): the Inactive section builds now.
+                UiInput::SavedLoaded { sessions } => {
+                    mode.saved = sessions;
+                    mode.rebuild_rows();
+                }
+                UiInput::SavedFailed { error } => {
+                    mode.status = Some(format!("Saved sessions unavailable: {error}"));
+                }
                 // The headless plan ended: the run stops here (the
                 // interactive harness's `HeadlessDone` contract). A plan
                 // that ends without an exit key still captures its frames
                 // and returns instead of spinning forever.
                 UiInput::Done => mode.running = false,
             }
-            if let Renderer::Terminal(_) = renderer {
-                renderer.draw(&mut mode);
+            // An exit decision skips sync terminal I/O: a wedged pty must
+            // not prevent the reader-armed force-quit deadline from firing.
+            if !mode.running {
+                break;
             }
-        }
-        if !mode.running {
-            break;
-        }
-        tokio::select! {
-            maybe_event = events.recv() => {
-                match maybe_event {
-                    Some(DaemonClientEvent::RosterUpdate { changed, removed, resync }) => {
-                        mode.apply_roster_update(changed, removed, resync);
-                    }
-                    Some(_) => {}
-                    None => {
-                        mode.status = Some("the daemon connection closed".to_string());
-                        mode.running = false;
+            redraw = true;
+        } else {
+            tokio::select! {
+                maybe_event = events.recv() => {
+                    match maybe_event {
+                        Some(DaemonClientEvent::RosterUpdate { changed, removed, resync }) => {
+                            mode.apply_roster_update(changed, removed, resync);
+                            redraw = true;
+                        }
+                        Some(_) => {}
+                        None => {
+                            mode.status = Some("the daemon connection closed".to_string());
+                            mode.running = false;
+                            redraw = true;
+                        }
                     }
                 }
-            }
-            maybe_input = ui_rx.recv() => {
-                if let Some(input) = maybe_input {
-                    pending.push(input);
+                maybe_input = ui_rx.recv() => {
+                    if let Some(input) = maybe_input {
+                        pending.push(input);
+                        continue;
+                    }
                 }
+                // Only a running row needs a periodic frame. The timer
+                // stays tied to the last pulse across unrelated inputs.
+                _ = tokio::time::sleep_until(last_pulse + Duration::from_millis(PULSE_INTERVAL_MS)),
+                    if mode.rows.iter().any(|row| row.section == Section::Running) => {}
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
-        // The running-row icon animates at the TS working-icon cadence.
-        if mode.rows.iter().any(|row| row.section == Section::Running)
-            && last_pulse.elapsed() >= Duration::from_millis(PULSE_INTERVAL_MS)
-        {
-            last_pulse = tokio::time::Instant::now();
-            mode.pulse = mode.pulse.wrapping_add(1);
+        // Coalesce a due animation pulse with the input or roster frame.
+        redraw |= advance_running_pulse(&mut mode, &mut last_pulse, tokio::time::Instant::now());
+        if redraw {
+            renderer.draw(&mut mode);
         }
-        renderer.draw(&mut mode);
     }
 
     // The view decided to leave: arm the force-quit deadline so the
     // teardown below (terminal restore, roster unsubscribe over a possibly
-    // dead daemon) is best-effort and cannot hold the process open.
-    if matches!(renderer, Renderer::Terminal(_)) {
+    // dead daemon) is best-effort and cannot hold the process open. A
+    // selection (or a new session) is a view switch, not an exit: the
+    // process keeps running and TS has no exit deadline on this path —
+    // its teardown may take its full drain second while the app simply
+    // waits, so the deadline covers only the leaves that end this process.
+    let handing_off = mode.opened.is_some() || mode.new_session;
+    if matches!(renderer, Renderer::Terminal(_)) && !handing_off {
         exit_guard.arm_for_exit();
     }
     // A selection hands the pane to the chat it opened (TS `result.type !== "exit"`);
     // exiting releases the alternate screen.
     let frames = renderer.finish(mode.opened.is_some() || mode.new_session);
-    let _ = client
-        .request(DaemonCommand::RosterUnsubscribe {
-            id: None,
-            rest: Default::default(),
-        })
-        .await;
-    client.close();
+    // TS `AgentsViewRosterStore.dispose` fires the roster unsubscribe
+    // fire-and-forget ("nobody needs the ack"; the supervisor also drops
+    // the subscription with the socket), so no handoff ever waits on it.
+    {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = client
+                .request(DaemonCommand::RosterUnsubscribe {
+                    id: None,
+                    rest: Default::default(),
+                })
+                .await;
+        });
+    }
     // A selection hands the terminal to a session run: the process keeps
     // going, so retire the watchdog. A selection-less exit ends the
     // process, where the deadline dies with it — or fires if it wedged.
@@ -1478,25 +1710,53 @@ pub async fn run_agents_view(
         exit_guard.cancel();
     }
     let opened = mode.opened.take();
-    Ok(AgentsViewOutcome {
-        selection: opened
-            .as_ref()
-            .map(|row| row.selection.clone())
-            .or(mode.new_session.then_some(SessionSelection::New)),
-        frames,
-        query: (!mode.query.is_empty()).then(|| mode.query.clone()),
-        scope_popped: mode.scope_popped,
-        scope_dropped: mode.scope_dropped,
-        expanded_ancestors: opened
-            .as_ref()
-            .map(|row| row.expanded_ancestors.clone())
-            .unwrap_or_default(),
-        selected_row_identity: opened.as_ref().map(|row| row.selected_row_identity.clone()),
-        selected_key: opened.as_ref().map(|row| row.selected_key.clone()),
-        opened_rlm_depth: opened.as_ref().and_then(|row| row.rlm_depth),
-        opened_has_children: opened.as_ref().map(|row| row.has_children).unwrap_or(false),
-        status_message: opened.as_ref().and_then(|row| row.status_message.clone()),
+    // A handoff returns the roster connection for the flow's next view run
+    // (TS `persistentState.rosterClient`); a selection-less exit closes it.
+    let link = if opened.is_some() || mode.new_session {
+        Some(AgentsViewLink { client, events })
+    } else {
+        client.close();
+        None
+    };
+    Ok(AgentsViewRun {
+        link,
+        outcome: AgentsViewOutcome {
+            selection: opened
+                .as_ref()
+                .map(|row| row.selection.clone())
+                .or(mode.new_session.then_some(SessionSelection::New)),
+            frames,
+            query: (!mode.query.is_empty()).then(|| mode.query.clone()),
+            scope_popped: mode.scope_popped,
+            scope_dropped: mode.scope_dropped,
+            expanded_ancestors: opened
+                .as_ref()
+                .map(|row| row.expanded_ancestors.clone())
+                .unwrap_or_default(),
+            selected_row_identity: opened.as_ref().map(|row| row.selected_row_identity.clone()),
+            selected_key: opened.as_ref().map(|row| row.selected_key.clone()),
+            opened_rlm_depth: opened.as_ref().and_then(|row| row.rlm_depth),
+            opened_has_children: opened.as_ref().map(|row| row.has_children).unwrap_or(false),
+            status_message: opened.as_ref().and_then(|row| row.status_message.clone()),
+        },
     })
+}
+
+/// Advance the running icon at its fixed cadence, independent of other inputs.
+fn advance_running_pulse(
+    mode: &mut AgentsViewMode,
+    last_pulse: &mut tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    if mode.rows.iter().any(|row| row.section == Section::Running)
+        && now.duration_since(*last_pulse) >= Duration::from_millis(PULSE_INTERVAL_MS)
+    {
+        *last_pulse = now;
+        mode.pulse = mode.pulse.wrapping_add(1);
+        true
+    } else {
+        false
+    }
 }
 
 /// Pop the next queued input, or `None` when the queue is empty.
@@ -1657,6 +1917,160 @@ mod tests {
         mode
     }
 
+    /// A fresh-open view anchored on the given session (the agents-back
+    /// handoff state: no carried selection, the session just left).
+    fn mode_with_anchor(anchor: Option<&str>, roster: Vec<serde_json::Value>) -> AgentsViewMode {
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: anchor.map(str::to_string),
+            scope: None,
+            query: None,
+            expanded_ancestors: Vec::new(),
+            selected_row_identity: None,
+            selected_key: None,
+            status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
+        });
+        mode.roster = roster;
+        mode.rebuild_rows();
+        mode
+    }
+
+    /// A fresh open (the agents-back handoff) anchors the entry selection
+    /// on the session the view was opened from, not the first row.
+    #[test]
+    fn entry_anchor_selects_the_left_session() {
+        let mode = mode_with_anchor(
+            Some("s2"),
+            vec![
+                roster_entry("s1", "idle", parent_summary("s1")),
+                roster_entry("s2", "idle", parent_summary("s2")),
+            ],
+        );
+        assert_eq!(mode.rows[mode.selected].summary["sessionId"], "s2");
+        assert!(!mode.anchor_selection_pending);
+    }
+
+    /// The anchor row can arrive after the first rebuild (the roster
+    /// streams, the saved catalog lands later): the wait survives the
+    /// rebuilds that pin other rows and lands once the row appears.
+    #[test]
+    fn anchor_wait_survives_until_the_row_arrives() {
+        let mut mode = mode_with_anchor(
+            Some("s2"),
+            vec![roster_entry("s1", "idle", parent_summary("s1"))],
+        );
+        assert_eq!(mode.rows[mode.selected].summary["sessionId"], "s1");
+        assert!(mode.anchor_selection_pending);
+        mode.roster
+            .push(roster_entry("s2", "idle", parent_summary("s2")));
+        mode.rebuild_rows();
+        assert_eq!(mode.rows[mode.selected].summary["sessionId"], "s2");
+        assert!(!mode.anchor_selection_pending);
+    }
+
+    /// The first user move cancels the wait: the anchor never overrides an
+    /// explicit selection.
+    #[test]
+    fn anchor_wait_cancels_on_the_first_user_move() {
+        let mut mode = mode_with_anchor(
+            Some("s2"),
+            vec![roster_entry("s1", "idle", parent_summary("s1"))],
+        );
+        mode.handle_key("down");
+        assert!(!mode.anchor_selection_pending);
+        mode.roster
+            .push(roster_entry("s2", "idle", parent_summary("s2")));
+        mode.rebuild_rows();
+        assert_eq!(mode.rows[mode.selected].summary["sessionId"], "s1");
+    }
+
+    /// A nested anchor (a subagent session the user was attached to) arrives
+    /// with its ancestors' lists expanded so its row is reachable — the
+    /// same expansion the drilled-in return path uses.
+    #[test]
+    fn nested_anchor_expands_its_ancestors() {
+        let mode = mode_with_anchor(
+            Some("c"),
+            vec![
+                roster_entry("p", "idle", parent_summary("p")),
+                roster_entry("c", "running", child_summary("c", "p", "worker one")),
+            ],
+        );
+        assert_eq!(mode.rows.len(), 3, "the parent's list opened");
+        assert_eq!(mode.rows[mode.selected].summary["sessionId"], "c");
+    }
+
+    /// A carried selection (the view/session loop's restore) wins over the
+    /// anchor: only fresh opens wait on it.
+    #[test]
+    fn carried_selection_wins_over_the_entry_anchor() {
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: Some("s2".to_string()),
+            scope: None,
+            query: None,
+            expanded_ancestors: Vec::new(),
+            selected_row_identity: None,
+            selected_key: Some(crate::agents_view_forest::SelectionKey {
+                session_id: Some("s1".to_string()),
+                active_session_id: Some("s1-live".to_string()),
+            }),
+            status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
+        });
+        mode.roster = vec![
+            roster_entry("s1", "idle", parent_summary("s1")),
+            roster_entry("s2", "idle", parent_summary("s2")),
+        ];
+        mode.rebuild_rows();
+        assert_eq!(mode.rows[mode.selected].summary["sessionId"], "s1");
+        assert!(!mode.anchor_selection_pending);
+    }
+
+    /// The scoped view (the subagents summary line's open action) never
+    /// lists the anchor — the scope root is excluded — so the first-row
+    /// default stands there.
+    #[test]
+    fn scoped_view_keeps_the_first_row_default() {
+        let mut mode = AgentsViewMode::new(AgentsViewOptions {
+            socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+            cwd: PathBuf::from("/tmp"),
+            session_dir: None,
+            theme: "prime".to_string(),
+            version: "0.0.0".to_string(),
+            anchor_session_id: Some("p".to_string()),
+            scope: Some(AgentsViewScope {
+                session_id: Some("p".to_string()),
+                active_session_id: Some("p-live".to_string()),
+                session_name: Some("p name".to_string()),
+            }),
+            query: None,
+            expanded_ancestors: Vec::new(),
+            selected_row_identity: None,
+            selected_key: None,
+            status_message: None,
+            keybindings: crate::keybindings::KeybindingsManager::new(),
+        });
+        mode.roster = vec![
+            roster_entry("p", "idle", parent_summary("p")),
+            roster_entry("c", "running", child_summary("c", "p", "worker one")),
+        ];
+        mode.rebuild_rows();
+        assert_eq!(mode.rows.len(), 1, "the scope root is excluded");
+        assert_eq!(mode.selected, 0);
+        assert_eq!(mode.rows[0].summary["sessionId"], "c");
+        assert!(mode.anchor_selection_pending, "the wait never resolves");
+    }
+
     /// TS `countRowsBySection` (the splash header counts) counts agent-kind
     /// rows only: a nested running subagent never inflates the header.
     #[test]
@@ -1812,6 +2226,21 @@ mod tests {
         mode.handle_key("ctrl+c");
         assert!(mode.exit_armed, "the cleared hint re-arms");
         assert!(mode.running);
+    }
+
+    /// Kitty-protocol key releases map to no key id: the reader filters
+    /// them the way every session handler does, so a release never runs
+    /// handle_key's "any other key" arm — which would clear the armed
+    /// exit hint between the presses of a double Ctrl+C, and the second
+    /// press would re-arm the hint instead of exiting.
+    #[test]
+    fn kitty_releases_map_to_no_key_id() {
+        let mut release = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        release.kind = crossterm::event::KeyEventKind::Release;
+        assert!(crate::keys::key_event_to_id(&release).is_none());
     }
 
     #[test]
@@ -2233,5 +2662,40 @@ mod tests {
         let texts = frame_texts(&mut mode);
         assert!(texts[3].contains("session 1"));
         assert_eq!(texts[7].trim(), "...");
+    }
+
+    #[test]
+    fn idle_draws_only_on_running_row_pulses() {
+        for count in [0, 100, 1000] {
+            for running in [false, true] {
+                let (mut mode, _) = mode_with_row("row", "mock-1");
+                let template = mode.rows[0].clone();
+                mode.rows = (0..count)
+                    .map(|n| {
+                        let mut row = template.clone();
+                        row.identity = format!("agent {n}");
+                        row.section = if running {
+                            Section::Running
+                        } else {
+                            Section::Idle
+                        };
+                        row
+                    })
+                    .collect();
+                let start = tokio::time::Instant::now();
+                let mut last_pulse = start;
+                let draws = (1..=20)
+                    .filter(|tick| {
+                        advance_running_pulse(
+                            &mut mode,
+                            &mut last_pulse,
+                            start + Duration::from_millis(tick * 50),
+                        )
+                    })
+                    .count();
+                let expected = if running && count > 0 { 4 } else { 0 };
+                assert_eq!((draws, mode.pulse), (expected, expected));
+            }
+        }
     }
 }

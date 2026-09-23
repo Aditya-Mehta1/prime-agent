@@ -630,11 +630,7 @@ impl TurnBoundary {
                 // `compaction_end` pair streams in json mode (the outcome
                 // persists in the session entries the headless terminal
                 // result reads in text mode).
-                if engine
-                    .session
-                    .auto_compaction_due(model.context_window)
-                    .await
-                {
+                if engine.session.auto_compaction_due(model).await {
                     self.emit_json(compaction_start_event(
                         CompactionOutcomeReason::Threshold.wire(),
                         None,
@@ -934,10 +930,20 @@ impl TurnBoundary {
             .session
             .record_compaction_outcome(reason, outcome, message)
             .await;
-        if self.json_mode {
-            let value = crate::headless_autonomous::custom_row_wire_value(&row);
-            for event_type in ["message_start", "message_end"] {
-                (self.sink)(&json!({ "type": event_type, "message": value }));
+        // A failed durable row skips only the row events; the terminal
+        // `compaction_end` below still fires so a streamed
+        // `compaction_start` never stays pending.
+        match row {
+            Ok(row) => {
+                if self.json_mode {
+                    let value = crate::headless_autonomous::custom_row_wire_value(&row);
+                    for event_type in ["message_start", "message_end"] {
+                        (self.sink)(&json!({ "type": event_type, "message": value }));
+                    }
+                }
+            }
+            Err(error) => {
+                self.emit_json(json!({ "type": "error", "message": error.to_string() }));
             }
         }
         let mut event = json!({
@@ -971,6 +977,11 @@ mod tests {
     use pa_core::session_engine::engine::{create_session, SessionEngineConfig};
     use pa_types::session::FileEntry;
     use serde_json::json;
+
+    /// The faux model's per-request output budget (maxTokens 16_384 under the
+    /// 32_000 request cap): threshold fixtures subtract it from the window
+    /// alongside the headroom (the combined input+output ceiling).
+    const FAUX_REQUEST_BUDGET: u64 = 16_384;
 
     /// The faux provider registers process-globally; one test at a time
     /// keeps the queued responses deterministic. Async-aware: the guard
@@ -1076,6 +1087,8 @@ mod tests {
             .expect("a session manager");
         let engine = create_session(SessionEngineConfig {
             cron_store: None,
+            steering_mode: None,
+            follow_up_mode: None,
             telemetry,
             cwd: dir.path().to_path_buf(),
             agent_dir,
@@ -1101,6 +1114,7 @@ mod tests {
             extension_tool_allow_list: None,
             prewarm_ipython_kernel: None,
             queued_goal_context_purge: None,
+            queued_steering_probe: None,
         })
         .await
         .expect("the faux session assembles");
@@ -1875,7 +1889,7 @@ mod tests {
             json!({
                 "compaction": {
                     "enabled": true,
-                    "reserveTokens": 128_000u64.saturating_sub(headroom).max(1),
+                    "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
                     "keepRecentTokens": 10
                 }
             }),
@@ -1956,7 +1970,7 @@ mod tests {
             json!({
                 "compaction": {
                     "enabled": true,
-                    "reserveTokens": 128_000u64.saturating_sub(headroom).max(1),
+                    "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
                     "keepRecentTokens": 10
                 },
                 "autoRefine": { "enabled": false }
@@ -2046,7 +2060,7 @@ mod tests {
         let settings = json!({
             "compaction": {
                 "enabled": true,
-                "reserveTokens": 128_000u64.saturating_sub(headroom).max(1),
+                "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
                 "keepRecentTokens": 10,
             }
         });
@@ -2222,6 +2236,9 @@ mod tests {
         let (engine_a, dir_a, _model_a) = faux_engine_with_settings(
             json!({
                 "contextWindow": 20000,
+                // A small output budget keeps the combined input+output
+                // ceiling satisfiable on the 20k window.
+                "maxTokens": 2000,
                 "responses": [{"text": "seed reply"}, {"text": "crossing reply"}],
             }),
             json!({
@@ -2262,6 +2279,7 @@ mod tests {
         let (engine_b, _dir_b, model_b) = faux_engine_with_settings(
             json!({
                 "contextWindow": 20000,
+                "maxTokens": 2000,
                 "responses": [{"text": "the resumed summary"}, {"text": "recovered after the resume"}],
             }),
             json!({

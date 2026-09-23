@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "token": "27ab7b00-cffc-493e-97df-d64f3f0477d8",
-  "pid": 819135,
-  "processStartId": "proc:6892764",
-  "activeSessionId": "aacae3886681",
-  "sessionPath": "/home/ubuntu/lane-worktrees/compaction-abort/scripts/battery/runs/20260920T065725Z-abort/ts/agent/sessions/01a0bd9a-fecb-73eb-9370-f5a2debe77ea.jsonl",
-  "createdAt": "2026-09-20T06:57:26.738Z"
-}

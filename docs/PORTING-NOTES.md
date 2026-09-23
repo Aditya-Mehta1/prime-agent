@@ -533,7 +533,8 @@ Two TS wire behaviors are deliberately out of that row's scope and still open:
   `TurnEnd`/inner `TurnStart` boundary events and the worker frames them in
   the TS shapes — the terminal assistant message plus the turn's
   `toolResults` on every settled turn (aborts and provider errors included,
-  probe-verified cross-side on settled/abort/compact/kill/abort_and_clear_queue
+  probe-verified cross-side on
+  settled/abort/abort_and_send_queued/compact/kill/abort_and_clear_queue
   in `scripts/battery/aborted_row_probe.py`). The `agent_end` `messages`
   payload is still open. The worker's Done-synthesized frames are now a
   fallback for runs that ended without a model turn (session commands,
@@ -591,6 +592,19 @@ model-surface row still compares against the TS binary:
 
 ## Kernel packaging lane notes
 
+- Sandbox cargo gates for kernel-dependent tests: a sandbox build bakes the
+  build machine's source-checkout path into runtime resolution, and a bare
+  sandbox has no `uv` and no packaged sidecar — every kernel ipython cell
+  fails at startup (`kernel startup failed … uv is required …`). Gate runs
+  whose tests execute ipython cells (the pa-daemon goal-loop worker test,
+  the f18 battery flow) must install uv
+  (`curl -LsSf https://astral.sh/uv/install.sh | sh`) and export
+  `PI_PACKAGE_DIR=<repo checkout>` so the vendored `prime-agent-runtime/`
+  resolves (docs/parity-battery.md, "Sandbox-built rust binary + kernel
+  runtime"). Without it the goal-loop worker test fails with a misleading
+  continuation-count mismatch: `goal.complete()` never runs, the goal stays
+  active, and the loop (TS parity: goal continuations are unbounded while
+  the goal is active) mints until the faux script runs dry.
 - Packaged layout (TS install.sh native path + copy-binary-assets.mjs): the
   release artifact is the binary plus exe-adjacent `package.json` (the
   version manifest: `{"version", "piConfig"}`), `prime-agent-runtime/` (the
@@ -749,7 +763,9 @@ the autonomous accounting counts everything non-error).
   accounting counts it like TS's non-error guard.
 - Surface matrix (probe-verified against the TS binary,
   `scripts/battery/aborted_row_probe.py` — a daemon wire/store probe over
-  a held mid-provider-wait turn): `abort` and `abort_and_clear_queue`
+  a held mid-provider-wait turn): `abort`, `abort_and_send_queued` (the
+  interrupt that also delivers the parked steering at the boundary, schema
+  29), and `abort_and_clear_queue`
   broadcast + persist the row (TS `requestAbort` keeps the session
   subscribed), and so does the close family (`kill`; shutdown rides the
   same TS close path) — the gate forwards the row on all of them. The
@@ -998,3 +1014,227 @@ TS reference: `packages/coding-agent/src/modes/interactive/interactive-mode.ts` 
   (TS `tryExecUpdateRelaunch` semantics: exec, child fallback, exit-code
   relay), relaunching with this run's args plus `--resume <sessionFile>`
   unless the invocation already selected a session.
+
+## The stop/delete lifecycle — kill cancels goals and heartbeats (lane deletion-lifecycle, 2026-09-23)
+
+Reference: the TS daemon-mode `closeSessionOnce(reason)` arms
+(daemon-mode.ts) and the supervisor's stop machinery
+(daemon-supervisor.ts). The bug class (the 2026-09-23 zombie saga): a
+killed session's scheduled jobs stayed `active`, so every supervisor boot
+`rearm_scheduled_wake` pass resurrected the dead session on its own
+lane-liveness heartbeat, and the resurrected worker's goal continuation
+kept it working (billed model turns for a session nobody wanted alive).
+
+- TS `closeSessionOnce("killed")` cancels the session's whole job set
+  (`cancelScheduledJobsForSession`, the queued heartbeat follow-ups
+  purged, the scheduler re-armed); `shutdown`/`update` keep the resume
+  entry (the jobs survive for the later wake — TS
+  `closeKeepsResumeEntry`); `replaced`/`completed` keep plain cron jobs
+  but cancel a subagent's RLM heartbeats
+  (`cancelSubagentRlmHeartbeats`). The Rust port now threads the close
+  reason through the worker's `kill` (`rlmCloseReason` rest marker) and
+  the parent's child-close cascade (TS `closeChildSessions(parent,
+  reason)`), so a daemon shutdown no longer cancels the children's
+  heartbeats (the previous port collapsed every child close into a
+  kill, which this lane would otherwise have made load-bearing).
+- TS `persistWorkerStopTombstone` + `finalizeArchivedWorkerStop`: a root
+  kill tombstones BEFORE the worker is told and finalizes after it is
+  gone — the session tree's scheduled jobs cancel
+  (`cancelScheduledJobsForSessionTree`, a live worker covering any tree
+  member owns its stores again) and the root file carries the
+  `archived` state (the catalog `archive` belt). The port adds both to
+  the supervisor's plain-kill route, plus the interrupted-stop recovery:
+  the adoption scan finishes a tombstoned dead worker's stop instead of
+  relaunching it (TS `scheduleWorkerStopFinalization`).
+- TS `isPersistedCronJobRunnable` (the delivery-side gate): a fire whose
+  persisted target is gone (file deleted) or killed (`state !==
+  "active"`) cancels the session's jobs and skips. Ported into the
+  worker's `run_job`.
+- TS `collectPassiveScheduledJobs` (the wake-scan gates): the boot
+  re-arm only wakes a due job whose session file still exists, is still
+  the job's session, still carries the `active` state, and whose file no
+  live worker covers. Ported into `rearm_scheduled_wake` (the passive
+  catalog merge in `scheduling_catalog.rs` already had the state gate).
+- The continuation gates: the engine carries the session's closed marker
+  (TS `_disposed || _disposing`) set by the kill/shutdown closes; the
+  goal and autonomous mints and their settle-hook retries bail on it,
+  and the loop-level continuation hook honors the abort signal (TS
+  `signal?.aborted`). A stopped session mints no continuation.
+- TS `deleteRlmSubagentArtifacts`: a ledger-tombstoned child delete
+  sweeps the child's artifact partition; `delete_saved_session`'s
+  `afterFileRemoved` hook cancels the deleted file's jobs between the
+  file removal and the artifact sweep.
+- Verifiers: `crates/pa-daemon/tests/session_stop_lifecycle_e2e.rs`
+  (kill a goal+heartbeat session → the job cancels durably, the file
+  archives, the tombstoned-stop adoption finishes, and NOTHING revives
+  it across a supervisor restart — while the hard-crashed sibling comes
+  back, proving the wake model itself still works) +
+  `scripts/session_stop_lifecycle_parity.py` (the same flow over the
+  wire on both products).
+- Deliberate scope cuts (the TS sites, not ported here): the supervisor's
+  continuous `recomputeScheduledSessionWake` timer (still a boot/restore
+  pass only, as slice 5 recorded); the parent-walk half of the passive
+  scan's `uncoveredRootFor` (the tree cancel at kill covers the zombie
+  class; the job's own file coverage is checked); the "completed"
+  hydration-error child close (the Rust child worker dies with its own
+  process on spawn failure — no in-worker close to hook).
+- Ownership: pa-daemon `stop_cleanup.rs` (the finalize belt, the tree
+  cancel, the wake-scan gate), `worker.rs`/`rlm_children.rs` (the close
+  reason taxonomy), `scheduled_jobs.rs` (the delivery gate + the cancel
+  helpers), `supervisor.rs`/`ownership.rs`/`update_restore.rs` (the
+  routes), `goal_continuation.rs`/`autonomous_continuation.rs` (the
+  continuation gates).
+# Multi-steer batch delivery + the streaming follow-up hint (PR: `pa-daemon/pa-tui: multi-steer batch delivery (steeringMode "all" + the forced batch) + the streaming opt+enter hint`)
+
+TS reference: `packages/coding-agent/src/core/agent-session.ts` —
+`_pumpSessionInputs`'s mode-gated batch gathering (the
+`turnExecutionPoliciesEqual` + `steeringMode`/`followUpMode`/"all" gates),
+`abortAndSendQueued` + `_forcedAllSteeringBatch` (the one-shot armed
+batch), `sdk.ts`'s settings-seeded `Agent` queue modes,
+`setSteeringMode`/`setFollowUpMode`'s live agent write,
+`restoreSessionActions`'s persisted execution policy; and
+`interactive-mode.ts`'s `getTrayOverrideLabel` (the streaming
+`<followUp> to queue message` tray hint).
+
+- **The pump's batch gathering** (`crates/pa-daemon/src/worker.rs`,
+  `gather_delivery_batch`): the lane's front item anchors the delivery;
+  under queue mode "all" — or the forced steering batch — the same-class
+  prefix behind it co-delivers as ONE turn. Joining gates, exactly TS's:
+  the same turn-execution class (`QueuedItem::policy`, the port of
+  `TurnExecutionPolicy` — client rows ("queued"), injected rows
+  (heartbeats, agent-message deliveries, goal/autonomous continuations),
+  the idle prompt's direct hand-off), a plain user row (an injected
+  custom row delivers solo — it replaces its turn's user row), not a
+  queued session command, and armed-set membership while the forced batch
+  governs. The front item anchors regardless, exactly like TS's `first`.
+- **The forced batch** (`SessionCore::forced_all_steering` +
+  `QueuedItem::forced_batch`, armed by
+  `Worker::arm_forced_all_steering`): the visible plain-user steering
+  items — queue-visible rows whose delivery record is a user message,
+  not an accepted agent message or an injected custom row — co-deliver
+  as one batched turn even under "one-at-a-time". Transient worker
+  state, never journaled (the TS armed set is equally in-memory). The
+  caller is the `abort_and_send_queued` handler (schema 29): the
+  command + its Ctrl+C trigger are the abort-parity lane's surface per
+  the fleet split; this branch precedes its head, so the seam is
+  lint-silenced until the rebase wires the call.
+- **One turn for the whole batch** (`run_turn` over `Vec<QueuedItem>`):
+  the first item anchors the prompt; the rest ride as co-delivered rows
+  (`PromptRequest::batch` → the engine's `AgentPromptInput::Messages`
+  list, TS `_startPreparedTurnActions`'s `turns.flatMap(records)` → one
+  `agent.prompt`). Each batched row emits its accepted `message` frames
+  in order; the batch's queue-visible anchor projects the TS
+  active-action phases (`visibleSessionActionProjection()[0]`); one
+  waiter per queued `prompt_and_wait` item resolves at the settle.
+- **The queue modes, wired** (TS `sdk.ts` seeds the Agent from settings):
+  the engine's `SessionEngineConfig` carries `steering_mode`/
+  `follow_up_mode` into the `AgentOptions`; the worker create seeds them
+  through the new `SessionEngine::set_queue_modes` (the settings read
+  the create already had), and `set_steering_mode`/`set_follow_up_mode`
+  apply live (TS `setSteeringMode` writes the live agent — the trait
+  method updates both the built agent and any later build). The print
+  runtime reads the settings the same way its telemetry does.
+- **Recovery**: the worker journal's queue snapshot records carry the
+  policy class ("queued"/"injected"/"direct", the dominant "queued"
+  default for pre-field records); `restore_actions` maps the wire
+  `executionPolicy` back to the class (`nextTurnContextTiming`
+  "commit" → queued, "preparation" + preserved → injected, else direct).
+- **The streaming hint** (`crates/pa-tui/src/session_ui.rs`,
+  `streaming_tray_hint`): while a turn runs and a non-empty draft sits
+  in the editor, the tray's location label is replaced by
+  `<followUp> to queue message` (the effective `app.message.followUp`
+  key; the Ctrl+C exit hint outranks it while armed, TS
+  `isCtrlCExitHintVisible()`'s early return). `focus_subagents_summary`
+  consults the same override (TS `focusSubagentSummary`), so the
+  subagent-summary hand-off is blocked while the hint is up.
+- **Adoption telemetry**: `tui input queued` carries `steering_mode`
+  (the connection-state cached value, refreshed at every state read and
+  after the settings switch) — exposure under batched delivery is the
+  feature's adoption signal.
+- Verifiers: `scripts/steer_queue_parity.py`'s new `batch-delivery` flow
+  (both binaries over the daemon wire, `steeringMode: "all"` seeded via
+  `<agentDir>/settings.json`, three steers parked behind a wedge turn —
+  the normalized traces byte-compare; the side assertions pin ONE
+  delivery `agent_start` + three user rows + one reply) and
+  `scripts/queue_parity.py`'s new `h_streaming_hint` state (tmux
+  ANSI-byte-exact tray-row compare + the hint's departure with the
+  cleared draft); worker unit tests cover mode "all"/"one-at-a-time",
+  the forced batch (armed prefix batched, a post-arm steer excluded),
+  the policy-class split under "all", the follow-up lane's own mode,
+  and the arming classification; pa-tui unit tests cover the hint text
+  (default + rebound key) and its idle/empty-draft gates.
+
+## Daemon model allowlist — `allowedModels` (lane metered-model-guardrail, 2026-09-23)
+
+### The settings key
+
+Rust-only settings key `allowedModels` (JSON): a list of model patterns
+restricting what the **daemon** may resolve a model to. No TS equivalent —
+this is a deliberate daemon guardrail motivated by two production
+incidents: a silent fallback that burned metered-route spend (a requested
+model unavailable on a client landed on an unintended paid route), and a
+session pinned to `prime-inference/internal/glm-5.3-fast` silently falling
+back to `z-ai/glm-5.3` on a catalog flap (the 400 `enable_thinking`
+fleet kill at 2026-09-23 05:57 UTC). Unset (or a list that trims to empty)
+keeps the TS behavior byte-for-byte; parity when unset is the contract.
+
+```json
+{ "allowedModels": ["prime-inference/internal/*", "prime-inference/z-ai/glm-5.3"] }
+```
+
+Semantics:
+
+- **Global scope only** (`~/.prime/agent/settings.json`), like
+  `idleEvictionMinutes`: a daemon policy a project scope cannot weaken.
+- **Fails closed**: a settings document that cannot be loaded (lock
+  contention, read, or parse failure) is an UNKNOWN policy, never an
+  unrestricted one — every seam refuses loudly while unreadable
+  (`DaemonAllowlist::Unreadable`), and the failover chain yields no
+  candidates. A syntactically valid NON-OBJECT root (`[]`, `"bad"`) is a
+  corrupted document and fails closed the same way; the refusal
+  telemetry rides the typed pattern refusal only, never a fail-closed
+  error.
+- **Pattern grammar** = the `--models` CLI scope vocabulary, matched
+  case-insensitively against the full selector `provider/model-id` and the
+  bare id: a pattern with wildcards (`*`, `?`, `[`) globs; a plain pattern
+  must match exactly. No `:level` suffixes (an allowlist entry is a
+  pattern, not a cycling scope entry).
+- **Enforced at every daemon model resolution**, with a loud typed error
+  (`ModelAllowlistRefusal`), never a fallback and never a silently
+  different model:
+  1. the `set_model` wire command (the `/model` switch): the response
+     carries the refusal before any switch side effect;
+  2. RLM child-model resolution (`rlm.spawn` and `rlm.create_session`,
+     both `SupervisorChildSessions` paths) — an inherited parent model is
+     a resolution too, so an off-list parent fails the spawn loudly; the
+     registry's parent-model identity follows every live `switch_model`,
+     so the inherited selector is the model the session runs NOW;
+  3. the worker's startup model chain (`AgentSessionEngine::
+     resolve_registry_model`): the TS chain's fallbacks (settings default
+     → featured default `z-ai/glm-5.3` → first available) can no longer
+     land a session on an off-list model — the chain resolves, then the
+     gate refuses, so a broken pin surfaces as an error instead of a
+     session on the wrong model.
+- **Adoption telemetry**: a refusal emits `model refused` (schema v1;
+  `docs/telemetry-events.md`) once per distinct `(surface, selector)` per
+  worker — surface + provider/model categories only, never the refused
+  selector or the configured patterns. Surfaces: `set_model`,
+  `cycle_model`, `spawn`, `create_session`, `session_start`.
+
+### Parity stance
+
+TS has no `allowedModels` key and no daemon-level allowlist; the Rust key
+is additive (TS ignores unknown settings keys, so a TS client reading the
+same `settings.json` is unaffected). With the key unset, all three seams
+behave exactly as the TS daemon does (verified by the seam tests passing
+`None`). The typed refusal is Rust-only vocabulary on the wire error
+surface: the daemon never sends it unless an operator opts into the
+allowlist.
+
+### Where the code lives
+
+- `pa-core`: `models::allowlist` (pattern matching + the typed refusal),
+  `settings` (the `allowedModels` key, `get_allowed_models`), and the
+  `track_model_refused` telemetry seam.
+- `pa-daemon`: `model_allowlist` (the enforcement helpers + the worker's
+  lazy refusal-telemetry client), with the three seams above.

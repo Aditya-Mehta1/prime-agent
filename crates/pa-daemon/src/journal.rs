@@ -17,7 +17,7 @@ use std::path::Path;
 
 const COMPACT_AFTER_RECORDS: usize = 4096;
 
-fn append_record(path: &Path, record: &Value) -> Result<()> {
+pub(crate) fn append_record(path: &Path, record: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -35,7 +35,7 @@ fn append_record(path: &Path, record: &Value) -> Result<()> {
 
 /// How the temp journal lands on its path.
 #[derive(Debug, Clone, Copy)]
-enum Finalize {
+pub(crate) enum Finalize {
     /// Rename through `rename_onto`: the bounded win32 destination-busy
     /// retry (TS `writeFileAtomicSync` -> `renameOntoSync`).
     RetryBusy,
@@ -44,7 +44,7 @@ enum Finalize {
     Bare,
 }
 
-fn rewrite_records(path: &Path, records: &[Value], finalize: Finalize) -> Result<()> {
+pub(crate) fn rewrite_records(path: &Path, records: &[Value], finalize: Finalize) -> Result<()> {
     let temp = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
     {
         let file = File::create(&temp).with_context(|| format!("create {}", temp.display()))?;
@@ -280,17 +280,65 @@ fn parse_worker_records(path: &Path) -> Result<HashMap<String, WorkerRecoveryRec
     Ok(latest)
 }
 
+/// One parked queue row in a worker queue snapshot: the delivery payload a
+/// respawned worker needs — the message text, the labeled preview, the
+/// injected custom row, the queue key, and the visibility flag — so a
+/// restored queued heartbeat still delivers as the `heartbeat_prompt`
+/// component (and keeps its `Heartbeat prompt:` row) instead of
+/// collapsing into a plain user message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkerQueueItemRecord {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_message: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_key: Option<String>,
+    #[serde(default = "queue_visible_default")]
+    pub queue_visible: bool,
+    /// The item's turn-execution class ("queued"/"injected"/"direct", see
+    /// worker::TurnPolicy): the batch gathering's compatibility gate. A
+    /// record written before the field existed restores as "queued" — the
+    /// dominant lane class, and the only one a fresh snapshot can batch.
+    #[serde(default = "queue_policy_default")]
+    pub policy: String,
+}
+
+fn queue_visible_default() -> bool {
+    true
+}
+
+fn queue_policy_default() -> String {
+    "queued".to_string()
+}
+
+impl WorkerQueueItemRecord {
+    /// The record's turn-execution class; an unknown value restores as
+    /// the dominant "queued" class.
+    pub(crate) fn policy(&self) -> crate::worker::TurnPolicy {
+        match self.policy.as_str() {
+            "injected" => crate::worker::TurnPolicy::Injected,
+            "direct" => crate::worker::TurnPolicy::Direct,
+            _ => crate::worker::TurnPolicy::Queued,
+        }
+    }
+}
+
 /// A worker queue snapshot record: the pending steering/follow-up lanes so a
 /// respawned worker restores its queues. Lives in the worker recovery journal
 /// (TS keeps its session files free of daemon bookkeeping; queue recovery is
 /// worker-private state, so it rides the journal next to the busy records).
+/// Version 2 lanes carry the full item records; a version-1 lane (written
+/// before the item payload existed) is a bare message-text array and
+/// restores as a plain row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerQueueSnapshotRecord {
     pub version: u32,
     pub r#type: String,
     pub active_session_id: String,
-    pub steering: Vec<String>,
-    pub follow_up: Vec<String>,
+    pub steering: Vec<WorkerQueueItemRecord>,
+    pub follow_up: Vec<WorkerQueueItemRecord>,
     pub recorded_at: String,
 }
 
@@ -317,6 +365,18 @@ impl WorkerRecoveryJournal {
 
     pub fn read_latest(path: &Path) -> Result<Vec<WorkerRecoveryRecord>> {
         Ok(parse_worker_records(path)?.into_values().collect())
+    }
+
+    /// Does the journal prove live work at the worker's last exit? A plain
+    /// supervisor startup adopts a dead worker only when this holds (a
+    /// restart must not mass-revive historical sessions): a latest `busy`
+    /// record marks an in-flight turn or an admitted-but-undelivered
+    /// prompt/queue lane. An unreadable journal proves nothing —
+    /// uncertainty must not revive a session.
+    pub fn read_interrupted(path: &Path) -> bool {
+        Self::read_latest(path)
+            .map(|records| records.iter().any(|record| record.busy))
+            .unwrap_or(false)
     }
 
     pub fn record(
@@ -360,11 +420,11 @@ impl WorkerRecoveryJournal {
     pub fn record_queue_snapshot(
         &mut self,
         active_session_id: &str,
-        steering: &[String],
-        follow_up: &[String],
+        steering: &[WorkerQueueItemRecord],
+        follow_up: &[WorkerQueueItemRecord],
     ) -> Result<()> {
         let record = WorkerQueueSnapshotRecord {
-            version: 1,
+            version: QUEUE_SNAPSHOT_VERSION,
             r#type: QUEUE_SNAPSHOT_RECORD_TYPE.to_string(),
             active_session_id: active_session_id.to_string(),
             steering: steering.to_vec(),
@@ -377,11 +437,11 @@ impl WorkerRecoveryJournal {
         Ok(())
     }
 
-    /// The latest persisted queue lanes for `active_session_id`.
+    /// The latest persisted queue rows for `active_session_id`.
     pub fn latest_queue_snapshot(
         &self,
         active_session_id: &str,
-    ) -> Option<(Vec<String>, Vec<String>)> {
+    ) -> Option<(Vec<WorkerQueueItemRecord>, Vec<WorkerQueueItemRecord>)> {
         self.queue_snapshots
             .get(active_session_id)
             .map(|record| (record.steering.clone(), record.follow_up.clone()))
@@ -392,7 +452,7 @@ impl WorkerRecoveryJournal {
     pub fn read_queue_snapshot(
         path: &Path,
         active_session_id: &str,
-    ) -> Result<Option<(Vec<String>, Vec<String>)>> {
+    ) -> Result<Option<(Vec<WorkerQueueItemRecord>, Vec<WorkerQueueItemRecord>)>> {
         Ok(parse_queue_snapshot_records(path)?
             .remove(active_session_id)
             .map(|record| (record.steering, record.follow_up)))
@@ -416,6 +476,9 @@ impl WorkerRecoveryJournal {
 
 /// The record-type tag of a queue snapshot line.
 const QUEUE_SNAPSHOT_RECORD_TYPE: &str = "queue_snapshot";
+/// The current queue-snapshot record version: the lanes carry the full
+/// item records.
+const QUEUE_SNAPSHOT_VERSION: u32 = 2;
 
 fn parse_queue_snapshot_records(path: &Path) -> Result<HashMap<String, WorkerQueueSnapshotRecord>> {
     let mut latest: HashMap<String, WorkerQueueSnapshotRecord> = HashMap::new();
@@ -427,14 +490,61 @@ fn parse_queue_snapshot_records(path: &Path) -> Result<HashMap<String, WorkerQue
         }
     };
     for line in contents.split('\n').filter(|line| !line.is_empty()) {
-        let Ok(record) = serde_json::from_str::<WorkerQueueSnapshotRecord>(line) else {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if record.version == 1 && record.r#type == QUEUE_SNAPSHOT_RECORD_TYPE {
-            latest.insert(record.active_session_id.clone(), record);
+        if record.get("type").and_then(Value::as_str) != Some(QUEUE_SNAPSHOT_RECORD_TYPE) {
+            continue;
         }
+        let version = record.get("version").and_then(Value::as_u64);
+        if version != Some(1) && version != Some(QUEUE_SNAPSHOT_VERSION as u64) {
+            continue;
+        }
+        let Some(active_session_id) = record.get("active_session_id").and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let entry = WorkerQueueSnapshotRecord {
+            version: QUEUE_SNAPSHOT_VERSION,
+            r#type: QUEUE_SNAPSHOT_RECORD_TYPE.to_string(),
+            active_session_id: active_session_id.to_string(),
+            steering: parse_snapshot_lane(record.get("steering")),
+            follow_up: parse_snapshot_lane(record.get("follow_up")),
+            recorded_at: record
+                .get("recorded_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        latest.insert(active_session_id.to_string(), entry);
     }
     Ok(latest)
+}
+
+/// One snapshot lane: a version-2 entry is the full item record, while a
+/// version-1 entry is the bare message text and restores as a plain row
+/// (no preview, no injected custom row — the pre-item payload).
+fn parse_snapshot_lane(value: Option<&Value>) -> Vec<WorkerQueueItemRecord> {
+    value
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Value::String(message) => Some(WorkerQueueItemRecord {
+                        message: message.clone(),
+                        preview: None,
+                        custom_message: None,
+                        queue_key: None,
+                        queue_visible: true,
+                        policy: queue_policy_default(),
+                    }),
+                    Value::Object(_) => serde_json::from_value(entry.clone()).ok(),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -483,6 +593,39 @@ mod tests {
         assert_eq!(latest.len(), 2);
         let s1 = latest.iter().find(|r| r.active_session_id == "s1").unwrap();
         assert!(!s1.busy);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn worker_journal_interrupted_evidence_tracks_latest_busy() {
+        let path = temp_path("interrupted.recovery.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        // Idle sessions prove nothing: no interrupted work to revive.
+        journal
+            .record("s1", "sess1", None, false, "shutdown")
+            .unwrap();
+        journal.record("s2", "sess2", None, false, "ready").unwrap();
+        assert!(!WorkerRecoveryJournal::read_interrupted(&path));
+        // One busy session is durable evidence of interrupted work.
+        journal
+            .record("s2", "sess2", Some("/b.jsonl"), true, "create")
+            .unwrap();
+        assert!(WorkerRecoveryJournal::read_interrupted(&path));
+        // The latest record per session decides: s2 settles back to idle.
+        journal
+            .record("s2", "sess2", None, false, "shutdown")
+            .unwrap();
+        assert!(!WorkerRecoveryJournal::read_interrupted(&path));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn worker_journal_missing_or_unreadable_file_is_not_interrupted() {
+        let path = temp_path("missing.recovery.jsonl");
+        // No journal: no evidence, so no revival on uncertainty.
+        assert!(!WorkerRecoveryJournal::read_interrupted(&path));
+        std::fs::write(&path, "not json").unwrap();
+        assert!(!WorkerRecoveryJournal::read_interrupted(&path));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

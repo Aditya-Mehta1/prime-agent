@@ -1,3 +1,0 @@
-supervisor started pid 399632
-[2026-09-18T14:51:28.532Z] session worker 8344f0e0ac5b registered (epoch 1, pid 399639)
-[2026-09-18T14:51:28.598Z] session worker 8344f0e0ac5b re-registered (epoch 2, pid 399639)

@@ -202,4 +202,32 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(crate::platform::perms::file_mode(&path), Some(0o600));
     }
+
+    /// A relative agent dir (a relative `PRIME_AGENT_CODING_AGENT_DIR`)
+    /// locks and loads: the lock probe's `utimensat` resolves relative lock
+    /// paths against `AT_FDCWD`, and the settings document under it is
+    /// read back under the same lock.
+    #[test]
+    #[cfg(unix)]
+    fn relative_agent_dir_locks_and_loads() {
+        let cwd = tempfile::tempdir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd.path()).unwrap();
+        let relative = std::path::PathBuf::from("relative-agent");
+        let storage = FileSettingsStorage::new(cwd.path(), relative.clone());
+        let written = storage.with_lock(SettingsScope::Global, &mut |current| {
+            assert_eq!(current, None);
+            Some(r#"{ "theme": "prime" }"#.to_string())
+        });
+        let read = storage.with_lock(SettingsScope::Global, &mut |current| {
+            assert!(current.unwrap().contains("prime"));
+            None
+        });
+        std::env::set_current_dir(previous).unwrap();
+        written.unwrap();
+        read.unwrap();
+        // Assert through the temp cwd: the relative path itself only
+        // resolves from inside the chdir window.
+        assert!(cwd.path().join(&relative).join("settings.json").exists());
+    }
 }

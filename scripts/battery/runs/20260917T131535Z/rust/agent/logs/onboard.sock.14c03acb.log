@@ -1,3 +1,0 @@
-supervisor started pid 3263490
-[2026-09-17T13:18:32.466Z] session worker 1c12d2aaf28c registered (epoch 1, pid 3263495)
-[2026-09-17T13:18:32.484Z] session worker 1c12d2aaf28c re-registered (epoch 2, pid 3263495)

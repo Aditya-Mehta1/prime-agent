@@ -136,6 +136,12 @@ impl AcpSession {
 mod tests {
     use super::*;
     use crate::agent_engine::FAUX_TEST_LOCK;
+
+    /// The faux model's per-request output budget (maxTokens 16_384 under the
+    /// 32_000 request cap): threshold fixtures subtract it from the window
+    /// alongside the headroom (the combined input+output ceiling).
+    const FAUX_REQUEST_BUDGET: u64 = 16_384;
+
     use pa_core::session::manager::SessionManager;
     use pa_core::session_engine::engine::{create_session, SessionEngineConfig};
     use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn};
@@ -200,6 +206,9 @@ mod tests {
         let engine = std::sync::Arc::new(
             create_session(SessionEngineConfig {
                 cron_store: None,
+                queued_steering_probe: None,
+                steering_mode: None,
+                follow_up_mode: None,
                 telemetry: None,
                 cwd: dir.path().to_path_buf(),
                 agent_dir: agent_dir.clone(),
@@ -405,7 +414,7 @@ mod tests {
                 ]
             }),
             128_000u64
-                .saturating_sub(seed_usage + crossing_delta / 4)
+                .saturating_sub(FAUX_REQUEST_BUDGET + seed_usage + crossing_delta / 4)
                 .max(1),
         )
         .await;
@@ -478,7 +487,7 @@ mod tests {
                 ]
             }),
             128_000u64
-                .saturating_sub(seed_usage + crossing_delta / 4)
+                .saturating_sub(FAUX_REQUEST_BUDGET + seed_usage + crossing_delta / 4)
                 .max(1),
         )
         .await;

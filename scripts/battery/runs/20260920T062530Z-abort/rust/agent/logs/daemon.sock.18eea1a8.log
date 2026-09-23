@@ -1,3 +1,0 @@
-supervisor started pid 792250
-[2026-09-20T06:25:45.477Z] session worker d333c1edb4b8 registered (epoch 1, pid 792255)
-[2026-09-20T06:25:45.528Z] session worker d333c1edb4b8 re-registered (epoch 2, pid 792255)

@@ -63,10 +63,29 @@ pub(super) async fn mint_goal_continuation(
         return None;
     }
     let mut persistence = persistence.lock().await;
-    let message = driver.next_continuation_message(&mut persistence)?;
+    let message = match driver.next_continuation_message(&mut persistence) {
+        Ok(message) => message,
+        Err(error) => {
+            // TS `_getGoalContinuationMessages`'s catch arm: a failed
+            // persist fails the goal with the write error and mints
+            // nothing (the settle hook must not reject).
+            let error_text = format!("{error:#}");
+            eprintln!("pa-daemon: goal continuation mint persist failed: {error_text}");
+            if let Err(finish_error) = driver.finish_for_terminal_message(
+                &mut persistence,
+                pa_types::ai::StopReason::Error,
+                Some(&error_text),
+            ) {
+                eprintln!("pa-daemon: goal error finish also failed: {finish_error:#}");
+            }
+            drop(driver);
+            session.publish_goal_update().await;
+            return None;
+        }
+    };
     drop(driver);
     session.publish_goal_update().await;
-    Some(message)
+    message
 }
 
 /// The goal boundary consult for the settle loop: the budget steer runs
@@ -105,7 +124,10 @@ pub(super) async fn rollback_goal_mint(mode: &AcpModeState) {
     let persistence = mode.engine.session.shared_persistence();
     let mut driver = mode.engine.goal_driver.lock().await;
     let mut persistence = persistence.lock().await;
-    driver.rollback_continuation_mint(&mut persistence);
+    if let Err(error) = driver.rollback_continuation_mint(&mut persistence) {
+        // The restore hook must not reject: warn and keep the slot as-is.
+        eprintln!("pa-daemon: goal mint rollback persist failed: {error:#}");
+    }
 }
 
 /// TS `_finishGoalForTerminalAssistantMessage` for a failed run: an
@@ -119,11 +141,15 @@ pub(super) async fn fail_goal_for_terminal_error(
     let persistence = mode.engine.session.shared_persistence();
     let mut driver = mode.engine.goal_driver.lock().await;
     let mut persistence = persistence.lock().await;
-    driver.finish_for_terminal_message(
+    if let Err(error) = driver.finish_for_terminal_message(
         &mut persistence,
         pa_types::ai::StopReason::Error,
         error_message,
-    );
+    ) {
+        // The terminal hook is best-effort (TS's throws out of the
+        // agent-end handler): the failed turn already carries the error.
+        eprintln!("pa-daemon: goal terminal finish persist failed: {error:#}");
+    }
     drop(driver);
     session.publish_goal_update().await;
 }
@@ -137,6 +163,12 @@ pub(super) async fn fail_goal_for_terminal_error(
 mod tests {
     use super::*;
     use crate::agent_engine::FAUX_TEST_LOCK;
+
+    /// The faux model's per-request output budget (maxTokens 16_384 under the
+    /// 32_000 request cap): threshold fixtures subtract it from the window
+    /// alongside the headroom (the combined input+output ceiling).
+    const FAUX_REQUEST_BUDGET: u64 = 16_384;
+
     use pa_core::session::manager::SessionManager;
     use pa_core::session_engine::engine::{create_session, SessionEngineConfig};
     use pa_core::session_engine::provider_adapter::{json_round_trip, real_stream_fn};
@@ -197,6 +229,9 @@ mod tests {
             let engine = std::sync::Arc::new(
                 create_session(SessionEngineConfig {
                     cron_store: None,
+                    queued_steering_probe: None,
+                    steering_mode: None,
+                    follow_up_mode: None,
                     telemetry: None,
                     cwd: dir.path().to_path_buf(),
                     agent_dir: agent_dir.clone(),
@@ -514,7 +549,9 @@ mod tests {
                     "two",
                 ]
             }),
-            127_500,
+            // A 500-token combined ceiling (the window minus the faux
+            // request budget and the reserve).
+            128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + 500),
         )
         .await;
         // The harness shape: a seeded crossing turn whose boundary
@@ -629,7 +666,9 @@ mod tests {
                     { "text": "the summary", "delayMs": 30_000 },
                 ]
             }),
-            127_500,
+            // A 500-token combined ceiling (the window minus the faux
+            // request budget and the reserve).
+            128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + 500),
         )
         .await;
         // The harness shape: a seeded crossing turn (its boundary

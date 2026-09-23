@@ -1,8 +1,0 @@
-{"cwd":"/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/rust/work","id":"01a0afa2-9572-72e9-9ad7-23864771653b","rlmDepth":0,"timestamp":"2026-09-17T13:51:03.026Z","type":"session","version":3}
-{"type":"model_change","id":"8834adbd","parentId":null,"timestamp":"2026-09-17T13:51:03.030Z","modelId":"mock-1","provider":"prime-inference"}
-{"type":"thinking_level_change","id":"99e52909","parentId":"8834adbd","timestamp":"2026-09-17T13:51:03.030Z","thinkingLevel":"off"}
-{"type":"service_tier_change","id":"7f04176d","parentId":"99e52909","timestamp":"2026-09-17T13:51:03.030Z","serviceTier":"default"}
-{"type":"session_state","id":"2db752f2","parentId":"7f04176d","timestamp":"2026-09-17T13:51:03.030Z","state":{"status":"active"}}
-{"type":"session_info","id":"d3bfbc38","parentId":"2db752f2","timestamp":"2026-09-17T13:51:03.031Z","name":"battery-f9-busy"}
-{"type":"message","id":"22dda281","parentId":"d3bfbc38","timestamp":"2026-09-17T13:51:03.036Z","message":{"content":[{"text":"f9 busy prompt","type":"text"}],"role":"user","timestamp":1789653063036}}
-{"type":"message","id":"1fb761ab","parentId":"22dda281","timestamp":"2026-09-17T13:51:28.070Z","message":{"api":"openai-completions","content":[{"text":"f9 busy reply","type":"text"}],"model":"mock-1","provider":"prime-inference","responseId":"chatcmpl-battery","role":"assistant","stopReason":"stop","timestamp":1789653063046,"usage":{"cacheRead":80,"cacheWrite":0,"cost":{"cacheRead":0,"cacheWrite":0,"input":0,"output":0,"total":0},"input":20,"output":10,"totalTokens":110}}}

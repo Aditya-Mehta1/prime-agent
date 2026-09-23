@@ -1,6 +1,0 @@
-{
- "id": "gs2",
- "type": "response",
- "command": "prompt_and_wait",
- "success": true
-}

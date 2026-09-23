@@ -1,1 +1,0 @@
-{"responses": [{"toolCall": {"name": "ipython", "arguments": {"code": "import rlm; await rlm.spawn('f20 child task: reply with the fixture summary', name='f20-worker')"}}}, {"text": "f20 parent fixture reply"}, {"text": "f20 parent fixture reply"}], "queues": [{"name": "f20-worker", "match": ["f20 child task"], "responses": [{"text": "f20 child fixture reply"}]}]}

@@ -1,5 +1,0 @@
-{"activeSessionId":"0a0aefebb438","busy":true,"operation":"create","recordedAt":"2026-09-19T04:26:24.095Z","sessionFile":"/tmp/urw-s6/rust-t1/agent/sessions/01a0b7ea-59d2-7487-a7bd-45d9b1579846.jsonl","sessionId":"01a0b7ea-59d2-7487-a7bd-45d9b1579846"}
-{"active_session_id":"0a0aefebb438","follow_up":[],"recorded_at":"2026-09-19T04:26:25.332Z","steering":[],"type":"queue_snapshot","version":1}
-{"activeSessionId":"0a0aefebb438","busy":false,"operation":"shutdown","recordedAt":"2026-09-19T04:26:25.340Z","sessionFile":"/tmp/urw-s6/rust-t1/agent/sessions/01a0b7ea-59d2-7487-a7bd-45d9b1579846.jsonl","sessionId":"01a0b7ea-59d2-7487-a7bd-45d9b1579846"}
-{"activeSessionId":"0a0aefebb438","busy":true,"operation":"create","recordedAt":"2026-09-19T04:26:25.933Z","sessionFile":"/tmp/urw-s6/rust-t1/agent/sessions/01a0b7ea-59d2-7487-a7bd-45d9b1579846.jsonl","sessionId":"01a0b7ea-59d2-7487-a7bd-45d9b1579846"}
-{"activeSessionId":"0a0aefebb438","busy":false,"operation":"shutdown","recordedAt":"2026-09-19T04:26:28.231Z","sessionFile":"/tmp/urw-s6/rust-t1/agent/sessions/01a0b7ea-59d2-7487-a7bd-45d9b1579846.jsonl","sessionId":"01a0b7ea-59d2-7487-a7bd-45d9b1579846"}

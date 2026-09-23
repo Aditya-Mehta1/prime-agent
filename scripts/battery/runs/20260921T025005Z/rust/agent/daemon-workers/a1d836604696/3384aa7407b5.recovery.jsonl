@@ -1,8 +1,0 @@
-{"activeSessionId":"3384aa7407b5","busy":true,"operation":"create","recordedAt":"2026-09-21T02:50:24.698Z","sessionFile":"/tmp/nd-runs/20260921T025005Z/rust/agent/sessions/01a0c1df-3020-72e2-8b55-2bf5b29ddb7c.jsonl","sessionId":"01a0c1df-3020-72e2-8b55-2bf5b29ddb7c"}
-{"active_session_id":"3384aa7407b5","follow_up":[],"recorded_at":"2026-09-21T02:50:24.739Z","steering":["seed turn"],"type":"queue_snapshot","version":1}
-{"active_session_id":"3384aa7407b5","follow_up":[],"recorded_at":"2026-09-21T02:50:24.831Z","steering":["turn two"],"type":"queue_snapshot","version":1}
-{"active_session_id":"3384aa7407b5","follow_up":[],"recorded_at":"2026-09-21T02:50:24.833Z","steering":["turn two"],"type":"queue_snapshot","version":1}
-{"active_session_id":"3384aa7407b5","follow_up":[],"recorded_at":"2026-09-21T02:50:24.892Z","steering":["turn three"],"type":"queue_snapshot","version":1}
-{"active_session_id":"3384aa7407b5","follow_up":[],"recorded_at":"2026-09-21T02:50:24.894Z","steering":["turn three"],"type":"queue_snapshot","version":1}
-{"active_session_id":"3384aa7407b5","follow_up":[],"recorded_at":"2026-09-21T02:50:24.956Z","steering":[],"type":"queue_snapshot","version":1}
-{"activeSessionId":"3384aa7407b5","busy":false,"operation":"shutdown","recordedAt":"2026-09-21T02:51:36.651Z","sessionFile":"/tmp/nd-runs/20260921T025005Z/rust/agent/sessions/01a0c1df-3020-72e2-8b55-2bf5b29ddb7c.jsonl","sessionId":"01a0c1df-3020-72e2-8b55-2bf5b29ddb7c"}

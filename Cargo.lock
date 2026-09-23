@@ -1297,6 +1297,7 @@ dependencies = [
  "nix",
  "pa-agent",
  "pa-ai",
+ "pa-models",
  "pa-telemetry",
  "pa-types",
  "reqwest",
@@ -1325,6 +1326,7 @@ dependencies = [
  "pa-agent",
  "pa-ai",
  "pa-core",
+ "pa-models",
  "pa-telemetry",
  "pa-types",
  "regex",
@@ -1336,6 +1338,24 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "pa-models"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "pa-ai",
+ "pa-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1368,8 +1388,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "unicode-properties",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "url",
 ]
 
 [[package]]
@@ -2400,6 +2422,12 @@ checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
 dependencies = [
  "tinyvec",
 ]
+
+[[package]]
+name = "unicode-properties"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "unicode-segmentation"

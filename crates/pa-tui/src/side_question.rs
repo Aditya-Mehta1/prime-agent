@@ -29,11 +29,78 @@ pub fn turn_seeds_follow_up(turn: &SideQuestionTurn) -> bool {
     !turn.local && !turn.answer.is_empty()
 }
 
-/// The pane: the turns in order, plus the expansion flag the detail cycle
-/// toggles (TS `setExpanded`).
+/// A pane-mounted bash run (TS `SideQuestionComponent.addBash` mounting
+/// the `BashExecutionComponent` inside the pane: the pane renders the
+/// same bordered card the main thread mounts, at the pane width). The
+/// `!` variant seeds follow-up side questions through the pane's seed
+/// list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaneBash {
+    pub command: String,
+    /// The raw accumulated output chunks.
+    pub output: String,
+    pub running: bool,
+    pub exit_code: Option<i64>,
+    pub cancelled: bool,
+    pub truncated: bool,
+    pub full_output_path: Option<String>,
+    pub error_message: Option<String>,
+    /// The `!!` variant (TS `excludeFromContext` picks the card's color
+    /// key, so the pane card's border renders dim).
+    pub excluded: bool,
+}
+
+impl PaneBash {
+    /// A running pane-mounted run for one command (TS the component's
+    /// constructor: the `$ command` header with its running loader).
+    pub fn new_running(command: &str, excluded: bool) -> Self {
+        Self {
+            command: command.to_string(),
+            output: String::new(),
+            running: true,
+            exit_code: None,
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            error_message: None,
+            excluded,
+        }
+    }
+
+    /// The card the pane renders (TS `addBash` appends the same
+    /// `BashExecutionComponent` the main thread mounts, so the pane's
+    /// rows come from the shared card renderer).
+    pub fn execution_card(&self) -> crate::bash_card::BashExecutionCard {
+        let mut card =
+            crate::bash_card::BashExecutionCard::new_running("", &self.command, self.excluded);
+        card.append_output(&self.output);
+        if let Some(message) = &self.error_message {
+            card.set_failed(message);
+        } else if !self.running {
+            card.set_complete(
+                self.exit_code,
+                self.cancelled,
+                self.truncated,
+                self.full_output_path.clone(),
+            );
+        }
+        card
+    }
+}
+
+/// The pane: the turns in order, a bash run mounted after them (TS the
+/// pane appends the bash component below the answered turns), the
+/// invisible follow-up seeds a finished bash run contributed, and the
+/// expansion flag the detail cycle toggles (TS `setExpanded`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SideQuestionPane {
     pub turns: Vec<SideQuestionTurn>,
+    pub bash: Option<PaneBash>,
+    /// Follow-up seeds that never render in the pane (TS
+    /// `finishSideQuestionBash` pushes them to `sideQuestionTurns` — the
+    /// seed list — while the pane keeps showing the bash component
+    /// itself): the raw `!input` and the formatted output.
+    pub extra_seeds: Vec<(String, String)>,
     pub expanded: bool,
 }
 
@@ -43,12 +110,16 @@ const PADDING_X: usize = 2;
 
 impl SideQuestionPane {
     /// The turn the follow-up seeds its context with (TS
-    /// `sideQuestionTurns.filter(turn => turn.answer)`).
+    /// `sideQuestionTurns.filter(turn => turn.answer)`), plus the
+    /// pane-mounted bash runs the `!` variant contributed (TS
+    /// `finishSideQuestionBash` pushes the same `question`/`answer`
+    /// shape onto the seed list).
     pub fn seed_turns(&self) -> Vec<(String, String)> {
         self.turns
             .iter()
             .filter(|turn| turn_seeds_follow_up(turn))
             .map(|turn| (turn.question.clone(), turn.answer.clone()))
+            .chain(self.extra_seeds.iter().cloned())
             .collect()
     }
 
@@ -56,6 +127,7 @@ impl SideQuestionPane {
     /// condition; a completed notice can sit below a running turn).
     pub fn running(&self) -> bool {
         self.turns.iter().any(|turn| turn.status == "running")
+            || self.bash.as_ref().is_some_and(|bash| bash.running)
     }
 
     /// Upsert a streamed event into its turn (TS `update`).
@@ -81,8 +153,18 @@ impl SideQuestionPane {
 
     /// Render the pane (TS `render`): blank surfaced row, the turns, and
     /// the dim hint row, every row painted with the popup background and
-    /// padded to the full width.
-    pub fn render(&self, theme: &Theme, width: usize) -> Vec<crate::Line> {
+    /// padded to the full width. The bash run renders through the shared
+    /// `BashExecutionCard` rows (TS `addBash` appends the same component
+    /// the main thread mounts), so the pane passes the card renderer its
+    /// frame, expansion flag, and cancel hint.
+    pub fn render(
+        &self,
+        theme: &Theme,
+        frame: usize,
+        expanded: bool,
+        cancel_hint: &str,
+        width: usize,
+    ) -> Vec<crate::Line> {
         let bg = theme.bg_style(ThemeBg::ToolPanelBg);
         let user_text = theme.fg_style(ThemeColor::UserMessageText);
         let accent = theme.fg_style(ThemeColor::Accent);
@@ -123,7 +205,11 @@ impl SideQuestionPane {
             rows.push(blank());
             // The answer area: the markdown answer, the error line under
             // partial output, or the placeholder states.
-            let style = crate::markdown::MarkdownStyle::from_theme(theme);
+            let mut style = crate::markdown::MarkdownStyle::from_theme(theme);
+            // TS constructs the answer `Markdown` with `color:
+            // userMessageText`: the plain text renders in the
+            // user-message color, not the markdown body color.
+            style.body = theme.fg_style(ThemeColor::UserMessageText);
             let content_width = width.saturating_sub(PADDING_X).max(1);
             let mut rendered = if turn.answer.is_empty() {
                 Vec::new()
@@ -133,8 +219,7 @@ impl SideQuestionPane {
             if let Some(message) = &turn.error_message {
                 // TS `renderAnswer`: the error row is a single-paddingX
                 // `Text` row; the `padded` prefix below supplies the pad.
-                let line: crate::Line = vec![crate::Span::styled(message.clone(), error)];
-                rendered.push(line);
+                rendered.push(vec![crate::Span::styled(message.clone(), error)]);
             }
             if rendered.is_empty() {
                 // The placeholder rows (`Cancelled`/`No response`/
@@ -145,8 +230,7 @@ impl SideQuestionPane {
                     "complete" => "No response".to_string(),
                     _ => "Thinking…".to_string(),
                 };
-                let line: crate::Line = vec![crate::Span::styled(text, user_text)];
-                rendered.push(line);
+                rendered.push(vec![crate::Span::styled(text, user_text)]);
             }
             for line in rendered {
                 let padded: crate::Line =
@@ -156,6 +240,27 @@ impl SideQuestionPane {
                 for wrapped in wrap_row(&padded, width) {
                     rows.push(surface(wrapped));
                 }
+            }
+            rows.push(blank());
+        }
+        // A pane-mounted bash run (TS `addBash` — the
+        // `BashExecutionComponent` appended below the answered turns,
+        // its rows surfaced onto the popup background like every pane
+        // row): one blank before and after, the card's own leading
+        // spacer excluded (the pane adds the blank itself, matching the
+        // component's `Spacer(1)` row inside its render).
+        if let Some(bash) = &self.bash {
+            rows.push(blank());
+            let card = bash.execution_card();
+            for row in crate::bash_card::render_bash_execution(
+                &card,
+                frame,
+                expanded,
+                cancel_hint,
+                theme,
+                width,
+            ) {
+                rows.push(surface(row));
             }
             rows.push(blank());
         }
@@ -268,6 +373,75 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_bash_run_keeps_the_hint_cancelled_and_seeds_follow_ups() {
+        let mut pane = SideQuestionPane::default();
+        pane.upsert(turn("a", "complete", "done"));
+        assert!(!pane.running());
+        // A running pane bash run owns the hint's cancel affordance.
+        let mut bash = PaneBash::new_running("echo pane", true);
+        bash.output.push_str("hi\n");
+        pane.bash = Some(bash);
+        assert!(pane.running());
+        assert!(pane.active_turn().is_none());
+        // The finished run renders its rows and seeds the follow-up list
+        // without joining the pane's turns.
+        let mut bash = pane.bash.take().unwrap();
+        bash.running = false;
+        bash.exit_code = Some(0);
+        pane.bash = Some(bash);
+        assert!(!pane.running());
+        pane.extra_seeds
+            .push(("!echo pane".into(), "```\nhi\n```".into()));
+        assert_eq!(
+            pane.seed_turns(),
+            vec![
+                ("question a".into(), "done".into()),
+                ("!echo pane".into(), "```\nhi\n```".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pane_bash_run_renders_header_output_and_status() {
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::Color256);
+        let mut pane = SideQuestionPane::default();
+        pane.upsert(turn("a", "complete", "the answer"));
+        let mut bash = PaneBash::new_running("echo hi", true);
+        bash.output = "hi\n".to_string();
+        pane.bash = Some(bash);
+        let rows = pane.render(&theme, 0, false, "Esc/Ctrl+C", 80);
+        let text =
+            |line: &crate::Line| -> String { line.iter().map(|s| s.content.as_str()).collect() };
+        let joined: Vec<String> = rows.iter().map(&text).collect();
+        assert!(
+            joined.iter().any(|row| row.contains("$ echo hi")),
+            "the bash header rendered: {joined:?}"
+        );
+        assert!(
+            joined.iter().any(|row| row.contains("hi")),
+            "the streamed output rendered: {joined:?}"
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|row| row.contains("Running... (Esc/Ctrl+C to cancel)")),
+            "the running loader rendered: {joined:?}"
+        );
+        // A settled failing run shows its exit status instead.
+        pane.bash.as_mut().unwrap().running = false;
+        pane.bash.as_mut().unwrap().exit_code = Some(3);
+        let joined: Vec<String> = pane
+            .render(&theme, 0, false, "Esc/Ctrl+C", 80)
+            .iter()
+            .map(&text)
+            .collect();
+        assert!(
+            joined.iter().any(|row| row.contains("(exit 3)")),
+            "the exit status rendered: {joined:?}"
+        );
+    }
+
+    #[test]
     fn running_hint_follows_any_running_turn() {
         let mut pane = SideQuestionPane::default();
         pane.upsert(turn("a", "complete", "done"));
@@ -282,7 +456,7 @@ mod tests {
         let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::Color256);
         let mut pane = SideQuestionPane::default();
         pane.upsert(turn("a", "complete", "the answer"));
-        let rows = pane.render(&theme, 80);
+        let rows = pane.render(&theme, 0, false, "Esc/Ctrl+C", 80);
         let text =
             |line: &crate::Line| -> String { line.iter().map(|s| s.content.as_str()).collect() };
         let joined: Vec<String> = rows.iter().map(&text).collect();
@@ -297,7 +471,7 @@ mod tests {
             .any(|row| row.contains("reply to follow up · esc to return to session")));
         // A running turn swaps the hint.
         pane.upsert(turn("b", "running", ""));
-        let rows = pane.render(&theme, 80);
+        let rows = pane.render(&theme, 0, false, "Esc/Ctrl+C", 80);
         let joined: Vec<String> = rows.iter().map(&text).collect();
         assert!(joined
             .iter()
@@ -308,7 +482,7 @@ mod tests {
             answer: String::new(),
             ..turn("b", "cancelled", "")
         });
-        let rows = pane.render(&theme, 80);
+        let rows = pane.render(&theme, 0, false, "Esc/Ctrl+C", 80);
         let joined: Vec<String> = rows.iter().map(&text).collect();
         assert!(joined.iter().any(|row| row.contains("Cancelled")));
     }

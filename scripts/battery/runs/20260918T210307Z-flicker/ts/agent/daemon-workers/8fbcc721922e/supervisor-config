@@ -1,8 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/home/ubuntu/lane-worktrees/flicker/scripts/battery/runs/20260918T210307Z-flicker/ts/daemon.sock",
-  "defaultSessionConfig": {
-    "cwd": "/home/ubuntu/lane-worktrees/flicker/scripts/battery/runs/20260918T210307Z-flicker/ts/work",
-    "agentDir": "/home/ubuntu/lane-worktrees/flicker/scripts/battery/runs/20260918T210307Z-flicker/ts/agent"
-  }
-}

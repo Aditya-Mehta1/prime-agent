@@ -1,9 +1,0 @@
-{
-  "update_id": "upd-live",
-  "expires_at": "2026-09-19T00:36:02.435Z",
-  "supervisor": {
-    "pid": 139520,
-    "process_start_id": "proc:700730",
-    "generation": "sup:139520"
-  }
-}

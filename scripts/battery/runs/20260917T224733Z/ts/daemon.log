@@ -1,9 +1,0 @@
-Prime Agent daemon supervisor 8d418972-b52e-4aee-bee0-e38d5891b591 listening on /home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T224733Z/ts/daemon.sock
-Prime Agent daemon supervisor a97d7ebe-d45f-4cc6-8da2-4f6a09cfd57e listening on /home/ubuntu/lane-worktrees/fd-leak-audit/scripts/battery/runs/20260917T224733Z/ts/daemon.sock
-Session worker bd6ce3c15893 stderr: Prime Agent daemon listening on /tmp/vbat20260917T224733Z-ts/prime-agent-1000/worker-ad83cb3bf01d-bd6ce3c15893.sock
-Session worker 7c7fb6293f79 stderr: Prime Agent daemon listening on /tmp/vbat20260917T224733Z-ts/prime-agent-1000/worker-ad83cb3bf01d-7c7fb6293f79.sock
-Session worker 7c7fb6293f79 stderr: shutdown command received over socket; 1 active session(s) will be closed
-Session worker 7c7fb6293f79 stderr: shutting down (exit 0); closing 1 active session(s)
-Session worker 3cd20b46fb4d stderr: Prime Agent daemon listening on /tmp/vbat20260917T224733Z-ts/prime-agent-1000/worker-ad83cb3bf01d-3cd20b46fb4d.sock
-Session worker bd6ce3c15893 stderr: shutting down (exit 0); closing 0 active session(s)
-Session worker 3cd20b46fb4d stderr: shutting down (exit 0); closing 0 active session(s)

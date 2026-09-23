@@ -1,5 +1,5 @@
 //! The `/settings` inline menu (TS `SettingsSelectorComponent` over the
-//! pi-tui `SettingsList`): label/value rows with descriptions, Enter/Space
+//! the TS TUI `SettingsList`): label/value rows with descriptions, Enter/Space
 //! cycling values, Enter opening the submenus (thinking level, theme,
 //! warnings), Esc closing, and type-to-search over the labels. The caller
 //! owns the row data (daemon state + settings seam reads) and executes the

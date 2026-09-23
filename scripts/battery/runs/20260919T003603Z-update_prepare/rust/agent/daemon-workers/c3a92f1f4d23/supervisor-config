@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/tmp/upw-s3/rust/daemon.sock",
-  "defaultSessionDir": "/tmp/upw-s3/rust/agent/sessions"
-}

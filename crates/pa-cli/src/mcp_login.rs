@@ -60,6 +60,21 @@ impl TerminalMcpAuth {
                 )
             }),
             begin_login: None,
+            agent_dir: Some(self.agent_dir.clone()),
+            get_catalog_sources: Some(Box::new({
+                let cwd = self.cwd.clone();
+                let agent_dir = self.agent_dir.clone();
+                move || {
+                    let settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+                    settings
+                        .settings()
+                        .mcp_catalog_sources
+                        .clone()
+                        .unwrap_or_default()
+                }
+            })),
+            remote_source: None,
+            probe_override: None,
         })
     }
 
@@ -87,6 +102,41 @@ impl TerminalMcpAuth {
             .await
     }
 
+    /// The inline paste panel's flow (TS: prompt for the ONE credential a
+    /// pasteable service collects, store it bound to the endpoint, verify).
+    async fn paste_inner(&self, server: &str) -> Result<String> {
+        let manager = self.manager();
+        let service = manager
+            .service_descriptor(server)
+            .ok_or_else(|| anyhow!("{server} is not a resolved MCP service."))?;
+        let pasted = pa_core::mcp::mcp_paste_credential(service).ok_or_else(|| {
+            anyhow!("{server} does not collect a single credential; it is not pasteable.")
+        })?;
+        let prompt = pa_core::mcp::mcp_credential_field_prompt_label(service, &pasted.field);
+        println!("Paste the {prompt} for {server}:");
+        let token = read_terminal_line()
+            .await
+            .filter(|line| !line.is_empty())
+            .ok_or_else(|| anyhow!("Paste cancelled"))?;
+        let inputs = manager
+            .paste_install_inputs(server)
+            .map_err(|message| anyhow!("{message}"))?;
+        let outcome = pa_core::mcp::install_static_token(inputs, &token)
+            .await
+            .map_err(|message| anyhow!("{message}"))?;
+        if outcome.verified {
+            Ok(format!("Connected {server}."))
+        } else {
+            Ok(format!(
+                "Saved the token for {server}; verification pending{}.",
+                outcome
+                    .error
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            ))
+        }
+    }
+
     async fn logout_inner(&self, server: &str) -> Result<String> {
         let provider = format!("mcp:{server}");
         let mut auth = AuthStorage::create(&self.agent_dir);
@@ -111,6 +161,11 @@ impl ClientAuthCommands for TerminalMcpAuth {
         Box::pin(async move { auth.login_inner(&server).await })
     }
 
+    fn paste_token(&self, server: &str) -> AuthFuture {
+        let (auth, server) = (self.clone(), server.to_string());
+        Box::pin(async move { auth.paste_inner(&server).await })
+    }
+
     fn logout(&self, server: &str) -> AuthFuture {
         let (auth, server) = (self.clone(), server.to_string());
         Box::pin(async move { auth.logout_inner(&server).await })
@@ -122,7 +177,7 @@ impl ClientAuthCommands for TerminalMcpAuth {
 /// blocking pool: raw mode is suspended for the login, and a cancel leaves
 /// the waiting thread parked until a line arrives (the TS dialog's input
 /// races the same way).
-async fn read_terminal_line() -> Option<String> {
+pub(crate) async fn read_terminal_line() -> Option<String> {
     tokio::task::spawn_blocking(|| {
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {

@@ -15,13 +15,15 @@ use crate::width::is_whitespace_char;
 use std::collections::HashMap;
 
 use text_utils::{char_at, split_at_char};
-use wrap::segment_with_markers;
+use wrap::{parse_paste_marker, segment_with_markers};
 
 mod autocomplete;
 mod input;
 mod kill_ring;
 mod layout;
 mod motion;
+#[cfg(test)]
+mod paste_tests;
 mod text_ops;
 mod text_utils;
 mod wrap;
@@ -63,6 +65,16 @@ pub enum PasteDisposition {
     Inline,
     /// Large paste stored as an atomic `[paste #N ...]` marker.
     Marker { id: usize },
+}
+
+/// The collapsed-paste registry of an editor (TS `EditorPasteSnapshot`):
+/// the id/content map behind `[paste #N ...]` markers plus the id
+/// counter, so a draft moved to another editor still expands and keeps
+/// its markers atomic.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EditorPasteSnapshot {
+    pub pastes: Vec<(usize, String)>,
+    pub paste_counter: usize,
 }
 
 /// Outcome of a submit.
@@ -229,24 +241,35 @@ impl Editor {
     }
 
     fn expand_paste_markers(&self, text: &str) -> String {
-        let mut result = text.to_string();
-        for (id, content) in self.pastes.clone() {
-            while let Some(idx) = result.find(&format!("[paste #{id}")) {
-                let end = match result[idx..].find(']') {
-                    Some(rel) => idx + rel + 1,
-                    None => break,
-                };
-                let marker = result[idx..end].to_string();
-                let body = marker[8..marker.len() - 1].to_string();
-                let valid = body.strip_prefix(&format!("{id}")).is_some_and(|rest| {
-                    rest.is_empty() || rest.starts_with(' ') || rest.starts_with('+')
-                });
-                if !valid {
-                    break;
+        // One scan with the shared marker shape (TS builds one regex per
+        // registered id): a marker expands only when its parsed id is
+        // registered, so a typed or edited look-alike stays literal, and
+        // `[paste #1` never swallows the head of `[paste #10]`.
+        let mut result = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(idx) = rest.find("[paste #") {
+            result.push_str(&rest[..idx]);
+            let candidate = &rest[idx..];
+            match parse_paste_marker(candidate) {
+                Some((id, len)) => {
+                    if let Some(content) = self.pastes.get(&id) {
+                        result.push_str(content);
+                    } else {
+                        // Well-formed but unregistered: keep it literal.
+                        result.push_str(&candidate[..len]);
+                    }
+                    rest = &candidate[len..];
                 }
-                result.replace_range(idx..end, &content);
+                // Malformed marker head: keep up to the next `]` (or the
+                // rest when none remains) so the scan still progresses.
+                None => {
+                    let skip = candidate.find(']').map_or(candidate.len(), |p| p + 1);
+                    result.push_str(&candidate[..skip]);
+                    rest = &candidate[skip..];
+                }
             }
         }
+        result.push_str(rest);
         result
     }
 
@@ -258,6 +281,31 @@ impl Editor {
         (self.cursor_line, self.cursor_col)
     }
 
+    /// The prompt prefix the first line renders in place of its leading
+    /// `!`/`!!` (TS `CustomEditor.getPromptPrefix`): `! ` / `!! ` when the
+    /// first line opens a bang command, `None` for the default `> `.
+    pub fn bash_prompt_prefix(&self) -> Option<&'static str> {
+        self.lines
+            .first()
+            .and_then(|line| crate::bash_bang::bash_prompt_info(line))
+            .map(|(prefix, _)| prefix)
+    }
+
+    /// The hidden text prefix length of one line (TS
+    /// `getHiddenTextPrefixLength`): the bang prefix the prompt renders
+    /// in place of on line 0, zero everywhere else. The cursor cannot
+    /// move into it and edits treat it as the line's start.
+    pub fn line_start_col(&self, line_index: usize) -> usize {
+        if line_index != 0 {
+            return 0;
+        }
+        self.lines
+            .first()
+            .and_then(|line| crate::bash_bang::bash_prompt_info(line))
+            .map(|(_, hidden)| hidden)
+            .unwrap_or(0)
+    }
+
     /// The cursor sits at the end of the last logical line (TS
     /// `CustomEditor.isCursorAtEnd`): the position from which the
     /// move-below-prompt hook can hand the focus to the surface below the
@@ -267,16 +315,19 @@ impl Editor {
         self.cursor_line == last && self.cursor_col == self.lines[last].chars().count()
     }
 
-    pub fn get_paste_snapshot(&self) -> (Vec<(usize, String)>, usize) {
+    pub fn get_paste_snapshot(&self) -> EditorPasteSnapshot {
         let mut pastes: Vec<(usize, String)> =
             self.pastes.iter().map(|(k, v)| (*k, v.clone())).collect();
         pastes.sort();
-        (pastes, self.paste_counter)
+        EditorPasteSnapshot {
+            pastes,
+            paste_counter: self.paste_counter,
+        }
     }
 
-    pub fn restore_paste_snapshot(&mut self, pastes: Vec<(usize, String)>, counter: usize) {
-        self.pastes = pastes.into_iter().collect();
-        self.paste_counter = counter;
+    pub fn restore_paste_snapshot(&mut self, snapshot: EditorPasteSnapshot) {
+        self.pastes = snapshot.pastes.into_iter().collect();
+        self.paste_counter = snapshot.paste_counter;
     }
 
     pub fn set_text(&mut self, text: &str) {
@@ -498,7 +549,10 @@ impl Editor {
         self.last_action = None;
         self.push_undo_snapshot();
 
-        let clean = normalize_text(pasted_text);
+        // A tmux popup can re-encode control bytes inside the paste as
+        // CSI-u Ctrl+letter sequences; decode them before the per-char
+        // filter so newlines survive (TS handlePaste).
+        let clean = normalize_text(&text_utils::decode_paste_ctrl_sequences(pasted_text));
         let filtered_raw: String = clean
             .chars()
             .filter(|&c| c == '\n' || (c as u32) >= 32)
@@ -572,6 +626,17 @@ mod tests {
             .expect("submit event");
         assert_eq!(submitted, "a\nb");
         assert_eq!(e.get_text(), "");
+    }
+
+    #[test]
+    fn paste_decodes_reencoded_ctrl_bytes() {
+        // A tmux csi-u paste re-encodes newlines as CSI-u Ctrl+J; the
+        // decode happens before the per-char filter, so the newline
+        // survives instead of leaking "[106;5u" into the editor.
+        let mut e = ed();
+        e.handle_paste("alpha\x1b[106;5ubeta");
+        assert_eq!(e.get_text(), "alpha\nbeta");
+        assert_eq!(e.get_lines(), vec!["alpha", "beta"]);
     }
 
     #[test]
@@ -655,6 +720,31 @@ mod tests {
         assert_eq!(e.get_text(), "one\ntwo");
     }
 
+    /// One paste is one undo unit (TS `handlePaste` pushes a single undo
+    /// snapshot before inserting): one undo removes the whole paste — the
+    /// collapsed marker AND the stored content — never a fragment.
+    #[test]
+    fn undo_removes_a_whole_paste_in_one_step() {
+        let mut e = ed();
+        e.handle_input("x");
+        let big = (0..15)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(
+            e.handle_paste(&big),
+            PasteDisposition::Marker { .. }
+        ));
+        assert_eq!(e.get_text(), "x[paste #1 +15 lines]");
+        e.handle_input("ctrl+-");
+        assert_eq!(e.get_text(), "x", "one undo removed the whole paste");
+        // The same holds for a small inline paste: one undo, whole text.
+        e.handle_paste("one\ntwo");
+        assert_eq!(e.get_text(), "xone\ntwo");
+        e.handle_input("ctrl+-");
+        assert_eq!(e.get_text(), "x");
+    }
+
     #[test]
     fn backslash_enter_newline() {
         let mut e = ed();
@@ -662,5 +752,58 @@ mod tests {
         e.handle_input("\\");
         e.handle_input("enter");
         assert_eq!(e.get_lines(), vec!["a", ""]);
+    }
+
+    /// The hidden bang prefix (TS `getHiddenTextPrefixLength`): the prompt
+    /// renders it in place, Home lands after it, and the cursor cannot
+    /// step or word-skip into it.
+    #[test]
+    fn the_bang_prefix_is_hidden_and_protected() {
+        let mut e = ed();
+        e.set_text("!echo hi");
+        assert_eq!(e.bash_prompt_prefix(), Some("! "));
+        assert_eq!(e.line_start_col(0), 1);
+        assert_eq!(e.line_start_col(1), 0, "later lines have no prefix");
+        e.handle_input("home");
+        assert_eq!(e.get_cursor(), (0, 1), "Home lands after the prefix");
+        e.handle_input("left");
+        assert_eq!(e.get_cursor(), (0, 1), "left cannot cross into the prefix");
+        e.handle_input("right");
+        e.handle_input("alt+b");
+        assert_eq!(e.get_cursor(), (0, 1), "word-back stops at the prefix");
+        e.handle_input("ctrl+u");
+        assert_eq!(
+            e.get_text(),
+            "!echo hi",
+            "kill-to-start keeps the prefix and the text behind the cursor"
+        );
+    }
+
+    /// Backspacing the line down to its bare prefix clears the prompt (TS
+    /// `handleBackspace`'s `lineStartCol` branch): the bang prefix
+    /// included, so the editor returns to the plain `> ` prompt.
+    #[test]
+    fn backspacing_the_bare_prefix_clears_the_prompt() {
+        let mut e = ed();
+        e.set_text("!x");
+        e.handle_input("backspace");
+        assert_eq!(e.get_text(), "!", "the body deleted, the prefix kept");
+        assert_eq!(e.get_cursor(), (0, 1));
+        e.handle_input("backspace");
+        assert_eq!(e.get_text(), "", "backspacing the bare prefix clears it");
+        assert_eq!(e.bash_prompt_prefix(), None);
+    }
+
+    /// The `!!` prefix hides two characters and the prompt width grows to
+    /// three (the layout wraps the display line, not the raw one).
+    #[test]
+    fn the_double_bang_prefix_hides_two_characters() {
+        let mut e = ed();
+        e.set_text("!!echo hi");
+        assert_eq!(e.bash_prompt_prefix(), Some("!! "));
+        assert_eq!(e.line_start_col(0), 2);
+        let layout = e.layout_text(20);
+        assert_eq!(layout[0].text, "echo hi", "the raw prefix stays hidden");
+        assert_eq!(layout[0].source_start, 2);
     }
 }

@@ -38,7 +38,10 @@ pub fn private_prime_authorization_fingerprint(api_key: &str, team_id: &str) -> 
 }
 
 /// Fetch the team's authorized private models; 401/403 settle to empty.
+/// `base_url` is the Prime Inference API base (the shared catalog's, so
+/// hermetic tests aim the whole flow at a local server).
 pub async fn fetch_authorized_private_prime_inference_models(
+    base_url: &str,
     api_key: &str,
     team_headers: &HashMap<String, String>,
     public_model_ids: &HashSet<String>,
@@ -49,7 +52,8 @@ pub async fn fetch_authorized_private_prime_inference_models(
     }
     let mut headers = team_headers.clone();
     headers.insert("Authorization".to_string(), format!("Bearer {api_key}"));
-    let fetch = fetch_prime_inference_model_catalog(Some(&headers), timeout_ms, true).await;
+    let fetch =
+        fetch_prime_inference_model_catalog(base_url, Some(&headers), timeout_ms, true).await;
     let (payload, entries) = match fetch {
         Ok(result) => result,
         Err(error) => {
@@ -206,6 +210,64 @@ mod tests {
             models: get_private_prime_inference_models(),
             refreshed_at: 1,
         }
+    }
+
+    /// The injected private models keep their zero pricing end to end: a
+    /// cache entry priced `0.0` (the free internal models) resolves to a
+    /// model whose costs are zero, so the provider cost calculation bills
+    /// nothing for them — never a template's or a fallback's pricing.
+    #[test]
+    fn zero_priced_private_cache_models_resolve_free() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models_json = dir.path().join("models.json");
+        std::fs::write(
+            private_prime_authorization_cache_path(&models_json),
+            serde_json::json!({
+                "fingerprint": "fingerprint-a",
+                "refreshedAt": 1,
+                "data": [{
+                    "id": "internal/glm-5.3-fast",
+                    "display_name": "GLM 5.3 Fast (internal)",
+                    "pricing": {
+                        "input_usd_per_mtok": 0.0,
+                        "output_usd_per_mtok": 0.0,
+                        "cache_read_usd_per_mtok": 0.0,
+                        "cache_write_usd_per_mtok": 0.0,
+                    },
+                    "specs": {
+                        "context_window": 1_048_576,
+                        "max_output_tokens": 131_072,
+                        "modalities": { "input": ["text"], "output": ["text"] },
+                        "supports_reasoning": true,
+                    },
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cache = read_private_prime_authorization_cache(&models_json).expect("cache readable");
+        let model = cache
+            .models
+            .iter()
+            .find(|model| model.id == "internal/glm-5.3-fast")
+            .expect("the injected model resolves");
+        assert_eq!(model.cost.input.0, 0.0);
+        assert_eq!(model.cost.output.0, 0.0);
+        // The provider cost calculation over a heavy usage bills $0: the
+        // injected pricing, not a template's or a default's.
+        let usage = pa_types::ai::Usage {
+            input: 21_000_000,
+            output: 1_700_000,
+            cache_read: 2_000_000_000,
+            cache_write: 1_000_000,
+            ..pa_types::ai::Usage::default()
+        };
+        let cost = pa_ai::models::calculate_cost_values(model, &usage, None);
+        assert_eq!(cost.input.0, 0.0);
+        assert_eq!(cost.output.0, 0.0);
+        assert_eq!(cost.cache_read.0, 0.0);
+        assert_eq!(cost.cache_write.0, 0.0);
+        assert_eq!(cost.total.0, 0.0);
     }
 
     #[test]

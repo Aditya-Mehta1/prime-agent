@@ -1,3 +1,0 @@
-supervisor started pid 175196
-[2026-09-18T10:55:56.220Z] session worker 88ce825e90d3 registered (epoch 1, pid 175210)
-[2026-09-18T10:55:56.316Z] session worker 88ce825e90d3 re-registered (epoch 2, pid 175210)

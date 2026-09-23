@@ -214,8 +214,10 @@ pub async fn sync_after_compaction(
     probe: &dyn CompactionKernelProbe,
     session: &Arc<tokio::sync::Mutex<SessionManager>>,
     agent: &Arc<Agent>,
-) -> Option<CustomMessage> {
-    let content = capture_notice_content(probe).await?;
+) -> std::io::Result<Option<CustomMessage>> {
+    let Some(content) = capture_notice_content(probe).await else {
+        return Ok(None);
+    };
     let row = notice_message(content);
     {
         let mut session = session.lock().await;
@@ -224,12 +226,12 @@ pub async fn sync_after_compaction(
             row.content.clone(),
             row.display,
             row.details.clone(),
-        );
+        )?;
     }
     let Some(loop_message) = crate::session_engine::session_message_to_loop(
         &pa_types::session::AgentMessage::Custom(row.clone()),
     ) else {
-        return Some(row);
+        return Ok(Some(row));
     };
     let state = agent.state().await;
     let mut messages = state.messages;
@@ -244,7 +246,7 @@ pub async fn sync_after_compaction(
         messages.push(loop_message);
     }
     agent.set_messages(messages).await;
-    Some(row)
+    Ok(Some(row))
 }
 
 #[cfg(test)]
@@ -456,7 +458,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut session = SessionManager::in_memory(tmp.path());
         for text in ["turn zero", "turn one", "turn two"] {
-            session.append_message(user_turn(text));
+            session.append_message(user_turn(text)).unwrap();
         }
         let agent = std::sync::Arc::new(Agent::new(AgentOptions::default()));
         let mut engine = AgentSession::new(agent.clone(), session, Vec::new())

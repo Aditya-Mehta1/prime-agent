@@ -1,5 +1,0 @@
-Prime Agent daemon supervisor 5c9dcd90-0b80-4831-acbe-6fdd40459ead listening on /home/ubuntu/lane-worktrees/tui-interaction/scripts/battery/runs/20260918T112949Z/ts/daemon.sock
-Session worker dc6bdba90776 stderr: Prime Agent daemon listening on /tmp/vbat20260918T112949Z-ts/prime-agent-1000/worker-4d5728d9e770-dc6bdba90776.sock
-Session worker 040479a4578b stderr: Prime Agent daemon listening on /tmp/vbat20260918T112949Z-ts/prime-agent-1000/worker-4d5728d9e770-040479a4578b.sock
-Session worker dc6bdba90776 stderr: shutting down (exit 0); closing 0 active session(s)
-Session worker 040479a4578b stderr: shutting down (exit 0); closing 0 active session(s)

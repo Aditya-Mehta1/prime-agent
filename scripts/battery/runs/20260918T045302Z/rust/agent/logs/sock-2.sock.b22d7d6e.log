@@ -1,3 +1,0 @@
-supervisor started pid 994433
-[2026-09-18T04:57:33.547Z] session worker 6205fb0a43f4 registered (epoch 1, pid 994440)
-[2026-09-18T04:57:33.635Z] session worker 6205fb0a43f4 re-registered (epoch 2, pid 994440)

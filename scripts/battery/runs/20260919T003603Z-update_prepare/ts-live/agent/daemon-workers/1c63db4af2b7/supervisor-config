@@ -1,8 +1,0 @@
-{
-  "version": 1,
-  "socketPath": "/tmp/upw-s3/ts-live/daemon.sock",
-  "defaultSessionConfig": {
-    "cwd": "/tmp/upw-s3/ts-live/work",
-    "agentDir": "/tmp/upw-s3/ts-live/agent"
-  }
-}

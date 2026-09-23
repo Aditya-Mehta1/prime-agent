@@ -43,7 +43,9 @@ fn set_mtime(path: &Path, tv_sec: i64, tv_nsec: i64) -> io::Result<()> {
         libc::timespec { tv_sec, tv_nsec },
         libc::timespec { tv_sec, tv_nsec },
     ];
-    let result = unsafe { libc::utimensat(-1, path_c.as_ptr(), times.as_ptr(), 0) };
+    // Relative lock paths (a relative agent dir) resolve against the
+    // process cwd through AT_FDCWD.
+    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), 0) };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }

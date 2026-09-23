@@ -1,3 +1,0 @@
-{"activeSessionId":"4f985c12f207","busy":true,"operation":"create","recordedAt":"2026-09-19T00:35:59.429Z","sessionFile":"/tmp/upw-s3/rust-live/agent/sessions/01a0b717-672b-7760-93fa-3f9f1f6aef13.jsonl","sessionId":"01a0b717-672b-7760-93fa-3f9f1f6aef13"}
-{"active_session_id":"4f985c12f207","follow_up":[],"recorded_at":"2026-09-19T00:35:59.434Z","steering":[],"type":"queue_snapshot","version":1}
-{"activeSessionId":"4f985c12f207","busy":false,"operation":"shutdown","recordedAt":"2026-09-19T00:35:59.438Z","sessionFile":"/tmp/upw-s3/rust-live/agent/sessions/01a0b717-672b-7760-93fa-3f9f1f6aef13.jsonl","sessionId":"01a0b717-672b-7760-93fa-3f9f1f6aef13"}

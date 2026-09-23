@@ -14,7 +14,6 @@ use pa_agent::types::{Model, ThinkingLevel};
 use crate::resources::{load_resources, ResourceLoaderOptions};
 use crate::session::manager::SessionManager;
 use crate::skills::PromptTemplate;
-use pa_types::session::FileEntry;
 
 use pa_telemetry::base_properties;
 
@@ -81,6 +80,20 @@ pub struct SessionEngineConfig {
     /// sites and after a kernel `goal.complete` settles the goal): the
     /// daemon worker's queue purge.
     pub queued_goal_context_purge: Option<super::runtime::QueuedGoalContextPurge>,
+    /// TS `_steeringStopPending` (the session's `shouldStopAfterTurn`/
+    /// `shouldStopBeforeTurn` hooks): `true` while steering-lane session
+    /// actions are queued or mid-selection, so the running turn stops at
+    /// the next turn boundary and the queued steer delivers as the next
+    /// input (TS agent-session.ts's `_steeringStopPending`; the follow-up
+    /// lane never stops the run — `when_run_idle` waits for the settle).
+    pub queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// The session's queue delivery modes (TS `sdk.ts` passes
+    /// `settingsManager.getSteeringMode()`/`getFollowUpMode()` into the
+    /// Agent): the agent's steering/follow-up queues drain per the mode
+    /// at the loop boundary. `None` keeps the TS default
+    /// ("one-at-a-time").
+    pub steering_mode: Option<pa_agent::agent::QueueMode>,
+    pub follow_up_mode: Option<pa_agent::agent::QueueMode>,
     /// Boot the session's kernel in the background at creation (TS
     /// `prewarmIpythonKernel` from `createDefaultRuntimeFactory`): a main
     /// session (depth 0, the engine's gate like the TS `rlmDepth === 0`
@@ -560,27 +573,21 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let (existing_messages, has_thinking_entry, has_service_tier_entry) = {
         let session = wiring.session.lock().await;
         let messages = super::compact_session::rebuilt_context_after_compaction(&session);
-        let has_thinking_entry = session
-            .get_all_entries()
-            .iter()
-            .any(|entry| matches!(entry, FileEntry::ThinkingLevelChange { .. }));
-        let has_service_tier_entry = session
-            .get_all_entries()
-            .iter()
-            .any(|entry| matches!(entry, FileEntry::ServiceTierChange { .. }));
+        let has_thinking_entry = session.has_thinking_level();
+        let has_service_tier_entry = session.has_service_tier();
         (messages, has_thinking_entry, has_service_tier_entry)
     };
     let thinking_level = config.thinking_level.unwrap_or(ThinkingLevel::Off);
     {
         let mut session = wiring.session.lock().await;
         if existing_messages.is_empty() {
-            session.append_model_change(&model.provider, &model.id);
-            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase());
+            session.append_model_change(&model.provider, &model.id)?;
+            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase())?;
         } else if !has_thinking_entry {
-            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase());
+            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase())?;
         }
         if existing_messages.is_empty() || !has_service_tier_entry {
-            session.append_service_tier_change(Some(service_tier_preference));
+            session.append_service_tier_change(Some(service_tier_preference))?;
         }
     }
     // The loop consumes agent-side messages; session entries cross through
@@ -612,6 +619,22 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // (TS `convertToLlm`): bookkeeping custom rows drop, everything
         // else (the harness digest included) becomes a user turn.
         convert_to_llm: Some(super::messages::engine_convert_to_llm()),
+        // TS `_steeringStopPending`: both the after-turn and the
+        // before-turn hooks consult the same probe (a queued steer stops
+        // the run at the boundary; the pump delivers it next).
+        should_stop_after_turn: config.queued_steering_probe.take().map(|probe| {
+            let probe: pa_agent::agent_loop::ShouldStopAfterTurnFn =
+                std::sync::Arc::new(move |_context| {
+                    let probe = std::sync::Arc::clone(&probe);
+                    Box::pin(async move { Ok(probe()) })
+                });
+            probe
+        }),
+        should_stop_before_turn: config.queued_steering_probe.clone(),
+        // TS `sdk.ts`: the Agent's steering/follow-up queues drain per
+        // the session's configured modes (default "one-at-a-time").
+        steering_mode: config.steering_mode,
+        follow_up_mode: config.follow_up_mode,
         ..Default::default()
     });
 
@@ -652,6 +675,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         std::sync::Arc::downgrade(&provisioner),
     ));
     session.set_kernel_state_probe(Some(kernel_state_probe));
+    // The skill inventory `/skill:<name>` submissions expand against (TS
+    // reads the resource loader at expansion time; the session snapshots
+    // the engine's loaded list).
+    session.set_skills(resources.skills.clone());
     // The restore-notice mailbox becomes the session's next-turn queue:
     // rows parked by a boot that settled mid-build merge in, and later
     // restores (a lazy first-call boot) push straight into the live
@@ -688,6 +715,12 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         _ => None,
     };
 
+    // The `skill used` adoption event reports through the session's
+    // telemetry handle (installed once the telemetry composition decided
+    // whether this session reports at all).
+    if let Some(telemetry) = telemetry.as_ref() {
+        session.set_skill_telemetry(telemetry.clone());
+    }
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
         session,
@@ -708,6 +741,16 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
 }
 
 impl SessionEngine {
+    /// Expand a `/skill:<name>` submission into its `<skill>` block for
+    /// the accepted-turn row (TS `_expandSkillCommand`; the row the daemon
+    /// emits before admission must match the text the model turn
+    /// receives). Non-skill inputs pass through unchanged; the admitted
+    /// turn's own expansion is idempotent over the block. The `skill used`
+    /// adoption event reports from the admission, not here.
+    pub fn expand_skill_submission(&self, text: &str) -> String {
+        crate::skills::expand_skill_command(text, &self.skills).0
+    }
+
     /// Withdraw the queued goal-context turns (TS `_clearQueuedGoalContexts`
     /// at the `_pauseGoal`/`_clearGoal`/`_startGoal` command sites): a
     /// minted continuation waiting in the embedding's queue never runs
@@ -737,6 +780,20 @@ impl SessionEngine {
     /// session that owns it.
     pub async fn dispose_kernel(&self) {
         self.provisioner.dispose(None).await;
+    }
+
+    /// Out-of-band kernel bash activity, scoped to this session's live kernel.
+    pub async fn bash_activity(
+        &self,
+        action: &str,
+        activity_id: Option<&str>,
+        lines: usize,
+    ) -> anyhow::Result<serde_json::Value> {
+        let manager = self
+            .provisioner
+            .manager()
+            .ok_or_else(|| anyhow::anyhow!("Kernel is not running"))?;
+        manager.bash_activity(action, activity_id, lines).await
     }
 
     /// Per-server MCP tool listing through the session's kernel (the
@@ -822,6 +879,9 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let engine = create_session(SessionEngineConfig {
             cron_store: None,
+            queued_steering_probe: None,
+            steering_mode: None,
+            follow_up_mode: None,
             cwd: cwd.clone(),
             agent_dir: tmp.path().join("agent"),
             mcp_manager: None,
@@ -928,6 +988,9 @@ mod tests {
         ) -> SessionEngineConfig {
             SessionEngineConfig {
                 cron_store: None,
+                queued_steering_probe: None,
+                steering_mode: None,
+                follow_up_mode: None,
                 cwd: cwd.to_path_buf(),
                 agent_dir: agent_dir.to_path_buf(),
                 mcp_manager: None,

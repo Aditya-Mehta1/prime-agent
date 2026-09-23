@@ -1,6 +1,0 @@
-{"activeSessionId":"b2c18069a786","busy":true,"operation":"create","recordedAt":"2026-09-20T05:06:03.204Z","sessionFile":"/home/ubuntu/lane-worktrees/compaction-outcome/scripts/battery/runs/20260920T050501Z/rust/agent/sessions/01a0bd35-0335-739a-bb6f-901c402b56ff.jsonl","sessionId":"01a0bd35-0335-739a-bb6f-901c402b56ff"}
-{"active_session_id":"b2c18069a786","follow_up":[],"recorded_at":"2026-09-20T05:06:03.222Z","steering":["f14 auto seed turn"],"type":"queue_snapshot","version":1}
-{"active_session_id":"b2c18069a786","follow_up":[],"recorded_at":"2026-09-20T05:06:03.274Z","steering":[],"type":"queue_snapshot","version":1}
-{"active_session_id":"b2c18069a786","follow_up":[],"recorded_at":"2026-09-20T05:06:12.896Z","steering":["f14 threshold crossing turn"],"type":"queue_snapshot","version":1}
-{"active_session_id":"b2c18069a786","follow_up":[],"recorded_at":"2026-09-20T05:06:12.991Z","steering":[],"type":"queue_snapshot","version":1}
-{"activeSessionId":"b2c18069a786","busy":false,"operation":"shutdown","recordedAt":"2026-09-20T05:06:18.450Z","sessionFile":"/home/ubuntu/lane-worktrees/compaction-outcome/scripts/battery/runs/20260920T050501Z/rust/agent/sessions/01a0bd35-0335-739a-bb6f-901c402b56ff.jsonl","sessionId":"01a0bd35-0335-739a-bb6f-901c402b56ff"}

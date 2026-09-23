@@ -1,5 +1,0 @@
-{"type":"session","version":3,"id":"01a0ac4c-969f-72b9-97b1-49786c5cfa25","timestamp":"2026-09-16T22:18:15.583Z","cwd":"/home/ubuntu/lane-worktrees/gap-cli/scripts/battery/runs/20260916T221725Z/ts/work","rlmDepth":0,"git":{"repoUrl":"https://github.com/kevinjosethomas/prime-agent-rs.git","commit":"8d3275fc230998675e7400ebd9b83e95ec97a4da","branch":"lane/gap-cli"}}
-{"type":"model_change","id":"cd917623","parentId":null,"timestamp":"2026-09-16T22:18:15.797Z","provider":"prime-inference","modelId":"z-ai/glm-5.3"}
-{"type":"thinking_level_change","id":"3f8bf9ae","parentId":"cd917623","timestamp":"2026-09-16T22:18:15.797Z","thinkingLevel":"high"}
-{"type":"service_tier_change","id":"472d2a9b","parentId":"3f8bf9ae","timestamp":"2026-09-16T22:18:15.797Z","serviceTier":"default"}
-{"type":"session_state","id":"e003b6b9","parentId":"472d2a9b","timestamp":"2026-09-16T22:18:15.836Z","state":{"status":"active"}}

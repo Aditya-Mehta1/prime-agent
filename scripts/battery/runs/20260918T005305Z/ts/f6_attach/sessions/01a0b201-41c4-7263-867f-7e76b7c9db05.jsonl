@@ -1,5 +1,0 @@
-{"type":"session","version":3,"id":"01a0b201-41c4-7263-867f-7e76b7c9db05","timestamp":"2026-09-18T00:53:41.956Z","cwd":"/home/ubuntu/lane-worktrees/onboarding-parity/scripts/battery/runs/20260918T005305Z/ts/work","rlmDepth":0,"git":{"repoUrl":"https://github.com/kevinjosethomas/prime-agent-rs.git","commit":"9c3e4debfa87c530386dafd872ddb9861dbd25b6","branch":"lane/onboarding-parity"}}
-{"type":"model_change","id":"3f99331f","parentId":null,"timestamp":"2026-09-18T00:53:42.167Z","provider":"prime-inference","modelId":"z-ai/glm-5.3"}
-{"type":"thinking_level_change","id":"aa411a6a","parentId":"3f99331f","timestamp":"2026-09-18T00:53:42.167Z","thinkingLevel":"high"}
-{"type":"service_tier_change","id":"49e7eadd","parentId":"aa411a6a","timestamp":"2026-09-18T00:53:42.167Z","serviceTier":"default"}
-{"type":"session_state","id":"c2df0a1e","parentId":"49e7eadd","timestamp":"2026-09-18T00:53:42.199Z","state":{"status":"active"}}

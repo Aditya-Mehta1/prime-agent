@@ -1,7 +1,0 @@
-[2026-09-17T04:41:14.011Z] supervisor: Prime Agent daemon supervisor 15b35c5b-2199-48cd-8108-9dc65ee0422c listening on /home/ubuntu/lane-worktrees/trial-send/scripts/battery/runs/20260917T044113Z/ts/daemon.sock
-[2026-09-17T04:41:14.211Z] supervisor: Session worker ae506830a50e stderr: Prime Agent daemon listening on /tmp/vbat20260917T044113Z-ts/prime-agent-1000/worker-65cd008a5c03-ae506830a50e.sock
-[2026-09-17T04:41:14.383Z] supervisor: Session worker ae506830a50e stderr: shutdown command received over socket; 1 active session(s) will be closed
-[2026-09-17T04:41:14.384Z] supervisor: Session worker ae506830a50e stderr: shutting down (exit 0); closing 1 active session(s)
-[2026-09-17T04:41:14.939Z] supervisor: Session worker 39175f354606 stderr: Prime Agent daemon listening on /tmp/vbat20260917T044113Z-ts/prime-agent-1000/worker-65cd008a5c03-39175f354606.sock
-[2026-09-17T04:41:15.282Z] supervisor: Session worker 39175f354606 stderr: shutdown command received over socket; 1 active session(s) will be closed
-[2026-09-17T04:41:15.283Z] supervisor: Session worker 39175f354606 stderr: shutting down (exit 0); closing 1 active session(s)

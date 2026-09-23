@@ -1,3 +1,0 @@
-supervisor started pid 2388488
-[2026-09-17T04:34:37.531Z] session worker 04cf7d7b9629 registered (epoch 1, pid 2388494)
-[2026-09-17T04:34:37.558Z] session worker 04cf7d7b9629 re-registered (epoch 2, pid 2388494)

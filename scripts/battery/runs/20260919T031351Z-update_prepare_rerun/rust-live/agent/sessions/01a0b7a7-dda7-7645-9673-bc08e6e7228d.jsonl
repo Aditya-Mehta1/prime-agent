@@ -1,5 +1,0 @@
-{"cwd":"/tmp/upw-s5/rust-live/work","id":"01a0b7a7-dda7-7645-9673-bc08e6e7228d","rlmDepth":0,"timestamp":"2026-09-19T03:13:46.919Z","type":"session","version":3}
-{"type":"model_change","id":"4e5f1be7","parentId":null,"timestamp":"2026-09-19T03:13:46.942Z","modelId":"z-ai/glm-5.3","provider":"prime-inference"}
-{"type":"thinking_level_change","id":"7709fb13","parentId":"4e5f1be7","timestamp":"2026-09-19T03:13:46.942Z","thinkingLevel":"high"}
-{"type":"service_tier_change","id":"e8ed6ffa","parentId":"7709fb13","timestamp":"2026-09-19T03:13:46.942Z","serviceTier":"default"}
-{"type":"session_state","id":"24310501","parentId":"e8ed6ffa","timestamp":"2026-09-19T03:13:46.942Z","state":{"status":"active"}}

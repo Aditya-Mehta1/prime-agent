@@ -1,10 +1,12 @@
 //! The composition root's provider auth flows behind the TUI's `/login`
 //! and `/logout` (TS `ProviderAuthFlows`): the provider catalog rows with
-//! their auth status, the API-key store, the MCP device flow, and the
-//! credential removal. The provider OAuth flows (TS `pi-ai/oauth`:
+//! their auth status, the API-key store, the MCP device flow, the Prime
+//! Inference terminal login (`prime_inference_login`), and the credential
+//! removal. The provider OAuth flows (TS `the TS AI library/oauth`:
 //! Anthropic, GitHub Copilot, OpenAI Codex, xAI subscriptions) and the
-//! Prime browser logins are not ported yet; their rows render (TS shape)
-//! and their flows report the unavailability.
+//! Prime browser logins (the RSA `auth_challenge` flow) are not ported
+//! yet; their rows render (TS shape) and their flows report the
+//! unavailability.
 
 use std::path::PathBuf;
 
@@ -15,7 +17,7 @@ use pa_tui::provider_auth::{
     ProviderAuthFuture, ProviderAuthOutcome, ProviderRow, ProviderRowsFuture,
 };
 
-/// The TS OAuth provider rows (`pi-ai/oauth` registry): subscription
+/// The TS OAuth provider rows (`the TS AI library/oauth` registry): subscription
 /// logins whose flows this build does not port yet.
 const SUBSCRIPTION_PROVIDERS: [(&str, &str); 4] = [
     ("anthropic", "Anthropic (Claude Pro/Max)"),
@@ -130,7 +132,9 @@ fn status_indicator(
     }
     if let Some(credential) = credential {
         let credential_type = match credential {
-            AuthCredential::ApiKey { .. } => AuthType::ApiKey,
+            AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => {
+                AuthType::ApiKey
+            }
             AuthCredential::Oauth { .. } => AuthType::Oauth,
         };
         return Some(if credential_type == auth_type {
@@ -209,6 +213,8 @@ impl ProviderAuth {
     fn mcp_manager(&self) -> pa_core::mcp::McpManager {
         let cwd = self.cwd.clone();
         let agent_dir = self.agent_dir.clone();
+        let catalog_cwd = self.cwd.clone();
+        let catalog_agent_dir = self.agent_dir.clone();
         pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: self.auth_storage_with_oauth(),
             get_user_servers: Box::new(move || {
@@ -229,6 +235,21 @@ impl ProviderAuth {
                 )
             }),
             begin_login: None,
+            agent_dir: Some(self.agent_dir.clone()),
+            get_catalog_sources: Some(Box::new({
+                let cwd = catalog_cwd.clone();
+                let agent_dir = catalog_agent_dir.clone();
+                move || {
+                    let settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+                    settings
+                        .settings()
+                        .mcp_catalog_sources
+                        .clone()
+                        .unwrap_or_default()
+                }
+            })),
+            remote_source: None,
+            probe_override: None,
         })
     }
 
@@ -434,7 +455,9 @@ impl ProviderAuth {
                 continue;
             };
             let auth_type = match credential {
-                AuthCredential::ApiKey { .. } => AuthType::ApiKey,
+                AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => {
+                    AuthType::ApiKey
+                }
                 AuthCredential::Oauth { .. } => AuthType::Oauth,
             };
             let (is_serper, is_mcp) = (
@@ -501,9 +524,36 @@ fn login_blocking(
         };
     }
     if provider_row.id == PRIME_INFERENCE_PROVIDER_ID {
-        return ProviderAuthOutcome::Error(
-            "Prime Inference login is not available in this build yet.".to_string(),
-        );
+        // TS `loginProvider`'s prime-inference dispatch: the terminal
+        // API-key flow (the paste prompt, the whoami check, the team
+        // selection; the browser challenge stays unported). The flow
+        // awaits its transport, so drive it to completion on the
+        // dedicated thread (the terminal stays suspended).
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| {
+                runtime.block_on(crate::prime_inference_login::run_prime_inference_login(
+                    crate::prime_inference_login::PrimeLoginInputs {
+                        agent_dir: &agent_dir,
+                        provider_name: &provider_row.name,
+                        config: &pa_core::auth::resolve_prime_inference_auth_config(),
+                        http: &pa_core::auth::ReqwestPrimeHttp,
+                        prime_cli_config_path: crate::prime_inference_login::prime_cli_config_path(
+                            &agent_dir,
+                        )
+                        .as_deref(),
+                        prime_team_id: std::env::var("PRIME_TEAM_ID").ok().as_deref(),
+                    },
+                    &crate::prime_inference_login::TerminalPrimeLoginUi,
+                ))
+            })
+            .unwrap_or_else(|error| {
+                ProviderAuthOutcome::Error(format!(
+                    "Failed to login to {}: {error}",
+                    provider_row.name
+                ))
+            });
     }
     if provider_row.auth_type == AuthType::Oauth {
         return ProviderAuthOutcome::Error(format!(

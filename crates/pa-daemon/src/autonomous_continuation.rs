@@ -81,12 +81,18 @@ impl AgentSessionEngine {
         let Some(weak) = weak else {
             return;
         };
-        agent.set_continuation_hook(Some(Arc::new(move |context, _signal| {
+        agent.set_continuation_hook(Some(Arc::new(move |context, signal| {
             let weak = weak.clone();
             Box::pin(async move {
                 let Some(engine) = weak.upgrade() else {
                     return Ok(Vec::new());
                 };
+                // TS `_getGoalContinuationMessages`/`_getContinuationMessages`:
+                // an aborted run mints no continuation — a kill that lands
+                // mid-turn never rolls one more zombie turn.
+                if signal.is_aborted() || engine.session_is_closed() {
+                    return Ok(Vec::new());
+                }
                 Ok(engine.autonomous_continuation_rows(&context.message).await)
             })
                 as pa_agent::BoxFut<'static, anyhow::Result<Vec<pa_agent::types::AgentMessage>>>
@@ -109,6 +115,12 @@ impl AgentSessionEngine {
         self: &Arc<Self>,
         message: &pa_agent::types::AssistantMessage,
     ) -> Vec<pa_agent::types::AgentMessage> {
+        // A closed session (killed/stopped) mints no continuation (the TS
+        // loop's abort race drops the hook; the closed gate is the same
+        // boundary for the in-process consult).
+        if self.session_is_closed() {
+            return Vec::new();
+        }
         // TS `_getContinuationMessages`: queued session input owns the
         // boundary before any continuation work.
         if self.session_input_queued() {
@@ -207,7 +219,10 @@ impl AgentSessionEngine {
     /// Whether a threshold compaction is due at this turn boundary (the
     /// core session's context estimate over the resolved model's window).
     async fn autonomous_threshold_due(&self) -> bool {
-        let Ok(model) = self.resolve_model() else {
+        // The same live model the threshold arm compacts on (the provider
+        // target): the consult and the arm must agree, or a continuation
+        // queues for a threshold crossing the arm never sees (R8).
+        let Ok(model) = self.session_model() else {
             return false;
         };
         let Some(mirror) = self.autonomous_boundary_mirror() else {
@@ -225,6 +240,12 @@ impl AgentSessionEngine {
         pa_core::session_engine::compaction::threshold_compaction_due(
             &messages,
             model.context_window,
+            pa_core::session_engine::compaction::request_output_budget(
+                &model,
+                pa_core::session_engine::provider_adapter::model_thinking_level(
+                    state.thinking_level,
+                ),
+            ),
             &mirror.compaction,
         )
     }
@@ -243,6 +264,12 @@ impl AgentSessionEngine {
     }
 
     async fn autonomous_children_settled(self: &Arc<Self>) {
+        // A closed session (killed/stopped) drops the retry: no
+        // continuation for a session that is no longer live (TS
+        // `_disposed || _disposing` in the autonomous resume site).
+        if self.session_is_closed() {
+            return;
+        }
         if !self
             .autonomous_awaits_rlm_work
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -278,7 +305,7 @@ impl AgentSessionEngine {
     /// The latest settled assistant message of the built session, if any.
     async fn latest_settled_assistant(&self) -> Option<pa_agent::types::AssistantMessage> {
         let guard = self.session.lock().await;
-        let engine = guard.as_ref()?;
+        let engine = guard.as_deref()?;
         let state = engine.session.agent().state().await;
         state
             .messages

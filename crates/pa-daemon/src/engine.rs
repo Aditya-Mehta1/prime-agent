@@ -26,6 +26,19 @@ pub struct PromptRequest {
     /// the custom row, then runs the model on `message` (TS injected-prompt
     /// turns: RLM child terminal notices).
     pub custom_message: Option<Value>,
+    /// Co-delivered user rows of a batched turn (TS
+    /// `_startPreparedTurnActions`): the queue's batched actions ride the
+    /// same run as the primary message. Each row is accepted (persisted
+    /// and rendered) in order ahead of the model turn, and the loop
+    /// context carries every row as one `agent.prompt` message list.
+    pub batch: Vec<PromptBatchRow>,
+}
+
+/// One co-delivered user row of a batched prompt request.
+#[derive(Debug, Clone)]
+pub struct PromptBatchRow {
+    pub text: String,
+    pub images: Vec<pa_agent::types::ImageContent>,
 }
 
 /// Explicit model selection from a session's create config (the wire
@@ -279,6 +292,17 @@ pub trait SessionEngine: Send + Sync {
     /// loop have nothing in flight and keep the default no-op.
     fn abort_in_flight_turn(&self) {}
 
+    /// Switch the queue delivery modes live (TS `setSteeringMode` /
+    /// `setFollowUpMode` write the session's agent): the worker's
+    /// `set_steering_mode`/`set_follow_up_mode` commands apply the
+    /// persisted mode to the engine's agent-level queues too, so the
+    /// in-process steer/follow-up admissions drain per the new mode at
+    /// the loop boundary. Engines without agent-level queues keep the
+    /// default no-op.
+    fn set_queue_modes(&self, steering: Option<&str>, follow_up: Option<&str>) {
+        let _ = (steering, follow_up);
+    }
+
     /// Run one side question: a second LLM turn over a clone of the
     /// conversation with the serialized previous turns replayed, excluded
     /// from the session history. `signal` aborts the run; `sink` receives
@@ -428,12 +452,49 @@ pub trait SessionEngine: Send + Sync {
         let _ = path;
     }
 
-    /// Adopt the explicit model selection carried by the session's create
-    /// config. Explicit CLI flags must be authoritative end-to-end: the
-    /// selection reached the worker over the wire, so model resolution must
-    /// honor it instead of a process-wide fallback. Engines without a model
-    /// (the scripted harness) ignore it.
+    /// TS `createAgentSession`'s restored-from-session step: a session
+    /// being revived (scheduled wake, update restore, worker relaunch)
+    /// restores the model its file pins before the startup chain, giving
+    /// the daemon boot's in-flight catalog fetch a bounded readiness
+    /// window — without it a revived session silently lands on the
+    /// startup-chain default instead of the model it was running on. The
+    /// worker calls this at create, before the create-config selection;
+    /// explicit flags win, a miss records the fallback (never silent).
+    /// Engines without a persisted model context do nothing.
+    fn restore_session_model(
+        &self,
+        _session_path: &std::path::Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// TS `modelFallbackMessage`: the on-the-record reason a revived
+    /// session's model fell back (the summary publishes it — a model
+    /// fallback must never be silent). `None` while no restore missed.
+    fn model_fallback_message(&self) -> Option<String> {
+        None
+    }
+
+    /// Merge an explicit selection over the engine's live selection (the
+    /// TS runtime-config merge semantics): explicit wire flags replace,
+    /// absent fields keep. The worker's create-time restored-settings
+    /// adoption (the session file's saved thinking level) runs through
+    /// this seam — a live merge that must NOT fold into the reset target
+    /// (the create-config seam is [`Self::configure_create_model`]).
+    /// Engines without a model (the scripted harness) ignore it.
     fn configure_model(&self, _selection: EngineModelSelection) {}
+
+    /// Adopt the explicit model selection carried by the session's create
+    /// command (TS `mergeAgentSessionRuntimeConfig(defaultSessionConfig,
+    /// command.config)`): the flags are authoritative end-to-end AND
+    /// survive every session replacement (TS hands the merged
+    /// `sessionConfig` down through `switchSession`/`fork`/`import`), so
+    /// they must outlive the live selection a `/model` switch mutates.
+    /// Engines without a model (the scripted harness) ignore it.
+    fn configure_create_model(&self, _selection: EngineModelSelection) {}
+
+    /// Set the session's resolved service-tier preference before the next request.
+    fn configure_service_tier(&self, _tier: Option<pa_types::ai::ServiceTier>) {}
 
     /// The effective thinking level for the session, as a wire name
     /// (`"off"`, `"minimal"`, ...): the create-config flag (else the
@@ -1062,6 +1123,7 @@ impl SessionEngine for ScriptedEngine {
         let goal = self.goal.as_ref()?;
         Some(crate::engine::GoalContinuation {
             request: crate::engine::PromptRequest {
+                batch: Vec::new(),
                 message: goal.message.clone(),
                 images: Vec::new(),
                 source: "user".to_string(),
@@ -1121,6 +1183,34 @@ impl SessionEngine for ScriptedEngine {
             emit(cancelled());
             return;
         }
+        // The batched co-delivery rows (the real engine's one-run batch):
+        // one accepted user row per batched message, in delivery order —
+        // images ride as multimodal content blocks after the text, like
+        // the primary — ahead of the single scripted reply.
+        let mut batch_rows = Vec::new();
+        for row in &request.batch {
+            let mut content = vec![json!({ "type": "text", "text": row.text })];
+            for image in &row.images {
+                let mut block = match serde_json::to_value(image) {
+                    Ok(Value::Object(block)) => Value::Object(block),
+                    _ => continue,
+                };
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("type".to_string(), json!("image"));
+                }
+                content.push(block);
+            }
+            let accepted_row = json!({
+                "role": "user",
+                "content": content,
+                "timestamp": crate::util::now_ms(),
+            });
+            batch_rows.push(accepted_row.clone());
+            if !emit(EngineEvent::UserMessage(accepted_row)) {
+                emit(cancelled());
+                return;
+            }
+        }
         // The fixture's mid-turn goal announcement (the real engine's
         // `goal_update` emission path, TS `_setGoalState` ->
         // `_emitGoalUpdate`).
@@ -1155,10 +1245,14 @@ impl SessionEngine for ScriptedEngine {
             return;
         }
         // The loop's run-end frame (TS `agent_end`): the run's
-        // accumulated message set — the accepted row plus the final
-        // assistant message in the scripted shape.
+        // accumulated message set — the accepted rows (the primary plus
+        // every batched row) and the final assistant message in the
+        // scripted shape.
+        let mut run_messages = vec![accepted_row];
+        run_messages.extend(batch_rows);
+        run_messages.push(final_message);
         if !emit(EngineEvent::AgentEnd {
-            messages: vec![accepted_row, final_message],
+            messages: run_messages,
         }) {
             emit(cancelled());
             return;
@@ -1495,6 +1589,7 @@ mod tests {
         )
         .unwrap();
         let request_for = |message: &str| PromptRequest {
+            batch: Vec::new(),
             images: Vec::new(),
             message: message.to_string(),
             source: "test".to_string(),
@@ -1527,6 +1622,7 @@ mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "x".into(),
                 source: "test".into(),

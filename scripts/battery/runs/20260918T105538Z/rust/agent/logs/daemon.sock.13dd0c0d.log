@@ -1,3 +1,0 @@
-supervisor started pid 175024
-[2026-09-18T10:55:39.306Z] session worker 56c035d5f13b registered (epoch 1, pid 175040)
-[2026-09-18T10:55:39.397Z] session worker 56c035d5f13b re-registered (epoch 2, pid 175040)

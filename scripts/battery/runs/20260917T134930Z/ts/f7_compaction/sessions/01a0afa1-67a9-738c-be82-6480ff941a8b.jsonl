@@ -1,5 +1,0 @@
-{"type":"session","version":3,"id":"01a0afa1-67a9-738c-be82-6480ff941a8b","timestamp":"2026-09-17T13:49:45.769Z","cwd":"/home/ubuntu/lane-worktrees/mcp-execution/scripts/battery/runs/20260917T134930Z/ts/work","rlmDepth":0,"git":{"repoUrl":"https://github.com/kevinjosethomas/prime-agent-rs.git","commit":"245faf783e82b1d1fd68db1aa8337cfa08db049b","branch":"lane/mcp-execution"}}
-{"type":"model_change","id":"10e394f5","parentId":null,"timestamp":"2026-09-17T13:49:45.803Z","provider":"prime-inference","modelId":"z-ai/glm-5.3"}
-{"type":"thinking_level_change","id":"a5e5054d","parentId":"10e394f5","timestamp":"2026-09-17T13:49:45.803Z","thinkingLevel":"high"}
-{"type":"service_tier_change","id":"87f46de2","parentId":"a5e5054d","timestamp":"2026-09-17T13:49:45.803Z","serviceTier":"default"}
-{"type":"session_state","id":"eab71b65","parentId":"87f46de2","timestamp":"2026-09-17T13:49:45.813Z","state":{"status":"active"}}

@@ -4,6 +4,7 @@
 //! from `coding-agent/src/modes/interactive`. Components render styled lines;
 //! the terminal layer paints them with crossterm + ratatui diffing.
 
+pub mod activity_panel;
 pub mod agents_view;
 pub mod agents_view_forest;
 pub mod agents_view_state;
@@ -11,6 +12,9 @@ pub mod altscreen;
 pub mod ansi;
 pub mod app;
 pub mod autocomplete;
+mod autolink;
+pub mod bash_bang;
+pub mod bash_card;
 pub mod chat;
 pub mod chat_slash;
 pub mod chrome;
@@ -27,6 +31,7 @@ pub mod daemon_client;
 pub mod direct_transport;
 pub mod editor;
 pub mod effort_picker;
+mod enhanced_keys;
 pub mod error_summary;
 mod exit_guard;
 pub mod export_share;
@@ -57,9 +62,9 @@ pub(crate) mod prompt_highlight;
 pub mod prompt_stash;
 pub mod provider_auth;
 pub mod queued;
-pub mod scoped_models;
 pub(crate) mod search_input;
 pub mod selection;
+mod sequence_guard;
 pub mod session;
 pub mod session_ui;
 pub mod settings_menu;

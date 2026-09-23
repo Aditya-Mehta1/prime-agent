@@ -14,47 +14,10 @@ pub fn normalize_error_details(text: &str) -> String {
     unified.trim_end().to_string()
 }
 
-/// `strip-ansi`: remove CSI/OSC escape sequences.
+/// `stripAnsi`: remove every escape sequence (the exact TS utils.ts:899
+/// scanner — see [`crate::ansi::strip_ansi`]).
 pub fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
-                chars.next();
-                for c in chars.by_ref() {
-                    // The sequence ends at its final byte (0x40..=0x7e).
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                chars.next();
-                // OSC ends at BEL or ST (ESC backslash).
-                let mut last_was_esc = false;
-                for c in chars.by_ref() {
-                    if c == '\u{7}' {
-                        break;
-                    }
-                    if last_was_esc && c == '\\' {
-                        break;
-                    }
-                    last_was_esc = c == '\u{1b}';
-                }
-            }
-            // Two-character escape sequences.
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
+    crate::ansi::strip_ansi(text)
 }
 
 /// `shouldCollapseErrorDetails`: multi-line errors collapse.
@@ -97,6 +60,47 @@ pub fn summarize_error_details(text: &str) -> String {
     lines[0].trim().to_string()
 }
 
+fn display_content(text: &str, summary: Option<&str>, expanded: bool) -> Option<String> {
+    let text = normalize_error_details(text);
+    if text.is_empty() {
+        return None;
+    }
+    let collapsed = should_collapse_error_details(&text);
+    let content = if collapsed && !expanded {
+        let summary = match summary {
+            Some(summary) => normalize_error_details(summary),
+            None => summarize_error_details(&text),
+        };
+        format!("{summary} ")
+    } else {
+        text
+    };
+    Some(content)
+}
+
+/// Count the same normalized and collapsed content without painting rows.
+pub(crate) fn collapsible_error_row_count(
+    text: &str,
+    summary: Option<&str>,
+    expanded: bool,
+    width: usize,
+) -> usize {
+    let Some(content) = display_content(text, summary, expanded) else {
+        return 0;
+    };
+    content
+        .split('\n')
+        .map(|raw| {
+            let spans = if raw.is_empty() {
+                Vec::new()
+            } else {
+                vec![Span::raw(raw)]
+            };
+            crate::width::wrapped_line_count(&spans, width.saturating_sub(1).max(1))
+        })
+        .sum()
+}
+
 /// The collapsible error rows (`CollapsibleErrorComponent.render`): the
 /// summary line while collapsed, the full text expanded; every row
 /// one-space indented, wrapped at `width - 1`, padded with plain spaces.
@@ -108,19 +112,8 @@ pub fn render_collapsible_error(
     theme: &Theme,
     width: usize,
 ) -> Vec<Line> {
-    let text = normalize_error_details(text);
-    if text.is_empty() {
+    let Some(content) = display_content(text, summary, expanded) else {
         return Vec::new();
-    }
-    let collapsed = should_collapse_error_details(&text);
-    let content = if collapsed && !expanded {
-        let summary = match summary {
-            Some(summary) => normalize_error_details(summary),
-            None => summarize_error_details(&text),
-        };
-        format!("{summary} ")
-    } else {
-        text
     };
     let style = theme.fg_style(color);
     let content_width = width.saturating_sub(1).max(1);

@@ -149,6 +149,33 @@ impl Worker {
         };
         let provider = next_model.provider.clone();
         let model_id = next_model.id.clone();
+        // The daemon model allowlist gate, before the switch attempt: an
+        // off-list candidate answers the cycle with the loud refusal (the
+        // engine's switch guard would also refuse it, but the response
+        // should say why) and emits the `model refused` event.
+        {
+            let selector = format!("{provider}/{model_id}");
+            let cwd = {
+                let core = self.core.lock().unwrap();
+                core.cwd.clone()
+            };
+            let allowlist =
+                crate::model_allowlist::load(std::path::Path::new(&cwd), &self.config.agent_dir);
+            if let Err(refusal) = crate::model_allowlist::assert_allowed(&allowlist, &selector) {
+                // The event rides the typed refusal only (the other seams'
+                // rule): a fail-closed unreadable-allowlist error is a
+                // settings problem, not an allowlist refusal.
+                if refusal
+                    .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+                    .is_some()
+                {
+                    if let Some(agent_engine) = &self.agent_engine {
+                        agent_engine.note_model_refused("cycle_model", &selector);
+                    }
+                }
+                return response_failure(None, "cycle_model", &refusal.to_string(), None);
+            }
+        }
         let engine = std::sync::Arc::clone(&self.engine);
         let core = std::sync::Arc::clone(&self.core);
         let agent_dir = self.config.agent_dir.clone();
@@ -175,8 +202,10 @@ impl Worker {
                 let mut core = core.lock().unwrap();
                 if let Some(store) = core.store.as_mut() {
                     // TS `appendModelChange` records every switch.
-                    let _ = store.append_model_change(&provider, &model_id);
-                    let _ = store.rewrite();
+                    let _ = store.persist_entry(
+                        "model_change",
+                        json!({ "provider": provider, "modelId": model_id }),
+                    );
                 }
                 core.cwd.clone()
             };
@@ -234,6 +263,9 @@ impl Worker {
         };
         let effective = effective_service_tier(Some(previous), fast_mode).unwrap_or(previous);
         if effective != previous {
+            // The engine's request slot must follow the clamp, or requests
+            // keep the previous tier after cycling to a model without it.
+            self.engine.configure_service_tier(Some(effective));
             self.emit_worker_event(json!({
                 "type": "service_tier_changed",
                 "serviceTier": service_tier_wire_name(effective),
@@ -372,13 +404,13 @@ impl Worker {
                     // The same durable row the creation prefix writes (TS
                     // `appendServiceTierChange`).
                     let _ = store
-                        .append_entry("service_tier_change", json!({ "serviceTier": effective }));
-                    let _ = store.rewrite();
+                        .persist_entry("service_tier_change", json!({ "serviceTier": effective }));
                 }
                 cwd = core.cwd.clone();
             }
             (preference_changed, effective_changed, cwd)
         };
+        self.engine.configure_service_tier(Some(effective));
         if preference_changed && fast_mode {
             // TS persists the default only when the model keeps fast mode.
             let mut settings =
@@ -477,6 +509,16 @@ impl Worker {
         };
         if let Err(error) = persisted {
             return response_failure(None, command, &error.to_string(), None);
+        }
+        // TS `session.setSteeringMode`/`setFollowUpMode` write the live
+        // agent's queue mode (`this.agent.steeringMode = mode`): the
+        // engine's agent-level queues drain per the new mode from the
+        // next boundary (the worker lane's delivery mode already carries
+        // the `core.steering_mode`/`core.follow_up_mode` update above).
+        if command == "set_steering_mode" {
+            self.engine.set_queue_modes(Some(mode), None);
+        } else {
+            self.engine.set_queue_modes(None, Some(mode));
         }
         response_success(None, command, None)
     }
@@ -647,6 +689,59 @@ mod tests {
         assert_eq!(
             response.error.as_deref(),
             Some("This session does not support model switching")
+        );
+    }
+
+    /// `cycle_model` answers the daemon model-allowlist refusal with the
+    /// loud message (the refusal reason, not the generic non-switching
+    /// error) and never attempts the switch. The scoped list pins the
+    /// cycle to the two fixture models, so the next candidate is the
+    /// off-allowlist mock.
+    #[tokio::test]
+    async fn cycle_model_refuses_models_outside_the_allowlist() {
+        let dir = std::env::temp_dir().join(format!("pa-worker-cm3-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        models_fixture(&dir, 2);
+        std::fs::create_dir_all(dir.join("agent")).unwrap();
+        std::fs::write(
+            dir.join("agent").join("settings.json"),
+            json!({ "allowedModels": ["anthropic/*"] }).to_string(),
+        )
+        .unwrap();
+        let worker = Arc::new(Worker::new(worker_config(&dir), None));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": dir }))
+            .await;
+        assert!(created.success);
+        let scoped = worker
+            .dispatch(
+                "set_scoped_models",
+                &json!({
+                    "activeSessionId": "switch-session",
+                    "scopedModels": [
+                        { "model": { "provider": "prime-inference", "id": "mock-1" } },
+                        { "model": { "provider": "prime-inference", "id": "mock-2" } }
+                    ]
+                }),
+            )
+            .await;
+        assert!(scoped.success, "scoped fixture: {scoped:?}");
+        let response = worker
+            .dispatch(
+                "cycle_model",
+                &json!({ "activeSessionId": "switch-session" }),
+            )
+            .await;
+        assert!(!response.success);
+        assert_eq!(response.command, "cycle_model");
+        let error = response.error.expect("refusal message");
+        assert!(
+            error.contains("blocked by the daemon model allowlist"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("does not support model switching"),
+            "{error}"
         );
     }
 

@@ -1,3 +1,0 @@
-
-{"version":1,"type":"received","key":"[\"8ef89ee612aa\",\"sd\"]","clientId":"8ef89ee612aa","commandId":"sd","commandType":"shutdown","recordedAt":"2026-09-17T03:52:24.551Z"}
-{"version":1,"type":"result","key":"[\"8ef89ee612aa\",\"sd\"]","response":{"id":"sd","type":"response","command":"shutdown","success":true},"recordedAt":"2026-09-17T03:52:24.555Z"}

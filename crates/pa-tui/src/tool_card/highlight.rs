@@ -12,6 +12,36 @@
 
 use crate::theme::{Theme, ThemeColor};
 use crate::{Line, Span};
+use ratatui::style::Style;
+
+/// The resolved `syntax*` theme colors the scopes render with (TS
+/// `buildCliHighlightTheme`'s mapping of the highlight.js token classes to
+/// the theme's `syntax*` keys). Shared by every surface that renders
+/// highlighted code (the expanded ipython cell, the fenced markdown block).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SyntaxPalette {
+    pub keyword: Style,
+    pub type_: Style,
+    pub number: Style,
+    pub string: Style,
+    pub comment: Style,
+    pub function: Style,
+    pub variable: Style,
+}
+
+impl SyntaxPalette {
+    pub(crate) fn from_theme(theme: &Theme) -> Self {
+        Self {
+            keyword: theme.fg_style(ThemeColor::SyntaxKeyword),
+            type_: theme.fg_style(ThemeColor::SyntaxType),
+            number: theme.fg_style(ThemeColor::SyntaxNumber),
+            string: theme.fg_style(ThemeColor::SyntaxString),
+            comment: theme.fg_style(ThemeColor::SyntaxComment),
+            function: theme.fg_style(ThemeColor::SyntaxFunction),
+            variable: theme.fg_style(ThemeColor::SyntaxVariable),
+        }
+    }
+}
 
 /// The scope a token renders with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,16 +59,16 @@ pub(crate) enum Scope {
 }
 
 impl Scope {
-    fn style(self, theme: &Theme) -> Option<ratatui::style::Style> {
+    fn style(self, palette: &SyntaxPalette) -> Option<Style> {
         match self {
             Scope::Plain => None,
-            Scope::Keyword => Some(theme.fg_style(ThemeColor::SyntaxKeyword)),
-            Scope::BuiltIn | Scope::Type => Some(theme.fg_style(ThemeColor::SyntaxType)),
-            Scope::Literal | Scope::Number => Some(theme.fg_style(ThemeColor::SyntaxNumber)),
-            Scope::String => Some(theme.fg_style(ThemeColor::SyntaxString)),
-            Scope::Comment => Some(theme.fg_style(ThemeColor::SyntaxComment)),
-            Scope::Title => Some(theme.fg_style(ThemeColor::SyntaxFunction)),
-            Scope::Params => Some(theme.fg_style(ThemeColor::SyntaxVariable)),
+            Scope::Keyword => Some(palette.keyword),
+            Scope::BuiltIn | Scope::Type => Some(palette.type_),
+            Scope::Literal | Scope::Number => Some(palette.number),
+            Scope::String => Some(palette.string),
+            Scope::Comment => Some(palette.comment),
+            Scope::Title => Some(palette.function),
+            Scope::Params => Some(palette.variable),
         }
     }
 }
@@ -388,11 +418,11 @@ fn quote_char(byte: &u8) -> char {
 
 /// Highlight python `code` into per-line spans. The whole block is one
 /// highlight.js pass, so multi-line strings carry across lines.
-pub fn highlight_python(code: &str, theme: &Theme) -> Vec<Line> {
+pub(crate) fn highlight_python(code: &str, palette: &SyntaxPalette) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
     let mut current: Line = Vec::new();
     for (text, scope) in tokenize(code) {
-        let style = scope.style(theme);
+        let style = scope.style(palette);
         // A token carries at most one line break (comments stop at it).
         for (index, part) in text.split('\n').enumerate() {
             if index > 0 {
@@ -524,6 +554,11 @@ fn header_mode(
     if !code[i..].starts_with('(') {
         return Some(i);
     }
+    // The opening paren of the params group renders plain (hljs emits it
+    // outside the `params` span; cli-highlight colors only the param
+    // cells, so the paren must reach the stream or the line loses it).
+    flush_plain(plain, tokens);
+    tokens.push(("(".to_string(), Scope::Plain));
     i += 1;
     let mut params_plain = String::new();
     let flush_params = |params_plain: &mut String, tokens: &mut Vec<(String, Scope)>| {
@@ -611,12 +646,23 @@ mod tests {
                 ("def".into(), Scope::Keyword),
                 (" ".into(), Scope::Plain),
                 ("foo".into(), Scope::Title),
+                ("(".into(), Scope::Plain),
                 ("x, y=".into(), Scope::Params),
                 ("1".into(), Scope::Number),
                 (")".into(), Scope::Plain),
                 (":".into(), Scope::Plain),
             ]
         );
+    }
+
+    #[test]
+    fn def_header_line_text_is_lossless() {
+        // The params group's opening paren renders plain but must reach the
+        // stream: dropping it loses text from the rendered line.
+        let code = "def gutter_probe(count=7):";
+        let lines = highlight_python(code, &SyntaxPalette::from_theme(&theme()));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), code);
     }
 
     #[test]
@@ -628,6 +674,7 @@ mod tests {
                 ("class".into(), Scope::Keyword),
                 (" ".into(), Scope::Plain),
                 ("Foo".into(), Scope::Title),
+                ("(".into(), Scope::Plain),
                 ("Bar".into(), Scope::Params),
                 (")".into(), Scope::Plain),
                 (":".into(), Scope::Plain),
@@ -668,7 +715,7 @@ mod tests {
         let code = "s = '''a\nb'''\nt = 1";
         let toks = scopes(code);
         assert!(toks.contains(&("'''a\nb'''".into(), Scope::String)));
-        let lines = highlight_python(code, &theme());
+        let lines = highlight_python(code, &SyntaxPalette::from_theme(&theme()));
         assert_eq!(lines.len(), 3);
         assert_eq!(line_text(&lines[0]), "s = '''a");
         assert_eq!(line_text(&lines[1]), "b'''");

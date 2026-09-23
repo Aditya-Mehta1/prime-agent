@@ -1,34 +1,19 @@
-# Continuous build pipeline for the prime-agent Rust rewrite.
+# Continuous build pipeline for Prime Agent (Rust).
 #
-# Rolling prebuilt binaries for coworkers: every push to `main` builds the
-# 4-target release matrix and republishes it to the ROLLING GitHub release
-# tagged `continuous`, overwriting the artifacts so the stable download URLs
-# always serve the latest build of main. No Rust toolchain needed on the
-# consumer side: the kernel runtime sidecar ships inside every tarball.
+# Builds the 4-target release matrix on every push to `main` or `rust` and
+# uploads the tarballs as workflow artifacts (downloadable from the run page).
+# Does NOT create tags or releases — the org repo's release history stays
+# owned by the merged product's release workflow (release.yml).
+# No Rust toolchain needed on the consumer side: the kernel runtime sidecar
+# ships inside every tarball.
 #
-# Staged at ci/workflows/ (not .github/workflows/): the dev box's GitHub token
-# has no `workflow` scope, so this lane cannot push it live. Activation is the
-# operator step `make activate-workflows` (ci/workflows/README.md) — run it
-# from a machine whose push credential has workflow scope (Kevin's Mac) or
-# paste the file through the GitHub web UI. INERT until then. The local mirror
-# is `make continuous-dry-run`.
-#
-# Differences vs release.yml (docs/installer-ci-design.md §4 keeps the tag
-# pipeline as the release authority):
-#   - trigger: pushes to main, not `v<semver>` tags — this is a convenience
-#     channel, not the release channel; `make_latest` stays false.
-#   - the binary is version-stamped with the commit (`--sha ${GITHUB_SHA}`),
-#     so `prime-agent --version` reports exactly what coworkers are running.
-#   - publish job (contents: write only) overwrites the `continuous` release
-#     assets in place; no protected environment, no SBOM/attestation —
-#     the tag pipeline carries the supply-chain gates.
-
 name: continuous
 
 on:
   push:
     branches:
       - main
+      - rust
 
 permissions: {}
 
@@ -98,103 +83,3 @@ jobs:
             target/${{ matrix.target }}/dist/SHA256SUMS
             target/${{ matrix.target }}/dist/manifest.json
           if-no-files-found: error
-
-  publish:
-    needs: build
-    name: rolling `continuous` release republish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Download all build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: incoming
-      - name: Verify hash continuity + merge manifests
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, json, pathlib, sys
-          incoming = pathlib.Path("incoming")
-          jobs = sorted(p for p in incoming.iterdir() if p.is_dir())
-          if not jobs:
-              sys.exit("no build artifacts were downloaded")
-          merged, sums, version, commit = [], [], None, None
-          for entry_dir in jobs:
-              manifest = json.loads((entry_dir / "manifest.json").read_text())
-              version, commit = manifest["version"], manifest.get("commit")
-              for b in manifest["binaries"]:
-                  tar = entry_dir / b["file"]
-                  if not tar.is_file():
-                      sys.exit(f"{b['file']}: missing")
-                  digest = hashlib.sha256(tar.read_bytes()).hexdigest()
-                  if digest != b["sha256"]:
-                      sys.exit(f"{b['file']}: sha256 mismatch")
-                  merged.append(b)
-              sums.extend(line for line in
-                          (entry_dir / "SHA256SUMS").read_text().splitlines()
-                          if line.strip())
-          merged.sort(key=lambda b: b["file"])
-          sums.sort(key=lambda line: line.split(None, 1)[1])
-          out = pathlib.Path("publish-out")
-          out.mkdir()
-          payload = {"version": version, "binaries": merged}
-          if commit is not None:
-              payload["commit"] = commit
-          (out / "manifest.json").write_text(json.dumps(payload, indent=2) + "\n")
-          (out / "SHA256SUMS").write_text("\n".join(sums) + "\n")
-          for entry_dir in jobs:
-              for tar in sorted(entry_dir.glob("prime-agent-*.tar.gz")):
-                  (out / tar.name).hardlink_to(tar)
-          print(f"hash continuity verified for {len(merged)} archives")
-          PY
-      - name: Write the release body (commit + subject)
-        env:
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-        run: |
-          set -euo pipefail
-          subject="$(printf '%s' "${COMMIT_MESSAGE}" | head -1)"
-          {
-            printf 'Rolling continuous build of `main`. '
-            printf 'The artifacts below are overwritten on every push, '
-            printf 'so these URLs always serve the latest build.\n\n'
-            printf 'Built from `%s` — %s\n\n' "${GITHUB_SHA}" "${subject}"
-            printf 'The shipped `prime-agent --version` reports the exact '
-            printf 'commit it was built from.\n'
-          } > release-body.md
-          cat release-body.md
-      - name: Drop stale assets (a workspace version bump renames the archives)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if ! gh release view continuous -R "${GITHUB_REPOSITORY}" --json assets >/dev/null 2>&1; then
-            echo "no existing continuous release; first publish"
-            exit 0
-          fi
-          for asset in $(gh release view continuous -R "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name'); do
-            if [ ! -e "publish-out/${asset}" ]; then
-              echo "dropping stale asset ${asset}"
-              gh release delete-asset continuous "${asset}" -R "${GITHUB_REPOSITORY}" --yes
-            fi
-          done
-      - name: Publish to the rolling `continuous` release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          tag_name: continuous
-          name: "Continuous build (main)"
-          body_path: release-body.md
-          prerelease: true
-          make_latest: "false"
-          fail_on_unmatched_files: true
-          files: |
-            publish-out/prime-agent-*.tar.gz
-            publish-out/SHA256SUMS
-            publish-out/manifest.json

@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use pa_core::session_engine::agent_messaging::{
@@ -41,6 +42,51 @@ use crate::protocol::{
 };
 use crate::registration::RegistrationHandle;
 use crate::session_store::{session_file_name, SessionFile};
+
+/// The close reason one `kill` carries (TS `DaemonSessionClosedReason` at
+/// `closeSessionOnce`): the plain client kill is `killed`; a parent's
+/// child-close cascade passes `shutdown` or `replaced` through the
+/// `rlmCloseReason` rest marker, and the close arms differ exactly like
+/// TS — `killed` cancels the session's scheduled jobs and archives the
+/// state, `shutdown` keeps the resume entry (the jobs survive for the
+/// later wake), `replaced` keeps the plain cron jobs but cancels the RLM
+/// heartbeats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillCloseReason {
+    Killed,
+    Shutdown,
+    Replaced,
+}
+
+impl KillCloseReason {
+    /// The `rlmCloseReason` marker of a child-close cascade (the plain
+    /// client kill carries none).
+    fn from_payload(payload: &Value) -> Self {
+        match payload.get("rlmCloseReason").and_then(Value::as_str) {
+            Some("shutdown") => Self::Shutdown,
+            Some("replaced") => Self::Replaced,
+            _ => Self::Killed,
+        }
+    }
+
+    /// The wire `session_closed` reason.
+    fn session_closed_reason(self) -> DaemonSessionClosedReason {
+        match self {
+            Self::Killed => DaemonSessionClosedReason::Killed,
+            Self::Shutdown => DaemonSessionClosedReason::Shutdown,
+            Self::Replaced => DaemonSessionClosedReason::Replaced,
+        }
+    }
+
+    /// The recovery journal's close operation.
+    fn recovery_operation(self) -> &'static str {
+        match self {
+            Self::Killed => "killed",
+            Self::Shutdown => "shutdown",
+            Self::Replaced => "replaced",
+        }
+    }
+}
 use crate::setting_switches::{effective_service_tier, supports_fast_mode};
 use crate::types::{AgentConnectionState, SessionActionSnapshot, SessionSummary};
 
@@ -152,12 +198,82 @@ impl Lane {
 
 /// The TS `_assertSessionActionAdmissionAvailable` rejection while the
 /// queued-input pump is suspended (agent-session.ts).
+/// How long the close paths (`shutdown`, `kill`) wait for aborted side
+/// question runs to queue their terminal cancelled events before the
+/// process exits. The runs observe the abort within their 20ms pump tick
+/// and the stream teardown, so this is generous headroom, not a gate.
+const SIDE_QUESTION_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub(crate) const QUEUED_INPUT_SUSPENDED: &str =
     "Cannot admit a session action while queued session input is suspended.";
+
+/// The item's turn-execution class (TS `TurnExecutionPolicy`, the
+/// `_pumpSessionInputs` batch-gathering's `turnExecutionPoliciesEqual`
+/// gate): items co-deliver as one batched turn only within the same
+/// class. Client-queued rows (the `steer`/`follow_up` commands and
+/// prompt admissions behind work, TS `"queued"`) batch together;
+/// injected rows (heartbeat fires, agent-message deliveries, goal and
+/// autonomous continuations, TS `"injected"`) batch among themselves;
+/// the idle session's direct-prompt hand-off (TS `"directPrompt"`)
+/// never joins a queue batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnPolicy {
+    Queued,
+    Injected,
+    Direct,
+}
+
+impl TurnPolicy {
+    /// The journal record's string form (`worker.recovery` queue
+    /// snapshots); the restore maps it back through the same names.
+    pub(crate) fn journal_value(self) -> &'static str {
+        match self {
+            TurnPolicy::Queued => "queued",
+            TurnPolicy::Injected => "injected",
+            TurnPolicy::Direct => "direct",
+        }
+    }
+}
+
+/// The turn-execution class restored from a wire `restore_actions`
+/// payload (TS `restoreSessionActions` restores the full
+/// `executionPolicy`): `nextTurnContextTiming` "commit" is the
+/// client-queued policy; "preparation" with a preserved empty
+/// extension prompt is injected; "preparation" without it is the
+/// direct-prompt hand-off. An absent or unknown policy restores as the
+/// dominant queued class.
+pub(crate) fn restored_turn_policy(payload: &Value) -> TurnPolicy {
+    let timing = payload
+        .get("executionPolicy")
+        .and_then(|policy| policy.get("nextTurnContextTiming"))
+        .and_then(Value::as_str);
+    match timing {
+        Some("commit") => TurnPolicy::Queued,
+        Some("preparation") => {
+            let preserved = payload
+                .get("executionPolicy")
+                .and_then(|policy| policy.get("preserveEmptyExtensionPrompt"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if preserved {
+                TurnPolicy::Injected
+            } else {
+                TurnPolicy::Direct
+            }
+        }
+        _ => TurnPolicy::Queued,
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct QueuedItem {
     pub(crate) message: String,
+    /// The labeled queue-strip row (TS `payload.preview`): the queue
+    /// snapshot serves it instead of `message` when the delivery carries
+    /// one (TS `queuedAgentMessagePreview` returns
+    /// `payload.preview ?? payload.text`). The active-action label and the
+    /// turn's prompt text stay `message` (TS `compactRlmText(payload.text)`).
+    pub(crate) preview: Option<String>,
     /// An injected custom row that replaces this turn's user message (the
     /// RLM child terminal notices ride the follow-up lane this way).
     pub(crate) custom_message: Option<Value>,
@@ -178,6 +294,24 @@ pub(crate) struct QueuedItem {
     /// mime type), admitted with the message as multimodal content.
     pub(crate) images: Vec<pa_agent::types::ImageContent>,
     pub(crate) done: Option<oneshot::Sender<Result<(), String>>>,
+    /// TS `payload.queueVisible`: the item shows in the queue projection
+    /// and its delivery projects the active-action phase transitions
+    /// (steer/follow-up lanes, agent-message deliveries, prompt-behind-work,
+    /// heartbeat fires, restored rows). Injected continuations (goal,
+    /// autonomous, post-compaction) and an idle session's direct prompt
+    /// admission stay invisible: the TS wire shows no queue rows or
+    /// active phases for them.
+    pub(crate) queue_visible: bool,
+    /// The item's turn-execution class (see [`TurnPolicy`]): the batch
+    /// gathering's compatibility gate.
+    pub(crate) policy: TurnPolicy,
+    /// Membership of the one-shot forced steering batch (TS
+    /// `_forcedAllSteeringActionIds`, armed by `abortAndSendQueued`):
+    /// armed items co-deliver as one batched turn even under queue mode
+    /// "one-at-a-time". Transient worker state — never journaled; a
+    /// restart between the abort and the delivery loses the forced batch
+    /// (the TS armed set is equally in-memory).
+    pub(crate) forced_batch: bool,
 }
 
 /// Parse the wire `images` array of a prompt-family command (each entry
@@ -257,6 +391,12 @@ pub(crate) struct SessionCore {
     /// `"all"` or `"one-at-a-time"`.
     pub(crate) steering_mode: String,
     pub(crate) follow_up_mode: String,
+    /// The one-shot forced steering batch (TS `_forcedAllSteeringActionIds`
+    /// on the session, armed by `abortAndSendQueued`): while armed, armed
+    /// steering items co-deliver as ONE batched turn at the next boundary
+    /// — even under queue mode "one-at-a-time". Disarms when no armed
+    /// item remains queued (TS `_forcedAllSteeringBatch`'s disarm read).
+    pub(crate) forced_all_steering: bool,
     /// The scoped model list (TS `_scopedModels`): wire entries
     /// `{ model, thinkingLevel? }` the model cycler cycles within.
     pub(crate) scoped_models: Vec<Value>,
@@ -278,6 +418,13 @@ pub(crate) struct SessionCore {
     /// Restored next-turn rows (TS `_pendingNextTurnMessages`,
     /// `restore_next_turn`): delivered as prefix rows with the next turn.
     pub(crate) pending_next_turn: Vec<Value>,
+    /// The queue projection's active action (TS `getSessionActionSnapshot`
+    /// reads the store's first active action): the runner sets the phase
+    /// transitions of a queue-visible delivery (`preparing` at pickup,
+    /// `committing` before the turn dispatch, `running` at the turn's
+    /// `agent_start`) and clears it once the delivered turn settles. The
+    /// label rides the snapshot (TS `compactRlmText(active.payload.text)`).
+    pub(crate) active_action: Option<crate::types::SessionActionActive>,
 }
 
 impl SessionCore {
@@ -319,12 +466,14 @@ impl SessionCore {
             parent_session_id: None,
             child_script: None,
             service_tier: None,
-            steering_mode: "all".to_string(),
-            follow_up_mode: "all".to_string(),
+            steering_mode: "one-at-a-time".to_string(),
+            follow_up_mode: "one-at-a-time".to_string(),
+            forced_all_steering: false,
             scoped_models: Vec::new(),
             retry_abort_requested: false,
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
+            active_action: None,
         }
     }
 }
@@ -636,6 +785,24 @@ pub struct Worker {
     /// the worker rebinds the live session's jobs onto it after create
     /// and every replacement swap (TS `rebindCronJobsToState`).
     pub(crate) scheduled: std::sync::Arc<crate::scheduled_jobs::ScheduledJobs>,
+    /// Session creation is one serialized critical section (TS
+    /// `openingSessions`: a concurrent open for the same session JOINS
+    /// the in-flight one instead of racing it). Commands run on spawned
+    /// tasks, so without the gate two concurrent `create` requests could
+    /// both pass the `core.created` check while the first still awaits
+    /// its session-model restore — duplicating creation-prefix rows and
+    /// overwriting the initialized core state.
+    create_gate: tokio::sync::Mutex<()>,
+    /// Whole-session replacements are one serialized critical section
+    /// too: the teardown, the store/file swap, the session-model
+    /// restore's awaits, and the branch-context rebuild must move the
+    /// worker onto the replacement session as one unit. Two concurrent
+    /// replacements (`switch_session`/`new_session`/`import_jsonl`/
+    /// `fork`) could otherwise interleave at the restore's awaits — the
+    /// first command's rebuild landing against the second command's
+    /// session file, its restore decision rejected, the store, context,
+    /// and model left from different sessions.
+    pub(crate) replacement_gate: tokio::sync::Mutex<()>,
 }
 
 /// The kernel cron wiring the worker hands its session engine (TS
@@ -696,16 +863,33 @@ impl Worker {
             parent_session_id: None,
             child_script: None,
             service_tier: None,
-            steering_mode: "all".to_string(),
-            follow_up_mode: "all".to_string(),
+            steering_mode: "one-at-a-time".to_string(),
+            follow_up_mode: "one-at-a-time".to_string(),
+            forced_all_steering: false,
             scoped_models: Vec::new(),
             retry_abort_requested: false,
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
+            active_action: None,
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
         let core = Arc::new(Mutex::new(core));
+        // TS `_steeringStopPending` (the session's stop hooks): the
+        // steering lane owning the probe makes a queued steer stop the
+        // running turn at its next turn boundary — the runner delivers
+        // the steer as the next turn (the follow-up lane never stops the
+        // run; it waits for the settle, TS `when_run_idle`).
+        let queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>> = Some({
+            let core = Arc::clone(&core);
+            std::sync::Arc::new(move || {
+                !core
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .steering
+                    .is_empty()
+            })
+        });
         // Shared worker recovery journal: the turn runner persists queue
         // snapshots into it, `serve` opens the file, and command handlers
         // record busy/operation state.
@@ -742,6 +926,7 @@ impl Worker {
             Arc::clone(&work_notify),
             std::sync::Arc::clone(&user_bash),
             Arc::clone(&events),
+            Arc::clone(&recovery),
         ));
         // The turn runner runs for the whole process lifetime. The command
         // dispatcher keeps the engine handle too (model metadata for the
@@ -775,6 +960,7 @@ impl Worker {
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
                         cron_store: Some(kernel_cron_wiring(&scheduled)),
+                        queued_steering_probe: queued_steering_probe.clone(),
                     }) {
                         Ok(engine) => {
                             let concrete = std::sync::Arc::new(engine);
@@ -804,6 +990,7 @@ impl Worker {
                         supervisor_link: Some(supervisor_link_config(&config)),
                         telemetry_disabled: config.telemetry_disabled,
                         cron_store: Some(kernel_cron_wiring(&scheduled)),
+                        queued_steering_probe: queued_steering_probe.clone(),
                     }) {
                         Ok(engine) => {
                             let concrete = std::sync::Arc::new(engine);
@@ -835,19 +1022,39 @@ impl Worker {
                 let autonomous_sink: crate::agent_engine::AutonomousAdmission = {
                     let sink_core = Arc::clone(&sink_core);
                     let sink_notify = Arc::clone(&sink_notify);
+                    let sink_recovery = Arc::clone(&recovery);
                     std::sync::Arc::new(move |text| {
-                        admit_autonomous_follow_up(&sink_core, &sink_notify, text);
+                        admit_autonomous_follow_up(&sink_recovery, &sink_core, &sink_notify, text);
                     })
                 };
                 concrete.set_autonomous_admission(autonomous_sink);
                 let purge_core = Arc::clone(&core);
+                let purge_recovery = Arc::clone(&recovery);
                 let autonomous_purge: std::sync::Arc<dyn Fn() + Send + Sync> =
                     std::sync::Arc::new(move || {
-                        let mut core = purge_core.lock().unwrap();
-                        core.follow_up
-                            .retain(|item| item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY));
-                        core.steering
-                            .retain(|item| item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY));
+                        {
+                            let mut core = purge_core.lock().unwrap();
+                            core.follow_up.retain(|item| {
+                                item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY)
+                            });
+                            core.steering.retain(|item| {
+                                item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY)
+                            });
+                        }
+                        // The withdraw settles the rows: `/autonomous
+                        // off` dropping the last queued row must not
+                        // leave its admission busy=true promising a revive
+                        // work that was withdrawn (and the snapshot must
+                        // not keep replaying the withdrawn row). Mid-turn
+                        // the verdict stays busy — the in-flight turn is
+                        // live work until its own `turn_end`.
+                        checkpoint_queue_recovery(
+                            &purge_recovery,
+                            &purge_core,
+                            QueueCheckpoint::Settle {
+                                operation: "queue_purged",
+                            },
+                        );
                     });
                 concrete.set_autonomous_queue_purge(autonomous_purge);
                 let probe_core = Arc::clone(&core);
@@ -860,17 +1067,39 @@ impl Worker {
                 let sink_core = Arc::clone(&core);
                 let sink_events = events.clone();
                 let sink_notify = Arc::clone(&work_notify);
+                let sink_recovery = Arc::clone(&recovery);
                 let sink: crate::engine::GoalAdmissionSink = Arc::new(move |work| {
-                    admit_goal_follow_up(&sink_core, &sink_events, &sink_notify, work);
+                    admit_goal_follow_up(
+                        &sink_recovery,
+                        &sink_core,
+                        &sink_events,
+                        &sink_notify,
+                        work,
+                    );
                 });
                 // TS `_clearQueuedGoalContexts`: withdraw queued minted
                 // goal-context turns (the pause/clear/start commands and
                 // the kernel's `goal.complete`).
                 let purge_core = Arc::clone(&core);
+                let purge_recovery = Arc::clone(&recovery);
                 let queue_purge: std::sync::Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    let mut core = purge_core.lock().unwrap();
-                    core.steering.retain(|item| !is_goal_context_item(item));
-                    core.follow_up.retain(|item| !is_goal_context_item(item));
+                    {
+                        let mut core = purge_core.lock().unwrap();
+                        core.steering.retain(|item| !is_goal_context_item(item));
+                        core.follow_up.retain(|item| !is_goal_context_item(item));
+                    }
+                    // Same settle as the autonomous withdraw: the
+                    // withdrawal must refresh the verdict (and the
+                    // snapshot) so a pause/clear cannot leave busy=true
+                    // over withdrawn rows (a mid-turn withdrawal stays
+                    // busy through the in-flight turn).
+                    checkpoint_queue_recovery(
+                        &purge_recovery,
+                        &purge_core,
+                        QueueCheckpoint::Settle {
+                            operation: "queue_purged",
+                        },
+                    );
                 });
                 concrete.set_goal_admission(probe, sink, queue_purge);
             }
@@ -927,6 +1156,10 @@ impl Worker {
             auth_storage: pa_core::auth::AuthStorage::create(&agent_dir),
             get_user_servers: Box::new(|| None),
             begin_login: None,
+            agent_dir: Some(agent_dir.clone()),
+            get_catalog_sources: None,
+            remote_source: None,
+            probe_override: None,
         });
         let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
         let navigation = crate::session_navigation::SessionNavigation::new(
@@ -957,6 +1190,8 @@ impl Worker {
             navigation,
             prompt_admissions,
             scheduled,
+            create_gate: tokio::sync::Mutex::new(()),
+            replacement_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1421,6 +1656,52 @@ impl Worker {
     }
 
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
+        // Only operations that inspect or change historical branches need hydration.
+        // Cancellation is deliberately excluded: it must reach the live turn immediately.
+        if matches!(
+            command_type,
+            "get_session_tree"
+                | "get_context_tree"
+                | "get_user_messages_for_forking"
+                | "set_session_entry_label"
+                | "navigate_tree"
+                | "fork"
+                | "export_html"
+                | "export_jsonl"
+        ) && self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .is_some_and(|store| store.window.is_some())
+        {
+            let path = self
+                .core
+                .lock()
+                .unwrap()
+                .store
+                .as_ref()
+                .unwrap()
+                .path
+                .clone();
+            let load_path = path.clone();
+            let hydrated = tokio::task::spawn_blocking(move || SessionFile::open(&load_path))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+            match hydrated {
+                Ok(full) => {
+                    let mut core = self.core.lock().unwrap();
+                    if let Some(store) = core.store.as_mut().filter(|store| store.path == path) {
+                        store.install_full_history(full);
+                    }
+                }
+                Err(error) => {
+                    return response_failure(None, command_type, &error.to_string(), None);
+                }
+            }
+        }
         match command_type {
             "create" => self.handle_create(payload).await,
             "attach" => self.handle_attach(payload),
@@ -1430,6 +1711,7 @@ impl Worker {
             "steer" => self.handle_queue(payload, Lane::Steering),
             "follow_up" => self.handle_queue(payload, Lane::FollowUp),
             "abort" => self.handle_abort(),
+            "abort_and_send_queued" => self.handle_abort_and_send_queued(),
             "start_side_question" => {
                 if let Err(response) = self.require_created("start_side_question") {
                     return response;
@@ -1461,6 +1743,8 @@ impl Worker {
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
             "get_connection_state" => self.handle_get_connection_state(),
             "get_mcp_connections" => self.handle_get_mcp_connections().await,
+            "set_mcp_static_token" => self.handle_set_mcp_static_token(payload).await,
+            "remove_mcp_connection" => self.handle_remove_mcp_connection(payload).await,
             "get_rlm_children" => self.handle_get_rlm_children().await,
             "get_context_tree" => self.handle_get_context_tree().await,
             "get_commands" => self.handle_get_commands().await,
@@ -1472,7 +1756,7 @@ impl Worker {
             "get_available_models" => self.handle_get_available_models(),
             "worker_deliver_message" => self.handle_worker_deliver_message(payload),
             "update_snapshot" => self.handle_update_snapshot(),
-            "kill" => self.handle_kill().await,
+            "kill" => self.handle_kill(payload).await,
             "shutdown" => self.handle_shutdown().await,
             "rename" => self.handle_rename("rename", payload),
             "set_session_name" => self.handle_rename("set_session_name", payload),
@@ -1506,6 +1790,10 @@ impl Worker {
             "execute_bash" => self.handle_execute_bash(payload),
             "execute_bash_and_wait" => self.handle_execute_bash_and_wait(payload).await,
             "abort_bash" => self.handle_abort_bash().await,
+            "list_kernel_bash" | "tail_kernel_bash" | "kill_kernel_bash" => {
+                self.handle_kernel_bash_activity(command_type, payload)
+                    .await
+            }
             "append_custom_message" => self.handle_append_custom_message(payload),
             "restore_next_turn" => self.handle_restore_next_turn(payload),
             "restore_actions" => self.handle_restore_actions(payload),
@@ -1638,6 +1926,12 @@ impl Worker {
     }
 
     async fn handle_create(&self, payload: &Value) -> DaemonResponse {
+        // One create in flight at a time (TS `openingSessions`): the
+        // created check, the session-model restore's awaits, and the core
+        // initialization below are one serialized critical section, so a
+        // concurrent create joins this open and answers with the created
+        // summary below instead of racing a second initialization.
+        let _create_gate = self.create_gate.lock().await;
         {
             let core = self.core.lock().unwrap();
             if core.created {
@@ -1662,9 +1956,23 @@ impl Worker {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let name = payload.get("name").and_then(Value::as_str);
+        let flagged_model = payload.get("model").and_then(Value::as_str).is_some();
+        // TS createAgentSession's restored-from-session step: a revived
+        // session (an existing session file — scheduled wake, update
+        // restore, worker relaunch) restores the model its file pins
+        // before the startup chain. The bounded readiness wait covers the
+        // daemon boot's catalog fetch, so the revived session keeps the
+        // model it was running on instead of silently landing on the
+        // featured default while the catalog settles. An explicit model
+        // flag on the create wins instead (TS `options.model` takes
+        // priority over the saved session model): the restore is skipped
+        // entirely, so a flagged create never eats the readiness window or
+        // records a fallback that would not be used.
         // Explicit model flags from the create config are authoritative for
-        // this session (TS runtime-config propagation): the engine rebinds
-        // its selection instead of falling back to a process-wide model.
+        // this worker's session runtime config (TS runtime-config
+        // propagation): the engine rebinds its selection instead of
+        // falling back to a process-wide model, and the folded flags
+        // survive every session replacement (TS `sessionConfig`).
         let requested_thinking = match payload.get("thinking") {
             None => None,
             Some(Value::String(level)) => {
@@ -1691,7 +1999,7 @@ impl Worker {
                 );
             }
         };
-        self.engine.configure_model(EngineModelSelection {
+        self.engine.configure_create_model(EngineModelSelection {
             provider: payload
                 .get("provider")
                 .and_then(Value::as_str)
@@ -1767,23 +2075,86 @@ impl Worker {
             .map(str::to_string);
 
         let mut store = match (&session_path, no_session) {
-            (Some(path), false) if path.exists() => match SessionFile::open(path) {
-                Ok(mut opened) => {
-                    append_creation_prefix(
-                        &mut opened,
-                        self.engine.as_ref(),
-                        &self.config.agent_dir,
-                        &cwd,
-                        false,
-                    );
-                    let _ = opened.append_session_state("active");
-                    if let Err(error) = opened.rewrite() {
-                        return response_failure(None, "create", &error.to_string(), None);
+            (Some(path), false) if path.exists() => {
+                let loaded = {
+                    let path = path.clone();
+                    let agent_dir = self.config.agent_dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let lease = crate::lease::acquire_runtime_session_lease(&path, &agent_dir)?;
+                        let mut store = SessionFile::open_windowed(&path)?;
+                        store.lease = Some(Arc::new(lease));
+                        Ok(store)
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                };
+                match loaded {
+                    Ok(mut opened) => {
+                        // The engine owns the file from here on (the open
+                        // succeeded): the session-model restore binds the
+                        // engine and records its decision only for a path
+                        // this worker actually opened — a failed open (a
+                        // held lease, an unreadable file) never leaks the
+                        // binding into a later create's session. The
+                        // create's own flags were folded before this; a
+                        // flagged create still skips the restore (an
+                        // explicit model wins end-to-end, TS
+                        // `options.model`).
+                        self.engine.set_session_file(path.clone());
+                        if !flagged_model {
+                            self.engine.restore_session_model(path).await;
+                        }
+                        let restored = opened.restored_settings();
+                        // TS createAgentSession restores the session
+                        // file's saved thinking level when the create
+                        // carries no explicit flag (sdk.ts
+                        // `hasThinkingEntry ? existingSession.thinkingLevel`).
+                        // The saved MODEL restores through the engine's
+                        // session-model restore (the bounded readiness
+                        // window, the exact-match path, the published
+                        // fallback) — never this direct adoption, which
+                        // would bypass the window the fleet-kill
+                        // forensics pinned.
+                        self.engine.configure_model(EngineModelSelection {
+                            provider: None,
+                            model: None,
+                            api_key: None,
+                            thinking: requested_thinking.or_else(|| {
+                                opened
+                                    .has_thinking_level()
+                                    .then(|| {
+                                        pa_ai::models::thinking_level_from_str(
+                                            &restored.thinking_level,
+                                        )
+                                    })
+                                    .flatten()
+                            }),
+                        });
+                        let append_start = opened.entries.len();
+                        append_creation_prefix(
+                            &mut opened,
+                            self.engine.as_ref(),
+                            &self.config.agent_dir,
+                            &cwd,
+                            false,
+                        );
+                        let _ = opened.append_session_state("active");
+                        let persisted = if opened.window.is_some() {
+                            opened.persist_appended(append_start)
+                        } else {
+                            opened.rewrite()
+                        };
+                        if let Err(error) = persisted {
+                            return response_failure(None, "create", &error.to_string(), None);
+                        }
+                        opened
                     }
-                    opened
+                    Err(error) => {
+                        return response_failure(None, "create", &error.to_string(), None)
+                    }
                 }
-                Err(error) => return response_failure(None, "create", &error.to_string(), None),
-            },
+            }
             (Some(path), false) => {
                 let mut created = SessionFile::create(
                     &cwd,
@@ -1791,6 +2162,22 @@ impl Worker {
                     rlm_depth.unwrap_or(0),
                 );
                 created.set_path(path.clone());
+                let acquired = {
+                    let path = path.clone();
+                    let agent_dir = self.config.agent_dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::lease::acquire_runtime_session_lease(&path, &agent_dir)
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|lease| lease)
+                };
+                match acquired {
+                    Ok(lease) => created.lease = Some(Arc::new(lease)),
+                    Err(error) => {
+                        return response_failure(None, "create", &error.to_string(), None)
+                    }
+                }
                 if let Err(error) = created.rewrite() {
                     return response_failure(None, "create", &error.to_string(), None);
                 }
@@ -1830,7 +2217,23 @@ impl Worker {
                     rlm_depth.unwrap_or(0),
                 );
                 let path = session_dir.join(session_file_name(created.session_id()));
-                created.set_path(path);
+                created.set_path(path.clone());
+                let acquired = {
+                    let path = path.clone();
+                    let agent_dir = self.config.agent_dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::lease::acquire_runtime_session_lease(&path, &agent_dir)
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|lease| lease)
+                };
+                match acquired {
+                    Ok(lease) => created.lease = Some(Arc::new(lease)),
+                    Err(error) => {
+                        return response_failure(None, "create", &error.to_string(), None)
+                    }
+                }
                 if let Err(error) = created.rewrite() {
                     return response_failure(None, "create", &error.to_string(), None);
                 }
@@ -1858,9 +2261,14 @@ impl Worker {
         };
 
         if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
-            let _ = store.append_session_info(name);
-            let _ = store.rewrite();
+            if let Err(error) = store.persist_entry("session_info", json!({ "name": name.trim() }))
+            {
+                return response_failure(None, "create", &error.to_string(), None);
+            }
         }
+        let restored_tier = store
+            .has_service_tier()
+            .then(|| store.restored_settings().service_tier);
         // Restore the persisted queue snapshot (crash/respawn recovery) from
         // the worker recovery journal.
         let (steering, follow_up) = {
@@ -1896,6 +2304,37 @@ impl Worker {
                 settings.get_compaction_enabled(),
             )
         };
+        self.engine
+            .configure_service_tier(restored_tier.unwrap_or(Some(service_tier)));
+        // The abort supervision's terminal record (the supervisor declared
+        // a wedged run aborted and injected it into this create replay):
+        // the rebuilt transcript discloses the abort with the same
+        // `compaction_outcome` row the worker's own auto-abort arms
+        // persist. A manual run persists nothing — TS `compact()`'s abort
+        // arm writes no durable row. The row is identity-stamped with the
+        // declaration (`declaredAt`): a replacement that persisted it and
+        // died before the supervisor consumed the record replays the same
+        // declaration. The dedup matches the row's fields alone — a
+        // worker that persisted its own cancelled row for the same run
+        // (its abort arm ran, then the worker died before its
+        // `compaction_end` reached the supervisor) carries the persist-
+        // time stamp, not the declaration, and the replay must recognize
+        // it instead of appending a second row for the one abort.
+        let interrupted_compaction_requested = payload.get("interruptedCompaction").is_some();
+        let interrupted_compaction = crate::compaction::interrupted_compaction_disclosure(payload);
+        // The disclosure row's landing state for this replay: `true` when
+        // the rebuilt transcript now holds the exact row (persisted here,
+        // or already present from an earlier crash-replay), `false` when
+        // the persist failed — the create reply carries it so the
+        // supervisor consumes the terminal record only once the
+        // disclosure is durable; a failed persist keeps it pending for
+        // the next replacement to retry. A requested record with no
+        // disclosure row (a manual run — TS `compact()`'s abort arm
+        // writes none) is vacuously durable and reports `true`, so the
+        // record is consumed instead of re-injecting forever. No
+        // requested record adds no key: client-facing create replies
+        // stay byte-identical to the TS shape.
+        let mut interrupted_compaction_persisted = interrupted_compaction_requested;
         // The core lock stays inside this block: everything after it may
         // await (the schedule-catalog bind), and a std MutexGuard must
         // never ride an await point.
@@ -1905,12 +2344,37 @@ impl Worker {
             core.steering = steering;
             core.follow_up = follow_up;
             core.store = Some(store);
+            if let Some(disclosure) = &interrupted_compaction {
+                if let Some(store) = core.store.as_mut() {
+                    let already_disclosed = store.entries().iter().any(|entry| {
+                        entry.type_ == "custom_message" && entry.fields == disclosure.row
+                    });
+                    if !already_disclosed
+                        && store
+                            .persist_entry_at(
+                                "custom_message",
+                                disclosure.row.clone(),
+                                &disclosure.declared_at,
+                            )
+                            .is_err()
+                    {
+                        interrupted_compaction_persisted = false;
+                    }
+                }
+            }
             core.created = true;
             core.abort_requested = false;
+            // A fresh (or replaced) session starts live: the previous
+            // close's `session_closed` marker clears with the new session
+            // (TS's fresh runtime starts un-disposed).
+            if let Some(agent_engine) = &self.agent_engine {
+                agent_engine.clear_session_closed();
+            }
             core.auto_compaction_enabled = auto_compaction_enabled;
-            core.service_tier = Some(service_tier);
-            core.steering_mode = steering_mode;
-            core.follow_up_mode = follow_up_mode;
+            core.service_tier = restored_tier.unwrap_or(Some(service_tier));
+            core.steering_mode = steering_mode.clone();
+            core.follow_up_mode = follow_up_mode.clone();
+            core.forced_all_steering = false;
             core.scoped_models = Vec::new();
             core.retry_abort_requested = false;
             // The session's depth falls back to the opened file's header (TS
@@ -1935,6 +2399,12 @@ impl Worker {
             core.child_script = child_script.clone();
             (self.summary_locked(&core), rlm_depth)
         };
+        // TS `sdk.ts` seeds the Agent's queue modes from the settings
+        // manager at session create (`steeringMode`/`followUpMode`): the
+        // engine's agent-level queues drain per the same modes the worker
+        // lane delivers by. Scripted harness engines keep the no-op.
+        self.engine
+            .set_queue_modes(Some(&steering_mode), Some(&follow_up_mode));
         // Seed the engine's RLM identity: recursion depth and bound, this
         // session's persistence ids, the default thinking level its
         // children inherit, and the harness's child engine file.
@@ -1998,11 +2468,12 @@ impl Worker {
             let _ = registry.refresh_available_models().await;
         });
         self.work_notify.notify_one();
-        response_success(
-            None,
-            "create",
-            Some(serde_json::to_value(&summary).unwrap_or(Value::Null)),
-        )
+        let mut data = serde_json::to_value(&summary).unwrap_or(Value::Null);
+        if interrupted_compaction_requested {
+            data["interruptedCompactionPersisted"] =
+                serde_json::json!(interrupted_compaction_persisted);
+        }
+        response_success(None, "create", Some(data))
     }
 
     pub(crate) fn summary_locked(&self, core: &SessionCore) -> SessionSummary {
@@ -2117,6 +2588,7 @@ impl Worker {
             // TS roster summaries carry it; a not-yet-resolved engine
             // reports none).
             model: self.engine.model_metadata(),
+            model_fallback_message: self.engine.model_fallback_message(),
             runtime_kind: Some(core.runtime_kind.clone()),
             unfinished_action_count: Some(0),
         }
@@ -2307,6 +2779,7 @@ impl Worker {
                 }
             };
             let item = QueuedItem {
+                preview: None,
                 message: message.to_string(),
                 custom_message,
                 agent_message: None,
@@ -2314,18 +2787,27 @@ impl Worker {
                 admission_id: admission_id.clone(),
                 images: images.clone(),
                 done,
+                queue_visible: queued_behind_work,
+                policy: if queued_behind_work {
+                    TurnPolicy::Queued
+                } else {
+                    TurnPolicy::Direct
+                },
+                forced_batch: false,
             };
             match lane {
                 Lane::Steering => core.steering.push_back(item),
                 Lane::FollowUp => core.follow_up.push_back(item),
             }
             let snapshot = self.snapshot_locked(&core);
-            let lanes = queue_lanes(&core);
-            let active_session_id = core.active_session_id.clone();
-            drop(core);
-            self.persist_queue_snapshot(&active_session_id, &lanes);
             (snapshot, queued_behind_work)
         };
+        // The admission checkpoint (TS `prompt_accepted`, busy=true): the
+        // admitted prompt is undelivered live work until its turn
+        // settles, and the lane snapshot rides the same locked read.
+        self.checkpoint_queue(QueueCheckpoint::Admitted {
+            operation: "prompt_accepted",
+        });
         if queued_behind_work {
             let _ = self.emit_action_update(&snapshot);
         }
@@ -2363,6 +2845,7 @@ impl Worker {
             Lane::FollowUp => &mut core.follow_up,
         }
         .push_back(QueuedItem {
+            preview: None,
             message: message.to_string(),
             custom_message,
             agent_message: None,
@@ -2370,12 +2853,23 @@ impl Worker {
             admission_id: None,
             images,
             done: None,
+            queue_visible: true,
+            policy: TurnPolicy::Queued,
+            forced_batch: false,
         });
         let snapshot = self.snapshot_locked(&core);
-        let lanes = queue_lanes(&core);
-        let active_session_id = core.active_session_id.clone();
         drop(core);
-        self.persist_queue_snapshot(&active_session_id, &lanes);
+        // The queue-write checkpoint (busy=true): an undelivered lane is
+        // live work. The operation names are TS's journal strings
+        // (`steer_queued`/`follow_up_queued`), not this port's command
+        // names, so the journals stay comparable record-for-record.
+        let queued_operation = match lane {
+            Lane::Steering => "steer_queued",
+            Lane::FollowUp => "follow_up_queued",
+        };
+        self.checkpoint_queue(QueueCheckpoint::Admitted {
+            operation: queued_operation,
+        });
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
         let command = if lane == Lane::Steering {
@@ -2388,7 +2882,11 @@ impl Worker {
 
     /// Agent-to-agent message delivery, routed by the supervisor's
     /// `send_message` arm: render the `[agent-message from ...]` prompt and
-    /// queue it on the requested lane. Answers with the delivery receipt
+    /// queue it on the requested lane, carrying the `agent_message`
+    /// custom row on the queued item (TS `acceptAgentSessionMessage` ->
+    /// `acceptAgentMessagePrompt` with `customMessage`): the turn renders
+    /// the collapsed agent-message card while the model still runs on the
+    /// rendered prompt. Answers with the delivery receipt
     /// (`createAgentSessionMessageReceipt` shape): `queued` when a turn is
     /// running (`queueIfBusy` semantics), `delivered` when the prompt
     /// becomes the next run.
@@ -2459,7 +2957,7 @@ impl Worker {
         } else {
             Lane::Steering
         };
-        let (id, summary, queued, snapshot, lanes, active_session_id) = {
+        let (id, queued, snapshot, target) = {
             let mut core = self.core.lock().unwrap();
             let pending = core.steering.len() + core.follow_up.len();
             if let Err(error) =
@@ -2472,13 +2970,56 @@ impl Worker {
                 return response_failure(None, "worker_deliver_message", &error.to_string(), None);
             }
             let id = pa_core::session_engine::agent_messaging::create_agent_session_message_id();
+            let queued = core.busy;
+            let summary = self.summary_locked(&core);
+            // The receiving session's endpoint (TS
+            // `createAgentSessionMessageEndpoint`): the receipt's `target`
+            // and the delivered row's `details.target` share the one shape.
+            let mut target = json!({
+                "activeSessionId": summary.active_session_id.clone().unwrap_or_default(),
+                "sessionId": summary.session_id,
+                "runtimeKind": summary
+                    .runtime_kind
+                    .clone()
+                    .unwrap_or_else(|| "top-level".to_string()),
+            });
+            if let Some(name) = summary.session_name.clone().filter(|name| !name.is_empty()) {
+                target["sessionName"] = json!(name);
+            }
+            // The receiving side's custom row (TS
+            // `acceptAgentSessionMessage` -> `createAgentSessionMessage`,
+            // riding `acceptAgentMessagePrompt`'s `customMessage`): the
+            // queued turn carries the `agent_message` row so the
+            // transcript renders the collapsed card instead of a plain
+            // user row, while the row's `content` IS the rendered prompt -
+            // the model context stays byte-identical to the
+            // plain-prompt delivery.
+            let custom_message =
+                pa_core::session_engine::agent_messaging::create_agent_session_message_row(
+                    &pa_core::session_engine::agent_messaging::AgentSessionMessageRowPayload {
+                        id: &id,
+                        prompt: &prompt,
+                        message,
+                        from: &sender,
+                        from_relationship,
+                        target: &target,
+                        timestamp: crate::util::now_ms(),
+                    },
+                );
             match lane {
                 Lane::Steering => &mut core.steering,
                 Lane::FollowUp => &mut core.follow_up,
             }
             .push_back(QueuedItem {
+                // The labeled queue-strip row (TS `queuedAgentMessagePreview`:
+                // an agent-session-message custom row previews as
+                // "Agent message received: <details.message>").
+                preview: Some(format!(
+                    "{}: {message}",
+                    pa_core::session_engine::agent_messaging::AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL
+                )),
                 message: prompt,
-                custom_message: None,
+                custom_message: Some(custom_message),
                 // The agent-message marker: `agent_messages_clear` /
                 // `agent_messages_pause` remove exactly these items.
                 agent_message: Some(message.to_string()),
@@ -2486,28 +3027,26 @@ impl Worker {
                 admission_id: None,
                 images: Vec::new(),
                 done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Injected,
+                forced_batch: false,
             });
-            let queued = core.busy;
-            let summary = self.summary_locked(&core);
             let snapshot = self.snapshot_locked(&core);
-            let lanes = queue_lanes(&core);
-            let active_session_id = core.active_session_id.clone();
-            (id, summary, queued, snapshot, lanes, active_session_id)
+            (id, queued, snapshot, target)
         };
-        self.persist_queue_snapshot(&active_session_id, &lanes);
+        // The delivery checkpoint (busy=true): the queued agent message is
+        // admitted live work — a restart must revive the worker to
+        // deliver it (agent-to-agent messages have no client that
+        // reopens the session). The operation names are TS's steer/follow-up
+        // queue strings, matching the receipt's deliveryMode.
+        self.checkpoint_queue(QueueCheckpoint::Admitted {
+            operation: match lane {
+                Lane::Steering => "steer_queued",
+                Lane::FollowUp => "follow_up_queued",
+            },
+        });
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
-        let mut target = json!({
-            "activeSessionId": summary.active_session_id.clone().unwrap_or_default(),
-            "sessionId": summary.session_id,
-            "runtimeKind": summary
-                .runtime_kind
-                .clone()
-                .unwrap_or_else(|| "top-level".to_string()),
-        });
-        if let Some(name) = summary.session_name.clone().filter(|name| !name.is_empty()) {
-            target["sessionName"] = json!(name);
-        }
         let timestamp = crate::util::now_iso();
         let mut receipt = json!({
             "id": id,
@@ -2587,6 +3126,24 @@ impl Worker {
     /// The session's telemetry finalizes first (TS dispose callback:
     /// `agent session ended` + one flush), bounded by the sink timeouts.
     async fn handle_shutdown(&self) -> DaemonResponse {
+        // TS `shutdown` -> `closeSession(state, "shutdown")`: the session is
+        // closing, so the continuation mint sites and their settle-hook
+        // retries bail (a stopped session never continues) — but unlike a
+        // kill the close KEEPS the resume entry: no job cancel, no
+        // `archived` state, the scheduled jobs survive for the later wake
+        // (TS `closeKeepsResumeEntry("shutdown")`).
+        if let Some(agent_engine) = &self.agent_engine {
+            agent_engine.mark_session_closed();
+        }
+        // TS `shutdown` -> `closeSession` aborts the session's side questions
+        // per attached client before anything else closes, and each run's
+        // `done` chain writes its cancelled event while the client sockets
+        // are still open. Without this the restarted daemon never emits a
+        // terminal side_question_event, and the reattached client's pane
+        // wedges on a running turn no event will ever settle.
+        self.side_questions
+            .abort_all_and_settle(SIDE_QUESTION_SETTLE_TIMEOUT)
+            .await;
         {
             let mut core = self.core.lock().unwrap();
             core.shutdown_requested = true;
@@ -2610,14 +3167,27 @@ impl Worker {
         // `runtime.dispose` -> `disposeHostedSubagentRuntimes`): the
         // children close before the process exits, so the close's kills
         // never race the exit. Best-effort: an unreachable child must not
-        // block the worker's own exit.
-        if let Err(error) = self.close_rlm_children().await {
+        // block the worker's own exit. The children close with the
+        // `shutdown` reason too: their resume entries and scheduled jobs
+        // survive (a daemon shutdown preserves the wake model).
+        if let Err(error) = self
+            .close_rlm_children(crate::rlm_children::ChildCloseReason::Shutdown)
+            .await
+        {
             eprintln!("pa-daemon: RLM child close at shutdown failed: {error:#}");
         }
         if let Some(agent_engine) = &self.agent_engine {
             agent_engine.dispose_kernel().await;
         }
         self.engine.end_telemetry().await;
+        let lease = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_mut()
+            .and_then(|store| store.lease.take());
+        drop(lease);
         response_success(None, "shutdown", None)
     }
 
@@ -2663,6 +3233,14 @@ impl Worker {
     /// this: TS rebuilds the branch context in place and the kernel
     /// stays warm.
     pub(crate) async fn teardown_for_replacement(&self) -> anyhow::Result<()> {
+        // The retired session is closing: mark it before the children close,
+        // exactly like the kill/shutdown closes — each child's settle retry
+        // fires while the old runtime is still installed, and the marker
+        // keeps those retries from minting continuations into the retiring
+        // session (a replaced session never continues either).
+        if let Some(agent_engine) = &self.agent_engine {
+            agent_engine.mark_session_closed();
+        }
         {
             let mut core = self.core.lock().unwrap();
             core.steering.clear();
@@ -2679,23 +3257,28 @@ impl Worker {
         // `closeChildSessions(parentState, "replaced")`. A close failure
         // rethrows out of the teardown exactly like TS (the replacement
         // fails with the old runtime already retired).
-        self.close_rlm_children().await
+        self.close_rlm_children(crate::rlm_children::ChildCloseReason::Replaced)
+            .await
     }
 
     /// Close this session's supervisor-backed RLM children (TS
-    /// `closeChildSessions` through `disposeHostedSubagentRuntimes`).
-    /// Runs at every runtime teardown that ends the session - the
-    /// replacement retire, `kill`, and the worker `shutdown` - because
-    /// the TS daemon closes resident children on every session close and
-    /// at the replacement teardown, cascading to grandchildren through
-    /// each child worker's own close.
-    async fn close_rlm_children(&self) -> anyhow::Result<()> {
+    /// `closeChildSessions(parentState, reason)` through
+    /// `disposeHostedSubagentRuntimes`). Runs at every runtime teardown
+    /// that ends the session - the replacement retire, `kill`, and the
+    /// worker `shutdown` - because the TS daemon closes resident children
+    /// on every session close and at the replacement teardown, cascading
+    /// to grandchildren through each child worker's own close with the
+    /// same close reason.
+    async fn close_rlm_children(
+        &self,
+        reason: crate::rlm_children::ChildCloseReason,
+    ) -> anyhow::Result<()> {
         let children = self
             .agent_engine
             .as_ref()
             .and_then(|engine| engine.children.clone());
         match children {
-            Some(children) => children.close_children().await,
+            Some(children) => children.close_children(reason).await,
             None => Ok(()),
         }
     }
@@ -2863,7 +3446,77 @@ impl Worker {
         }
     }
 
-    fn handle_abort(&self) -> DaemonResponse {
+    /// Arm the one-shot forced steering batch (TS `abortAndSendQueued`'s
+    /// `_forcedAllSteeringActionIds = new Set(queuedSteering.map(...))`):
+    /// the visible plain-user steering items — queue-visible rows whose
+    /// delivery record is a user message, not an accepted agent message or
+    /// an injected custom row — deliver as ONE batched turn at the next
+    /// boundary, even under queue mode "one-at-a-time". Returns whether
+    /// anything armed; an empty lane (or an all-injected one) arms nothing
+    /// and the caller falls back to the plain abort (TS
+    /// `queuedSteering.length === 0 || !canResume`).
+    // Called by the `abort_and_send_queued` funnel (the wire command's
+    // body, #2599's handler once rebased).
+    pub(crate) fn arm_forced_all_steering(&self) -> bool {
+        let mut core = self.core.lock().unwrap();
+        let armable = |item: &QueuedItem| {
+            item.queue_visible && item.agent_message.is_none() && item.custom_message.is_none()
+        };
+        if !core.steering.iter().any(armable) {
+            return false;
+        }
+        core.forced_all_steering = true;
+        for item in core.steering.iter_mut() {
+            if armable(item) {
+                item.forced_batch = true;
+            }
+        }
+        true
+    }
+
+    /// TS `abortAndSendQueued` (agent-session.ts): abort the active run
+    /// and deliver every queued plain-user steering message together as
+    /// the next batched turn; abort-only when no armable steering sits
+    /// queued or the scheduler must stay parked (a held admission pause
+    /// or a pending shutdown — TS `canResume`). The follow-up lane never
+    /// merges in: it stays queued behind the delivered batch and drains
+    /// when the session goes idle. `steeringMode` is never changed.
+    ///
+    /// The `abort_and_send_queued` wire command (schema 29) and the
+    /// Ctrl+C trigger dispatch through this funnel (`handle_abort_and_send_queued`
+    /// below — the abort-parity lane's command surface, #2599).
+    pub(crate) fn abort_and_send_queued(&self) -> bool {
+        // TS `canResume`: no disposal in flight, no admission pause held —
+        // and the arm only fires in the send arm (`queuedSteering.length
+        // === 0 || !canResume` runs the plain `requestAbort()` without
+        // touching the armed set).
+        let can_resume =
+            !self.input_pauses.paused() && !self.core.lock().unwrap().shutdown_requested;
+        if !can_resume {
+            self.request_abort();
+            return false;
+        }
+        // TS `queuedSteering` + the arm: the visible plain-user steering
+        // rows carry the forced-batch flag; an empty (or all-injected)
+        // lane arms nothing and the abort below runs abort-only.
+        let armed = self.arm_forced_all_steering();
+        // TS runs `requestAbort()` in both arms (the suspension parks
+        // the queue), then arms + resumes only in the send arm: the
+        // resumed pump — not this funnel — owns the batch's delivery at
+        // the boundary.
+        self.request_abort();
+        if !armed {
+            return false;
+        }
+        self.resume_queued_input();
+        true
+    }
+
+    /// TS `requestAbort()`: the abort funnel behind both abort commands
+    /// (`abort` and `abort_and_send_queued`) - suspend queued-input
+    /// admission, cancel the queue-invisible turn actions, abort the
+    /// in-flight compaction, and cancel the running turn.
+    fn request_abort(&self) {
         {
             let mut core = self.core.lock().unwrap();
             core.abort_requested = true;
@@ -2872,13 +3525,66 @@ impl Worker {
             // site fires.
             core.queued_input_suspended = true;
         }
+        // TS `requestAbort()`'s `_cancelSessionActions`: queue-INVISIBLE
+        // turn actions cancel with "Prompt aborted before delivery." - a
+        // direct prompt admitted on an idle session never became a queue
+        // row, so the abort must resolve its waiting response instead of
+        // parking it behind the suspension forever (the ACP cancel wedge:
+        // the prompt item sat in the lane with no resume site, the
+        // `prompt_and_wait` response hung). The queue-visible lanes
+        // (steer/follow-up, agent-message deliveries, prompt-behind-work,
+        // heartbeat fires) survive parked - the suspension defers the
+        // pump, it never drops the queue (the abort-ownership probe).
+        {
+            let mut core = self.core.lock().unwrap();
+            let cancel = |lane: &mut VecDeque<QueuedItem>| {
+                let mut kept = VecDeque::new();
+                while let Some(item) = lane.pop_front() {
+                    if item.queue_visible {
+                        kept.push_back(item);
+                    } else {
+                        if let Some(id) = &item.admission_id {
+                            let _ = self.prompt_admissions.cancel(id);
+                        }
+                        if let Some(done) = item.done {
+                            let _ = done.send(Err("Prompt aborted before delivery.".to_string()));
+                        }
+                    }
+                }
+                *lane = kept;
+            };
+            cancel(&mut core.steering);
+            cancel(&mut core.follow_up);
+        };
         // TS `requestAbort()` also aborts the compaction in flight (manual
         // and automatic): the interrupt key cancels a compacting session.
         self.compaction.abort();
         // `requestAbort()` closes with `this.agent.abort()`: the in-flight
         // turn's fetch cancels now, not at its next streamed event.
         self.engine.abort_in_flight_turn();
+    }
+
+    fn handle_abort(&self) -> DaemonResponse {
+        self.request_abort();
         response_success(None, "abort", None)
+    }
+
+    /// `abort_and_send_queued` (TS `abortAndSendQueued`, schema 29): abort
+    /// the active run and deliver the queued steering at the boundary;
+    /// abort-only when the visible steering queue is empty or the
+    /// scheduler must stay parked. The queue lanes drain through the turn
+    /// runner once the aborted run settles (steering first, then
+    /// follow-ups when idle), like the TS resumed pump's
+    /// next-turn-boundary-then-when-idle selection order.
+    fn handle_abort_and_send_queued(&self) -> DaemonResponse {
+        // The command is the TS `abortAndSendQueued` funnel (above): the
+        // arm classifies the visible plain-user steering rows, the abort
+        // parks the scheduler, and the resume - the send arm only - lets
+        // the pump deliver the armed batch as ONE co-delivered turn at
+        // the boundary (the abort-only arm leaves the suspension set, so
+        // the parked queue survives untouched).
+        self.abort_and_send_queued();
+        response_success(None, "abort_and_send_queued", None)
     }
 
     /// `compact` (TS handler): run one compaction and answer with the TS
@@ -2982,6 +3688,7 @@ impl Worker {
                         {
                             let mut core = self.core.lock().unwrap();
                             core.follow_up.push_back(QueuedItem {
+                                preview: None,
                                 message: continuation.request.message,
                                 custom_message: continuation.request.custom_message,
                                 agent_message: None,
@@ -2989,8 +3696,20 @@ impl Worker {
                                 admission_id: None,
                                 images: continuation.request.images,
                                 done: None,
+                                queue_visible: false,
+                                policy: TurnPolicy::Injected,
+                                forced_batch: false,
                             });
                         }
+                        // The admission checkpoint (busy=true): the
+                        // post-compaction continuation is admitted while
+                        // the session is idle, so without this record a
+                        // kill before the turn's settle would park it on
+                        // a plain boot (the runner records nothing at
+                        // pickup).
+                        self.checkpoint_queue(QueueCheckpoint::Admitted {
+                            operation: "follow_up_queued",
+                        });
                     }
                 }
                 // The resume site: clears the suspension and wakes the
@@ -3242,12 +3961,15 @@ impl Worker {
             return response;
         }
         let core = self.core.lock().unwrap();
+        // TS `get_queue` serves `getSteeringMessagePreviews` /
+        // `getFollowUpMessagePreviews`: the labeled preview when the
+        // delivery carries one, else the message text.
         response_success(
             None,
             "get_queue",
             Some(json!({
-                "steering": core.steering.iter().map(|item| item.message.clone()).collect::<Vec<_>>(),
-                "followUp": core.follow_up.iter().map(|item| item.message.clone()).collect::<Vec<_>>(),
+                "steering": core.steering.iter().map(|item| item.preview.clone().unwrap_or_else(|| item.message.clone())).collect::<Vec<_>>(),
+                "followUp": core.follow_up.iter().map(|item| item.preview.clone().unwrap_or_else(|| item.message.clone())).collect::<Vec<_>>(),
             })),
         )
     }
@@ -3260,10 +3982,14 @@ impl Worker {
         let steering: Vec<String> = core.steering.drain(..).map(|item| item.message).collect();
         let follow_up: Vec<String> = core.follow_up.drain(..).map(|item| item.message).collect();
         let snapshot = self.snapshot_locked(&core);
-        let lanes = queue_lanes(&core);
-        let active_session_id = core.active_session_id.clone();
         drop(core);
-        self.persist_queue_snapshot(&active_session_id, &lanes);
+        // The cleared lanes are idle again: the verdict refresh rides the
+        // same checkpoint as the snapshot (a stale busy=true from the
+        // cleared items' admission must not revive an empty session; a
+        // clear mid-turn keeps the verdict busy through the turn).
+        self.checkpoint_queue(QueueCheckpoint::Settle {
+            operation: "queue_cleared",
+        });
         let _ = self.emit_action_update(&snapshot);
         response_success(
             None,
@@ -3307,13 +4033,44 @@ impl Worker {
         )
     }
 
-    async fn handle_kill(&self) -> DaemonResponse {
-        self.side_questions.abort_all();
-        // TS `closeSessionOnce("killed")` cascades the close to the
-        // session's resident children before the session's own archive
-        // and dispose; a close failure is swallowed here exactly like the
-        // daemon-mode kill handler's `.catch(() => undefined)`.
-        if let Err(error) = self.close_rlm_children().await {
+    async fn handle_kill(&self, payload: &Value) -> DaemonResponse {
+        let reason = KillCloseReason::from_payload(payload);
+        // The session is closing: the continuation mint sites and their
+        // settle-hook retries bail from here on (TS `_disposed ||
+        // _disposing` in the goal/autonomous resume sites). A stopped
+        // session never continues.
+        if let Some(agent_engine) = &self.agent_engine {
+            agent_engine.mark_session_closed();
+        }
+        // TS `closeSession` aborts the side questions per attached client
+        // before `closeSessionOnce`'s arms run.
+        self.side_questions
+            .abort_all_and_settle(SIDE_QUESTION_SETTLE_TIMEOUT)
+            .await;
+        // TS `closeSessionOnce`'s first act: `killed` cancels the session's
+        // scheduled jobs (`cancelScheduledJobsForSession` — the queued
+        // heartbeat follow-ups' purge included); `replaced` keeps the plain
+        // cron jobs but cancels the subagent's RLM heartbeats
+        // (`cancelSubagentRlmHeartbeats`); `shutdown` keeps them all (the
+        // jobs survive the close for the later scheduled wake). The store
+        // cancel is durable, so the stopped session's own heartbeats can
+        // never revive it (the zombie fix).
+        match reason {
+            KillCloseReason::Killed => self.cancel_session_scheduled_jobs().await,
+            KillCloseReason::Replaced => self.cancel_session_rlm_heartbeats().await,
+            KillCloseReason::Shutdown => {}
+        }
+        // TS `closeSessionOnce(reason)` cascades the close to the
+        // session's resident children with the SAME reason before the
+        // session's own archive and dispose; a close failure is swallowed
+        // here exactly like the daemon-mode kill handler's
+        // `.catch(() => undefined)`.
+        let child_reason = match reason {
+            KillCloseReason::Killed => crate::rlm_children::ChildCloseReason::Killed,
+            KillCloseReason::Shutdown => crate::rlm_children::ChildCloseReason::Shutdown,
+            KillCloseReason::Replaced => crate::rlm_children::ChildCloseReason::Replaced,
+        };
+        if let Err(error) = self.close_rlm_children(child_reason).await {
             eprintln!("pa-daemon: RLM child close at kill failed: {error:#}");
         }
         // The persist (TS `archiveSession` -> `appendSessionState`, before
@@ -3321,17 +4078,29 @@ impl Worker {
         // lands while the turn still holds its provider wait. The turn can
         // only append its aborted row once the abort flag below opens the
         // gate, so the file order (archived, then the aborted row) stays
-        // the TS one. The core lock never blocks on the in-flight turn:
-        // the turn runner holds it only for the instants it persists an
-        // event, never across the provider wait. The guard rides a block,
-        // not an explicit drop: a `drop(core)` does not end the guard's
-        // slot in an async generator, so the later awaits would make the
-        // future non-Send.
+        // the TS one. `shutdown` keeps the resume entry (TS
+        // `closeKeepsResumeEntry`), so its file stays live on disk. The
+        // core lock never blocks on the in-flight turn: the turn runner
+        // holds it only for the instants it persists an event, never
+        // across the provider wait. The guard rides a block, not an
+        // explicit drop: a `drop(core)` does not end the guard's slot in
+        // an async generator, so the later awaits would make the future
+        // non-Send.
         {
             let mut core = self.core.lock().unwrap();
-            if let Some(store) = core.store.as_mut() {
-                let _ = store.append_session_state("archived");
-                let _ = store.rewrite();
+            // `shutdown` keeps the resume entry (TS
+            // `closeKeepsResumeEntry`), so its file stays live on disk;
+            // the killed and replaced closes archive (the base's
+            // `persist_entry` write).
+            if reason != KillCloseReason::Shutdown {
+                if let Some(store) = core.store.as_mut() {
+                    if let Err(error) = store.persist_entry(
+                        "session_state",
+                        json!({ "state": { "status": "archived" } }),
+                    ) {
+                        return response_failure(None, "kill", &error.to_string(), None);
+                    }
+                }
             }
             core.created = false;
         }
@@ -3380,8 +4149,16 @@ impl Worker {
             agent_engine.dispose_kernel().await;
         }
         let active_session_id = self.core.lock().unwrap().active_session_id.clone();
-        let _ = self.emit_session_closed(&active_session_id, DaemonSessionClosedReason::Killed);
-        let _ = self.record_recovery(false, "killed");
+        let _ = self.emit_session_closed(&active_session_id, reason.session_closed_reason());
+        let _ = self.record_recovery(false, reason.recovery_operation());
+        let lease = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_mut()
+            .and_then(|store| store.lease.take());
+        drop(lease);
         response_success(None, "kill", None)
     }
 
@@ -3395,8 +4172,9 @@ impl Worker {
         }
         let mut core = self.core.lock().unwrap();
         if let Some(store) = core.store.as_mut() {
-            let _ = store.append_session_info(name);
-            let _ = store.rewrite();
+            if let Err(error) = store.persist_entry("session_info", json!({ "name": name })) {
+                return response_failure(None, command, &error.to_string(), None);
+            }
         }
         let summary = self.summary_locked(&core);
         drop(core);
@@ -3468,12 +4246,7 @@ impl Worker {
             message_count: store.map(|s| s.message_count()).unwrap_or(0) as u32,
             session_actions: session_snapshot(core),
             compaction_count: store
-                .map(|s| {
-                    s.entries()
-                        .iter()
-                        .filter(|entry| entry.type_ == "compaction")
-                        .count() as u32
-                })
+                .map(|store| store.compaction_count() as u32)
                 .unwrap_or(0),
             goal: self.engine.goal_state_value(),
             scoped_models: core.scoped_models.clone(),
@@ -3493,6 +4266,13 @@ impl Worker {
             return;
         };
         let _ = journal.record_queue_snapshot(active_session_id, &lanes.steering, &lanes.follow_up);
+    }
+
+    /// One queue-lane recovery checkpoint through the worker's own
+    /// journal: the lane snapshot and the busy verdict ride one locked
+    /// read (`checkpoint_queue_recovery`).
+    pub(crate) fn checkpoint_queue(&self, checkpoint: QueueCheckpoint) {
+        checkpoint_queue_recovery(&self.recovery, &self.core, checkpoint);
     }
 
     pub(crate) fn record_recovery(&self, busy: bool, operation: &str) -> Result<()> {
@@ -3662,14 +4442,8 @@ fn append_creation_prefix(
     cwd: &str,
     fresh: bool,
 ) {
-    let has_thinking_entry = store
-        .entries()
-        .iter()
-        .any(|entry| entry.type_ == "thinking_level_change");
-    let has_service_tier_entry = store
-        .entries()
-        .iter()
-        .any(|entry| entry.type_ == "service_tier_change");
+    let has_thinking_entry = store.has_thinking_level();
+    let has_service_tier_entry = store.has_service_tier();
     let thinking_level = engine
         .effective_thinking_level()
         .unwrap_or_else(|| "off".to_string());
@@ -3691,10 +4465,13 @@ fn append_creation_prefix(
     }
 }
 
-/// The pending queue lanes of a session (journal persistence payload).
+/// The pending queue lanes of a session (journal persistence payload):
+/// the full parked rows — message text, labeled preview, injected custom
+/// row, queue key, and visibility — so crash/respawn recovery restores a
+/// queued heartbeat as the heartbeat component, not a plain prompt.
 pub(crate) struct QueueLanes {
-    pub(crate) steering: Vec<String>,
-    pub(crate) follow_up: Vec<String>,
+    pub(crate) steering: Vec<crate::journal::WorkerQueueItemRecord>,
+    pub(crate) follow_up: Vec<crate::journal::WorkerQueueItemRecord>,
 }
 
 /// Read the pending lanes off a locked core.
@@ -3726,19 +4503,177 @@ fn parse_custom_message(value: Option<&Value>) -> Result<Option<Value>, String> 
     Ok(Some(value.clone()))
 }
 
-pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
-    QueueLanes {
-        steering: core
-            .steering
-            .iter()
-            .map(|item| item.message.clone())
-            .collect(),
-        follow_up: core
-            .follow_up
-            .iter()
-            .map(|item| item.message.clone())
-            .collect(),
+/// One queue-lane recovery checkpoint. The verdict and the persisted
+/// lane snapshot come from one locked read, so a concurrent
+/// enqueue/clear cannot be overwritten by a stale verdict and a stale
+/// snapshot cannot resurrect cleared lanes.
+#[derive(Clone, Copy)]
+pub(crate) enum QueueCheckpoint {
+    /// The lanes hold admitted live work: `busy = true` (TS
+    /// `prompt_accepted` / `steer_queued` / `follow_up_queued` /
+    /// `actions_restored`).
+    Admitted { operation: &'static str },
+    /// The verdict follows the lanes: `busy = whether lanes remain
+    /// queued` (TS `turn_end` computes the same verdict over live
+    /// work). Also used by queue mutations with no TS record (a clear,
+    /// an edit, an agent-message drain) so the journal never keeps a
+    /// stale verdict over a changed queue.
+    Settle { operation: &'static str },
+}
+
+/// Write one queue-lane recovery checkpoint: under the recovery lock
+/// (then the core lock, the documented order) the lanes are snapshotted
+/// into the journal and the busy verdict is recorded from the same
+/// read. Shared by the worker (`prompt` admission,
+/// `steer`/`follow_up`/agent-message delivery, `restore_actions`, queue
+/// clears/edits) and the turn runner (`turn_end` settle), which own the
+/// same fields.
+pub(crate) fn checkpoint_queue_recovery(
+    recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
+    core_lock: &std::sync::Mutex<SessionCore>,
+    checkpoint: QueueCheckpoint,
+) {
+    let mut guard = recovery.lock().unwrap();
+    let Some(journal) = guard.as_mut() else {
+        return;
+    };
+    // The lanes are read under the recovery lock (a microsecond core
+    // hold — never across the journal's fsyncs, which would block every
+    // concurrent command behind the write): every queue mutation that
+    // persists lands its own snapshot under this same recovery lock, so
+    // no persist can interleave between this read and the appends, and a
+    // mutating non-persist (a runner pop) is corrected by the next
+    // checkpoint's fresh read.
+    let (active_session_id, session_id, session_file, lanes, turn_in_flight) = {
+        let core = core_lock.lock().unwrap();
+        (
+            core.active_session_id.clone(),
+            core.store
+                .as_ref()
+                .map(|s| s.session_id().to_string())
+                .unwrap_or_default(),
+            core.store
+                .as_ref()
+                .map(|s| s.path.to_string_lossy().to_string()),
+            queue_lanes(&core),
+            core.busy,
+        )
+    };
+    let (busy, operation) = match checkpoint {
+        QueueCheckpoint::Admitted { operation } => (true, operation),
+        // TS computes a settled verdict from live session work
+        // (`hasLiveSessionWork` — an active session counts — plus retries
+        // and accepted prompts), never from the lanes alone: a withdrawal
+        // landing mid-turn (queue purge, clear, drop) must not flip the
+        // journal to idle while the turn still streams, or a crash in
+        // that window parks live work. The turn's own settle reads the
+        // idle flip first, so `turn_in_flight` is false at `turn_end`.
+        QueueCheckpoint::Settle { operation } => (
+            turn_in_flight || !lanes.steering.is_empty() || !lanes.follow_up.is_empty(),
+            operation,
+        ),
+    };
+    // The verdict never publishes over a snapshot that did not persist:
+    // busy=true evidence must not promise a queue the journal cannot
+    // replay (a skipped settled verdict keeps the previous record — the
+    // worst case parks like any uncheckpointed session).
+    if journal
+        .record_queue_snapshot(&active_session_id, &lanes.steering, &lanes.follow_up)
+        .is_err()
+    {
+        return;
     }
+    let _ = journal.record(
+        &active_session_id,
+        &session_id,
+        session_file.as_deref(),
+        busy,
+        operation,
+    );
+}
+
+pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
+    fn items(lane: &VecDeque<QueuedItem>) -> Vec<crate::journal::WorkerQueueItemRecord> {
+        lane.iter()
+            .map(|item| crate::journal::WorkerQueueItemRecord {
+                message: item.message.clone(),
+                preview: item.preview.clone(),
+                custom_message: item.custom_message.clone(),
+                queue_key: item.queue_key.clone(),
+                queue_visible: item.queue_visible,
+                policy: item.policy.journal_value().to_string(),
+            })
+            .collect()
+    }
+    QueueLanes {
+        steering: items(&core.steering),
+        follow_up: items(&core.follow_up),
+    }
+}
+
+/// TS `_pumpSessionInputs`'s batch gathering: the lane's front item
+/// anchors the delivery; under queue mode "all" — or the forced steering
+/// batch armed by `abort_and_send_queued` (TS `abortAndSendQueued`'s
+/// `_forcedAllSteeringActionIds`) — the same-class prefix behind it joins
+/// as co-delivered rows of ONE turn (TS `turnExecutionPoliciesEqual` +
+/// the mode/armed-set gates).
+///
+/// Joining gates: the same turn-execution class; a plain user row (an
+/// injected custom row always delivers solo — it replaces its turn's
+/// user row); not a queued session command (TS batches only `turn`-kind
+/// actions); and membership of the armed set while the forced batch
+/// governs this delivery. The front item anchors regardless — a
+/// non-batchable front delivers solo, exactly like TS's `first`.
+fn gather_delivery_batch(core: &mut SessionCore, lane: Lane) -> Vec<QueuedItem> {
+    let (items, mode) = match lane {
+        Lane::Steering => (&mut core.steering, core.steering_mode.as_str()),
+        Lane::FollowUp => (&mut core.follow_up, core.follow_up_mode.as_str()),
+    };
+    let Some(first) = items.front() else {
+        return Vec::new();
+    };
+    // TS `_forcedAllSteeringBatch(first)`: the armed set forces "all" only
+    // when the front item is armed; an un-armed front disarms the batch
+    // once no armed item remains queued (a delivered item leaves the lane
+    // with its flag, so the armed prefix exhausts itself). The read runs
+    // before the front's delivery class — every pickup disarms an
+    // exhausted arm, whatever it delivers.
+    let forced = lane == Lane::Steering && core.forced_all_steering && first.forced_batch;
+    let mut batch = Vec::new();
+    if lane == Lane::Steering
+        && core.forced_all_steering
+        && !forced
+        && !items.iter().any(|item| item.forced_batch)
+    {
+        core.forced_all_steering = false;
+    }
+    // The front's own delivery class decides the turn's shape before any
+    // gathering (TS: the direct prompt hand-off never queues, an injected
+    // custom row replaces its turn's user row, and a queued session
+    // command runs as the command — none of those turns carry co-delivered
+    // rows, so the front delivers solo).
+    if first.custom_message.is_some()
+        || first.policy == TurnPolicy::Direct
+        || crate::session_commands::parse_prompt_session_command(&first.message).is_some()
+    {
+        batch.push(items.pop_front().expect("front checked"));
+        return batch;
+    }
+    let first_policy = first.policy;
+    batch.push(items.pop_front().expect("front checked"));
+    if forced || mode == "all" {
+        while let Some(next) = items.front() {
+            if next.policy != first_policy
+                || next.custom_message.is_some()
+                || (forced && !next.forced_batch)
+                || crate::session_commands::parse_prompt_session_command(&next.message).is_some()
+            {
+                break;
+            }
+            batch.push(items.pop_front().expect("front checked"));
+        }
+    }
+    batch
 }
 
 /// Queue snapshot restore from the worker recovery journal (crash/respawn
@@ -3749,20 +4684,32 @@ fn restore_queue_snapshot(
 ) -> (VecDeque<QueuedItem>, VecDeque<QueuedItem>) {
     let mut steering = VecDeque::new();
     let mut follow_up = VecDeque::new();
-    fn pending(lanes: Vec<String>) -> VecDeque<QueuedItem> {
+    fn pending(lanes: Vec<crate::journal::WorkerQueueItemRecord>) -> VecDeque<QueuedItem> {
         // Images on a queued prompt do not survive the worker restart:
-        // the recovery journal stores the message lanes as text (the TS
-        // command-recovery journal keeps the same text-only shape).
+        // the recovery journal stores the delivery rows without the
+        // process-local attachments (the TS command-recovery journal
+        // keeps the same text-only shape for its lanes). Everything the
+        // turn needs to deliver identically — the labeled preview, the
+        // injected custom row, the queue key, the visibility flag —
+        // rides the item record, so a restored queued heartbeat still
+        // runs and persists as the `heartbeat_prompt` component.
         lanes
             .into_iter()
-            .map(|message| QueuedItem {
-                message,
-                custom_message: None,
-                agent_message: None,
-                queue_key: None,
-                admission_id: None,
-                images: Vec::new(),
-                done: None,
+            .map(|record| {
+                let policy = record.policy();
+                QueuedItem {
+                    preview: record.preview,
+                    message: record.message,
+                    custom_message: record.custom_message,
+                    agent_message: None,
+                    queue_key: record.queue_key,
+                    admission_id: None,
+                    images: Vec::new(),
+                    done: None,
+                    queue_visible: record.queue_visible,
+                    policy,
+                    forced_batch: false,
+                }
             })
             .collect()
     }
@@ -3820,6 +4767,7 @@ pub(crate) fn emit_worker_event_with(
 /// admission): the runner wakes, the item runs as its own queue item after
 /// the current run settles.
 pub(crate) fn admit_autonomous_follow_up(
+    recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
     core: &Arc<Mutex<SessionCore>>,
     work_notify: &Arc<Notify>,
     text: String,
@@ -3827,6 +4775,7 @@ pub(crate) fn admit_autonomous_follow_up(
     {
         let mut core = core.lock().unwrap();
         core.follow_up.push_back(QueuedItem {
+            preview: None,
             message: text,
             custom_message: None,
             agent_message: None,
@@ -3834,12 +4783,29 @@ pub(crate) fn admit_autonomous_follow_up(
             admission_id: None,
             images: Vec::new(),
             done: None,
+            queue_visible: false,
+            policy: TurnPolicy::Injected,
+            forced_batch: false,
         });
     }
+    // The admission checkpoint (busy=true): an injected continuation
+    // admitted while idle (after the previous settle) is undelivered
+    // live work the journal must prove — the runner records nothing at
+    // pickup, so a kill between this admission and the turn's settle
+    // would otherwise read as idle and park the continuation on a
+    // plain boot.
+    checkpoint_queue_recovery(
+        recovery,
+        core,
+        QueueCheckpoint::Admitted {
+            operation: "follow_up_queued",
+        },
+    );
     work_notify.notify_waiters();
 }
 
 pub(crate) fn admit_goal_follow_up(
+    recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
     core: &Arc<Mutex<SessionCore>>,
     events: &Arc<EventPump>,
     work_notify: &Arc<Notify>,
@@ -3867,6 +4833,7 @@ pub(crate) fn admit_goal_follow_up(
     {
         let mut core = core.lock().unwrap();
         let item = QueuedItem {
+            preview: None,
             message: follow_up.request.message,
             custom_message: follow_up.request.custom_message,
             agent_message: None,
@@ -3874,12 +4841,29 @@ pub(crate) fn admit_goal_follow_up(
             admission_id: None,
             images: follow_up.request.images,
             done: None,
+            queue_visible: false,
+            policy: TurnPolicy::Injected,
+            forced_batch: false,
         };
         match lane {
             Lane::Steering => core.steering.push_back(item),
             Lane::FollowUp => core.follow_up.push_back(item),
         }
     }
+    // The admission checkpoint (busy=true, TS's queue strings by lane):
+    // a minted follow-up admitted while idle is undelivered live work
+    // the journal must prove until its turn settles (same gap as the
+    // autonomous continuation above).
+    checkpoint_queue_recovery(
+        recovery,
+        core,
+        QueueCheckpoint::Admitted {
+            operation: match lane {
+                Lane::Steering => "steer_queued",
+                Lane::FollowUp => "follow_up_queued",
+            },
+        },
+    );
     // `resumeIfIdle`: the runner re-checks the queue at its loop head, so
     // the minted turn runs as the next admitted turn.
     work_notify.notify_one();
@@ -3919,7 +4903,7 @@ impl TurnRunner {
     async fn run(self) {
         loop {
             let engine = self.engine.clone();
-            let item: Option<QueuedItem> = {
+            let item: Option<Vec<QueuedItem>> = {
                 let mut core = self.core.lock().unwrap();
                 if core.shutdown_requested {
                     drop(core);
@@ -3942,26 +4926,81 @@ impl TurnRunner {
                 if self.input_pauses.paused() || core.queued_input_suspended {
                     core.busy = false;
                     None
-                } else if let Some(item) = core.steering.pop_front() {
+                } else if core.steering.front().is_some() {
+                    let items = gather_delivery_batch(&mut core, Lane::Steering);
                     core.busy = true;
                     core.abort_requested = false;
                     core.retry_abort_requested = false;
-                    Some(item)
-                } else if let Some(item) = core.follow_up.pop_front() {
+                    Some(items)
+                } else if core.follow_up.front().is_some() {
+                    let items = gather_delivery_batch(&mut core, Lane::FollowUp);
                     core.busy = true;
                     core.abort_requested = false;
                     core.retry_abort_requested = false;
-                    Some(item)
+                    Some(items)
                 } else {
                     core.busy = false;
                     None
                 }
             };
-            if let Some(item) = item {
+            if let Some(items) = item {
+                // No pickup checkpoint by design: every path that
+                // admits work into the lanes has already recorded its
+                // busy=true evidence at admission (`prompt_accepted`,
+                // `steer_queued`/`follow_up_queued`, `actions_restored`),
+                // so the whole in-flight window reads as interrupted
+                // work without another journal write on the runner; the
+                // settle's `turn_end` verdict is what parks the session
+                // later.
+                // The pickup projection (TS `_pumpSessionInputs` emits the
+                // queue update at the action's `preparing` transition): the
+                // delivered item leaves the queue projection BEFORE its
+                // turn starts, so a client's queue strip drops the row at
+                // delivery time. Without it the strip keeps the delivered
+                // message for the whole turn (dogfood P0: the steered
+                // message sends but still shows in the queue) and a browse
+                // edit addressed at the stale row is rejected as changed.
+                // A queue-visible delivery carries the active action through
+                // its TS phase transitions (`selected`/`preparing` projects
+                // first, then the `committing` transition before the turn
+                // dispatch, `running` once the turn's `agent_start` lands,
+                // cleared at the settle); an invisible item (an idle
+                // session's direct prompt admission, injected goal and
+                // autonomous continuations) projects the plain pickup like
+                // TS's `queueVisible` filter.
+                // The batch's active action is the first queue-visible row
+                // (TS `visibleSessionActionProjection(activeActions())[0]`):
+                // an all-invisible batch (injected continuations) projects
+                // nothing, like TS's `queueVisible` filter.
+                let visible_index = items.iter().position(|item| item.queue_visible);
+                let anchor = visible_index.map(|index| &items[index]);
+                let queue_visible = anchor.is_some();
+                {
+                    let mut core = self.core.lock().unwrap();
+                    if let Some(anchor) = anchor {
+                        core.active_action = Some(crate::types::SessionActionActive {
+                            kind: "turn".to_string(),
+                            phase: "preparing".to_string(),
+                            label: Some(compact_action_label(&anchor.message)),
+                        });
+                    }
+                    let snapshot = self.snapshot_from(&core);
+                    drop(core);
+                    let _ = self.emit_action_update(&snapshot);
+                }
+                if queue_visible {
+                    let mut core = self.core.lock().unwrap();
+                    if let Some(active) = core.active_action.as_mut() {
+                        active.phase = "committing".to_string();
+                    }
+                    let snapshot = self.snapshot_from(&core);
+                    drop(core);
+                    let _ = self.emit_action_update(&snapshot);
+                }
                 // The busy flip reaches the supervisor's roster before the
                 // turn runs (TS pushes the same transition).
                 self.push_roster_delta();
-                self.run_turn(engine, item).await;
+                self.run_turn(engine, items).await;
             } else {
                 self.idle_notify.notify_waiters();
                 self.work_notify.notified().await;
@@ -3990,6 +5029,7 @@ impl TurnRunner {
                     .effective_thinking_level()
                     .unwrap_or_else(|| "default".to_string()),
                 self.engine.model_metadata(),
+                self.engine.model_fallback_message(),
             )
         };
         let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
@@ -4007,13 +5047,32 @@ impl TurnRunner {
         });
     }
 
-    async fn run_turn(&self, engine: std::sync::Arc<dyn SessionEngine>, item: QueuedItem) {
+    /// One delivery: a single item, or the batch the pump gathered (TS
+    /// `_startPreparedTurnActions`): the first item anchors the turn and
+    /// the rest ride as co-delivered user rows of the same run.
+    async fn run_turn(&self, engine: std::sync::Arc<dyn SessionEngine>, items: Vec<QueuedItem>) {
+        let Some((first, batched)) = items.split_first() else {
+            return;
+        };
         // An admitted prompt's turn started: its prompt admission commits
-        // (TS `commitAdmission`).
-        if let Some(admission_id) = &item.admission_id {
+        // (TS `commitAdmission`) — one per batched item, in delivery order.
+        for admission_id in items.iter().filter_map(|item| item.admission_id.as_ref()) {
             self.prompt_admissions.commit(admission_id);
         }
         self.emit_turn_event(json!({ "type": "agent_start" }));
+        // The active action's `running` phase lands right after the turn's
+        // `agent_start` (TS marks the action running once the primary
+        // message starts the run): a queue-visible delivery projects it,
+        // and every later queue snapshot mid-turn carries it too.
+        if items.iter().any(|item| item.queue_visible) {
+            let mut core = self.core.lock().unwrap();
+            if let Some(active) = core.active_action.as_mut() {
+                active.phase = "running".to_string();
+            }
+            let snapshot = self.snapshot_from(&core);
+            drop(core);
+            let _ = self.emit_action_update(&snapshot);
+        }
         self.emit_turn_event(json!({ "type": "turn_start" }));
 
         let prompt_index = {
@@ -4021,11 +5080,18 @@ impl TurnRunner {
             core.store.as_ref().map(|s| s.message_count()).unwrap_or(0) / 2
         };
         let request = PromptRequest {
-            message: item.message.clone(),
-            images: item.images.clone(),
+            batch: batched
+                .iter()
+                .map(|item| crate::engine::PromptBatchRow {
+                    text: item.message.clone(),
+                    images: item.images.clone(),
+                })
+                .collect(),
+            message: first.message.clone(),
+            images: first.images.clone(),
             source: "user".to_string(),
             agent_message_id: None,
-            custom_message: item.custom_message.clone(),
+            custom_message: first.custom_message.clone(),
         };
         // Live token-stream coalescing for this turn: the emit path parks
         // `message_update` frames in a single slot and a flusher task
@@ -4066,7 +5132,16 @@ impl TurnRunner {
         // the suspension gate queued it behind the (indefinite)
         // suspension instead of rejecting it — the f7 suspension
         // sequence's post-abort prompt hung exactly there.
-        let item_done = item.done;
+        // The batch's waiting prompts (TS `promptAndWait`): one waiter per
+        // queued `prompt_and_wait` item in the delivery, each resolved at
+        // the same fully-settled point. The settled admissions clear at the
+        // same point (collected before the items are consumed).
+        let settled_admissions: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.admission_id.clone())
+            .collect();
+        let items_done: Vec<oneshot::Sender<Result<(), String>>> =
+            items.into_iter().filter_map(|item| item.done).collect();
         let turn_outcome = Arc::new(std::sync::Mutex::new(
             None::<std::result::Result<(), String>>,
         ));
@@ -4093,16 +5168,31 @@ impl TurnRunner {
                 // Sequence + persist under the core lock, then broadcast.
                 // The abort flag lives on the session core (`abort`
                 // command): a cancelled turn stops consuming its own
-                // events — except the aborted assistant row, its
-                // `turn_end` frame, and the run's `agent_end` carrying
-                // that row. TS `createAbortedAssistantMessage`'s
-                // message_start/message_end pair reaches the listeners and
-                // `appendMessage` persists it, the loop's trailing
-                // `turn_end` carries that row as the terminal payload, and
-                // the run's `agent_end` carries it in the messages, so the
-                // row's frames pass the gate (persist + broadcast) while
-                // the turn still unwinds; every other post-abort event
-                // stays dropped.
+                // events — except the frames TS still broadcasts for an
+                // interrupted turn. TS applies no post-abort gate at all:
+                // the agent abort cancels the provider fetch and turns the
+                // in-flight tool into an error result, and the frames that
+                // settle the cancelled run reach the listeners and the
+                // session store (the tool-phase probe: `abort` mid-kernel
+                // cell broadcasts tool_execution_end + the aborted
+                // toolResult row pair + turn_end + agent_end, exactly like
+                // a settled turn). The only post-abort noise TS never
+                // shows is the cancelled fetch's stream stragglers (the
+                // provider stream stops at the cancel, and TS tool
+                // updates stop at `acceptingUpdates = false`), so the gate
+                // drops the stream-update family and forwards:
+                // - the aborted assistant row (`createAbortedAssistantMessage`:
+                //   the pair broadcasts, `appendMessage` persists, the
+                //   trailing `turn_end` and `agent_end` carry the row),
+                //   closed by `suppress_aborted_row` for the detached-run
+                //   paths (TS `compact`/branch navigation);
+                // - the aborted tool's settle frames (the error
+                //   tool_execution_end, the toolResult row pair, the
+                //   cancelled run's own turn_end/agent_end);
+                // - the engine's trailing `Done` outcome, which parks the
+                //   turn result so a waiting `prompt_and_wait` resolves at
+                //   the settle (a dropped Done hung the response forever —
+                //   the abort UX probe).
                 if matches!(event, EngineEvent::TurnEnd { .. }) {
                     engine_turn_ended = true;
                 }
@@ -4122,8 +5212,18 @@ impl TurnRunner {
                             message.get("stopReason").and_then(Value::as_str) == Some("aborted")
                         })
                 );
+                let abort_settle = matches!(
+                    &event,
+                    EngineEvent::ToolExecutionEnd { .. }
+                        | EngineEvent::ToolResultMessage(_)
+                        | EngineEvent::TurnEnd { .. }
+                        | EngineEvent::AgentEnd { .. }
+                        | EngineEvent::Done(_)
+                );
                 let mut core = core.lock().unwrap();
-                if core.abort_requested && !(aborted_row && !core.suppress_aborted_row) {
+                if core.abort_requested
+                    && (core.suppress_aborted_row || !(abort_settle || aborted_row))
+                {
                     return false;
                 }
                 // The engine cuts its in-memory entries; its
@@ -4497,6 +5597,7 @@ impl TurnRunner {
         {
             let mut core = self.core.lock().unwrap();
             core.busy = false;
+            core.active_action = None;
         }
         self.push_roster_delta();
         // The fallback `agent_end` for runs that ended without a model
@@ -4512,29 +5613,32 @@ impl TurnRunner {
             let core = self.core.lock().unwrap();
             self.snapshot_from(&core)
         };
-        let (lanes, lane_session_id) = {
-            let core = self.core.lock().unwrap();
-            (queue_lanes(&core), core.active_session_id.clone())
-        };
-        {
-            let mut guard = self.recovery.lock().unwrap();
-            if let Some(journal) = guard.as_mut() {
-                let _ = journal.record_queue_snapshot(
-                    &lane_session_id,
-                    &lanes.steering,
-                    &lanes.follow_up,
-                );
-            }
-        }
+        // The settle checkpoint (TS `turn_end`, busy computed): the
+        // journal's latest record must track liveness, not the last
+        // structural write. The idle flip above precedes it, so the
+        // settle's in-flight term reads false here: a turn that settled
+        // with empty lanes leaves the session idle, so an unclean kill
+        // from here on must NOT read as interrupted work; undelivered
+        // lanes stay busy (they are admitted work a revive must
+        // redeliver). The busy verdict and the queue snapshot come from
+        // one locked read, so a concurrent enqueue cannot be overwritten
+        // by a stale idle verdict.
+        checkpoint_queue_recovery(
+            &self.recovery,
+            &self.core,
+            QueueCheckpoint::Settle {
+                operation: "turn_end",
+            },
+        );
         let _ = self.emit_action_update(&snapshot);
         // A finished turn is the cue to refresh the session's status line
         // (the runner debounces a burst into one request).
         let _ = self.status_notify.send(());
         self.idle_notify.notify_waiters();
-        // The settled prompt's admission clears (TS `clearAdmission` in
+        // The settled prompts' admissions clear (TS `clearAdmission` in
         // the prompt arm's finally).
-        if let Some(admission_id) = &item.admission_id {
-            self.prompt_admissions.clear(admission_id);
+        for admission_id in settled_admissions {
+            self.prompt_admissions.clear(&admission_id);
         }
         // The turn is fully unwound (idle flip, roster, boundary frames,
         // queue projection, admission bookkeeping): the waiting prompt now
@@ -4543,8 +5647,8 @@ impl TurnRunner {
         // the idle session.
         let settled_outcome = turn_outcome.lock().unwrap().take();
         if let Some(result) = settled_outcome {
-            if let Some(done) = item_done {
-                let _ = done.send(result);
+            for done in items_done {
+                let _ = done.send(result.clone());
             }
         }
     }
@@ -4578,20 +5682,7 @@ impl TurnRunner {
     }
 
     fn snapshot_from(&self, core: &SessionCore) -> SessionActionSnapshot {
-        SessionActionSnapshot {
-            queued_count: (core.steering.len() + core.follow_up.len()) as u32,
-            steering: core
-                .steering
-                .iter()
-                .map(|item| item.message.clone())
-                .collect(),
-            follow_ups: core
-                .follow_up
-                .iter()
-                .map(|item| item.message.clone())
-                .collect(),
-            active: None,
-        }
+        session_snapshot(core)
     }
 
     fn emit_turn_event(&self, event: Value) {
@@ -4654,6 +5745,7 @@ fn session_summary(
     core: &SessionCore,
     thinking_level: &str,
     model: Option<Value>,
+    model_fallback_message: Option<String>,
 ) -> SessionSummary {
     let store = core.store.as_ref();
     let streaming = core.busy;
@@ -4758,6 +5850,7 @@ fn session_summary(
         summary: None,
         task_state: None,
         model,
+        model_fallback_message,
         runtime_kind: Some(core.runtime_kind.clone()),
         unfinished_action_count: Some(0),
     }
@@ -4767,27 +5860,38 @@ fn session_summary(
 fn session_snapshot(core: &SessionCore) -> SessionActionSnapshot {
     SessionActionSnapshot {
         queued_count: (core.steering.len() + core.follow_up.len()) as u32,
+        // TS `queuedAgentMessagePreview`: a parked row reads the
+        // delivery's labeled preview when it carries one, else the
+        // message text.
         steering: core
             .steering
             .iter()
-            .map(|item| item.message.clone())
+            .map(|item| item.preview.clone().unwrap_or_else(|| item.message.clone()))
             .collect(),
         follow_ups: core
             .follow_up
             .iter()
-            .map(|item| item.message.clone())
+            .map(|item| item.preview.clone().unwrap_or_else(|| item.message.clone()))
             .collect(),
-        active: if core.busy {
-            Some(crate::types::SessionActionActive {
-                kind: "turn".to_string(),
-                phase: "running".to_string(),
-                label: None,
-            })
-        } else {
-            None
-        },
+        active: core.active_action.clone(),
     }
 }
+
+/// The active action's queue label (TS `compactRlmText(text, 160)`):
+/// collapse whitespace and cap at 160 chars with an ellipsis.
+fn compact_action_label(text: &str) -> String {
+    let compact: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_CHARS: usize = 160;
+    if compact.chars().count() <= MAX_CHARS {
+        return compact;
+    }
+    let kept: String = compact.chars().take(MAX_CHARS - 3).collect();
+    format!("{}...", kept.trim_end())
+}
+
+#[cfg(test)]
+#[path = "worker_resume_settings_tests.rs"]
+mod worker_resume_settings_tests;
 
 #[cfg(test)]
 mod update_snapshot_tests {
@@ -4821,6 +5925,66 @@ mod update_snapshot_tests {
         assert!(created.success, "create must succeed: {created:?}");
         let response = worker.dispatch("update_snapshot", &json!({})).await;
         (worker, response)
+    }
+
+    /// TS `queuedAgentMessagePreview`: the queue action rows serve a
+    /// delivery's labeled preview when it carries one, while the raw
+    /// steering lane keeps the message text (TS `getSteeringMessages`).
+    #[tokio::test]
+    async fn queue_action_rows_serve_the_labeled_preview() {
+        let (worker, _) = snapshot_after_create().await;
+        {
+            let mut core = worker.core.lock().unwrap();
+            core.steering.push_back(QueuedItem {
+                message: "[heartbeat: every 10m run#0]\n\nnudge the mission".to_string(),
+                preview: Some(
+                    "Heartbeat prompt: [heartbeat: every 10m run#0]\n\nnudge the mission"
+                        .to_string(),
+                ),
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Injected,
+                forced_batch: false,
+            });
+            core.steering.push_back(QueuedItem {
+                message: "plain queued prompt".to_string(),
+                preview: None,
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            });
+        }
+        let response = worker.dispatch("update_snapshot", &json!({})).await;
+        assert!(response.success);
+        let data = response.data.expect("snapshot data");
+        assert_eq!(
+            data["queue"]["actions"]["steering"],
+            json!([
+                "Heartbeat prompt: [heartbeat: every 10m run#0]\n\nnudge the mission",
+                "plain queued prompt",
+            ]),
+            "the action rows must serve the labeled preview"
+        );
+        assert_eq!(
+            data["queue"]["steering"],
+            json!([
+                "[heartbeat: every 10m run#0]\n\nnudge the mission",
+                "plain queued prompt",
+            ]),
+            "the raw lane keeps the message text"
+        );
+        assert_eq!(data["queue"]["actions"]["queuedCount"], 2);
     }
 
     #[tokio::test]
@@ -4965,6 +6129,70 @@ mod agent_message_tests {
         assert!(queue_texts(&worker.core, Lane::FollowUp).is_empty());
     }
 
+    /// The queued delivery carries the `agent_message` custom row (TS
+    /// `acceptAgentSessionMessage` rides `acceptAgentMessagePrompt`'s
+    /// `customMessage`): the row's content is the rendered prompt, the
+    /// details carry the identity the collapsed card reads, and the
+    /// agent-message marker still targets `agent_messages_clear`/`pause`.
+    #[tokio::test]
+    async fn deliver_message_carries_the_agent_message_custom_row() {
+        let worker = created_worker().await;
+        let response = worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({
+                    "targetActiveSessionId": "target-session",
+                    "message": "the research is done",
+                    "sender": {
+                        "activeSessionId": "source-session",
+                        "sessionId": "source-file",
+                        "sessionName": "research-lane",
+                        "runtimeKind": "subagent",
+                    },
+                }),
+            )
+            .await;
+        assert!(response.success, "deliver failed: {response:?}");
+        let data = response.data.expect("receipt data");
+        let prompt = "[agent-message from child:research-lane]\n\nthe research is done";
+        let (custom, message, agent_message, preview) = {
+            let core = worker.core.lock().unwrap();
+            let item = core.steering.front().expect("the delivery queued");
+            (
+                item.custom_message
+                    .clone()
+                    .expect("the agent_message row rides the delivery"),
+                item.message.clone(),
+                item.agent_message.clone(),
+                item.preview.clone(),
+            )
+        };
+        // The queue strip serves the TS labeled preview.
+        assert_eq!(
+            preview.as_deref(),
+            Some("Agent message received: the research is done")
+        );
+        assert_eq!(custom["role"], "custom");
+        assert_eq!(custom["customType"], "agent_message");
+        assert_eq!(custom["content"], prompt);
+        assert_eq!(custom["display"], true);
+        assert_eq!(custom["details"]["id"], data["id"]);
+        assert_eq!(custom["details"]["message"], "the research is done");
+        assert_eq!(
+            custom["details"]["from"]["activeSessionId"],
+            "source-session"
+        );
+        assert_eq!(custom["details"]["fromRelationship"], "child");
+        assert_eq!(
+            custom["details"]["target"]["activeSessionId"],
+            "target-session"
+        );
+        // The turn still runs on the rendered prompt, and the marker the
+        // clear/pause arms read is untouched.
+        assert_eq!(message, prompt);
+        assert_eq!(agent_message.as_deref(), Some("the research is done"));
+    }
+
     /// An explicit `follow_up` delivery mode queues behind current work
     /// instead of steering, and a subagent sender renders the relationship.
     #[tokio::test]
@@ -5029,6 +6257,7 @@ mod agent_message_tests {
             let mut core = worker.core.lock().unwrap();
             for _ in 0..DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION {
                 core.follow_up.push_back(QueuedItem {
+                    preview: None,
                     message: "occupied".to_string(),
                     custom_message: None,
                     agent_message: None,
@@ -5036,6 +6265,9 @@ mod agent_message_tests {
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
+                    queue_visible: true,
+                    policy: TurnPolicy::Injected,
+                    forced_batch: false,
                 });
             }
         }
@@ -5159,11 +6391,14 @@ mod tests {
     #[test]
     fn summary_lifecycle_is_message_based() {
         let empty = SessionCore::test_core(None, "/tmp".to_string());
-        assert_eq!(session_summary(&empty, "default", None).lifecycle, "draft");
+        assert_eq!(
+            session_summary(&empty, "default", None, None).lifecycle,
+            "draft"
+        );
         let mut subagent = SessionCore::test_core(None, "/tmp".to_string());
         subagent.runtime_kind = "subagent".to_string();
         assert_eq!(
-            session_summary(&subagent, "default", None).lifecycle,
+            session_summary(&subagent, "default", None, None).lifecycle,
             "live"
         );
         // The busy-flip roster delta fires before the store flushes the
@@ -5171,7 +6406,10 @@ mod tests {
         // reads the runtime's in-memory messages, which already hold it).
         let mut busy = SessionCore::test_core(None, "/tmp".to_string());
         busy.busy = true;
-        assert_eq!(session_summary(&busy, "default", None).lifecycle, "live");
+        assert_eq!(
+            session_summary(&busy, "default", None, None).lifecycle,
+            "live"
+        );
         let dir = std::env::temp_dir().join(format!("pa-worker-lc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
@@ -5185,7 +6423,7 @@ mod tests {
         session.rewrite().unwrap();
         let with_message = SessionCore::test_core(Some(session), "/tmp".to_string());
         assert_eq!(
-            session_summary(&with_message, "default", None).lifecycle,
+            session_summary(&with_message, "default", None, None).lifecycle,
             "live"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -5313,6 +6551,302 @@ mod tests {
             plain.success,
             "still suspended after resume_queue: {plain:?}"
         );
+    }
+
+    /// `abort_and_send_queued` (TS `abortAndSendQueued`, schema 29): with
+    /// visible steering parked at a running turn's boundary, the interrupt
+    /// aborts the run AND delivers the parked queue right after the aborted
+    /// turn settles (TS `requestAbort()` + `resumeQueuedWork()`); the
+    /// follow-up lane drains too, once the session goes idle. The aborted
+    /// turn's row surfaces with the aborted shape.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    async fn abort_and_send_queued_delivers_the_parked_queue_at_the_boundary() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-abort-send-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "abort-send-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [
+                    { "text": "held reply", "delayMs": 60000 },
+                    "steering one reply",
+                    "steering two reply",
+                    "follow-up reply",
+                ],
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "abort-send" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let mut subscription = worker.events.subscribe();
+        // The held turn parks the queue behind it (60s fetch hold).
+        let prompt = worker
+            .dispatch(
+                "prompt",
+                &json!({
+                    "activeSessionId": "abort-send-session",
+                    "message": "held turn for the abort-and-send probe",
+                }),
+            )
+            .await;
+        assert!(prompt.success, "prompt failed: {prompt:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if worker.core.lock().unwrap().busy {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held turn was never admitted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Parked steering and one follow-up behind the running turn.
+        for message in ["steering one", "steering two"] {
+            let steered = worker
+                .dispatch("steer", &json!({ "message": message }))
+                .await;
+            assert!(steered.success, "steer failed: {steered:?}");
+        }
+        let follow = worker
+            .dispatch("follow_up", &json!({ "message": "follow-up now" }))
+            .await;
+        assert!(follow.success, "follow_up failed: {follow:?}");
+        // The interrupt: abort the run and send the parked queue.
+        let aborted = worker.dispatch("abort_and_send_queued", &json!({})).await;
+        assert!(aborted.success, "abort_and_send_queued failed: {aborted:?}");
+        assert_eq!(aborted.command, "abort_and_send_queued");
+        let idle = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            worker.dispatch("wait_for_idle", &json!({})),
+        )
+        .await;
+        assert!(idle.is_ok(), "the session never went idle after the abort");
+        assert!(idle.unwrap().success, "wait_for_idle failed");
+        // The held turn aborted (its row carries the aborted shape) and
+        // the parked queue delivered: steering one, steering two, then the
+        // follow-up, each answered by its scripted reply.
+        let messages = worker.dispatch("get_messages", &json!({})).await;
+        assert!(messages.success, "get_messages failed: {messages:?}");
+        let wire_messages = messages
+            .data
+            .as_ref()
+            .and_then(|data| data.get("messages"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let texts: Vec<String> = wire_messages
+            .iter()
+            .filter(|message| crate::types::message_role(message) == Some("user"))
+            .map(crate::types::message_text)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "held turn for the abort-and-send probe",
+                "steering one",
+                "steering two",
+                "follow-up now",
+            ],
+            "the parked queue never delivered in order: {texts:?}"
+        );
+        // The one-batched-turn granularity (the steer-family lane's
+        // supersede of this test's original reply-granularity
+        // expectations): the two parked steers deliver as ONE co-delivered
+        // turn — a single `agent_start` for both rows and ONE assistant
+        // reply for the whole batch — exactly TS `abortAndSendQueued`'s
+        // armed batch (`_forcedAllSteeringActionIds` +
+        // `_startPreparedTurnActions`); the follow-up stays a turn of its
+        // own behind it.
+        let events = session_events_since(&mut subscription);
+        let agent_starts = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("agent_start"))
+            .count();
+        assert_eq!(
+            agent_starts, 3,
+            "the held turn, the steers' ONE batched turn, the follow-up's: {events:?}"
+        );
+        let replies: Vec<String> = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_end")
+                    && event["message"]["role"] == "assistant"
+                    && event["message"].get("stopReason").and_then(Value::as_str) != Some("aborted")
+            })
+            .filter_map(|event| {
+                let message = event.get("message")?;
+                let content = message.get("content")?;
+                content
+                    .as_array()
+                    .and_then(|parts| parts.first())
+                    .and_then(|part| part.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        // The batch's one reply is the next scripted response; the
+        // follow-up's turn takes the one after it - the steers never
+        // consume one reply each.
+        assert_eq!(
+            replies,
+            [
+                "steering one reply".to_string(),
+                "steering two reply".to_string()
+            ],
+            "ONE reply for the whole steers' batch, one for the follow-up: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_end")
+                    && event["message"]["role"] == "assistant"
+                    && event["message"]["stopReason"] == "aborted"
+            }),
+            "the held turn never surfaced its aborted row: {events:?}"
+        );
+        // The queue drained and the suspension is gone (a plain prompt is
+        // admissible again, unlike the plain-abort path).
+        let queue = worker.dispatch("get_queue", &json!({})).await;
+        assert!(queue.success, "get_queue failed: {queue:?}");
+        let lanes = queue.data.as_ref().expect("the queue lanes");
+        assert_eq!(lanes["steering"], json!([]), "queue: {queue:?}");
+        assert_eq!(lanes["followUp"], json!([]), "queue: {queue:?}");
+        assert!(
+            !worker.core.lock().unwrap().queued_input_suspended,
+            "the abort-and-send suspension never cleared"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The abort-only arm: `abort_and_send_queued` with no visible steering
+    /// parked is a plain abort (TS `queuedSteering.length === 0` ->
+    /// `requestAbort()` + `return false`) - the queued-input suspension
+    /// stays set, so a plain prompt is rejected until a resume site fires.
+    #[tokio::test]
+    async fn abort_and_send_queued_with_an_empty_queue_is_a_plain_abort() {
+        let worker = created_dispatch_worker().await;
+        let aborted = worker.dispatch("abort_and_send_queued", &json!({})).await;
+        assert!(aborted.success, "abort_and_send_queued failed: {aborted:?}");
+        assert_eq!(aborted.command, "abort_and_send_queued");
+        let rejected = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "suspension-session", "message": "hi" }),
+            )
+            .await;
+        assert!(
+            !rejected.success,
+            "admitted after the abort-only abort: {rejected:?}"
+        );
+        assert_eq!(rejected.error.as_deref(), Some(QUEUED_INPUT_SUSPENDED));
+    }
+
+    /// A follow-up-only queue stays parked (TS ENG-5991: the forced batch
+    /// spans the next-turn-boundary lane only, so a when-idle follow-up
+    /// does not arm the send): the abort answers abort-only and the
+    /// follow-up survives undelivered behind the suspension.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    async fn abort_and_send_queued_with_only_follow_ups_stays_abort_only() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("pa-worker-abort-fu-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "abort-fu-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [
+                    { "text": "held reply", "delayMs": 60000 },
+                    "follow-up reply that must not run yet",
+                ],
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "abort-fu" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let prompt = worker
+            .dispatch(
+                "prompt",
+                &json!({
+                    "activeSessionId": "abort-fu-session",
+                    "message": "held turn for the follow-up abort probe",
+                }),
+            )
+            .await;
+        assert!(prompt.success, "prompt failed: {prompt:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if worker.core.lock().unwrap().busy {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held turn was never admitted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let follow = worker
+            .dispatch("follow_up", &json!({ "message": "follow-up parked" }))
+            .await;
+        assert!(follow.success, "follow_up failed: {follow:?}");
+        let aborted = worker.dispatch("abort_and_send_queued", &json!({})).await;
+        assert!(aborted.success, "abort_and_send_queued failed: {aborted:?}");
+        // The held turn settles on its abort; the follow-up stays parked
+        // behind the still-set suspension (wait_for_idle would hang on
+        // the parked lane, so poll the runner's busy flag instead).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while worker.core.lock().unwrap().busy {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the aborted turn never settled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let queue = worker.dispatch("get_queue", &json!({})).await;
+        assert!(queue.success, "get_queue failed: {queue:?}");
+        assert_eq!(
+            queue.data.as_ref().expect("the queue lanes")["followUp"],
+            json!(["follow-up parked"]),
+            "the follow-up was consumed by the abort: {queue:?}"
+        );
+        assert!(
+            worker.core.lock().unwrap().queued_input_suspended,
+            "the abort-only arm must keep the suspension set"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A scripted goal session's dispatch worker (the goal section feeds
@@ -5444,6 +6978,7 @@ mod tests {
             let mut core = worker.core.lock().unwrap();
             core.queued_input_suspended = true;
             core.follow_up.push_back(QueuedItem {
+                preview: None,
                 message: "parked queued work".to_string(),
                 custom_message: None,
                 agent_message: None,
@@ -5451,6 +6986,9 @@ mod tests {
                 admission_id: None,
                 images: Vec::new(),
                 done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
             });
         }
         let compact = worker
@@ -5525,7 +7063,11 @@ mod tests {
     /// budget-free loop keeps prompting until the kernel's
     /// `goal.complete()` (the scripted ipython tool call, the f18
     /// completion surface) settles the goal, and the completion's
-    /// boundary mints nothing more.
+    /// boundary mints nothing more. The completing cell needs a
+    /// bootable kernel: a sandbox gate run must provide uv and
+    /// PI_PACKAGE_DIR at the checkout (the guard inside names the
+    /// recipe when the cell fails instead of letting the loop drain
+    /// the faux script into a misleading count mismatch).
     #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
     #[tokio::test]
     async fn goal_turn_end_loop_runs_to_completion() {
@@ -5582,6 +7124,27 @@ mod tests {
         let idle = worker.dispatch("wait_for_idle", &json!({})).await;
         assert!(idle.success, "the goal loop never settled: {idle:?}");
         let events = session_events_since(&mut subscription);
+        // A gate run without the kernel environment (uv on PATH and
+        // PI_PACKAGE_DIR at the checkout — docs/parity-battery.md,
+        // "Sandbox-built rust binary + kernel runtime") fails the
+        // completing ipython cell: the goal stays active and the loop
+        // keeps minting (TS parity: goal continuations are unbounded while
+        // the goal is active) until the faux script runs dry. Fail with
+        // the diagnosis instead of the misleading continuation-count
+        // mismatch.
+        let kernel_failure = events.iter().find(|event| {
+            event.get("type").and_then(Value::as_str) == Some("message_end")
+                && event["message"]["role"] == "toolResult"
+                && event["message"]["isError"] == json!(true)
+        });
+        if let Some(failure) = kernel_failure {
+            panic!(
+                "the completing ipython cell failed — this test needs the kernel \
+                 environment (uv on PATH and PI_PACKAGE_DIR at the checkout; \
+                 docs/parity-battery.md, \"Sandbox-built rust binary + kernel \
+                 runtime\"): {failure:?}"
+            );
+        }
         // Each minted continuation ran as a queued follow-up turn: the
         // start row plus two continuation rows (the completion turn is the
         // second continuation's turn).
@@ -5838,6 +7401,85 @@ mod tests {
             goal_before["continuationsUsed"]
         );
         assert_eq!(goal_after["objective"], goal_before["objective"]);
+    }
+
+    /// The killed close's schedule cancel (TS `cancelScheduledJobsForSession`
+    /// at `closeSessionOnce("killed")`): a session with an active heartbeat
+    /// job dies at kill — the job cancels durably and the session file
+    /// archives, so no scheduled wake can revive the stopped session (the
+    /// zombie fix's stop-side gate).
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    #[tokio::test]
+    async fn kill_cancels_the_sessions_scheduled_jobs() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-kill-jobs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sessions_dir = dir.join("sessions");
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "kill-jobs-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "engine": "faux", "responses": [] })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({
+                    "cwd": dir.to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                    "name": "kill-jobs",
+                }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let data = created.data.expect("the create answers a summary");
+        let session_id = data.get("sessionId").and_then(Value::as_str).expect("id");
+        let session_file = data
+            .get("sessionFile")
+            .and_then(Value::as_str)
+            .expect("session file");
+        // A lane-liveness heartbeat on the session's artifact store.
+        let job = worker
+            .scheduled
+            .store()
+            .create(&pa_core::cron::store::CreateAgentCronJobInput {
+                active_session_id: "kill-jobs-session".to_string(),
+                session_id: session_id.to_string(),
+                session_file: session_file.to_string(),
+                cwd: dir.to_string_lossy().to_string(),
+                prompt: "lane-liveness ping".to_string(),
+                schedule_text: "every 10s".to_string(),
+                source: Some("rlm_heartbeat".to_string()),
+                now: Some(1),
+                ..Default::default()
+            })
+            .expect("the store creates the job");
+        assert_eq!(job.status, pa_core::cron::JobStatus::Active);
+
+        let killed = worker.dispatch("kill", &json!({})).await;
+        assert!(killed.success, "kill failed: {killed:?}");
+
+        // The job cancelled durably: no later fire can wake the session.
+        let stored = worker.scheduled.store().list();
+        let cancelled = stored
+            .iter()
+            .find(|candidate| candidate.id == job.id)
+            .expect("the job stays in the store");
+        assert_eq!(cancelled.status, pa_core::cron::JobStatus::Cancelled);
+        assert_eq!(cancelled.next_run_at, None);
+        // The close archived the session file (the wake scan's state gate).
+        let info =
+            crate::session_store::read_session_info(std::path::Path::new(session_file)).unwrap();
+        assert_eq!(info.state.as_deref(), Some("archived"));
     }
 
     /// The `kill` path (the #247 residue, probe-verified): TS
@@ -6354,21 +7996,57 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let journal_path = dir.join("recovery.jsonl");
         let mut journal = WorkerRecoveryJournal::open(&journal_path).unwrap();
+        // A parked heartbeat rides the journal with its full delivery row
+        // (labeled preview, injected custom row, queue key), so a respawned
+        // worker restores the heartbeat component instead of a plain user
+        // message.
+        let content = "[heartbeat: every 10m run#0]\n\nnudge the mission";
+        let labeled_preview = format!(
+            "{}: {content}",
+            pa_core::session_engine::messages::HEARTBEAT_PROMPT_PREVIEW_LABEL
+        );
+        let heartbeat = crate::journal::WorkerQueueItemRecord {
+            message: content.to_string(),
+            preview: Some(labeled_preview),
+            custom_message: Some(json!({
+                "role": "custom",
+                "customType": "heartbeat_prompt",
+                "content": content,
+                "display": true,
+                "details": { "jobId": "hb-1" },
+            })),
+            queue_key: Some("heartbeat:hb-1".to_string()),
+            queue_visible: true,
+            policy: "injected".to_string(),
+        };
+        let plain = crate::journal::WorkerQueueItemRecord {
+            message: "follow-me".to_string(),
+            preview: None,
+            custom_message: None,
+            queue_key: None,
+            queue_visible: true,
+            policy: "queued".to_string(),
+        };
         journal
             .record_queue_snapshot(
                 "session-a",
-                &["steer-me".to_string()],
-                &["follow-me".to_string()],
+                std::slice::from_ref(&heartbeat),
+                std::slice::from_ref(&plain),
             )
             .unwrap();
         // A reopen (respawned worker) reads the latest snapshot per session.
         let reloaded = WorkerRecoveryJournal::open(&journal_path).unwrap();
         let (steering, follow_up) = restore_queue_snapshot(&reloaded, "session-a");
         assert_eq!(steering.len(), 1);
-        assert_eq!(steering[0].message, "steer-me");
+        assert_eq!(steering[0].message, heartbeat.message);
+        assert_eq!(steering[0].preview, heartbeat.preview);
+        assert_eq!(steering[0].custom_message, heartbeat.custom_message);
+        assert_eq!(steering[0].queue_key, heartbeat.queue_key);
+        assert!(steering[0].queue_visible);
         assert_eq!(follow_up.len(), 1);
         assert_eq!(follow_up[0].message, "follow-me");
-        // Compaction (triggered by an all-idle record) keeps the snapshot.
+        // Compaction (triggered by an all-idle record) keeps the snapshot
+        // with its full rows.
         let mut compacting = WorkerRecoveryJournal::open(&journal_path).unwrap();
         compacting
             .record("session-a", "s1", None, false, "idle")
@@ -6376,7 +8054,129 @@ mod tests {
         let compacted = WorkerRecoveryJournal::open(&journal_path).unwrap();
         let (steering, _) = restore_queue_snapshot(&compacted, "session-a");
         assert_eq!(steering.len(), 1);
+        assert_eq!(steering[0].custom_message, heartbeat.custom_message);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A version-1 queue snapshot (the pre-item text lanes a prior binary
+    /// wrote) still restores as plain rows.
+    #[test]
+    fn a_version_one_queue_snapshot_restores_as_plain_rows() {
+        let dir = std::env::temp_dir().join(format!("pa-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal_path = dir.join("recovery.jsonl");
+        std::fs::write(
+            &journal_path,
+            "{\"version\":1,\"type\":\"queue_snapshot\",\"active_session_id\":\"session-b\",\"steering\":[\"steer-me\"],\"follow_up\":[\"follow-me\"],\"recorded_at\":\"2026-09-22T00:00:00.000Z\"}\n",
+        )
+        .unwrap();
+        let journal = WorkerRecoveryJournal::open(&journal_path).unwrap();
+        let (steering, follow_up) = restore_queue_snapshot(&journal, "session-b");
+        assert_eq!(steering.len(), 1);
+        assert_eq!(steering[0].message, "steer-me");
+        assert_eq!(steering[0].preview, None);
+        assert_eq!(steering[0].custom_message, None);
+        assert_eq!(steering[0].queue_key, None);
+        assert!(steering[0].queue_visible);
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(follow_up[0].message, "follow-me");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The forced-batch arming classification (TS `abortAndSendQueued`'s
+    /// `queuedSteering` filter): only the visible plain-user steering items
+    /// arm — queue-visible rows whose delivery record is a user message;
+    /// agent-message deliveries and injected custom rows never join, and an
+    /// empty (or all-injected) lane arms nothing.
+    #[tokio::test]
+    async fn forced_batch_arming_classifies_the_visible_plain_rows() {
+        let worker = created_dispatch_worker().await;
+        {
+            let mut core = worker.core.lock().unwrap();
+            core.steering.push_back(QueuedItem {
+                preview: None,
+                message: "steer one".to_string(),
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            });
+            core.steering.push_back(QueuedItem {
+                preview: None,
+                message: "agent message row".to_string(),
+                custom_message: None,
+                agent_message: Some("agent message row".to_string()),
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Injected,
+                forced_batch: false,
+            });
+            core.steering.push_back(QueuedItem {
+                preview: None,
+                message: "injected custom row".to_string(),
+                custom_message: Some(json!({ "role": "custom", "customType": "x" })),
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Injected,
+                forced_batch: false,
+            });
+            core.steering.push_back(QueuedItem {
+                preview: None,
+                message: "steer two".to_string(),
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            });
+        }
+        assert!(
+            worker.arm_forced_all_steering(),
+            "the armable rows exist: the arm fired"
+        );
+        {
+            let core = worker.core.lock().unwrap();
+            assert!(core.forced_all_steering, "the forced batch is armed");
+            let armed: Vec<bool> = core.steering.iter().map(|item| item.forced_batch).collect();
+            assert_eq!(
+                armed,
+                vec![true, false, false, true],
+                "only the visible plain-user rows armed: {armed:?}"
+            );
+        }
+        // A lane with nothing armable arms nothing new — the armed state
+        // itself persists (TS's armed set survives until a pump selection
+        // consumes or disarms it; a later abort with an empty lane runs
+        // the plain `requestAbort` arm and touches nothing).
+        worker.core.lock().unwrap().steering.clear();
+        assert!(
+            !worker.arm_forced_all_steering(),
+            "an empty lane arms nothing"
+        );
+        {
+            let core = worker.core.lock().unwrap();
+            assert!(core.forced_all_steering, "the armed state persists");
+            assert!(
+                core.steering.iter().all(|item| !item.forced_batch),
+                "no item carries the armed flag"
+            );
+        }
     }
 }
 
@@ -6577,12 +8377,14 @@ mod turn_stream_tests {
             parent_session_id: None,
             child_script: None,
             service_tier: None,
-            steering_mode: "all".to_string(),
-            follow_up_mode: "all".to_string(),
+            steering_mode: "one-at-a-time".to_string(),
+            follow_up_mode: "one-at-a-time".to_string(),
+            forced_all_steering: false,
             scoped_models: Vec::new(),
             retry_abort_requested: false,
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
+            active_action: None,
         }));
         let (status_notify, _status_rx) = tokio::sync::mpsc::unbounded_channel();
         TurnRunner {
@@ -6615,6 +8417,7 @@ mod turn_stream_tests {
             let mut core = runner.core.lock().unwrap();
             core.queued_input_suspended = true;
             core.steering.push_back(QueuedItem {
+                preview: None,
                 message: "parked steer".to_string(),
                 custom_message: None,
                 agent_message: None,
@@ -6622,6 +8425,9 @@ mod turn_stream_tests {
                 admission_id: None,
                 images: Vec::new(),
                 done: Some(done_tx),
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
             });
         }
         let parked = std::sync::Arc::clone(&runner.core);
@@ -6651,6 +8457,609 @@ mod turn_stream_tests {
         running.abort();
     }
 
+    /// The session-event frames off the runner's event pump (the same
+    /// wire shape the outer tests' `session_events_since` collects).
+    fn runner_events(
+        subscription: &mut tokio::sync::broadcast::Receiver<Arc<OutboundFrame>>,
+    ) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Ok(frame) = subscription.try_recv() {
+            if frame.outbound_type == "session_event" {
+                if let Ok(outbound) = serde_json::from_slice::<Value>(&frame.payload) {
+                    events.push(outbound["event"].clone());
+                }
+            }
+        }
+        events
+    }
+
+    /// A queued plain-prompt item for the pump tests.
+    fn queued_prompt(message: &str, policy: TurnPolicy) -> QueuedItem {
+        QueuedItem {
+            preview: None,
+            message: message.to_string(),
+            custom_message: None,
+            agent_message: None,
+            queue_key: None,
+            admission_id: None,
+            images: Vec::new(),
+            done: None,
+            queue_visible: true,
+            policy,
+            forced_batch: false,
+        }
+    }
+
+    /// Run the pump until both lanes drain (the runner keeps idling; the
+    /// task is aborted by the test's end).
+    async fn drain_pump(core: &Arc<Mutex<SessionCore>>, work_notify: &Arc<Notify>) {
+        work_notify.notify_one();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let core = core.lock().unwrap();
+                let drained = core.steering.is_empty() && core.follow_up.is_empty() && !core.busy;
+                if drained {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pump never drained the lanes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The settled user/assistant rows of the session events, in wire
+    /// order (the `message_end` frames; the scripted engine carries the
+    /// text as a plain string content, the real engine as content parts).
+    fn delivered_rows(events: &[Value]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|event| {
+                if event.get("type").and_then(Value::as_str) != Some("message_end") {
+                    return None;
+                }
+                let message = event.get("message")?;
+                let row_role = message.get("role").and_then(Value::as_str)?.to_string();
+                let content = message.get("content")?;
+                let text = content
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        content
+                            .as_array()
+                            .and_then(|parts| parts.first())
+                            .and_then(|part| part.get("text"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .or_else(|| {
+                        content
+                            .as_array()
+                            .and_then(|parts| {
+                                parts.iter().find(|part| {
+                                    part.get("type").and_then(Value::as_str) == Some("text")
+                                })
+                            })
+                            .and_then(|part| part.get("text"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })?;
+                Some((row_role, text))
+            })
+            .collect()
+    }
+
+    /// TS `_pumpSessionInputs` under queue mode "all"
+    /// (`turnExecutionPoliciesEqual` + the mode gate): the same-lane
+    /// same-class prefix co-delivers as ONE batched turn — one
+    /// `agent_start`/`turn_start` pair, every user row in delivery order,
+    /// one assistant reply for the whole batch.
+    #[tokio::test]
+    async fn steering_mode_all_batches_the_queued_prefix_into_one_turn() {
+        let engine: Arc<dyn SessionEngine> = Arc::new(
+            ScriptedEngine::from_value(json!({ "responses": ["batched reply"] }))
+                .unwrap_or_default(),
+        );
+        let runner = burst_runner(Arc::clone(&engine));
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.steering_mode = "all".to_string();
+            core.steering
+                .push_back(queued_prompt("steer one", TurnPolicy::Queued));
+            core.steering
+                .push_back(queued_prompt("steer two", TurnPolicy::Queued));
+            core.steering
+                .push_back(queued_prompt("steer three", TurnPolicy::Queued));
+        }
+        let mut subscription = runner.events.subscribe();
+        let core = std::sync::Arc::clone(&runner.core);
+        let work_notify = std::sync::Arc::clone(&runner.work_notify);
+        let running = tokio::spawn(async move { runner.run().await });
+        drain_pump(&core, &work_notify).await;
+        running.abort();
+
+        let events = runner_events(&mut subscription);
+        let starts = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("agent_start"))
+            .count();
+        let turn_starts = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("turn_start"))
+            .count();
+        assert_eq!(starts, 1, "one agent_start for the whole batch");
+        assert_eq!(turn_starts, 1, "one turn_start for the whole batch");
+        let rows = delivered_rows(&events);
+        assert_eq!(
+            rows,
+            vec![
+                ("user".to_string(), "steer one".to_string()),
+                ("user".to_string(), "steer two".to_string()),
+                ("user".to_string(), "steer three".to_string()),
+                ("assistant".to_string(), "batched reply".to_string()),
+            ],
+            "the batched prefix delivered as one turn: {rows:?}"
+        );
+    }
+
+    /// Queue mode "one-at-a-time" (the TS default): each queued steer is
+    /// its own turn — one reply each, delivered in order.
+    #[tokio::test]
+    async fn one_at_a_time_delivers_each_queued_steer_as_its_own_turn() {
+        // The burst harness has no session store, so the scripted engine
+        // serves its first response for EVERY turn (prompt_index stays
+        // 0): the turns are discriminated by the agent_start count and
+        // the user-row order, not the reply text.
+        let engine: Arc<dyn SessionEngine> = Arc::new(
+            ScriptedEngine::from_value(json!({ "responses": ["settled reply"] }))
+                .unwrap_or_default(),
+        );
+        let runner = burst_runner(Arc::clone(&engine));
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.steering
+                .push_back(queued_prompt("steer one", TurnPolicy::Queued));
+            core.steering
+                .push_back(queued_prompt("steer two", TurnPolicy::Queued));
+        }
+        let mut subscription = runner.events.subscribe();
+        let core = std::sync::Arc::clone(&runner.core);
+        let work_notify = std::sync::Arc::clone(&runner.work_notify);
+        let running = tokio::spawn(async move { runner.run().await });
+        drain_pump(&core, &work_notify).await;
+        running.abort();
+
+        let events = runner_events(&mut subscription);
+        let starts = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("agent_start"))
+            .count();
+        assert_eq!(starts, 2, "one agent_start per steer: {events:?}");
+        let rows = delivered_rows(&events);
+        assert_eq!(
+            rows,
+            vec![
+                ("user".to_string(), "steer one".to_string()),
+                ("assistant".to_string(), "settled reply".to_string()),
+                ("user".to_string(), "steer two".to_string()),
+                ("assistant".to_string(), "settled reply".to_string()),
+            ],
+            "one-at-a-time delivers in order, one turn each: {rows:?}"
+        );
+    }
+
+    /// The forced steering batch (TS `abortAndSendQueued`'s
+    /// `_forcedAllSteeringActionIds`): the armed prefix co-delivers as ONE
+    /// turn even under queue mode "one-at-a-time"; an item queued after
+    /// the arm stays out of the batch and delivers next.
+    #[tokio::test]
+    async fn forced_batch_delivers_the_armed_prefix_as_one_turn() {
+        // (The burst harness serves the first scripted response for every
+        // turn — see one_at_a_time above.)
+        let engine: Arc<dyn SessionEngine> = Arc::new(
+            ScriptedEngine::from_value(json!({ "responses": ["batch reply"] })).unwrap_or_default(),
+        );
+        let runner = burst_runner(Arc::clone(&engine));
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.steering
+                .push_back(queued_prompt("armed one", TurnPolicy::Queued));
+            core.steering
+                .push_back(queued_prompt("armed two", TurnPolicy::Queued));
+            core.forced_all_steering = true;
+            for item in core.steering.iter_mut() {
+                item.forced_batch = true;
+            }
+            // An un-armed steer queued behind the armed prefix (a steer
+            // that arrived after the abort): it never joins the batch.
+            core.steering
+                .push_back(queued_prompt("late steer", TurnPolicy::Queued));
+        }
+        let mut subscription = runner.events.subscribe();
+        let core = std::sync::Arc::clone(&runner.core);
+        let work_notify = std::sync::Arc::clone(&runner.work_notify);
+        let running = tokio::spawn(async move { runner.run().await });
+        drain_pump(&core, &work_notify).await;
+        running.abort();
+
+        let events = runner_events(&mut subscription);
+        let starts = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("agent_start"))
+            .count();
+        assert_eq!(
+            starts, 2,
+            "the armed batch runs as one turn, the late steer its own"
+        );
+        let rows = delivered_rows(&events);
+        assert_eq!(
+            rows,
+            vec![
+                ("user".to_string(), "armed one".to_string()),
+                ("user".to_string(), "armed two".to_string()),
+                ("assistant".to_string(), "batch reply".to_string()),
+                ("user".to_string(), "late steer".to_string()),
+                ("assistant".to_string(), "batch reply".to_string()),
+            ],
+            "the armed prefix batched; the late steer never joined: {rows:?}"
+        );
+    }
+
+    /// TS `turnExecutionPoliciesEqual`: mode "all" never batches across
+    /// turn-execution classes — a client steer and an injected heartbeat
+    /// row deliver as separate turns even under "all".
+    #[tokio::test]
+    async fn mode_all_never_batches_across_policy_classes() {
+        // (The burst harness serves the first scripted response for every
+        // turn — see one_at_a_time above.)
+        let engine: Arc<dyn SessionEngine> = Arc::new(
+            ScriptedEngine::from_value(json!({ "responses": ["lane reply"] })).unwrap_or_default(),
+        );
+        let runner = burst_runner(Arc::clone(&engine));
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.steering_mode = "all".to_string();
+            core.steering
+                .push_back(queued_prompt("client steer", TurnPolicy::Queued));
+            core.steering
+                .push_back(queued_prompt("nudge the mission", TurnPolicy::Injected));
+        }
+        let mut subscription = runner.events.subscribe();
+        let core = std::sync::Arc::clone(&runner.core);
+        let work_notify = std::sync::Arc::clone(&runner.work_notify);
+        let running = tokio::spawn(async move { runner.run().await });
+        drain_pump(&core, &work_notify).await;
+        running.abort();
+
+        let events = runner_events(&mut subscription);
+        let starts = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("agent_start"))
+            .count();
+        assert_eq!(starts, 2, "policy classes never share a turn");
+        let rows = delivered_rows(&events);
+        assert_eq!(
+            rows,
+            vec![
+                ("user".to_string(), "client steer".to_string()),
+                ("assistant".to_string(), "lane reply".to_string()),
+                ("user".to_string(), "nudge the mission".to_string()),
+                ("assistant".to_string(), "lane reply".to_string()),
+            ],
+            "each policy class delivered its own turn: {rows:?}"
+        );
+    }
+
+    /// The follow-up lane batches under its own mode (TS `followUpMode`):
+    /// two queued follow-ups co-deliver as one turn with "all".
+    #[tokio::test]
+    async fn follow_up_mode_all_batches_the_follow_up_lane() {
+        let engine: Arc<dyn SessionEngine> = Arc::new(
+            ScriptedEngine::from_value(json!({ "responses": ["follow-up batch reply"] }))
+                .unwrap_or_default(),
+        );
+        let runner = burst_runner(Arc::clone(&engine));
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.follow_up_mode = "all".to_string();
+            core.follow_up
+                .push_back(queued_prompt("follow up one", TurnPolicy::Queued));
+            core.follow_up
+                .push_back(queued_prompt("follow up two", TurnPolicy::Queued));
+        }
+        let mut subscription = runner.events.subscribe();
+        let core = std::sync::Arc::clone(&runner.core);
+        let work_notify = std::sync::Arc::clone(&runner.work_notify);
+        let running = tokio::spawn(async move { runner.run().await });
+        drain_pump(&core, &work_notify).await;
+        running.abort();
+
+        let events = runner_events(&mut subscription);
+        let starts = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("agent_start"))
+            .count();
+        assert_eq!(starts, 1, "the follow-up lane batched under mode all");
+        let rows = delivered_rows(&events);
+        assert_eq!(
+            rows,
+            vec![
+                ("user".to_string(), "follow up one".to_string()),
+                ("user".to_string(), "follow up two".to_string()),
+                ("assistant".to_string(), "follow-up batch reply".to_string()),
+            ],
+            "the follow-up prefix batched into one turn: {rows:?}"
+        );
+    }
+
+    /// Kevin's acceptance case (the multi-steer abort flow, TS
+    /// `abortAndSendQueued` + `interactive-mode.ts`'s Ctrl+C path): on the
+    /// abort of a streaming turn, ALL visible queued plain-user steering
+    /// messages send together as the next batched turn — the follow-up
+    /// lane stays queued behind it (never discarded, never merged), then
+    /// runs in order once the session goes idle; the default queue mode
+    /// ("one-at-a-time") is unchanged, and with nothing armable queued the
+    /// abort runs abort-only (the queue parks behind the suspension).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    async fn abort_and_send_queued_delivers_the_steering_batch_then_the_follow_ups() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-abort-send-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "abort-send-family".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [
+                    { "text": "held reply", "delayMs": 600000 },
+                    "batch reply",
+                    "follow-up reply"
+                ],
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "abort-send-family" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let mut subscription = worker.events.subscribe();
+        // The held turn parks the queue behind it (the 600s fetch hold).
+        let prompt = worker
+            .dispatch(
+                "prompt",
+                &json!({
+                    "activeSessionId": "abort-send-family",
+                    "message": "held turn for the batch abort",
+                }),
+            )
+            .await;
+        assert!(prompt.success, "prompt failed: {prompt:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if worker.core.lock().unwrap().busy {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held turn was never admitted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Two steering messages and one follow-up behind the streaming
+        // turn (the real wire admission path: queue-visible, policy-queued
+        // rows).
+        for message in ["steering one", "steering two"] {
+            let steered = worker
+                .dispatch("steer", &json!({ "message": message }))
+                .await;
+            assert!(steered.success, "steer failed: {steered:?}");
+        }
+        let follow = worker
+            .dispatch(
+                "follow_up",
+                &json!({ "message": "follow up after the batch" }),
+            )
+            .await;
+        assert!(follow.success, "follow_up failed: {follow:?}");
+        // The funnel (the wire command's body — #2599's handler calls it):
+        // arm the visible plain-user steering, abort the run, resume the
+        // pump. The default queue mode stays "one-at-a-time".
+        let sent = worker.abort_and_send_queued();
+        assert!(sent, "the armed steering batch sent with the abort");
+        let idle = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            worker.dispatch("wait_for_idle", &json!({})),
+        )
+        .await;
+        assert!(idle.is_ok(), "the session never went idle after the abort");
+        assert!(idle.unwrap().success, "wait_for_idle failed");
+        // The aborted turn's row + the batched steers + the follow-up, in
+        // order: the two steers share ONE turn (one reply), the follow-up
+        // runs after it as its own turn.
+        let messages = worker.dispatch("get_messages", &json!({})).await;
+        assert!(messages.success, "get_messages failed: {messages:?}");
+        let wire_messages = messages
+            .data
+            .as_ref()
+            .and_then(|data| data.get("messages"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let texts: Vec<String> = wire_messages
+            .iter()
+            .filter(|message| crate::types::message_role(message) == Some("user"))
+            .map(crate::types::message_text)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "held turn for the batch abort",
+                "steering one",
+                "steering two",
+                "follow up after the batch",
+            ],
+            "the steering batch sent as one turn; the follow-up ran after it: {texts:?}"
+        );
+        // The reply granularity: the aborted row, then ONE assistant
+        // reply for the whole steering batch, then the follow-up's own
+        // reply (never one per steer).
+        let replies: Vec<String> = wire_messages
+            .iter()
+            .filter(|message| crate::types::message_role(message) == Some("assistant"))
+            .map(crate::types::message_text)
+            .collect();
+        assert_eq!(
+            replies.len(),
+            3,
+            "the aborted row, the batch's one reply, the follow-up's reply: {replies:?}"
+        );
+        assert_eq!(
+            &replies[1..],
+            &["batch reply".to_string(), "follow-up reply".to_string()],
+            "one reply for the batch, one for the follow-up: {replies:?}"
+        );
+        // The wire frames: each batched user row broadcasts exactly once
+        // (the accepted-row emission — never the engine's loop re-emission).
+        let events = runner_events(&mut subscription);
+        let wire_user_starts: Vec<String> = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("message_start"))
+            .filter(|event| {
+                let message = event.get("message").unwrap_or(&Value::Null);
+                message.get("role").and_then(Value::as_str) == Some("user")
+            })
+            .filter_map(|event| {
+                let message = event.get("message")?;
+                let content = message.get("content")?;
+                content
+                    .as_array()
+                    .and_then(|parts| parts.first())
+                    .and_then(|part| part.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            wire_user_starts,
+            vec![
+                "held turn for the batch abort".to_string(),
+                "steering one".to_string(),
+                "steering two".to_string(),
+                "follow up after the batch".to_string(),
+            ],
+            "every user row broadcast exactly once: {wire_user_starts:?}"
+        );
+        {
+            let core = worker.core.lock().unwrap();
+            assert!(
+                core.steering.is_empty() && core.follow_up.is_empty(),
+                "both lanes drained in order"
+            );
+            assert_eq!(
+                core.steering_mode, "one-at-a-time",
+                "the default mode is untouched"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The abort-only arm (TS `queuedSteering.length === 0`): with no
+    /// armable steering queued the funnel aborts and the queue parks
+    /// behind the suspension — a follow-up never rides a forced batch.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    async fn abort_and_send_queued_with_no_steering_aborts_only_and_parks_the_queue() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pa-worker-abort-only-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "abort-only-family".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [{ "text": "held again", "delayMs": 600000 }, "later"]
+            })),
+        };
+        let worker = std::sync::Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "abort-only-family" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let prompt = worker
+            .dispatch(
+                "prompt",
+                &json!({
+                    "activeSessionId": "abort-only-family",
+                    "message": "held turn for the abort-only arm",
+                }),
+            )
+            .await;
+        assert!(prompt.success, "prompt failed: {prompt:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if worker.core.lock().unwrap().busy {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held turn was never admitted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Only a follow-up parks (nothing armable in the steering lane).
+        let follow = worker
+            .dispatch("follow_up", &json!({ "message": "follow up parked" }))
+            .await;
+        assert!(follow.success, "follow_up failed: {follow:?}");
+        let sent = worker.abort_and_send_queued();
+        assert!(!sent, "nothing armable: the funnel ran abort-only");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        {
+            let core = worker.core.lock().unwrap();
+            assert!(
+                core.queued_input_suspended,
+                "the abort parked the queue behind the suspension"
+            );
+            assert_eq!(
+                core.follow_up.len(),
+                1,
+                "the parked follow-up survived the abort, undelivered"
+            );
+            assert!(core.steering.is_empty(), "the steering lane stays empty");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The waiting prompt resolves only after the turn fully unwinds (TS
     /// `promptAndWait` settles the completion after the whole turn settle):
     /// the `done` waiter fires after the idle flip and the queue projection,
@@ -6671,7 +9080,8 @@ mod turn_stream_tests {
             runner
                 .run_turn(
                     engine,
-                    QueuedItem {
+                    vec![QueuedItem {
+                        preview: None,
                         message: "burst".to_string(),
                         custom_message: None,
                         agent_message: None,
@@ -6679,7 +9089,10 @@ mod turn_stream_tests {
                         admission_id: None,
                         images: Vec::new(),
                         done: Some(done_tx),
-                    },
+                        queue_visible: true,
+                        policy: TurnPolicy::Queued,
+                        forced_batch: false,
+                    }],
                 )
                 .await;
         });
@@ -6703,7 +9116,8 @@ mod turn_stream_tests {
         runner
             .run_turn(
                 engine,
-                QueuedItem {
+                vec![QueuedItem {
+                    preview: None,
                     message: "burst".to_string(),
                     custom_message: None,
                     agent_message: None,
@@ -6711,7 +9125,10 @@ mod turn_stream_tests {
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
-                },
+                    queue_visible: true,
+                    policy: TurnPolicy::Queued,
+                    forced_batch: false,
+                }],
             )
             .await;
         let mut events = Vec::new();
@@ -6736,7 +9153,8 @@ mod turn_stream_tests {
         runner
             .run_turn(
                 engine,
-                QueuedItem {
+                vec![QueuedItem {
+                    preview: None,
                     message: "[child-exited: no-reply child:lane]".to_string(),
                     custom_message: Some(custom_message),
                     agent_message: None,
@@ -6744,7 +9162,10 @@ mod turn_stream_tests {
                     admission_id: None,
                     images: Vec::new(),
                     done: None,
-                },
+                    queue_visible: true,
+                    policy: TurnPolicy::Injected,
+                    forced_batch: false,
+                }],
             )
             .await;
         let mut events = Vec::new();
@@ -6811,6 +9232,98 @@ mod turn_stream_tests {
         // (the scripted engine carries the reply as a plain string).
         assert_eq!(events[ends[1]]["message"]["role"], "assistant");
         assert_eq!(events[ends[1]]["message"]["content"], "notice acknowledged");
+    }
+
+    /// A delivered agent message (the `worker_deliver_message` arm) runs
+    /// as its `agent_message` custom row: the accepted-row frames carry
+    /// the custom pair the collapsed card decodes from, no plain user row
+    /// reaches the wire, and the model turn still runs on the rendered
+    /// prompt.
+    #[tokio::test]
+    async fn a_delivered_agent_message_turn_emits_the_custom_row() {
+        let dir = std::env::temp_dir().join(format!("pa-worker-amw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "target-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let worker = Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        // A busy session parks the delivery on the steering lane, so the
+        // queued item is exactly what the served runner would pop.
+        worker.core.lock().unwrap().busy = true;
+        let delivered = worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({
+                    "targetActiveSessionId": "target-session",
+                    "message": "the research is done",
+                    "sender": {
+                        "activeSessionId": "source-session",
+                        "sessionName": "research-lane",
+                        "runtimeKind": "subagent",
+                    },
+                }),
+            )
+            .await;
+        assert!(delivered.success, "deliver failed: {delivered:?}");
+        let item = worker
+            .core
+            .lock()
+            .unwrap()
+            .steering
+            .pop_front()
+            .expect("the delivery parked on the steering lane");
+        let engine: Arc<dyn SessionEngine> = Arc::new(
+            ScriptedEngine::from_value(json!({ "responses": ["ack"] })).unwrap_or_default(),
+        );
+        let runner = burst_runner(Arc::clone(&engine));
+        let mut subscription = runner.events.subscribe();
+        runner.run_turn(engine, vec![item]).await;
+        let mut events = Vec::new();
+        while let Ok(frame) = subscription.try_recv() {
+            if frame.outbound_type == "session_event" {
+                if let Ok(outbound) = serde_json::from_slice::<Value>(&frame.payload) {
+                    events.push(outbound["event"].clone());
+                }
+            }
+        }
+        // The accepted row is the agent_message custom pair - the
+        // collapsed card's wire form - and no user row rides the turn.
+        let starts = positions_of(&events, "message_start");
+        assert_eq!(
+            starts.len(),
+            1,
+            "only the custom row opens a start: {events:?}"
+        );
+        assert_eq!(events[starts[0]]["message"]["role"], "custom");
+        assert_eq!(events[starts[0]]["message"]["customType"], "agent_message");
+        assert_eq!(
+            events[starts[0]]["message"]["content"],
+            "[agent-message from child:research-lane]\n\nthe research is done"
+        );
+        let user_rows = events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("message_start")
+                && event["message"]["role"] == "user"
+        });
+        assert!(!user_rows, "the delivered turn must not emit a user row");
+        // The model turn ran on the rendered prompt and settled the reply.
+        let ends = positions_of(&events, "message_end");
+        assert_eq!(ends.len(), 2, "the custom row and the reply settle");
+        assert_eq!(events[ends[1]]["message"]["role"], "assistant");
     }
 
     /// A settled turn's wire `agent_end` (TS parity): the engine's per-run
@@ -7167,5 +9680,365 @@ mod turn_stream_tests {
             updates.iter().all(|index| *index < end[0]),
             "the flushed snapshot precedes message_end"
         );
+    }
+}
+
+#[cfg(test)]
+mod replacement_gate_tests {
+    use super::*;
+    use crate::engine::SessionEngine;
+    use std::path::Path;
+
+    /// A recording engine whose session-model restore holds open for a
+    /// fixed window (the restore's readiness awaits): the event log proves
+    /// whether two concurrent replacement commands interleave their
+    /// teardown/swap/restore/rebuild critical sections.
+    struct RecordingEngine {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SessionEngine for RecordingEngine {
+        fn restore_session_model(
+            &self,
+            session_path: &std::path::Path,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let events = std::sync::Arc::clone(&self.events);
+            let path = session_path.display().to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push(format!("restore-enter {path}"));
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                events.lock().unwrap().push(format!("restore-exit {path}"));
+            })
+        }
+
+        fn rebuild_session_context(
+            &self,
+            _: Vec<pa_types::session::FileEntry>,
+            _: pa_core::session_engine::goal_driver::GoalBranchReload,
+        ) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("rebuild".to_string());
+            Ok(())
+        }
+
+        fn run_prompt(
+            &self,
+            _: usize,
+            _: PromptRequest,
+            _: &dyn Fn() -> bool,
+            _: &mut dyn FnMut(EngineEvent) -> bool,
+        ) {
+        }
+
+        fn run_side_question(
+            &self,
+            request: crate::engine::SideQuestionRequest,
+            signal: &pa_agent::abort::AbortSignal,
+            sink: &pa_core::session_engine::side_question::SideQuestionSink,
+        ) -> crate::engine::SideQuestionOutcome {
+            ScriptedEngine::default().run_side_question(request, signal, sink)
+        }
+
+        fn run_compaction(
+            &self,
+            request: crate::engine::CompactionRequest,
+            signal: &pa_agent::abort::AbortSignal,
+        ) -> crate::engine::CompactionOutcome {
+            ScriptedEngine::default().run_compaction(request, signal)
+        }
+
+        fn run_branch_summary(
+            &self,
+            request: crate::engine::BranchSummaryRequest,
+            signal: &pa_agent::abort::AbortSignal,
+        ) -> crate::engine::BranchSummaryOutcome {
+            ScriptedEngine::default().run_branch_summary(request, signal)
+        }
+    }
+
+    fn written_session_file(dir: &Path, name: &str) -> PathBuf {
+        let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let path = dir.join(name);
+        session.set_path(path.clone());
+        session.rewrite().unwrap();
+        path
+    }
+
+    fn recording_worker(
+        dir: &Path,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Worker {
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "replacement-gate".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: Some(true),
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let mut worker = Worker::new(config, None);
+        let engine: std::sync::Arc<dyn SessionEngine> =
+            std::sync::Arc::new(RecordingEngine { events });
+        let core = std::sync::Arc::clone(&worker.core);
+        worker.engine = std::sync::Arc::clone(&engine);
+        worker.navigation = crate::session_navigation::SessionNavigation::new(engine, core);
+        worker
+    }
+
+    /// Two concurrent `switch_session` commands must not interleave their
+    /// replacement critical sections: the teardown, the store/file swap,
+    /// the restore, and the rebuild move the worker onto one session as a
+    /// unit — the second command runs only after the first settles, so
+    /// the restore windows never overlap (an overlap would leave the
+    /// store, the branch context, and the model from different sessions).
+    #[tokio::test]
+    async fn concurrent_replacements_never_interleave_their_critical_sections() {
+        let dir = std::env::temp_dir().join(format!(
+            "pa-replacement-gate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = recording_worker(&dir, std::sync::Arc::clone(&events));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": "/tmp" }))
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+
+        let file_a = written_session_file(&dir, "session-a.jsonl");
+        let file_b = written_session_file(&dir, "session-b.jsonl");
+        let payload_a = json!({ "sessionPath": file_a.to_string_lossy(), "cwdOverride": "/tmp" });
+        let payload_b = json!({ "sessionPath": file_b.to_string_lossy(), "cwdOverride": "/tmp" });
+        let (first, second) = tokio::join!(
+            worker.dispatch("switch_session", &payload_a),
+            worker.dispatch("switch_session", &payload_b)
+        );
+        assert!(first.success, "first switch failed: {first:?}");
+        assert!(second.success, "second switch failed: {second:?}");
+
+        // The restore windows never overlap: no restore may enter while
+        // another is still open.
+        let log = events.lock().unwrap().clone();
+        let mut open = false;
+        for event in &log {
+            if event.starts_with("restore-enter") {
+                assert!(
+                    !open,
+                    "a replacement restored while another was in flight: {log:?}"
+                );
+                open = true;
+            } else if event.starts_with("restore-exit") {
+                open = false;
+            }
+        }
+        assert_eq!(
+            log.iter().filter(|e| e.starts_with("rebuild")).count(),
+            2,
+            "both replacements rebuilt: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed existing-session `create` (a held lease, an unreadable
+    /// file) must never bind the engine to the failed path: the
+    /// session-model restore runs only after the file opened, so a later
+    /// create on a different session never resolves against the failed
+    /// path's model or records it in its creation prefix.
+    #[tokio::test]
+    async fn a_failed_existing_session_create_never_binds_the_engine() {
+        let dir =
+            std::env::temp_dir().join(format!("pa-create-bind-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = recording_worker(&dir, std::sync::Arc::clone(&events));
+
+        // An unreadable "session file" (a directory at the path): the
+        // existing-session arm fails its windowed open.
+        let held = dir.join("held.jsonl");
+        std::fs::create_dir_all(&held).expect("directory at the session path");
+
+        let failed = worker
+            .dispatch(
+                "create",
+                &json!({ "sessionPath": held.to_string_lossy(), "cwd": "/tmp" }),
+            )
+            .await;
+        assert!(
+            !failed.success,
+            "the unreadable path must fail the create: {failed:?}"
+        );
+
+        // The engine never bound to the failed path: no restore ran for
+        // it.
+        let log = events.lock().unwrap().clone();
+        assert!(
+            log.iter().all(|event| !event.starts_with("restore-enter")),
+            "a failed open never restores the failed path: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod recovery_verdict_tests {
+    use super::*;
+
+    fn worker_with_journal() -> Arc<Worker> {
+        let dir = std::env::temp_dir().join(format!("pa-worker-verdict-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "target-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let worker = Arc::new(Worker::new(config, None));
+        // The journal is opened in `serve()`; tests open it directly so the
+        // checkpoints have the same durable sink as production.
+        *worker.recovery.lock().unwrap() =
+            Some(WorkerRecoveryJournal::open(&worker.config.recovery_journal_path).unwrap());
+        worker
+    }
+
+    async fn created_worker_with_journal() -> Arc<Worker> {
+        let worker = worker_with_journal();
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        worker
+    }
+
+    fn latest_record(worker: &Worker) -> crate::journal::WorkerRecoveryRecord {
+        WorkerRecoveryJournal::read_latest(&worker.config.recovery_journal_path)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.active_session_id == "target-session")
+            .expect("session record")
+    }
+
+    /// An idle-time injected continuation is journal busy evidence: the
+    /// admission (not the pickup) proves the work, so a plain boot revives
+    /// the worker to deliver it.
+    #[tokio::test]
+    async fn idle_time_injected_admission_is_busy_evidence() {
+        let worker = created_worker_with_journal().await;
+        // Settle first: the create record's busy=true must not mask the
+        // admission's verdict.
+        worker.dispatch("clear_queue", &json!({})).await;
+        assert!(
+            !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the settled session proves nothing"
+        );
+        let notify = Arc::new(Notify::new());
+        admit_autonomous_follow_up(
+            &worker.recovery,
+            &worker.core,
+            &notify,
+            "continue the mission".to_string(),
+        );
+        assert!(
+            WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the injected admission is live work"
+        );
+        let latest = latest_record(&worker);
+        assert_eq!(latest.operation, "follow_up_queued");
+        let (steering, follow_up) = WorkerRecoveryJournal::read_queue_snapshot(
+            &worker.config.recovery_journal_path,
+            "target-session",
+        )
+        .unwrap()
+        .expect("the admission flushed its snapshot");
+        assert!(steering.is_empty(), "steering: {steering:?}");
+        assert_eq!(follow_up[0].message, "continue the mission");
+        let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+    }
+
+    /// Dropping a cancelled admission settles the verdict: the cancelled
+    /// rows leave no busy evidence and no replayable snapshot.
+    #[tokio::test]
+    async fn cancelled_admission_drop_settles_the_verdict() {
+        let worker = created_worker_with_journal().await;
+        worker.dispatch("clear_queue", &json!({})).await;
+        let admitted = worker
+            .dispatch("prompt", &json!({ "admissionId": "a1", "message": "go" }))
+            .await;
+        assert!(admitted.success, "prompt failed: {admitted:?}");
+        assert!(
+            WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the admitted prompt is live work"
+        );
+        worker.drop_queued_admitted_prompt("a1");
+        assert!(
+            !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the dropped rows leave no busy evidence"
+        );
+        let latest = latest_record(&worker);
+        assert_eq!(latest.operation, "queue_dropped");
+        let (steering, follow_up) = WorkerRecoveryJournal::read_queue_snapshot(
+            &worker.config.recovery_journal_path,
+            "target-session",
+        )
+        .unwrap()
+        .expect("the drop flushed its snapshot");
+        assert!(
+            steering.is_empty() && follow_up.is_empty(),
+            "lanes: {steering:?} {follow_up:?}"
+        );
+        let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+    }
+
+    /// A withdrawal landing mid-turn settles the rows but never the
+    /// verdict: the in-flight turn is live work (TS computes settled
+    /// busy from `isSessionActive`, never from the lanes alone), so a
+    /// crash after the withdrawal still reads interrupted. Only the
+    /// turn's own `turn_end` — after the runner's idle flip — settles
+    /// the same empty lanes back to idle.
+    #[tokio::test]
+    async fn mid_turn_withdrawal_keeps_the_in_flight_turn_busy() {
+        let worker = created_worker_with_journal().await;
+        // Mid-turn: the runner is streaming, and the withdrawal leaves
+        // nothing queued behind it.
+        worker.core.lock().unwrap().busy = true;
+        worker.dispatch("clear_queue", &json!({})).await;
+        let latest = latest_record(&worker);
+        assert_eq!(latest.operation, "queue_cleared");
+        assert!(
+            latest.busy,
+            "the in-flight turn keeps the withdrawal's verdict busy"
+        );
+        let (steering, follow_up) = WorkerRecoveryJournal::read_queue_snapshot(
+            &worker.config.recovery_journal_path,
+            "target-session",
+        )
+        .unwrap()
+        .expect("the withdrawal flushed its snapshot");
+        assert!(
+            steering.is_empty() && follow_up.is_empty(),
+            "the withdrawn rows left the snapshot: {steering:?} {follow_up:?}"
+        );
+        // The turn ends: the runner's idle flip precedes its settle, so
+        // the same empty lanes now record busy=false.
+        worker.core.lock().unwrap().busy = false;
+        worker.dispatch("clear_queue", &json!({})).await;
+        let latest = latest_record(&worker);
+        assert_eq!(latest.operation, "queue_cleared");
+        assert!(!latest.busy, "the settled turn leaves the session idle");
+        assert!(
+            !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the settled session proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
     }
 }

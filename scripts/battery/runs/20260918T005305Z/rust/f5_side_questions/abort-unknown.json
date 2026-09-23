@@ -1,9 +1,0 @@
-{
- "command": "abort_side_question",
- "data": {
-  "aborted": false
- },
- "id": "ab0",
- "success": true,
- "type": "response"
-}

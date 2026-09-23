@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "token": "673629c3-cdf6-4fd2-8f2d-b9bb6b7f0e2f",
-  "pid": 1135026,
-  "processStartId": "proc:9177631",
-  "activeSessionId": "4a03be7b0557",
-  "sessionPath": "/home/ubuntu/lane-worktrees/harness-debt/scripts/battery/runs/20260920T131814Z-abort/ts/agent/sessions/01a0bef7-a381-7219-939c-dceac8021077.jsonl",
-  "createdAt": "2026-09-20T13:18:15.432Z"
-}
