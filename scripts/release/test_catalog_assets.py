@@ -24,6 +24,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -89,6 +90,45 @@ class RecordingServer:
                 pass
 
         return Handler
+
+    @property
+    def base(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+class DripServer:
+    """A response that always has another chunk on the way (the slow-drip
+    shape): individual reads never hit the socket timeout, so only a TOTAL
+    deadline can stop the fetch."""
+
+    def __init__(self, interval=0.3, chunk=b"x" * 1024):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                # A cap far beyond the 20 MiB limit: only the deadline or the
+                # size cap can end this read loop.
+                self.send_header("content-length", str(100 * 1024 * 1024))
+                self.end_headers()
+                try:
+                    while True:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        time.sleep(interval)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
 
     @property
     def base(self):
@@ -296,6 +336,57 @@ class ValidationGates(unittest.TestCase):
                              ["verify", "--out", str(out), "--allow-small-fixture"])
             self.assertEqual(waived.returncode, 0, waived.stderr)
 
+    def test_fixture_http_template_entries_match_the_runtime_schema(self):
+        """Regression (Cursor Bugbot): the fixture's http-template entries
+        must parse under the runtime's strict catalog_schema — template
+        variables are {name, description} objects and the entry url is empty
+        (a fail-closed runtime parse drops the whole asset otherwise)."""
+        plugins = json.loads(bundle_catalog.fixture_catalog_bodies()
+                             ["mcp-services.bundled.json"])
+        templates = [entry for entry in plugins["entries"]
+                     if entry["transport"]["type"] == "http-template"]
+        self.assertTrue(templates, "the fixture must exercise the http-template shape")
+        for entry in templates:
+            transport = entry["transport"]
+            self.assertEqual(set(transport), {"type", "template", "variables"})
+            self.assertTrue(transport["template"])
+            self.assertTrue(transport["variables"])
+            for variable in transport["variables"]:
+                self.assertEqual(set(variable), {"name", "description"})
+                self.assertTrue(variable["name"])
+                self.assertTrue(variable["description"])
+            self.assertEqual(entry["url"], "")
+
+    def test_validator_rejects_runtime_invalid_plugin_shapes(self):
+        """The packaging gate must reject shapes the runtime rejects (the
+        pre-fix fixture bug: string template variables + non-empty url)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = json.loads(bundle_catalog.fixture_catalog_bodies()
+                                 ["mcp-services.bundled.json"])
+            entry = next(item for item in catalog["entries"]
+                         if item["transport"]["type"] == "http-template")
+            entry["transport"]["variables"] = ["region"]
+            path = Path(tmp) / "mcp-services.bundled.json"
+            path.write_text(json.dumps(catalog))
+            with self.assertRaises(SystemExit):
+                bundle_catalog.validate_bundled_mcp_catalog(path)
+
+    def test_validator_rejects_models_missing_required_fields(self):
+        """The packaging gate must reject model entries the runtime's strict
+        parse would drop (missing cost/contextWindow pass the tuple count but
+        fail the runtime schema)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            models = {"schemaVersion": 1, "models": [json.loads(
+                bundle_catalog.fixture_catalog_bodies()["models.bundled.json"]
+            )["models"][0]]}
+            del models["models"][0]["cost"]
+            del models["models"][0]["contextWindow"]
+            path = Path(tmp) / "models.bundled.json"
+            path.write_text(json.dumps(models))
+            with self.assertRaises(SystemExit):
+                bundle_catalog.validate_bundled_model_catalog(
+                    path, allow_small_fixture=True)
+
 
 class CatalogDirMode(unittest.TestCase):
 
@@ -420,6 +511,57 @@ class NetworkMode(unittest.TestCase):
                                       "--out", str(Path(tmp) / "assets")])
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("mutually exclusive", result.stderr)
+
+    def test_failed_mcp_fetch_leaves_the_previous_snapshot_intact(self):
+        """Both bodies are fetched before either target is replaced: a
+        failed MCP fetch must not leave a mixed snapshot (fresh models file
+        beside the previous services file)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "assets"
+            first = self._generate(out)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            models_before = (out / "models.bundled.json").read_text()
+            services_before = (out / "mcp-services.bundled.json").read_text()
+            broken = RecordingServer({
+                "/models/catalog.v1.json": (models_before.encode(), {}, 200),
+                "/plugins/catalog.v2.json": (b"gone", {}, 404),
+            })
+            try:
+                result = run_cli(BUNDLER, [
+                    "generate", "--network",
+                    "--models-url", f"{broken.base}/models/catalog.v1.json",
+                    "--mcp-services-url", f"{broken.base}/plugins/catalog.v2.json",
+                    "--out", str(out)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("HTTP 404", result.stderr)
+            finally:
+                broken.stop()
+            self.assertEqual((out / "models.bundled.json").read_text(),
+                             models_before)
+            self.assertEqual((out / "mcp-services.bundled.json").read_text(),
+                             services_before)
+
+    def test_network_fetch_enforces_a_total_deadline(self):
+        """The 5 s timeout is the TOTAL fetch budget, not per blocking op: a
+        slow-drip server that always delivers another chunk keeps every
+        individual read alive, so only the absolute deadline ends it."""
+        drip = DripServer()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / "assets"
+                started = time.monotonic()
+                result = run_cli(BUNDLER, [
+                    "generate", "--network",
+                    "--models-url", f"{drip.base}/models/catalog.v1.json",
+                    "--mcp-services-url", f"{drip.base}/plugins/catalog.v2.json",
+                    "--out", str(out)])
+                elapsed = time.monotonic() - started
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("hard timeout", result.stderr)
+                self.assertLess(elapsed, 60,
+                                "the deadline must bound the total fetch time")
+        finally:
+            drip.stop()
 
 
 class PackerGates(unittest.TestCase):
