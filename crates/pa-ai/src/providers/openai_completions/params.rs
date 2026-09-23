@@ -149,7 +149,7 @@ pub(crate) fn build_params(
                     if !off.is_some_and(|value| value.is_none()) {
                         if compat.supports_reasoning_effort {
                             let off_value =
-                                off.flatten().cloned().unwrap_or_else(|| "none".to_string());
+                                off.and_then(|value| value.as_deref()).unwrap_or("none").to_string();
                             params.insert("reasoning".into(), json!({ "effort": off_value }));
                         } else {
                             params.insert("reasoning".into(), json!({ "enabled": false }));
@@ -179,7 +179,7 @@ pub(crate) fn build_params(
                     // sends the off value.
                     if !off.is_some_and(|value| value.is_none()) {
                         let off_value =
-                            off.flatten().cloned().unwrap_or_else(|| "none".to_string());
+                            off.and_then(|value| value.as_deref()).unwrap_or("none").to_string();
                         params.insert("reasoning_effort".into(), json!(off_value));
                     }
                 }
