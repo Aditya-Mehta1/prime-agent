@@ -20,12 +20,16 @@ pub(crate) struct AgentRoster {
     entries: HashMap<String, AgentRosterEntry>,
     agent_id_by_active_session_id: HashMap<String, String>,
     agent_id_by_session_file: HashMap<String, String>,
-    /// The newest roster-delta sequence applied per worker: the Rust
-    /// supervisor link dials one socket per request, so deltas arrive
-    /// unordered and the gate drops a delayed older snapshot instead of
-    /// letting it overwrite a newer one. The TS worker never needs this —
-    /// its roster deltas ride one ordered supervisor client socket.
-    delta_sequences: HashMap<String, u64>,
+    /// The newest roster-delta sequence applied per (worker id, worker
+    /// process instance): the Rust supervisor link dials one socket per
+    /// request, so deltas arrive unordered and the gate drops a delayed
+    /// older snapshot instead of letting it overwrite a newer one. The
+    /// instance keys the watermark because a replacement process reuses
+    /// the resident worker id but restarts its counter — the
+    /// predecessor's in-flight deltas stay gated against the
+    /// predecessor's watermark. The TS worker never needs this — its
+    /// roster deltas ride one ordered supervisor client socket.
+    delta_watermarks: HashMap<(String, String), u64>,
 }
 
 impl AgentRoster {
@@ -34,35 +38,67 @@ impl AgentRoster {
             entries: HashMap::new(),
             agent_id_by_active_session_id: HashMap::new(),
             agent_id_by_session_file: HashMap::new(),
-            delta_sequences: HashMap::new(),
+            delta_watermarks: HashMap::new(),
         }
     }
 
     /// The stale-delta gate for one worker's `worker_roster_delta`: a
     /// sequence below or equal to the newest applied one is stale (a
-    /// newer delta already reached the store) and must not write. `0`
-    /// means unsequenced (the caller did not stamp one) and always
-    /// applies — the registration and create refreshes are authoritative
-    /// pulls, not deltas.
-    pub(crate) fn accept_delta_sequence(&mut self, worker_id: &str, sequence: u64) -> bool {
+    /// newer delta already reached the store) and must not write. The
+    /// watermark is keyed by the sending worker process instance — a
+    /// replacement reuses the resident worker id but restarts its
+    /// counter, so its fresh sequences are never compared against the
+    /// predecessor's. `0` means unsequenced (the caller did not stamp
+    /// one) and always applies.
+    pub(crate) fn accept_delta_sequence(
+        &mut self,
+        worker_id: &str,
+        instance: &str,
+        sequence: u64,
+    ) -> bool {
         if sequence == 0 {
             return true;
         }
-        match self.delta_sequences.get(worker_id) {
+        let key = (worker_id.to_string(), instance.to_string());
+        match self.delta_watermarks.get(&key) {
             Some(applied) if sequence <= *applied => false,
             _ => {
-                self.delta_sequences.insert(worker_id.to_string(), sequence);
+                self.delta_watermarks.insert(key, sequence);
                 true
             }
         }
     }
 
-    /// Forget one worker's delta sequence: the stop path keeps the map
-    /// bounded, and a (re-)registration resets the gate so a replacement
-    /// process reusing the resident worker id starts its fresh counter
-    /// from an empty gate.
+    /// Raise one (worker, instance) watermark (never lower it): the
+    /// authoritative pulls — registration, create, refresh — write a
+    /// summary that embeds the worker's counter at snapshot time, so a
+    /// delta still in flight when the pull answered (sequence at or below
+    /// the embedded counter) is stale once the pull has applied.
+    pub(crate) fn raise_delta_watermark(&mut self, worker_id: &str, instance: &str, ceiling: u64) {
+        if ceiling == 0 {
+            return;
+        }
+        let key = (worker_id.to_string(), instance.to_string());
+        let watermark = self.delta_watermarks.entry(key).or_insert(0);
+        if *watermark < ceiling {
+            *watermark = ceiling;
+        }
+    }
+
+    /// Saturate the watermark of one retired worker process instance: a
+    /// replacement registered with a new instance, so every delta still
+    /// in flight from the predecessor is stale by construction.
+    pub(crate) fn retire_worker_instance(&mut self, worker_id: &str, instance: &str) {
+        self.delta_watermarks
+            .insert((worker_id.to_string(), instance.to_string()), u64::MAX);
+    }
+
+    /// Forget every watermark of one stopped worker (the stop path keeps
+    /// the map bounded; the worker's token no longer authenticates, so
+    /// its deltas cannot reach the gate anyway).
     pub(crate) fn forget_worker_sequences(&mut self, worker_id: &str) {
-        self.delta_sequences.remove(worker_id);
+        self.delta_watermarks
+            .retain(|(worker, _), _| worker != worker_id);
     }
 
     /// Classify and store one entry from a worker's slim summary. Returns
@@ -382,21 +418,35 @@ mod tests {
         let roster = locked();
         let mut roster = roster.lock().unwrap();
         // In order: applied.
-        assert!(roster.accept_delta_sequence("w1", 1));
-        assert!(roster.accept_delta_sequence("w1", 2));
+        assert!(roster.accept_delta_sequence("w1", "i1", 1));
+        assert!(roster.accept_delta_sequence("w1", "i1", 2));
         // A delayed older snapshot (delivered after a newer one) is stale:
         // equal or lower sequences never overwrite the newer state.
-        assert!(!roster.accept_delta_sequence("w1", 1));
-        assert!(!roster.accept_delta_sequence("w1", 2));
-        // The gate is per worker — another worker's counter is independent.
-        assert!(roster.accept_delta_sequence("w2", 1));
-        // Unsequenced (0 / absent) always applies: the registration and
-        // create refreshes are authoritative pulls, not deltas.
-        assert!(roster.accept_delta_sequence("w1", 0));
-        // Forgetting the worker resets its gate: the stop cleanup keeps
-        // the map bounded, and a replacement process that reuses the
-        // resident worker id starts its fresh counter from an empty gate.
+        assert!(!roster.accept_delta_sequence("w1", "i1", 1));
+        assert!(!roster.accept_delta_sequence("w1", "i1", 2));
+        // The watermark is keyed by worker process instance — another
+        // worker, or a replacement instance restarting the counter, is
+        // independent of w1's watermark.
+        assert!(roster.accept_delta_sequence("w2", "i1", 1));
+        assert!(roster.accept_delta_sequence("w1", "i2", 1));
+        // Unsequenced (0 / absent) always applies.
+        assert!(roster.accept_delta_sequence("w1", "i1", 0));
+        // The authoritative pulls raise the watermark to the summary's
+        // embedded counter: a delta still in flight when the pull answered
+        // (sequence at or below the counter) is stale afterward.
+        roster.raise_delta_watermark("w1", "i1", 5);
+        assert!(!roster.accept_delta_sequence("w1", "i1", 4));
+        assert!(roster.accept_delta_sequence("w1", "i1", 6));
+        // The raise never lowers the watermark.
+        roster.raise_delta_watermark("w1", "i1", 3);
+        assert!(!roster.accept_delta_sequence("w1", "i1", 5));
+        // A replacement registration saturates the PREDECESSOR instance's
+        // watermark: every predecessor delta still in flight is stale.
+        roster.retire_worker_instance("w1", "i1");
+        assert!(!roster.accept_delta_sequence("w1", "i1", 9_000_000));
+        assert!(roster.accept_delta_sequence("w1", "i2", 2));
+        // The stop cleanup forgets every watermark of the worker.
         roster.forget_worker_sequences("w1");
-        assert!(roster.accept_delta_sequence("w1", 1));
+        assert!(roster.accept_delta_sequence("w1", "i1", 1));
     }
 }

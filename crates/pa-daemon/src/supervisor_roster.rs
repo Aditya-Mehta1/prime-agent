@@ -149,6 +149,7 @@ impl Supervisor {
         summary: Value,
         removed: Vec<String>,
         sequence: Option<u64>,
+        worker_instance_id: Option<&str>,
     ) -> DaemonResponse {
         let Some(resident) = self.registry.find_by_token(worker_token).await else {
             return response_failure(
@@ -158,26 +159,32 @@ impl Supervisor {
                 None,
             );
         };
-        // The stale-delta gate: the worker's per-request links deliver
-        // deltas unordered, so a delayed older snapshot must not overwrite
-        // a newer one — the supervisor answers success (the delta is
-        // delivered, just superseded) and skips the write.
+        // The stale-delta gate and the write share ONE roster lock
+        // acquisition: two accepted deltas must never write in reverse
+        // order (each supervisor connection runs its own task), so the
+        // accept order is the apply order. The gate keys the watermark by
+        // the sending worker process instance — the per-request links
+        // deliver deltas unordered, a replacement process restarts the
+        // counter under a new instance, and the supervisor answers
+        // success for a stale delta (delivered, just superseded).
+        let mut changed = Vec::new();
+        let mut removed_ids = Vec::new();
         {
             let mut roster = self.roster.lock().unwrap();
-            if !roster.accept_delta_sequence(&resident.worker_id, sequence.unwrap_or(0)) {
+            if !roster.accept_delta_sequence(
+                &resident.worker_id,
+                worker_instance_id.unwrap_or(""),
+                sequence.unwrap_or(0),
+            ) {
                 return response_success(Some(command_id), type_name, None);
             }
-        }
-        let mut changed = Vec::new();
-        if let Some(entry) = self.write_roster_summary(&summary, Some(&resident.worker_id)) {
+            let entry = roster.write_summary(summary, Some(&resident.worker_id), None);
             changed.push(entry);
-        }
-        let mut removed_ids = Vec::new();
-        for agent_id in removed {
-            let mut roster = self.roster.lock().unwrap();
-            if roster.get(&agent_id).is_some() {
-                roster.delete(&agent_id);
-                removed_ids.push(agent_id);
+            for agent_id in removed {
+                if roster.get(&agent_id).is_some() {
+                    roster.delete(&agent_id);
+                    removed_ids.push(agent_id);
+                }
             }
         }
         self.push_roster_update(changed, removed_ids);
@@ -200,6 +207,36 @@ impl Supervisor {
         Some(entry)
     }
 
+    /// The authoritative pull write (registration, adoption, create,
+    /// refresh): write the resident's fresh `get_state` summary AND raise
+    /// the (worker, instance) stale-delta watermark to the counter the
+    /// summary embeds — every delta the worker stamped before the pull
+    /// carries a sequence at or below it, so a delta still in flight when
+    /// the pull answered is dropped instead of overwriting the pull's
+    /// fresher state.
+    pub(crate) async fn write_roster_summary_for_resident(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        summary: &Value,
+    ) -> Option<AgentRosterEntry> {
+        let entry = self.write_roster_summary(summary, Some(&resident.worker_id));
+        let instance = resident
+            .descriptor
+            .lock()
+            .await
+            .worker_instance_id
+            .clone()
+            .unwrap_or_default();
+        if let Some(counter) = summary
+            .get("rosterDeltaSequence")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let mut roster = self.roster.lock().unwrap();
+            roster.raise_delta_watermark(&resident.worker_id, &instance, counter);
+        }
+        entry
+    }
+
     /// Refresh one resident worker's entry from its live `get_state`
     /// (registration, adoption, and create flows).
     pub(crate) async fn refresh_roster_entry(self: &Arc<Self>, resident: &Arc<ResidentWorker>) {
@@ -209,7 +246,8 @@ impl Supervisor {
         if let Ok(response) = response {
             if response.success {
                 if let Some(data) = response.data {
-                    self.write_roster_summary(&data, Some(&resident.worker_id));
+                    self.write_roster_summary_for_resident(resident, &data)
+                        .await;
                 }
             }
         }
@@ -430,7 +468,7 @@ mod tests {
         ));
     }
 
-/// The stale-delta gate at the handler: the worker's per-request
+    /// The stale-delta gate at the handler: the worker's per-request
     /// supervisor links deliver deltas unordered, so a delayed older
     /// snapshot (a lower sequence) must not overwrite a newer one — the
     /// TS worker never has this race (its roster deltas ride one ordered
@@ -488,7 +526,7 @@ mod tests {
                 "thinkingLevel": level,
             })
         };
-        let delta = |token: &str, level: &str, sequence: Option<u64>| {
+        let delta = |token: &str, level: &str, sequence: Option<u64>, instance: &str| {
             supervisor.handle_worker_roster_delta(
                 "d",
                 "worker_roster_delta",
@@ -496,34 +534,77 @@ mod tests {
                 summary(level),
                 Vec::new(),
                 sequence,
+                Some(instance),
             )
         };
 
         // In-order deltas apply (the newer level lands).
-        let applied = delta("seq-token", "high", Some(2)).await;
+        let applied = delta("seq-token", "high", Some(2), "i1").await;
         assert!(applied.success, "sequence 2 applies: {applied:?}");
         assert_eq!(entry_level(), serde_json::json!("high"));
         // The delayed older snapshot (sequence 1, delivered after 2) answers
         // success but never overwrites the newer state.
-        let stale = delta("seq-token", "low", Some(1)).await;
-        assert!(stale.success, "a stale delta still answers success: {stale:?}");
+        let stale = delta("seq-token", "low", Some(1), "i1").await;
+        assert!(
+            stale.success,
+            "a stale delta still answers success: {stale:?}"
+        );
         assert_eq!(
             entry_level(),
             serde_json::json!("high"),
             "the stale snapshot never overwrites the newer one"
         );
         // A newer sequence applies again.
-        let applied = delta("seq-token", "low", Some(3)).await;
+        let applied = delta("seq-token", "low", Some(3), "i1").await;
         assert!(applied.success, "sequence 3 applies: {applied:?}");
         assert_eq!(entry_level(), serde_json::json!("low"));
-        // An unsequenced delta applies (the authoritative pulls —
-        // registration and create refreshes — never carry a sequence).
-        let unsequenced = delta("seq-token", "off", None).await;
-        assert!(unsequenced.success, "unsequenced applies: {unsequenced:?}");
+        // The authoritative pull raises the watermark to the summary's
+        // embedded counter (the get_state snapshot read the worker's
+        // counter): a delta still in flight when the pull answered is
+        // dropped instead of overwriting the pull's fresher state.
+        let mut pulled = summary("off");
+        pulled["rosterDeltaSequence"] = serde_json::json!(4);
+        let pull = supervisor
+            .write_roster_summary_for_resident(
+                &supervisor
+                    .registry
+                    .get("seq-worker")
+                    .await
+                    .expect("resident"),
+                &pulled,
+            )
+            .await;
+        assert!(pull.expect("pull entry").summary["thinkingLevel"] == serde_json::json!("off"));
         assert_eq!(entry_level(), serde_json::json!("off"));
+        let stale = delta("seq-token", "high", Some(4), "i1").await;
+        assert!(
+            stale.success,
+            "the in-flight delta answers success: {stale:?}"
+        );
+        assert_eq!(
+            entry_level(),
+            serde_json::json!("off"),
+            "a delta older than the pull never overwrites the pull"
+        );
+        // A replacement process (a new instance, counter restarted)
+        // applies: its sequences are never compared against the
+        // predecessor's watermark.
+        let replacement = delta("seq-token", "medium", Some(1), "i2").await;
+        assert!(
+            replacement.success,
+            "the replacement applies: {replacement:?}"
+        );
+        assert_eq!(entry_level(), serde_json::json!("medium"));
+        // An unsequenced delta applies (a caller that stamped nothing).
+        let unsequenced = delta("seq-token", "low", None, "i2").await;
+        assert!(unsequenced.success, "unsequenced applies: {unsequenced:?}");
+        assert_eq!(entry_level(), serde_json::json!("low"));
         // A wrong token still fails authentication, before the gate.
-        let rejected = delta("wrong-token", "high", Some(9)).await;
-        assert!(!rejected.success, "authentication still gates: {rejected:?}");
+        let rejected = delta("wrong-token", "high", Some(9), "i2").await;
+        assert!(
+            !rejected.success,
+            "authentication still gates: {rejected:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

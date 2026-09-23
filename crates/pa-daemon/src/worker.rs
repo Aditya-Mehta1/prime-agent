@@ -752,6 +752,10 @@ pub struct Worker {
     /// per-request links deliver pushes unordered, so every delta carries
     /// the counter's value for the supervisor's stale-delta gate.
     roster_delta_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The push-order lock shared with the turn runner: the snapshot and
+    /// its sequence stamp are one atomic pair, so sequence order is
+    /// snapshot order.
+    roster_push_order: std::sync::Arc<std::sync::Mutex<()>>,
     pub(crate) work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     pub(crate) events: Arc<EventPump>,
@@ -928,8 +932,8 @@ impl Worker {
                 .unwrap_or_default(),
         ));
         let worker_token = std::env::var(WORKER_TOKEN_ENV).unwrap_or_default();
-        let roster_delta_sequence =
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let roster_delta_sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let roster_push_order = std::sync::Arc::new(std::sync::Mutex::new(()));
         // The session input-pause table (the admission gate): shared by
         // the worker's arms and the turn runner below.
         let input_pauses = crate::session_input_pause::InputPauseTable::new();
@@ -1139,6 +1143,8 @@ impl Worker {
                 roster_link: std::sync::Arc::clone(&roster_link),
                 worker_token: worker_token.clone(),
                 roster_delta_sequence: std::sync::Arc::clone(&roster_delta_sequence),
+                roster_push_order: std::sync::Arc::clone(&roster_push_order),
+                worker_instance_id: config.worker_instance_id.clone(),
             };
             tokio::spawn(async move {
                 runner.run().await;
@@ -1195,6 +1201,7 @@ impl Worker {
             roster_link,
             worker_token,
             roster_delta_sequence,
+            roster_push_order,
             work_notify,
             idle_notify,
             events,
@@ -2606,6 +2613,15 @@ impl Worker {
             status_label: None,
             summary: None,
             task_state: None,
+            // The worker's roster-delta counter at snapshot time: the
+            // supervisor's authoritative pulls raise their stale-delta
+            // watermark to it, so a delta still in flight when the pull
+            // answered is dropped instead of overwriting the pull's
+            // fresher state.
+            roster_delta_sequence: Some(
+                self.roster_delta_sequence
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
             // The engine's resolved model (the agents-view Model column:
             // TS roster summaries carry it; a not-yet-resolved engine
             // reports none).
@@ -2632,7 +2648,9 @@ impl Worker {
             &self.engine,
             &self.roster_link,
             &self.worker_token,
+            &self.config.worker_instance_id,
             &self.roster_delta_sequence,
+            &self.roster_push_order,
         );
     }
 
@@ -4939,6 +4957,14 @@ struct TurnRunner {
     /// counter per worker session, so the supervisor's stale-delta gate
     /// sees a total order over this worker's pushes).
     roster_delta_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The push-order lock shared with the command arms (snapshot and
+    /// stamp are one atomic pair).
+    roster_push_order: std::sync::Arc<std::sync::Mutex<()>>,
+    /// The worker process instance id riding every roster delta (the
+    /// supervisor's gate keys its watermark by worker id + instance, so a
+    /// replacement process's restarted counter is never compared against
+    /// the predecessor's).
+    worker_instance_id: String,
 }
 
 impl TurnRunner {
@@ -5061,7 +5087,9 @@ impl TurnRunner {
             &self.engine,
             &self.roster_link,
             &self.worker_token,
+            &self.worker_instance_id,
             &self.roster_delta_sequence,
+            &self.roster_push_order,
         );
     }
 
@@ -5780,7 +5808,9 @@ fn push_roster_delta(
     engine: &std::sync::Arc<dyn SessionEngine>,
     roster_link: &std::sync::Arc<crate::supervisor_link::SupervisorLink>,
     worker_token: &str,
+    worker_instance_id: &str,
     sequence: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    push_order: &std::sync::Arc<std::sync::Mutex<()>>,
 ) {
     if std::env::var_os("PA_WORKER_DISABLE_ROSTER_PUSH").is_some() {
         return;
@@ -5788,7 +5818,13 @@ fn push_roster_delta(
     if worker_token.is_empty() || roster_link.socket_path().as_os_str().is_empty() {
         return;
     }
-    let summary = {
+    // The push-order lock holds the snapshot and its sequence stamp
+    // together: a busy-flip push racing a switch push must never let the
+    // older snapshot carry the newer sequence (the supervisor would then
+    // keep the stale row and drop the fresh one), so the pair is atomic
+    // and the pairs themselves order — sequence order is snapshot order.
+    let _order = push_order.lock().unwrap();
+    let mut summary = {
         let core = core.lock().unwrap();
         session_summary(
             &core,
@@ -5799,16 +5835,24 @@ fn push_roster_delta(
             engine.model_fallback_message(),
         )
     };
+    // The embedded counter is the pre-stamp value read under the order
+    // lock: every sequence this worker stamped before the snapshot is at
+    // or below it. The supervisor's authoritative pulls raise their
+    // watermark to it, so a delta still in flight when the pull answered
+    // is dropped instead of overwriting the pull's fresher state.
+    summary.roster_delta_sequence = Some(sequence.load(std::sync::atomic::Ordering::SeqCst));
     let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
     let link = std::sync::Arc::clone(roster_link);
     let worker_token = worker_token.to_string();
-    let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let worker_instance_id = worker_instance_id.to_string();
+    let sequence_value = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     tokio::spawn(async move {
         let command = serde_json::json!({
             "type": "worker_roster_delta",
             "workerToken": worker_token,
             "summary": summary,
-            "sequence": sequence,
+            "sequence": sequence_value,
+            "workerInstanceId": worker_instance_id,
         });
         let _ = link
             .request(command, std::time::Duration::from_secs(10))
@@ -5924,6 +5968,10 @@ fn session_summary(
         status_label: None,
         summary: None,
         task_state: None,
+        // Set by the caller when the snapshot backs a roster push (the
+        // push-order lock reads the pre-stamp counter); authoritative
+        // pulls embed the live counter in `summary_locked` instead.
+        roster_delta_sequence: None,
         model,
         model_fallback_message,
         runtime_kind: Some(core.runtime_kind.clone()),
@@ -8475,6 +8523,9 @@ mod turn_stream_tests {
             status_notify,
             roster_link: Arc::new(crate::supervisor_link::SupervisorLink::new(PathBuf::new())),
             worker_token: String::new(),
+            roster_delta_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            roster_push_order: Arc::new(std::sync::Mutex::new(())),
+            worker_instance_id: String::new(),
         }
     }
 

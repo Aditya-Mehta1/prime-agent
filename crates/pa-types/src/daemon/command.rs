@@ -170,10 +170,19 @@ pub enum DaemonCommand {
         /// The worker's monotonic roster-delta sequence: the per-request
         /// supervisor links deliver deltas unordered, so the supervisor
         /// drops a stale delta (a newer one already applied) instead of
-        /// letting a delayed older snapshot overwrite it. Absent means
-        /// unsequenced (always applied).
+        /// letting a delayed older snapshot overwrite it. The sequence is
+        /// stamped under the worker's push-order lock together with the
+        /// snapshot it describes, so sequence order is snapshot order.
+        /// Absent means unsequenced (always applied).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence: Option<u64>,
+        /// The sending worker process instance: a replacement process
+        /// reuses the resident worker id but restarts its sequence, so the
+        /// supervisor's stale-delta gate keys the watermark by
+        /// (worker id, instance) — a predecessor's in-flight deltas stay
+        /// gated against the predecessor's watermark.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_instance_id: Option<String>,
         #[serde(flatten)]
         rest: JsonMap,
     },

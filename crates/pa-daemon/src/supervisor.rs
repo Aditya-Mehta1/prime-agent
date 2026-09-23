@@ -2313,6 +2313,7 @@ impl Supervisor {
                 summary,
                 removed,
                 sequence,
+                worker_instance_id,
                 ..
             } => {
                 let response = self
@@ -2323,6 +2324,7 @@ impl Supervisor {
                         summary.clone(),
                         removed.clone().unwrap_or_default(),
                         *sequence,
+                        worker_instance_id.as_deref(),
                     )
                     .await;
                 (vec![response_line(&response)], false)
@@ -3223,11 +3225,12 @@ impl Supervisor {
         // path). Both reads share this one lock acquisition - the
         // create path holds this mutex around its own replay steps, and a
         // second acquisition here let the two race into a stall.
-        let durable_session_id = {
+        let (durable_session_id, previous_worker_instance_id) = {
             let mut descriptor = resident.descriptor.lock().await;
             if token.as_str() != descriptor.authentication_token {
                 return fail("Session worker authentication failed");
             }
+            let previous_worker_instance_id = descriptor.worker_instance_id.clone();
             descriptor.pid = *pid;
             descriptor.socket_path = socket_path.clone();
             descriptor.worker_instance_id = worker_instance_id.clone();
@@ -3245,7 +3248,7 @@ impl Supervisor {
                 descriptor.session_file.as_deref(),
             );
             let _ = persist_worker(&resident.descriptor_path, &descriptor);
-            match registration.session_id.clone() {
+            let durable_session_id = match registration.session_id.clone() {
                 Some(session_id) => Some(session_id),
                 None => descriptor
                     .session_file
@@ -3253,16 +3256,22 @@ impl Supervisor {
                     .as_deref()
                     .and_then(|file| Path::new(file).file_stem())
                     .map(|stem| stem.to_string_lossy().to_string()),
-            }
+            };
+            (durable_session_id, previous_worker_instance_id)
         };
         let record = self.registry.record_registration(registration).await;
-        // The (re-)registration resets the worker's roster-delta sequence
-        // gate: a replacement process reuses the resident worker id but
-        // starts its monotonic counter over, so the supervisor must not
-        // keep comparing its deltas against the predecessor's sequence.
-        {
+        // A REPLACEMENT registration (a new worker process instance for the
+        // same resident worker id) saturates the predecessor's roster-delta
+        // watermark: the replacement restarts its monotonic counter, so a
+        // delta still in flight from the predecessor is stale by
+        // construction. A same-process re-register (a dropped supervisor
+        // link, a create replay) keeps the gate untouched — the counter did
+        // not restart, and clearing it would let the older in-flight
+        // deltas apply again.
+        if previous_worker_instance_id.as_deref() != worker_instance_id.as_deref() {
+            let retired = previous_worker_instance_id.clone().unwrap_or_default();
             let mut roster = self.roster.lock().unwrap();
-            roster.forget_worker_sequences(&resident.worker_id);
+            roster.retire_worker_instance(&resident.worker_id, &retired);
         }
         // A restore pass that owns this session's roster row can settle it
         // now (spec §10.4): the live worker serves the row's waiters
@@ -3774,8 +3783,11 @@ impl Supervisor {
             _ => create_summary.clone(),
         };
         // The new session joins the agent roster immediately (subscribers
-        // see the roster_update before their next list).
-        self.write_roster_summary(&summary, Some(&resident.worker_id));
+        // see the roster_update before their next list) — as an
+        // authoritative pull write, so its embedded counter raises the
+        // stale-delta watermark for the resident.
+        self.write_roster_summary_for_resident(&resident, &summary)
+            .await;
         // The spawn append is a ledger-append moment: the new edge can be
         // the first time this family is live in the roster (a resumed
         // parent, a supervisor restart), so the seed runs here too - after
