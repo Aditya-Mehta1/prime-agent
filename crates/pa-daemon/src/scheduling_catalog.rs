@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -211,6 +212,13 @@ impl Supervisor {
     /// Selector-less `heartbeats_list` (TS supervisor arm): merge every
     /// live worker's heartbeats with the passive heartbeat jobs; the
     /// passive rows carry the saved session's name and first message.
+    ///
+    /// Each worker serves its last-good snapshot when it cannot answer a
+    /// fresh list (TS `worker.heartbeatSnapshot`): a busy turn must not
+    /// empty the merged catalog while the worker's scheduler keeps firing.
+    /// A worker with no usable snapshot fails the whole response (TS
+    /// `failed`), so the client keeps its own last catalog instead of
+    /// reading a partial merge as an emptied one.
     pub(crate) async fn handle_heartbeats_list_catalog(
         &self,
         command: &DaemonCommand,
@@ -220,26 +228,67 @@ impl Supervisor {
     ) -> (Vec<Value>, bool) {
         let mut heartbeats: Vec<Value> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let mut failed: Option<DaemonResponse> = None;
         for resident in self.live_workers_in_creation_order().await {
+            // The generation this read captures (TS queues one more refresh
+            // pass when `heartbeats_changed` lands mid-read; Rust instead
+            // never lets an in-flight read publish over a newer
+            // invalidation): a stored snapshot is only fresh while its
+            // generation is still current.
+            let generation = resident
+                .heartbeat_snapshot_generation
+                .load(Ordering::Relaxed);
             let response = self
                 .forward_with_catalog_timeout(&resident, command, client_id)
                 .await;
-            if !response.success {
+            // TS `heartbeatsFromResponse`: a success without a rows array is
+            // an empty catalog (a good snapshot), not a failure.
+            let list = if response.success {
+                Some(
+                    response
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("heartbeats"))
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            } else {
                 self.log_line(&format!(
                     "Could not list heartbeats from a worker: {}",
-                    response.error.unwrap_or_default()
+                    response.error.clone().unwrap_or_default()
                 ));
-                continue;
-            }
-            let Some(list) = response
-                .data
-                .as_ref()
-                .and_then(|data| data.get("heartbeats"))
-                .and_then(Value::as_array)
-                .cloned()
-            else {
-                continue;
+                None
             };
+            let list = match list {
+                Some(list) => list,
+                None => {
+                    let snapshot = resident.heartbeat_snapshot.lock().await;
+                    match snapshot.as_ref().filter(|snapshot| {
+                        snapshot.generation
+                            == resident
+                                .heartbeat_snapshot_generation
+                                .load(Ordering::Relaxed)
+                    }) {
+                        Some(snapshot) => snapshot.rows.clone(),
+                        None => {
+                            failed.get_or_insert(response);
+                            continue;
+                        }
+                    }
+                }
+            };
+            // The stored snapshot carries the generation captured before
+            // the forward: an invalidation that landed during the read bumps
+            // the current generation past it, so the store lands already
+            // stale instead of clearing the newer invalidation. The store
+            // itself is generation-monotonic: an older in-flight read
+            // returning after a newer read already stored never replaces
+            // the stored snapshot, so a late read cannot retag it as stale
+            // and busy-worker fallbacks keep serving the last-good rows.
+            resident
+                .store_heartbeat_snapshot(list.clone(), generation)
+                .await;
             for heartbeat in list {
                 let Some(id) = heartbeat
                     .get("job")
@@ -253,6 +302,13 @@ impl Supervisor {
                     heartbeats.push(heartbeat);
                 }
             }
+        }
+        // A worker with no usable snapshot fails the response (TS
+        // `failed`): the client keeps its last catalog instead of reading a
+        // partial merge as an emptied one.
+        if let Some(mut response) = failed {
+            response.id = Some(command_id.to_string());
+            return (vec![response_line(&response)], false);
         }
         // Passivated sessions keep their armed heartbeats; no worker can
         // list them.

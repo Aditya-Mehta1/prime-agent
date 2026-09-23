@@ -836,9 +836,18 @@ impl Supervisor {
                             .unwrap_or(ClientRouting::Broadcast);
                         let _ = events.send((routing, payload));
                     } else if outbound_type == "heartbeats_changed" {
-                        // A worker's heartbeat catalog changed (TS
-                        // `broadcastHeartbeatsChanged` re-broadcast): every
-                        // client re-reads the catalog.
+                        // The worker's own catalog changed: its last-good
+                        // snapshot can no longer be trusted as fresh (TS
+                        // `heartbeatSnapshotStale = true` + a queued re-read
+                        // for an in-flight pass; Rust bumps the generation,
+                        // so an in-flight read keeps an older generation
+                        // and can never publish itself as fresh over this
+                        // invalidation), and every client re-reads the
+                        // catalog (TS `broadcastHeartbeatsChanged`
+                        // re-broadcast).
+                        reader_resident
+                            .heartbeat_snapshot_generation
+                            .fetch_add(1, Ordering::Relaxed);
                         let _ = events.send((ClientRouting::Broadcast, payload));
                     }
                 }
