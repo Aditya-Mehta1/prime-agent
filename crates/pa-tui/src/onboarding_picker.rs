@@ -205,8 +205,12 @@ impl OnboardingPicker {
             },
         ));
         let end = filtered.len().min(scroll_top.saturating_add(visible_rows));
-        for index in scroll_top..end {
-            let item = filtered[index];
+        for (index, item) in filtered
+            .iter()
+            .enumerate()
+            .skip(scroll_top)
+            .take(end - scroll_top)
+        {
             lines.push(render_row(
                 theme,
                 width,
