@@ -9180,7 +9180,7 @@ mod turn_stream_tests {
         runner
             .run_turn(
                 engine,
-                QueuedItem {
+                vec![QueuedItem {
                     preview: None,
                     message: "run the tool".to_string(),
                     custom_message: None,
@@ -9190,7 +9190,9 @@ mod turn_stream_tests {
                     images: Vec::new(),
                     done: None,
                     queue_visible: true,
-                },
+                    policy: TurnPolicy::Queued,
+                    forced_batch: false,
+                }],
             )
             .await;
         // The settle push is in flight once the turn returns; the last
