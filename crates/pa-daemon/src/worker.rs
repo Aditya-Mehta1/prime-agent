@@ -295,6 +295,11 @@ pub(crate) struct SessionCore {
     pub(crate) shutdown_requested: bool,
     /// True while a compaction run is in flight (TS `isCompacting`).
     pub(crate) compacting: bool,
+    /// The turn's tool calls in flight, keyed by tool-call id (TS
+    /// `session.state.pendingToolCalls`): the tool-execution frames add
+    /// and remove ids, and the roster summary derives `isRunningTools`
+    /// (`isStreaming && pendingToolCalls.size > 0`) from its size.
+    pub(crate) running_tool_calls: std::collections::HashSet<String>,
     /// TS `autoCompactionEnabled` (settings default: on).
     pub(crate) auto_compaction_enabled: bool,
     /// The last broadcast queue snapshot (TS `_lastSessionActionSnapshot`):
@@ -383,6 +388,7 @@ impl SessionCore {
             suppress_aborted_row: false,
             shutdown_requested: false,
             compacting: false,
+            running_tool_calls: std::collections::HashSet::new(),
             auto_compaction_enabled: true,
             last_action_snapshot: Some(SessionActionSnapshot::default()),
             rlm_depth: 0,
@@ -795,6 +801,7 @@ impl Worker {
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
             active_action: None,
+            running_tool_calls: std::collections::HashSet::new(),
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -984,6 +991,27 @@ impl Worker {
                 });
                 concrete.set_goal_admission(probe, sink, queue_purge);
             }
+            // The live roster activity feed (TS `observeRosterEvent` +
+            // `scheduleRosterFlush`): the busy flips and every trigger
+            // event that flows through the worker's event pump coalesce
+            // into fresh-composed `worker_roster_delta` pushes, so the
+            // activity rows advance mid-turn (`running tools` while tool
+            // calls execute, `running bash` for the user bash, idle at the
+            // settle) instead of holding the turn-start snapshot.
+            let roster_link = std::sync::Arc::new(crate::supervisor_link::SupervisorLink::new(
+                config.supervisor_socket_path.clone(),
+            ));
+            let roster_pushes = crate::roster_activity::RosterPushQueue::spawn(
+                Arc::clone(&core),
+                std::sync::Arc::clone(&engine),
+                std::sync::Arc::clone(&user_bash),
+                roster_link,
+                config.token.clone(),
+            );
+            crate::roster_activity::spawn_roster_activity_watch(
+                events.clone(),
+                roster_pushes.clone(),
+            );
             let runner = TurnRunner {
                 recovery: Arc::clone(&recovery),
                 core: Arc::clone(&core),
@@ -995,12 +1023,7 @@ impl Worker {
                 engine: std::sync::Arc::clone(&engine),
                 active_session_id,
                 status_notify: status_notify.clone(),
-                roster_link: std::sync::Arc::new(crate::supervisor_link::SupervisorLink::new(
-                    std::env::var_os(WORKER_SUPERVISOR_SOCKET_ENV)
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_default(),
-                )),
-                worker_token: std::env::var(WORKER_TOKEN_ENV).unwrap_or_default(),
+                roster_pushes,
             };
             tokio::spawn(async move {
                 runner.run().await;
@@ -2347,121 +2370,21 @@ impl Worker {
     }
 
     pub(crate) fn summary_locked(&self, core: &SessionCore) -> SessionSummary {
-        let store = core.store.as_ref();
-        let streaming = core.busy;
-        let compacting = core.compacting;
-        let queued = core.steering.len() + core.follow_up.len();
-        // `modified` is the session file mtime; `lastActivityAt` prefers the
-        // newest message timestamp (port of `summaryForActiveSession`).
-        let modified = store
-            .and_then(|store| std::fs::metadata(&store.path).ok())
-            .and_then(|metadata| metadata.modified().ok())
-            .map(|time| {
-                crate::util::iso_from_unix_ms(
-                    time.duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or_default(),
-                )
-            });
-        let messages = store.map(|store| store.messages()).unwrap_or_default();
-        let last_activity_at = messages
-            .iter()
-            .rev()
-            .find_map(crate::types::message_timestamp_ms)
-            .map(crate::util::iso_from_unix_ms)
-            .or_else(|| modified.clone())
-            .or_else(|| store.map(|store| store.header.timestamp.clone()));
-        // Usage: summed assistant usage (`sessionUsageSummaryFrom`), absent
-        // when everything is zero.
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
-        let mut cost = 0.0f64;
-        for message in &messages {
-            if crate::types::message_role(message) != Some("assistant") {
-                continue;
-            }
-            let Some(usage) = message.get("usage") else {
-                continue;
-            };
-            input_tokens += usage
-                .get("input")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            input_tokens += usage
-                .get("cacheRead")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            input_tokens += usage
-                .get("cacheWrite")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            output_tokens += usage
-                .get("output")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            cost += usage
-                .get("cost")
-                .and_then(|cost| cost.get("total"))
-                .and_then(Value::as_f64)
-                .unwrap_or_default();
-        }
-        let usage = (input_tokens > 0 || output_tokens > 0 || cost > 0.0).then(
-            || json!({ "inputTokens": input_tokens, "outputTokens": output_tokens, "cost": cost }),
-        );
-        SessionSummary {
-            id: core.active_session_id.clone(),
-            lifecycle: active_lifecycle(&core.runtime_kind, messages.is_empty(), streaming)
-                .to_string(),
-            activity: if streaming || compacting {
-                "working"
-            } else {
-                "idle"
-            }
-            .to_string(),
-            is_session_active: streaming || compacting || queued > 0,
-            has_registered_cron_job: Some(false),
-            last_activity_at,
-            rlm_depth: Some(core.rlm_depth),
-            active_session_id: Some(core.active_session_id.clone()),
-            session_id: store
-                .map(|s| s.session_id().to_string())
-                .unwrap_or_default(),
-            session_file: store.map(|s| s.path.to_string_lossy().to_string()),
-            session_name: store.and_then(|s| s.session_name().map(str::to_string)),
-            cwd: core.cwd.clone(),
-            thinking_level: Some(
-                self.engine
-                    .effective_thinking_level()
-                    .unwrap_or_else(|| "default".to_string()),
-            ),
-            is_streaming: streaming,
-            is_compacting: compacting,
-            is_bash_running: Some(false),
-            attached_clients: core.attached_client_ids.len() as u32,
-            message_count: store.map(|s| s.message_count()).unwrap_or(0) as u32,
-            session_actions: self.snapshot_locked(core),
-            streaming_message: None,
-            created: store.map(|s| s.header.timestamp.clone()),
-            modified,
-            first_message: store.and_then(|s| s.first_message()),
-            parent_session_path: store.and_then(|store| store.header.parent_session.clone()),
-            parent_active_session_id: core.parent_active_session_id.clone(),
-            parent_session_id: core.parent_session_id.clone(),
-            rlm_child_id: core.rlm_child_id.clone(),
-            usage,
-            worker_state: Some("ready".to_string()),
-            worker_pid: Some(std::process::id()),
-            status_label: None,
-            summary: None,
-            task_state: None,
-            // The engine's resolved model (the agents-view Model column:
-            // TS roster summaries carry it; a not-yet-resolved engine
-            // reports none).
-            model: self.engine.model_metadata(),
-            model_fallback_message: self.engine.model_fallback_message(),
-            runtime_kind: Some(core.runtime_kind.clone()),
-            unfinished_action_count: Some(0),
-        }
+        // The one summary composer (TS `summaryForActiveSession`): the
+        // roster feed, `get_state`, and list rows all serve it, so the
+        // live flags (`isRunningTools` from the core's in-flight tool
+        // calls, `isBashRunning` from the user bash) never drift between
+        // surfaces.
+        session_summary(
+            core,
+            &self
+                .engine
+                .effective_thinking_level()
+                .unwrap_or_else(|| "default".to_string()),
+            self.engine.model_metadata(),
+            self.engine.model_fallback_message(),
+            self.user_bash.is_running(),
+        )
     }
 
     pub(crate) fn snapshot_locked(&self, core: &SessionCore) -> SessionActionSnapshot {
@@ -4470,10 +4393,10 @@ struct TurnRunner {
     recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
     active_session_id: String,
     status_notify: tokio::sync::mpsc::UnboundedSender<()>,
-    /// The supervisor link for roster pushes (lazy reconnect like the
-    /// agent-messaging link).
-    roster_link: std::sync::Arc<crate::supervisor_link::SupervisorLink>,
-    worker_token: String,
+    /// The coalescing roster push queue: the busy flips enqueue here and
+    /// the queue's consumer composes and ships the summary (the
+    /// event-driven arm lives in [`crate::roster_activity`]).
+    roster_pushes: crate::roster_activity::RosterPushQueue,
 }
 
 impl TurnRunner {
@@ -4507,11 +4430,15 @@ impl TurnRunner {
                     core.busy = true;
                     core.abort_requested = false;
                     core.retry_abort_requested = false;
+                    // The run starts with no tool calls in flight (TS
+                    // resets `pendingToolCalls` at run start).
+                    core.running_tool_calls.clear();
                     Some(item)
                 } else if let Some(item) = core.follow_up.pop_front() {
                     core.busy = true;
                     core.abort_requested = false;
                     core.retry_abort_requested = false;
+                    core.running_tool_calls.clear();
                     Some(item)
                 } else {
                     core.busy = false;
@@ -4572,40 +4499,12 @@ impl TurnRunner {
     /// Push one roster delta to the supervisor (the Rust-native form of
     /// the TS `roster_delta` worker frame): the worker's summary after a
     /// busy flip, so subscribed clients see live status without polling.
-    /// Fire-and-forget: a dead link reconnects on the next flip, and a
-    /// supervisor restart re-seeds the entry from registration.
+    /// The queue's consumer composes and ships the summary, coalescing
+    /// this request with any event-driven flush that raced the flip; a
+    /// dead link reconnects on the next flush, and a supervisor restart
+    /// re-seeds the entry from registration.
     fn push_roster_delta(&self) {
-        if std::env::var_os("PA_WORKER_DISABLE_ROSTER_PUSH").is_some() {
-            return;
-        }
-        if self.worker_token.is_empty() || self.roster_link.socket_path().as_os_str().is_empty() {
-            return;
-        }
-        let summary = {
-            let core = self.core.lock().unwrap();
-            session_summary(
-                &core,
-                &self
-                    .engine
-                    .effective_thinking_level()
-                    .unwrap_or_else(|| "default".to_string()),
-                self.engine.model_metadata(),
-                self.engine.model_fallback_message(),
-            )
-        };
-        let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
-        let link = std::sync::Arc::clone(&self.roster_link);
-        let worker_token = self.worker_token.clone();
-        tokio::spawn(async move {
-            let command = serde_json::json!({
-                "type": "worker_roster_delta",
-                "workerToken": worker_token,
-                "summary": summary,
-            });
-            let _ = link
-                .request(command, std::time::Duration::from_secs(10))
-                .await;
-        });
+        self.roster_pushes.push();
     }
 
     async fn run_turn(&self, engine: std::sync::Arc<dyn SessionEngine>, item: QueuedItem) {
@@ -4803,6 +4702,19 @@ impl TurnRunner {
                         if let Some(store) = core.store.as_mut() {
                             let _ = store.persist_entry("message", json!({ "message": message }));
                         }
+                    }
+                    // The in-flight tool-call set (TS
+                    // `session.state.pendingToolCalls`): the summary's
+                    // `isRunningTools` derives from its size, and the
+                    // update happens under the same core lock the frames
+                    // sequence under, so the roster feed composed from a
+                    // broadcast trigger frame never reads a half-applied
+                    // transition.
+                    EngineEvent::ToolExecutionStart { tool_call_id, .. } => {
+                        core.running_tool_calls.insert(tool_call_id.clone());
+                    }
+                    EngineEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                        core.running_tool_calls.remove(tool_call_id);
                     }
                     // The session-file form of a custom row (TS
                     // `appendCustomMessageEntry`: customType/content/display/
@@ -5277,11 +5189,12 @@ fn active_lifecycle(runtime_kind: &str, messageless: bool, busy: bool) -> &'stat
     }
 }
 
-fn session_summary(
+pub(crate) fn session_summary(
     core: &SessionCore,
     thinking_level: &str,
     model: Option<Value>,
     model_fallback_message: Option<String>,
+    bash_running: bool,
 ) -> SessionSummary {
     let store = core.store.as_ref();
     let streaming = core.busy;
@@ -5367,7 +5280,8 @@ fn session_summary(
         thinking_level: Some(thinking_level.to_string()),
         is_streaming: streaming,
         is_compacting: compacting,
-        is_bash_running: Some(false),
+        is_bash_running: Some(bash_running),
+        is_running_tools: streaming && !core.running_tool_calls.is_empty(),
         attached_clients: core.attached_client_ids.len() as u32,
         message_count: store.map(|s| s.message_count()).unwrap_or(0) as u32,
         session_actions: session_snapshot(core),
@@ -5922,13 +5836,13 @@ mod tests {
     fn summary_lifecycle_is_message_based() {
         let empty = SessionCore::test_core(None, "/tmp".to_string());
         assert_eq!(
-            session_summary(&empty, "default", None, None).lifecycle,
+            session_summary(&empty, "default", None, None, /*bash_running=*/ false).lifecycle,
             "draft"
         );
         let mut subagent = SessionCore::test_core(None, "/tmp".to_string());
         subagent.runtime_kind = "subagent".to_string();
         assert_eq!(
-            session_summary(&subagent, "default", None, None).lifecycle,
+            session_summary(&subagent, "default", None, None, /*bash_running=*/ false).lifecycle,
             "live"
         );
         // The busy-flip roster delta fires before the store flushes the
@@ -5936,8 +5850,33 @@ mod tests {
         // reads the runtime's in-memory messages, which already hold it).
         let mut busy = SessionCore::test_core(None, "/tmp".to_string());
         busy.busy = true;
+        busy.running_tool_calls.insert("call-1".to_string());
+        // `isRunningTools` is the streaming gate over the in-flight tool
+        // set (TS `isStreaming && pendingToolCalls.size > 0`): tools in
+        // flight read true only while the turn streams.
+        assert!(
+            session_summary(&busy, "default", None, None, /*bash_running=*/ false).is_running_tools
+        );
+        busy.running_tool_calls.clear();
+        assert!(
+            !session_summary(&busy, "default", None, None, /*bash_running=*/ false)
+                .is_running_tools
+        );
+        busy.running_tool_calls.insert("call-1".to_string());
+        busy.busy = false;
+        assert!(
+            !session_summary(&busy, "default", None, None, /*bash_running=*/ false)
+                .is_running_tools
+        );
+        // The user bash state rides the summary as its own flag (TS
+        // `session.isBashRunning`).
         assert_eq!(
-            session_summary(&busy, "default", None, None).lifecycle,
+            session_summary(&busy, "default", None, None, /*bash_running=*/ true).is_bash_running,
+            Some(true)
+        );
+        busy.busy = true;
+        assert_eq!(
+            session_summary(&busy, "default", None, None, /*bash_running=*/ false).lifecycle,
             "live"
         );
         let dir = std::env::temp_dir().join(format!("pa-worker-lc-{}", uuid::Uuid::new_v4()));
@@ -5953,7 +5892,14 @@ mod tests {
         session.rewrite().unwrap();
         let with_message = SessionCore::test_core(Some(session), "/tmp".to_string());
         assert_eq!(
-            session_summary(&with_message, "default", None, None).lifecycle,
+            session_summary(
+                &with_message,
+                "default",
+                None,
+                None,
+                /*bash_running=*/ false
+            )
+            .lifecycle,
             "live"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -7769,6 +7715,7 @@ mod turn_stream_tests {
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
             active_action: None,
+            running_tool_calls: std::collections::HashSet::new(),
         }));
         let (status_notify, _status_rx) = tokio::sync::mpsc::unbounded_channel();
         TurnRunner {
@@ -7782,8 +7729,7 @@ mod turn_stream_tests {
             recovery: Arc::new(Mutex::new(None)),
             active_session_id: "burst-session".to_string(),
             status_notify,
-            roster_link: Arc::new(crate::supervisor_link::SupervisorLink::new(PathBuf::new())),
-            worker_token: String::new(),
+            roster_pushes: crate::roster_activity::RosterPushQueue::disabled(),
         }
     }
 
@@ -7885,6 +7831,203 @@ mod turn_stream_tests {
             assert!(!core.busy, "the waiter resolved before the idle flip");
         }
         turn.await.expect("the turn task panicked");
+    }
+
+    /// A fake supervisor link endpoint: every `worker_roster_delta`
+    /// command's summary is recorded in arrival order.
+    async fn fake_supervisor(
+        socket: std::path::PathBuf,
+    ) -> (Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = Arc::clone(&recorded);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let sink = Arc::clone(&sink);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let (reader, mut writer) = stream.into_split();
+                    writer
+                        .write_all(b"{\"type\":\"daemon_hello\"}\n")
+                        .await
+                        .unwrap();
+                    let mut lines = BufReader::new(reader);
+                    loop {
+                        let mut line = String::new();
+                        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok(request) = serde_json::from_str::<Value>(line.trim()) else {
+                            continue;
+                        };
+                        sink.lock()
+                            .unwrap()
+                            .push(request["command"]["summary"].clone());
+                        let response =
+                            crate::protocol::response_line(&crate::protocol::response_success(
+                                request["id"].as_str(),
+                                "worker_roster_delta",
+                                None,
+                            ));
+                        writer
+                            .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                            .await
+                            .unwrap();
+                        writer.write_all(b"\n").await.unwrap();
+                    }
+                });
+            }
+        });
+        (recorded, server)
+    }
+
+    /// A turn runner whose roster pushes and activity watcher ship to a
+    /// live supervisor link (the burst runner keeps them disabled).
+    fn live_feed_runner(engine: Arc<dyn SessionEngine>, socket: std::path::PathBuf) -> TurnRunner {
+        let core = Arc::new(Mutex::new(SessionCore::test_core(None, "/tmp".to_string())));
+        let user_bash = Arc::new(crate::user_bash::UserBash::new());
+        let events = Arc::new(EventPump::new());
+        let roster_pushes = crate::roster_activity::RosterPushQueue::spawn(
+            Arc::clone(&core),
+            std::sync::Arc::clone(&engine),
+            user_bash,
+            Arc::new(crate::supervisor_link::SupervisorLink::new(socket)),
+            "token".to_string(),
+        );
+        crate::roster_activity::spawn_roster_activity_watch(
+            Arc::clone(&events),
+            roster_pushes.clone(),
+        );
+        let (status_notify, _status_rx) = tokio::sync::mpsc::unbounded_channel();
+        TurnRunner {
+            recovery: Arc::new(Mutex::new(None)),
+            core,
+            input_pauses: crate::session_input_pause::InputPauseTable::new(),
+            prompt_admissions: crate::prompt_admission::WorkerAdmissions::new(),
+            work_notify: Arc::new(Notify::new()),
+            idle_notify: Arc::new(Notify::new()),
+            events,
+            engine,
+            active_session_id: "feed-session".to_string(),
+            status_notify,
+            roster_pushes,
+        }
+    }
+
+    /// The waiting/executing indicator over the wire: a working session's
+    /// roster deltas carry live `isRunningTools` transitions while the
+    /// tool executes (mid-turn pushes, not a static turn-start snapshot)
+    /// and end idle once the turn settles (TS `observeRosterEvent` +
+    /// `ROSTER_SESSION_EVENT_TRIGGERS` + `scheduleRosterFlush`).
+    #[tokio::test]
+    async fn roster_feed_publishes_live_tool_activity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("sup.sock");
+        let (recorded, server) = fake_supervisor(socket.clone()).await;
+        let engine: Arc<dyn SessionEngine> = Arc::new(
+            ScriptedEngine::from_value(json!({
+                "responses": [{
+                    "text": "ran the tool",
+                    "toolCalls": [{
+                        "toolCallId": "call-1",
+                        "toolName": "bash",
+                        "args": { "command": "ls" },
+                        "result": "listing",
+                        "delayMs": 250,
+                    }],
+                }],
+            }))
+            .unwrap_or_default(),
+        );
+        let runner = live_feed_runner(Arc::clone(&engine), socket);
+        // The pickup's busy flip (the run loop's arm before `run_turn`).
+        runner.core.lock().unwrap().busy = true;
+        runner
+            .run_turn(
+                engine,
+                QueuedItem {
+                    preview: None,
+                    message: "run the tool".to_string(),
+                    custom_message: None,
+                    agent_message: None,
+                    queue_key: None,
+                    admission_id: None,
+                    images: Vec::new(),
+                    done: None,
+                    queue_visible: true,
+                },
+            )
+            .await;
+        // The settle push is in flight once the turn returns; the last
+        // delta composes the idle state.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let settled = recorded
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|summary| summary["isStreaming"] == json!(false));
+            if settled || std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let summaries = recorded.lock().unwrap().clone();
+        let statuses = |key: &str| {
+            summaries
+                .iter()
+                .filter(|summary| summary["isStreaming"] == json!(true))
+                .any(|summary| summary[key] == json!(true))
+        };
+        assert!(
+            statuses("isRunningTools"),
+            "no mid-turn delta carried isRunningTools=true: {summaries:?}"
+        );
+        assert!(
+            !summaries.is_empty(),
+            "the worker never pushed a roster delta"
+        );
+        let last = summaries.last().cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            last["isStreaming"],
+            json!(false),
+            "the settled worker's roster row must read idle (isRunningTools={}): {summaries:?}",
+            last["isRunningTools"]
+        );
+        assert_eq!(
+            last["isRunningTools"],
+            json!(false),
+            "an idle session cannot report tools in flight: {summaries:?}"
+        );
+        assert_eq!(
+            last["activity"],
+            json!("idle"),
+            "the settled worker's activity is idle: {summaries:?}"
+        );
+        // The working turns' deltas carry the mid-turn flags.
+        let working: Vec<&Value> = summaries
+            .iter()
+            .filter(|summary| summary["isStreaming"] == json!(true))
+            .collect();
+        assert!(
+            working
+                .iter()
+                .any(|summary| summary["isRunningTools"] == json!(true)),
+            "the tool execution never showed in the feed: {summaries:?}"
+        );
+        assert!(
+            working
+                .iter()
+                .any(|summary| summary["isRunningTools"] == json!(false)),
+            "the tool's settle never showed in the feed: {summaries:?}"
+        );
+        server.abort();
     }
 
     async fn turn_session_events(engine: Arc<dyn SessionEngine>) -> Vec<Value> {
