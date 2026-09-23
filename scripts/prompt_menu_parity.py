@@ -415,6 +415,18 @@ def main():
 
     all_results = []
     sockets = []
+    # Reap any daemons a previous (possibly crashed) run leaked on this
+    # harness's sockets before launching fresh sides.
+    stale_sandbox = os.path.join(args.out, "sandbox")
+    stale_sockets = []
+    for side in ("base", "branch"):
+        socket = os.path.join(stale_sandbox, side, "agent", "daemon.sock")
+        if os.path.exists(socket):
+            stale_sockets.append(socket)
+    if stale_sockets:
+        batterylib.reap_daemons(
+            socket_paths=stale_sockets, needles=(args.out,), cwd_roots=(args.out,)
+        )
     if not args.skip_base:
         if not args.base_binary:
             raise SystemExit("set --base-binary (or PA_BASE_BINARY)")
