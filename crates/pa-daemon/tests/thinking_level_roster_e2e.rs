@@ -169,18 +169,21 @@ impl Client {
         if let Some(index) = self.roster_updates.iter().position(|line| accept(line)) {
             return self.roster_updates.remove(index);
         }
+        // Poll (not block in read_line): the deadline assertion is the
+        // repro's failure message, so it must fire inside this loop.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
                 Instant::now() < deadline,
                 "no matching roster_update arrived (the roster push never carried the change)"
             );
-            let line = self.read_line();
-            if line["type"] == "roster_update" && accept(&line) {
-                return line;
-            }
-            if line["type"] == "roster_update" {
-                self.roster_updates.push(line);
+            if let Some(line) = self.try_read_line() {
+                if line["type"] == "roster_update" {
+                    if accept(&line) {
+                        return line;
+                    }
+                    self.roster_updates.push(line);
+                }
             }
         }
     }
@@ -366,6 +369,14 @@ fn thinking_level_changes_reach_the_roster_push() {
         .or_else(|| child_created["data"]["activeSessionId"].as_str())
         .expect("child active session id")
         .to_string();
+
+    // Probe: a plain child read answers before the switch (routing sanity).
+    harness.client.send_command(
+        "gs-child",
+        json!({ "type": "get_state", "activeSessionId": child_id }),
+    );
+    let probed = harness.client.request("gs-child");
+    assert_eq!(probed["success"], true, "child get_state failed: {probed}");
 
     // Subscribe: the snapshot carries both rows at low.
     harness.client.send_command("rs", json!({ "type": "roster_subscribe" }));

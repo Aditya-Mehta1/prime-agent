@@ -742,6 +742,12 @@ pub struct Worker {
     /// session build (TS `createAgentSessionFromServices` parity — the
     /// kernel prewarm starts at create) runs through the concrete handle.
     pub(crate) agent_engine: Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
+    /// The supervisor link the command arms push roster deltas over (the
+    /// same link the turn runner's busy-flip pushes use; stateless, so
+    /// each request dials its own socket).
+    roster_link: std::sync::Arc<crate::supervisor_link::SupervisorLink>,
+    /// The supervisor-issued worker token authenticating roster pushes.
+    worker_token: String,
     pub(crate) work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     pub(crate) events: Arc<EventPump>,
@@ -908,6 +914,16 @@ impl Worker {
         tokio::spawn(async move {
             status_runner.run(status_rx).await;
         });
+        // The supervisor link and worker token for roster pushes: one
+        // construction shared by the turn runner's busy-flip pushes and
+        // the command arms' switch pushes (the same env the runner reads,
+        // so both push over the identical dial path).
+        let roster_link = std::sync::Arc::new(crate::supervisor_link::SupervisorLink::new(
+            std::env::var_os(WORKER_SUPERVISOR_SOCKET_ENV)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default(),
+        ));
+        let worker_token = std::env::var(WORKER_TOKEN_ENV).unwrap_or_default();
         // The session input-pause table (the admission gate): shared by
         // the worker's arms and the turn runner below.
         let input_pauses = crate::session_input_pause::InputPauseTable::new();
@@ -1114,12 +1130,8 @@ impl Worker {
                 engine: std::sync::Arc::clone(&engine),
                 active_session_id,
                 status_notify: status_notify.clone(),
-                roster_link: std::sync::Arc::new(crate::supervisor_link::SupervisorLink::new(
-                    std::env::var_os(WORKER_SUPERVISOR_SOCKET_ENV)
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_default(),
-                )),
-                worker_token: std::env::var(WORKER_TOKEN_ENV).unwrap_or_default(),
+                roster_link: std::sync::Arc::clone(&roster_link),
+                worker_token: worker_token.clone(),
             };
             tokio::spawn(async move {
                 runner.run().await;
@@ -1173,6 +1185,8 @@ impl Worker {
             core,
             engine,
             agent_engine,
+            roster_link,
+            worker_token,
             work_notify,
             idle_notify,
             events,
@@ -2596,6 +2610,21 @@ impl Worker {
 
     pub(crate) fn snapshot_locked(&self, core: &SessionCore) -> SessionActionSnapshot {
         session_snapshot(core)
+    }
+
+    /// Push one roster delta from a command arm (the model/thinking
+    /// switch seams): the same frame the turn runner's busy flips push,
+    /// so a switch reaches the subscribed roster surfaces (the agents
+    /// view) without a turn — the TS roster-flush parity for
+    /// `thinking_level_changed` and the `set_model`/`cycle_model`
+    /// handlers.
+    pub(crate) fn push_roster_delta(&self) {
+        push_roster_delta(
+            &self.core,
+            &self.engine,
+            &self.roster_link,
+            &self.worker_token,
+        );
     }
 
     fn handle_attach(&self, payload: &Value) -> DaemonResponse {
@@ -5014,37 +5043,12 @@ impl TurnRunner {
     /// Fire-and-forget: a dead link reconnects on the next flip, and a
     /// supervisor restart re-seeds the entry from registration.
     pub(crate) fn push_roster_delta(&self) {
-        if std::env::var_os("PA_WORKER_DISABLE_ROSTER_PUSH").is_some() {
-            return;
-        }
-        if self.worker_token.is_empty() || self.roster_link.socket_path().as_os_str().is_empty() {
-            return;
-        }
-        let summary = {
-            let core = self.core.lock().unwrap();
-            session_summary(
-                &core,
-                &self
-                    .engine
-                    .effective_thinking_level()
-                    .unwrap_or_else(|| "default".to_string()),
-                self.engine.model_metadata(),
-                self.engine.model_fallback_message(),
-            )
-        };
-        let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
-        let link = std::sync::Arc::clone(&self.roster_link);
-        let worker_token = self.worker_token.clone();
-        tokio::spawn(async move {
-            let command = serde_json::json!({
-                "type": "worker_roster_delta",
-                "workerToken": worker_token,
-                "summary": summary,
-            });
-            let _ = link
-                .request(command, std::time::Duration::from_secs(10))
-                .await;
-        });
+        push_roster_delta(
+            &self.core,
+            &self.engine,
+            &self.roster_link,
+            &self.worker_token,
+        );
     }
 
     /// One delivery: a single item, or the batch the pump gathered (TS
@@ -5739,6 +5743,52 @@ fn active_lifecycle(runtime_kind: &str, messageless: bool, busy: bool) -> &'stat
     } else {
         "draft"
     }
+}
+
+/// The worker's roster-delta push (the Rust-native form of the TS
+/// `roster_delta` worker frame): the fresh session summary rides the
+/// supervisor link, so subscribed roster surfaces (the agents view) see a
+/// state change without polling. Shared by the turn runner's busy flips
+/// and the worker's command arms (the model/thinking switches). The
+/// supervisor's roster refresh still backstops every push, so this stays
+/// fire-and-forget: a dead link reconnects on the next push, and a
+/// supervisor restart re-seeds the entry from registration.
+fn push_roster_delta(
+    core: &Arc<Mutex<SessionCore>>,
+    engine: &std::sync::Arc<dyn SessionEngine>,
+    roster_link: &std::sync::Arc<crate::supervisor_link::SupervisorLink>,
+    worker_token: &str,
+) {
+    if std::env::var_os("PA_WORKER_DISABLE_ROSTER_PUSH").is_some() {
+        return;
+    }
+    if worker_token.is_empty() || roster_link.socket_path().as_os_str().is_empty() {
+        return;
+    }
+    let summary = {
+        let core = core.lock().unwrap();
+        session_summary(
+            &core,
+            &engine
+                .effective_thinking_level()
+                .unwrap_or_else(|| "default".to_string()),
+            engine.model_metadata(),
+            engine.model_fallback_message(),
+        )
+    };
+    let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
+    let link = std::sync::Arc::clone(roster_link);
+    let worker_token = worker_token.to_string();
+    tokio::spawn(async move {
+        let command = serde_json::json!({
+            "type": "worker_roster_delta",
+            "workerToken": worker_token,
+            "summary": summary,
+        });
+        let _ = link
+            .request(command, std::time::Duration::from_secs(10))
+            .await;
+    });
 }
 
 fn session_summary(
