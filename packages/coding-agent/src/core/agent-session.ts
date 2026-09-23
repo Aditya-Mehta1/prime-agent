@@ -1144,6 +1144,12 @@ const IMAGE_TURN_CHILD_MAX_IMAGES = 8;
 const IMAGE_TURN_CHILD_MAX_IMAGE_BYTES = 8_000_000;
 const IMAGE_TURN_CHILD_MAX_TOTAL_BYTES = 24_000_000;
 const IMAGE_TURN_CHILD_TIMEOUT_MS = 180_000;
+/**
+ * Read-child session ids kept for late-reply suppression: bounded so a session
+ * that reads thousands of images cannot grow the set, wide enough that a reply
+ * arriving after its child was deleted still finds its id.
+ */
+const VISION_READ_CHILD_ID_HISTORY = 64;
 /** Bound on waiting for the read child's session to publish. */
 const IMAGE_TURN_CHILD_PUBLICATION_TIMEOUT_MS = 30_000;
 const IMAGE_TURN_READING_MAX_CHARS = 4000;
@@ -2774,11 +2780,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Remember one read child's session id for the session's lifetime: a reply can
-	 * land after the child was deleted, and dropping ids would let that late
-	 * message be admitted as an unsolicited turn.
+	 * Remember one read child's session id. The set is bounded (oldest first) so a
+	 * long-lived session cannot grow it without limit, while a reply that lands
+	 * after the child was deleted still finds its id: a real late delivery arrives
+	 * within the read that spawned the child, far inside this window.
 	 */
 	private _rememberVisionReadChildSession(sessionId: string): void {
+		if (this._visionReadChildSessionIds.size >= VISION_READ_CHILD_ID_HISTORY) {
+			const oldest = this._visionReadChildSessionIds.values().next().value;
+			if (oldest) this._visionReadChildSessionIds.delete(oldest);
+		}
 		this._visionReadChildSessionIds.add(sessionId);
 	}
 
