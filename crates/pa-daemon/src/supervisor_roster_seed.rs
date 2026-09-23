@@ -361,7 +361,9 @@ pub(crate) fn family_descends_from(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::registry::ResidentWorker;
     use crate::rlm_ledger::RlmLedgerEdge;
+    use crate::supervisor::ClientRouting;
     use pa_types::daemon::agent_roster::AgentRosterStatus;
 
     fn edge(child_id: &str, parent: &str, child: &str, depth: u32, name: &str) -> RlmLedgerEdge {
