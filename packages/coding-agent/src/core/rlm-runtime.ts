@@ -1,6 +1,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSession, RlmChildAgentStatus } from "./agent-session.js";
+import type { DispatchBinding } from "./dispatch/types.js";
 import type { ToolDefinition } from "./extensions/index.js";
 import type { HostRequestHandler } from "./kernel/index.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
@@ -297,10 +298,10 @@ export function createRlmCreateSessionHostHandler(handler: RlmCreateSessionHandl
 }
 
 /** Adapt an RlmRunHandler into the typed `rlm.run` kernel host handler. */
-export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHandler {
+export function createRlmRunHostHandler(handler: RlmRunHandler, operation = "rlm.spawn"): HostRequestHandler {
 	return async (payload) => {
 		if (typeof payload.prompt !== "string") {
-			throw new Error("rlm.spawn prompt must be a string");
+			throw new Error(`${operation} prompt must be a string`);
 		}
 		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
 		const cellSourceCode = typeof payload.cellSourceCode === "string" ? payload.cellSourceCode : undefined;
@@ -450,8 +451,27 @@ export interface RlmSubagentRuntime {
 	session: AgentSession;
 }
 
+export interface RlmDispatchOptions {
+	inputs: Record<string, string>;
+	sourceBinding?: DispatchBinding;
+}
+
+export function normalizeRlmDispatchInputs(value: unknown): Record<string, string> {
+	if (value === undefined) return {};
+	if (!isRecord(value)) throw new Error("rlm.dispatch inputs must map names to paths");
+	for (const [name, path] of Object.entries(value)) {
+		if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name) || typeof path !== "string" || !path.trim()) {
+			throw new Error("rlm.dispatch inputs must map simple names to non-empty paths");
+		}
+	}
+	return value as Record<string, string>;
+}
+
 export interface CreateRlmSubagentRuntimeOptions {
 	parentSession: AgentSession;
+	dispatch?: RlmDispatchOptions;
+	preparationSignal?: AbortSignal;
+	dispatchBinding?: DispatchBinding;
 	id: string;
 	prompt: string;
 	sessionName: string;
@@ -484,7 +504,10 @@ export interface CreateRlmRootSessionOptions {
 	thinkingLevel: ThinkingLevel;
 }
 
+export type RlmRuntimeCloseReason = "killed" | "replaced" | "completed" | "shutdown" | "update";
+
 export interface SubagentRuntimeHost {
+	readonly supportsDispatch?: boolean;
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
 	createRlmRootSession?(options: CreateRlmRootSessionOptions): Promise<RlmCreateSessionResult>;
 	/** Persist host-owned completion before the child becomes passivation-eligible. */
@@ -497,5 +520,5 @@ export interface SubagentRuntimeHost {
 	) => Promise<void>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
 	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
-	disposeRlmSubagentRuntimes?(): Promise<void>;
+	disposeRlmSubagentRuntimes?(reason?: RlmRuntimeCloseReason): Promise<void>;
 }

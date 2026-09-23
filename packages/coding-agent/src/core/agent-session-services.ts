@@ -9,6 +9,7 @@ import { installAgentTraceUpload } from "./agent-traces.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
+import type { DispatchBinding } from "./dispatch/types.js";
 import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent-state.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
@@ -28,6 +29,7 @@ export interface AgentSessionRuntimeDiagnostic {
 
 export interface CreateAgentSessionServicesOptions {
 	cwd: string;
+	dispatchBinding?: DispatchBinding;
 	agentDir?: string;
 	authStorage?: AuthStorage;
 	settingsManager?: SettingsManager;
@@ -53,6 +55,7 @@ export interface CreateAgentSessionServicesOptions {
 }
 
 export interface AgentSessionCreationOptions {
+	dispatchBinding?: DispatchBinding;
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
 	serviceTier?: ServiceTier;
@@ -186,7 +189,7 @@ export async function createAgentSessionServices(
 	const resourceLoader: DefaultResourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
 		extensionFactories: [...builtinExtensionFactories, ...userExtensionFactories],
-		cwd,
+		cwd: options.dispatchBinding?.hostResourceDir ?? cwd,
 		agentDir,
 		settingsManager,
 		extraBuiltinSkillOverrides: () => mcpManager.getDisabledBuiltinSkillOverrides(),
@@ -250,6 +253,7 @@ export async function createAgentSessionFromServices(
 	});
 	const result = await createAgentSession({
 		cwd: options.services.cwd,
+		dispatchBinding: options.dispatchBinding,
 		agentDir: options.services.agentDir,
 		authStorage: options.services.authStorage,
 		settingsManager: options.services.settingsManager,

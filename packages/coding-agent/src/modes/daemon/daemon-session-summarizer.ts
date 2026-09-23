@@ -147,6 +147,7 @@ export function parseAgentStatusResponse(text: string, isWorking: boolean): Agen
 
 export interface GenerateAgentStatusParams {
 	registry: ModelRegistry;
+	model?: Model<Api>;
 	messages: readonly AgentMessage[];
 	isWorking: boolean;
 	retryPolicy?: ProviderRetryPolicy;
@@ -159,7 +160,7 @@ export async function generateAgentStatus(params: GenerateAgentStatusParams): Pr
 	if (messages.length === 0) {
 		return undefined;
 	}
-	const model = resolveSummaryModel(registry);
+	const model = params.model ?? resolveSummaryModel(registry);
 	if (!model) {
 		return undefined;
 	}
@@ -397,6 +398,7 @@ export class DaemonSessionSummarizer {
 		try {
 			const generated = await this.generate({
 				registry: session.modelRegistry,
+				model: session.dispatchBinding ? session.model : undefined,
 				messages: contextMessages,
 				isWorking,
 				retryPolicy: providerRetryPolicy(session.settingsManager),

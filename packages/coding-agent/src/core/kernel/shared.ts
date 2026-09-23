@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import type { KernelBootstrapProgressHandler, KernelPythonSkill } from "./bootstrap.js";
 import type { RestoreResult, SnapshotResult } from "./state-snapshot.js";
@@ -45,6 +46,11 @@ export interface KernelSnapshotConfig {
 }
 
 export interface KernelManagerOptions {
+	/** Remote transport backed by a real local relay process. Cleanup must verify remote termination. */
+	processLauncher?: {
+		spawn(): ChildProcess;
+		stop(child: ChildProcess): Promise<void>;
+	};
 	/** Python interpreter with the kernel runtime available. Defaults to the auto-bootstrapped kernel. */
 	python?: string;
 	cwd?: string;

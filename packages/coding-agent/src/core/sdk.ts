@@ -164,7 +164,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({
-			cwd,
+			cwd: options.dispatchBinding?.hostResourceDir ?? cwd,
 			agentDir,
 			settingsManager,
 			extraBuiltinSkillOverrides: () => mcpManager.getDisabledBuiltinSkillOverrides(),
@@ -351,6 +351,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const session = new AgentSession({
+		dispatchBinding: options.dispatchBinding,
 		agent,
 		sessionManager,
 		settingsManager,

@@ -34,6 +34,19 @@ function providerError(): AssistantMessage {
 }
 
 describe("completeWithProviderRetry", () => {
+	it("does not resubmit Sail background inference after a poll failure", async () => {
+		let attempts = 0;
+		const result = await completeWithProviderRetry(
+			async () => {
+				attempts++;
+				return { ...providerError(), api: "sail-responses", provider: "sail" };
+			},
+			{ policy: { enabled: true, maxRetries: 1, baseDelayMs: 0, maxRetryDelayMs: 0 } },
+		);
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+	});
+
 	it("returns an aborted result instead of the provider error when cancelled during backoff", async () => {
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 10);

@@ -176,6 +176,7 @@ export class ReplKernelManager {
 		| "snapshot"
 		| "bootstrapCode"
 		| "stderrLogPath"
+		| "processLauncher"
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
@@ -222,6 +223,7 @@ export class ReplKernelManager {
 	private pendingRestore = false;
 	private rebootstrapPromise?: Promise<boolean>;
 	private teardownInFlight = 0;
+	private processCleanup?: Promise<void>;
 
 	constructor(options: KernelManagerOptions) {
 		this.options = {
@@ -234,6 +236,7 @@ export class ReplKernelManager {
 			snapshot: options.snapshot,
 			bootstrapCode: options.bootstrapCode,
 			stderrLogPath: options.stderrLogPath,
+			processLauncher: options.processLauncher,
 		};
 	}
 
@@ -309,6 +312,7 @@ export class ReplKernelManager {
 	}
 
 	private async doStart(startOptions: KernelStartOptions): Promise<void> {
+		if (this.processCleanup) await this.processCleanup;
 		if (this.state !== "idle") return;
 		const generation = ++this.startGeneration;
 		this.state = "starting";
@@ -319,12 +323,13 @@ export class ReplKernelManager {
 
 		let python: string;
 		try {
-			python =
-				this.options.python ??
-				(await ensureKernelPython({
-					pythonSkills: this.options.pythonSkills,
-					onProgress: startOptions.onBootstrapProgress,
-				}));
+			python = this.options.processLauncher
+				? ""
+				: (this.options.python ??
+					(await ensureKernelPython({
+						pythonSkills: this.options.pythonSkills,
+						onProgress: startOptions.onBootstrapProgress,
+					})));
 			if (this.startStale(generation)) throw new Error("Kernel start superseded");
 			this.options.python = python;
 		} catch (error) {
@@ -338,20 +343,22 @@ export class ReplKernelManager {
 			throw new Error("Kernel was disposed during startup");
 		}
 
-		const child = spawnHidden(python, ["-m", "rlm.repl"], {
-			cwd: this.options.cwd,
-			// bash.py journals its process groups under this pid so the host can
-			// reap them if the runtime dies without running its shutdown hook.
-			env: {
-				...process.env,
-				...this.options.env,
-				...(process.platform === "win32" ? { PYTHONUTF8: "1" } : {}),
-				PRIME_AGENT_KERNEL_OWNER_PID: String(process.pid),
-			},
-			stdio: ["pipe", "pipe", "pipe"],
-		});
+		const child =
+			this.options.processLauncher?.spawn() ??
+			spawnHidden(python, ["-m", "rlm.repl"], {
+				cwd: this.options.cwd,
+				// bash.py journals its process groups under this pid so the host can
+				// reap them if the runtime dies without running its shutdown hook.
+				env: {
+					...process.env,
+					...this.options.env,
+					...(process.platform === "win32" ? { PYTHONUTF8: "1" } : {}),
+					PRIME_AGENT_KERNEL_OWNER_PID: String(process.pid),
+				},
+				stdio: ["pipe", "pipe", "pipe"],
+			});
 		this.child = child;
-		if (child.pid !== undefined) recordOrphanProcessState(child.pid, true);
+		if (!this.options.processLauncher && child.pid !== undefined) recordOrphanProcessState(child.pid, true);
 		this.readyDeferred = createDeferred<number>();
 		this.startupProtocolError = undefined;
 		this.wireChild(child);
@@ -371,7 +378,7 @@ export class ReplKernelManager {
 			}
 		} catch (e) {
 			if (this.startStale(generation)) throw e; // never tear down a newer start's kernel
-			const canRetryStartup = (this.state as string) !== "shutdown";
+			const canRetryStartup = !this.options.processLauncher && (this.state as string) !== "shutdown";
 			// Only the call that performed the cleanup may resurrect to idle; a
 			// concurrent kill()/teardown owns the state otherwise.
 			if ((await this.shutdown()) && canRetryStartup) this.state = "idle";
@@ -518,6 +525,12 @@ export class ReplKernelManager {
 		if (this.state === "starting") this.startupProtocolError = error;
 		this.readyDeferred?.reject(error);
 		this.rejectActiveExecution(error);
+		if (this.options.processLauncher) {
+			this.state = "shutdown";
+			liveKernels.delete(this);
+			this.cleanupResources();
+			return;
+		}
 		if (this.teardownInFlight > 0 || this.state !== "running") return;
 
 		if (this.protocolRepairOwner) {
@@ -1337,6 +1350,13 @@ export class ReplKernelManager {
 		this.child = undefined;
 		this.readyDeferred = undefined;
 		if (child) {
+			if (this.options.processLauncher) {
+				const cleanup = this.options.processLauncher.stop(child).finally(() => child.kill(killSignal));
+				this.processCleanup = cleanup;
+				void cleanup.catch((error: unknown) =>
+					this.appendKernelDiagnostic(`remote cleanup failed: ${errorMessage(error)}`),
+				);
+			}
 			child.stdin?.destroy();
 			child.stdout?.destroy();
 			// An exited child keeps its stderr: the post-exit drain owns it, and
@@ -1349,15 +1369,15 @@ export class ReplKernelManager {
 			const pid = child.pid;
 			let signaled = false;
 			try {
-				signaled = child.kill(killSignal);
+				if (!this.options.processLauncher) signaled = child.kill(killSignal);
 			} catch {
 				// The kernel has already exited.
 			}
 			// Inactive only when the signal proved the pid still named our un-reaped child.
-			if (pid !== undefined && signaled) recordOrphanProcessState(pid, false);
+			if (!this.options.processLauncher && pid !== undefined && signaled) recordOrphanProcessState(pid, false);
 			// A killed/crashed kernel cannot run its own shutdown hook, so the host
 			// reaps the bash() process groups it journaled under this kernel pid.
-			if (pid !== undefined) reapKernelOrphanProcesses(pid);
+			if (!this.options.processLauncher && pid !== undefined) reapKernelOrphanProcesses(pid);
 		}
 		this.startPromise = undefined;
 	}
@@ -1394,6 +1414,7 @@ export class ReplKernelManager {
 		const inFlightShutdown = this.gracefulShutdownPromise;
 		if (inFlightShutdown) {
 			await inFlightShutdown;
+			if (this.processCleanup) await this.processCleanup;
 			return false;
 		}
 
@@ -1402,7 +1423,9 @@ export class ReplKernelManager {
 		const operation = this.performShutdown(opts);
 		this.gracefulShutdownPromise = operation;
 		try {
-			return await operation;
+			const result = await operation;
+			if (this.processCleanup) await this.processCleanup;
+			return result;
 		} finally {
 			this.teardownInFlight--;
 			if (this.gracefulShutdownPromise === operation) this.gracefulShutdownPromise = undefined;
@@ -1511,6 +1534,7 @@ export class ReplKernelManager {
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
+		if (this.processCleanup) await this.processCleanup;
 	}
 
 	/**

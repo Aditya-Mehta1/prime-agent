@@ -87,6 +87,13 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
+import type { DispatchBinding } from "../../core/dispatch/types.js";
+import {
+	loadDispatchBinding,
+	prepareDispatchWorkspace,
+	sleepDispatchWorkspace,
+	terminateDispatchWorkspace,
+} from "../../core/dispatch/workspace.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
@@ -549,6 +556,7 @@ export class AgentDaemon {
 			promise: Promise<void>;
 			reason: DaemonSessionClosedReason;
 			descendants: Set<ActiveSessionState>;
+			passiveDispatchBindings: DispatchBinding[];
 			reasonUpgrade?: Promise<void>;
 		}
 	>();
@@ -2658,6 +2666,7 @@ export class AgentDaemon {
 
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
+			supportsDispatch: true,
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
 			createRlmRootSession: async (options) => this.createRlmRootSession(parentState, options),
 			completeRlmSubagentRuntime: (childId, session) => {
@@ -2768,6 +2777,13 @@ export class AgentDaemon {
 						: undefined;
 				const childSessionFile =
 					persisted?.sessionFile ?? state?.runtime.session.sessionFile ?? legacyFallback?.sessionFile;
+				for (const binding of await this.passiveDispatchBindingsFor(childSessionFile)) {
+					await terminateDispatchWorkspace(binding);
+				}
+				if (!state && childSessionFile) {
+					const binding = loadDispatchBinding(dirname(childSessionFile));
+					if (binding) await terminateDispatchWorkspace(binding);
+				}
 				// Persist the deletion boundary before tearing down the runtime.
 				await this.recordRlmSubagentDeletion(parentState, childId);
 				const staleSession = state && session && state.runtime.session !== session ? session : undefined;
@@ -2800,8 +2816,8 @@ export class AgentDaemon {
 					}
 				}
 			},
-			disposeRlmSubagentRuntimes: async () => {
-				const cascadeError = await this.closeChildSessions(parentState, "replaced");
+			disposeRlmSubagentRuntimes: async (reason = "replaced") => {
+				const cascadeError = await this.closeChildSessions(parentState, reason);
 				if (cascadeError) {
 					throw cascadeError;
 				}
@@ -2913,9 +2929,34 @@ export class AgentDaemon {
 			throw new Error(formatAgentSessionNameUnavailable(options.sessionName, options.rlmDepth));
 		}
 		this.pendingSessionNames.add(reservationKey);
+		let dispatchBinding: DispatchBinding | undefined;
 		try {
 			await this.assertFamilySessionNameAvailable(nameReservation, parentState, true);
-			return await this.admitRlmSubagentRuntime(parentState, options);
+			options.preparationSignal?.throwIfAborted();
+			if (options.dispatch) {
+				dispatchBinding = await prepareDispatchWorkspace({
+					sourceCwd: options.dispatch.sourceBinding?.guestCwd ?? options.parentSession.sessionManager.getCwd(),
+					sessionDir: options.sessionDir,
+					inputs: options.dispatch.inputs,
+					sourceBinding: options.dispatch.sourceBinding,
+					model: { provider: options.model.provider, id: options.model.id },
+					signal: options.preparationSignal,
+				});
+			}
+			options.preparationSignal?.throwIfAborted();
+			return await this.admitRlmSubagentRuntime(parentState, { ...options, dispatchBinding });
+		} catch (error) {
+			if (dispatchBinding) {
+				try {
+					await terminateDispatchWorkspace(dispatchBinding);
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[error, cleanupError],
+						`Dispatch startup failed; cleanup failed for Sailbox ${dispatchBinding.boxId}`,
+					);
+				}
+			}
+			throw error;
 		} finally {
 			this.pendingSessionNames.delete(reservationKey);
 		}
@@ -2940,6 +2981,7 @@ export class AgentDaemon {
 				sessionStartEvent: { type: "session_start", reason: "startup" },
 				sessionConfig: parentState.runtime.runtimeConfig,
 				sessionOptions: {
+					dispatchBinding: options.dispatchBinding,
 					model: options.model,
 					thinkingLevel: options.thinkingLevel,
 					serviceTier: options.serviceTier,
@@ -3149,6 +3191,9 @@ export class AgentDaemon {
 			}
 			try {
 				await this.closeSession(state, "shutdown", true, false);
+				if (state.runtime.session.dispatchBinding) {
+					await sleepDispatchWorkspace(state.runtime.session.dispatchBinding);
+				}
 			} catch (error) {
 				if (
 					this.sessions.get(state.activeSessionId) === state &&
@@ -3344,6 +3389,7 @@ export class AgentDaemon {
 		let sessionLease: SessionLease | undefined;
 		try {
 			sessionLease = acquireSessionLease(entry.sessionFile, parentState.runtime.services.agentDir);
+			const dispatchBinding = loadDispatchBinding(entry.sessionDir);
 			const sessionManager = await SessionManager.openAsync(entry.sessionFile, entry.sessionDir);
 			const modelRegistry = parentState.runtime.services.modelRegistry;
 			let rehydratedModel: Model<Api> | undefined;
@@ -3352,6 +3398,12 @@ export class AgentDaemon {
 				if (resolved && (await modelRegistry.canUseModel(resolved))) {
 					rehydratedModel = resolved;
 				}
+			}
+			if (
+				dispatchBinding &&
+				(!rehydratedModel || rehydratedModel.provider !== "sail" || rehydratedModel.api !== "sail-responses")
+			) {
+				throw new Error(`Sail model unavailable for dispatched child ${entry.childId}`);
 			}
 			runtime = await withClientEnv(hydrationEnv, () =>
 				createAgentSessionRuntime(this.options.createRuntime, {
@@ -3362,6 +3414,7 @@ export class AgentDaemon {
 					sessionConfig: parentState.runtime.runtimeConfig,
 					sessionLease,
 					sessionOptions: {
+						dispatchBinding,
 						...(rehydratedModel ? { model: rehydratedModel } : {}),
 						agentMessageController: this.createAgentMessageController(() => stateRef),
 						agentObserveController: this.createAgentObserveController(() => stateRef),
@@ -6874,10 +6927,16 @@ export class AgentDaemon {
 				closeError = error;
 				closeFailed = true;
 			}
-			const reasonUpgrade = (existingClose.reasonUpgrade ?? Promise.resolve()).then(() => {
+			const reasonUpgrade = (existingClose.reasonUpgrade ?? Promise.resolve()).then(async () => {
 				if (!this.isStrongerCloseReason(requestedReason, existingClose.reason)) return;
 				try {
-					this.applyReasonUpgrade(state, existingClose.descendants, existingClose.reason, requestedReason);
+					await this.applyReasonUpgrade(
+						state,
+						existingClose.descendants,
+						existingClose.reason,
+						requestedReason,
+						existingClose.passiveDispatchBindings,
+					);
 				} finally {
 					existingClose.reason = requestedReason;
 				}
@@ -6893,10 +6952,12 @@ export class AgentDaemon {
 			return;
 		}
 		const descendants = new Set<ActiveSessionState>();
-		const closePromise = Promise.resolve().then(() =>
-			this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants, disposal),
-		);
-		const close = { promise: closePromise, reason, descendants };
+		const passiveDispatchBindings: DispatchBinding[] = [];
+		const closePromise = Promise.resolve().then(async () => {
+			passiveDispatchBindings.push(...(await this.passiveDispatchBindingsFor(state.runtime.session.sessionFile)));
+			await this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants, disposal);
+		});
+		const close = { promise: closePromise, reason, descendants, passiveDispatchBindings };
 		this.closingSessions.set(state.activeSessionId, close);
 		try {
 			await closePromise;
@@ -6919,15 +6980,34 @@ export class AgentDaemon {
 		return this.closeReasonStrength(candidate) > this.closeReasonStrength(current);
 	}
 
-	private applyReasonUpgrade(
+	private async applyReasonUpgrade(
 		state: ActiveSessionState,
 		descendants: ReadonlySet<ActiveSessionState>,
 		from: DaemonSessionClosedReason,
 		to: DaemonSessionClosedReason,
-	): void {
+		passiveBindings: readonly DispatchBinding[],
+	): Promise<void> {
 		let persistError: unknown;
 		let persistenceFailed = false;
+		if (to === "killed" || to === "replaced") {
+			for (const binding of passiveBindings) {
+				try {
+					await terminateDispatchWorkspace(binding);
+				} catch (error) {
+					persistError ??= error;
+					persistenceFailed = true;
+				}
+			}
+		}
 		for (const target of [state, ...descendants]) {
+			try {
+				if ((to === "killed" || to === "replaced") && target.runtime.session.dispatchBinding) {
+					await terminateDispatchWorkspace(target.runtime.session.dispatchBinding);
+				}
+			} catch (error) {
+				persistError ??= error;
+				persistenceFailed = true;
+			}
 			try {
 				if (to === "killed") this.cancelScheduledJobsForSession(target);
 			} catch (error) {
@@ -7016,7 +7096,7 @@ export class AgentDaemon {
 		state.unsubscribe?.();
 		let disposeError: unknown;
 		try {
-			await state.runtime.dispose(disposal);
+			await state.runtime.dispose({ ...disposal, reason });
 		} catch (error) {
 			disposeError = error;
 		}
@@ -7053,6 +7133,25 @@ export class AgentDaemon {
 		}
 	}
 
+	private async passiveDispatchBindingsFor(sessionFile: string | undefined): Promise<DispatchBinding[]> {
+		if (!sessionFile) return [];
+		const parentPath = canonicalSessionPath(sessionFile);
+		const bindings: DispatchBinding[] = [];
+		for (const passive of await this.listPassiveRlmSubagents()) {
+			if (
+				!passive.chain.some(
+					(entry) =>
+						canonicalSessionPath(entry.sessionFile) === parentPath ||
+						(entry.parentSessionFile && canonicalSessionPath(entry.parentSessionFile) === parentPath),
+				)
+			)
+				continue;
+			const binding = loadDispatchBinding(passive.entry.sessionDir);
+			if (binding) bindings.push(binding);
+		}
+		return bindings;
+	}
+
 	private async closeChildSessions(
 		parentState: ActiveSessionState,
 		reason: DaemonSessionClosedReason,
@@ -7061,6 +7160,15 @@ export class AgentDaemon {
 		disposal?: AgentSessionRuntimeDisposeOptions,
 	): Promise<unknown> {
 		let cascadeError: unknown;
+		if (reason === "killed" || reason === "replaced") {
+			for (const binding of await this.passiveDispatchBindingsFor(parentState.runtime.session.sessionFile)) {
+				try {
+					await terminateDispatchWorkspace(binding);
+				} catch (error) {
+					cascadeError ??= error;
+				}
+			}
+		}
 		for (const childState of getChildActiveSessionStates(this.sessions, parentState)) {
 			descendants.add(childState);
 			try {

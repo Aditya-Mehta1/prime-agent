@@ -14,6 +14,7 @@ import type { AgentObserveController } from "../../src/core/agent-observe.js";
 import { AgentSession, type AgentSessionEvent, type AutoRefineReviewer } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { AgentAutonomousConfig } from "../../src/core/autonomous.js";
+import type { DispatchBinding } from "../../src/core/dispatch/types.js";
 import type { ExtensionRunner } from "../../src/core/extensions/index.js";
 import { convertToLlm, HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
@@ -67,6 +68,7 @@ export function getAssistantTexts(harness: Harness): string[] {
 }
 
 export interface HarnessOptions {
+	dispatchBinding?: DispatchBinding;
 	api?: string;
 	provider?: string;
 	models?: FauxModelDefinition[];
@@ -203,6 +205,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
 	const session = new AgentSession({
+		dispatchBinding: options.dispatchBinding,
 		agent,
 		sessionManager,
 		settingsManager,

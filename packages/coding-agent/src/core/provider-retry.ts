@@ -116,7 +116,13 @@ export async function completeWithProviderRetry(
 			// A cancel that raced the failure is an abort, not a provider failure.
 			return { ...message, stopReason: "aborted" };
 		}
-		if (retriesPerformed >= maxRetries || isAgentLifecycleFailure(message) || isFauxProviderQueueExhausted(message)) {
+		// Flex submission/poll failures must not submit a second background request.
+		if (
+			message.api === "sail-responses" ||
+			retriesPerformed >= maxRetries ||
+			isAgentLifecycleFailure(message) ||
+			isFauxProviderQueueExhausted(message)
+		) {
 			return message;
 		}
 		const kind = providerStreamFailureKind(message);

@@ -9,6 +9,7 @@ export interface RlmPromptOptions {
 	depth?: number;
 	parentAgent?: string;
 	activeTools?: string[];
+	remoteExecution?: boolean;
 }
 
 const LONG_RUNNING_WORK_PROMPT = [
@@ -163,6 +164,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"",
 			"An `rlm` object is already in your global namespace. `await rlm.spawn('sub-task', name='api-reviewer')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.",
 			"`name` is required: choose a stable child name that is unique among siblings.",
+			"Use `await rlm.dispatch('task', name='worker', model='sail/model-id', inputs={'notes': 'path'})` to start a child in its own Sailbox with a copy of the current workspace. Use a Sail Flex model. `spawn` inherits your execution location.",
 			"A child inherits your model. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`. Children also inherit your thinking level; the `thinking` option overrides it with any level the resolved child model supports, and an unsupported level fails spawn.",
 		);
 		parts.push(
@@ -189,7 +191,19 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	}
 
 	if (hasIpython) {
-		parts.push("", REPL_CONTROL_PROMPT);
+		parts.push(
+			"",
+			options.remoteExecution
+				? REPL_CONTROL_PROMPT.split("\n")
+						.filter((line) => !line.startsWith("Continual harness state is available"))
+						.join("\n")
+				: REPL_CONTROL_PROMPT,
+		);
+		if (options.remoteExecution) {
+			parts.push(
+				"Your Python and files run in a Sailbox. Send results through agent_message; use Git for code delivery. The box remains available while idle and is removed when the child is killed.",
+			);
+		}
 		if (installedSkills.includes("refine")) {
 			parts.push(
 				"",

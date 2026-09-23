@@ -732,6 +732,7 @@ export function resolveRuntimeSessionOptions(
 		rlmDepth: runtimeSessionOptions?.rlmDepth,
 		rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
+		dispatchBinding: runtimeSessionOptions?.dispatchBinding,
 		rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
 		rlmParentAgent: runtimeSessionOptions?.rlmParentAgent,
 		semanticParentSessionId: runtimeSessionOptions?.semanticParentSessionId,
@@ -810,6 +811,7 @@ async function prepareRuntimeServices(options: {
 	});
 	const services = await createAgentSessionServices({
 		cwd: options.cwd,
+		dispatchBinding: options.sessionOptionsOverride?.dispatchBinding,
 		agentDir: effectiveAgentDir,
 		authStorage,
 		extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),

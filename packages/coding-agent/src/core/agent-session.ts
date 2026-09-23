@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import {
 	Agent,
 	type AgentContext,
@@ -34,6 +34,7 @@ import {
 	resetApiProviders,
 	supportsFastMode,
 } from "@earendil-works/pi-ai";
+import { getBundledSkillsDir } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
@@ -124,6 +125,8 @@ import {
 import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
 import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { dispatchKernelOptions } from "./dispatch/kernel.js";
+import type { DispatchBinding } from "./dispatch/types.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
@@ -269,10 +272,12 @@ import {
 	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
 	normalizeRequestedRlmSubagentThinkingLevel,
+	normalizeRlmDispatchInputs,
 	type RlmCollectResult,
 	type RlmCollectResultEntry,
 	type RlmCreateSessionResult,
 	type RlmDeleteSubagentResult,
+	type RlmDispatchOptions,
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
 	type RlmProgressNoteResult,
@@ -487,6 +492,7 @@ export class CompactionSkippedError extends Error {}
 export class RefineSkippedError extends Error {}
 
 export interface AgentSessionConfig {
+	dispatchBinding?: DispatchBinding;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
@@ -1534,6 +1540,7 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
+	readonly dispatchBinding?: DispatchBinding;
 	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
@@ -1623,7 +1630,11 @@ export class AgentSession {
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
-		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
+		this._allowedToolNames = config.dispatchBinding
+			? new Set(["ipython"])
+			: config.allowedToolNames
+				? new Set(config.allowedToolNames)
+				: undefined;
 		this._includeGoals = config.includeGoals ?? true;
 		this._includeCompactSkill = config.includeCompactSkill ?? this.settingsManager.getCompactionAgentCallable();
 		this._rlmHeartbeatController = config.rlmHeartbeatController;
@@ -1647,6 +1658,7 @@ export class AgentSession {
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
 		this._rlmSessionDir = config.rlmSessionDir;
+		this.dispatchBinding = config.dispatchBinding;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
 		this._semanticEdges = new SemanticEdgeRecorder({
@@ -4238,7 +4250,11 @@ export class AgentSession {
 
 		const lastAssistant = this._findLastAssistantInMessages(event.messages);
 		const concreteAuthFailure = lastAssistant ? this._isConcreteProviderAuthFailure(lastAssistant) : false;
-		if (!lastAssistant || (!this._isRetryableError(lastAssistant) && !concreteAuthFailure)) {
+		if (
+			!lastAssistant ||
+			lastAssistant.api === "sail-responses" ||
+			(!this._isRetryableError(lastAssistant) && !concreteAuthFailure)
+		) {
 			return;
 		}
 		if (concreteAuthFailure) {
@@ -5115,12 +5131,30 @@ export class AgentSession {
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
 		this._baseSystemPromptOptions = {
-			cwd: this._cwd,
-			skills: loadedSkills,
-			contextFiles: loadedContextFiles,
+			cwd: this.dispatchBinding?.guestCwd ?? this._cwd,
+			remoteExecution: !!this.dispatchBinding,
+			skills: this.dispatchBinding
+				? loadedSkills.map((skill) => ({
+						...skill,
+						filePath: this._dispatchGuestResourcePath(skill.filePath)!,
+					}))
+				: loadedSkills,
+			contextFiles: this.dispatchBinding
+				? loadedContextFiles.map((file) => ({
+						...file,
+						path: this._dispatchGuestResourcePath(file.path) ?? basename(file.path),
+					}))
+				: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
-			appendSystemPrompt,
-			messagesPath: this.sessionManager.getSessionFile(),
+			appendSystemPrompt: this.dispatchBinding
+				? [
+						appendSystemPrompt,
+						`Copied dispatch inputs (name to guest path): ${JSON.stringify(this.dispatchBinding.inputs)}`,
+					]
+						.filter(Boolean)
+						.join("\n\n")
+				: appendSystemPrompt,
+			messagesPath: this.dispatchBinding ? "host-managed; use agent_observe" : this.sessionManager.getSessionFile(),
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
@@ -8005,6 +8039,9 @@ export class AgentSession {
 	}
 
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
+		if (this.dispatchBinding && (model.provider !== "sail" || model.api !== "sail-responses")) {
+			throw new Error("Dispatched sessions require a Sail Flex model");
+		}
 		// Explicit selection recovers from a stale-auth lockout, but only a fully
 		// validated switch commits the clear (single owner): failed selections never unlock.
 		const staleOnly =
@@ -8077,7 +8114,9 @@ export class AgentSession {
 		direction: "forward" | "backward",
 		options: ModelSelectOptions,
 	): Promise<ModelCycleResult | undefined> {
-		const availableModels = await this._modelRegistry.refreshAvailableModels();
+		const availableModels = (await this._modelRegistry.refreshAvailableModels()).filter(
+			(model) => !this.dispatchBinding || (model.provider === "sail" && model.api === "sail-responses"),
+		);
 		const scopedModels = this._scopedModels.filter((scoped) =>
 			availableModels.some((model) => modelsAreEqual(model, scoped.model)),
 		);
@@ -8119,7 +8158,9 @@ export class AgentSession {
 		direction: "forward" | "backward",
 		options: ModelSelectOptions,
 	): Promise<ModelCycleResult | undefined> {
-		const availableModels = await this._modelRegistry.refreshAvailableModels();
+		const availableModels = (await this._modelRegistry.refreshAvailableModels()).filter(
+			(model) => !this.dispatchBinding || (model.provider === "sail" && model.api === "sail-responses"),
+		);
 		if (availableModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
@@ -10253,8 +10294,11 @@ export class AgentSession {
 			...this._customTools.map(sdkToolEntry),
 			...this._acpMcpTools.map(sdkToolEntry),
 		];
-		const isAllowedTool = (name: string): boolean => !allowedToolNames || allowedToolNames.has(name);
-		const allowedCustomTools = allCustomTools.filter((tool) => isAllowedTool(tool.definition.name));
+		const isAllowedTool = (name: string): boolean =>
+			(!this.dispatchBinding || name === "ipython") && (!allowedToolNames || allowedToolNames.has(name));
+		const allowedCustomTools = this.dispatchBinding
+			? []
+			: allCustomTools.filter((tool) => isAllowedTool(tool.definition.name));
 		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
 			Array.from(this._baseToolDefinitions.entries())
 				.filter(([name]) => isAllowedTool(name))
@@ -10370,6 +10414,7 @@ export class AgentSession {
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
+				...(this.dispatchBinding ? dispatchKernelOptions(this.dispatchBinding) : {}),
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
@@ -10464,8 +10509,24 @@ export class AgentSession {
 	 * Skills exposed to the model (system prompt + kernel). The bundled goal
 	 * and compact skills are withheld when disabled for this session.
 	 */
+	private _dispatchGuestResourcePath(path: string): string | undefined {
+		const binding = this.dispatchBinding;
+		if (!binding) return path;
+		const bundledRelative = relative(getBundledSkillsDir(), path);
+		if (bundledRelative !== ".." && !bundledRelative.startsWith(`..${sep}`)) {
+			return join(binding.guestSkillsDir, bundledRelative);
+		}
+		const guestPath = resolve(binding.guestCwd, relative(binding.hostResourceDir, path));
+		return guestPath === binding.guestRepoDir || guestPath.startsWith(`${binding.guestRepoDir}/`)
+			? guestPath
+			: undefined;
+	}
+
 	private _modelVisibleSkills(): Skill[] {
 		let skills = this._resourceLoader.getSkills().skills;
+		if (this.dispatchBinding) {
+			skills = skills.filter((skill) => this._dispatchGuestResourcePath(skill.filePath) !== undefined);
+		}
 		if (!this._includeGoals) {
 			skills = skills.filter((skill) => skill.name !== GOAL_SKILL_NAME);
 		}
@@ -10492,6 +10553,12 @@ export class AgentSession {
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
 			})),
+			"rlm.dispatch": createRlmRunHostHandler(
+				async ({ prompt, kwargs, cellSourceCode }) => ({
+					...(await this.dispatchRlmChild(prompt, kwargs, cellSourceCode)),
+				}),
+				"rlm.dispatch",
+			),
 			"rlm.create_session": createRlmCreateSessionHostHandler(async ({ prompt, kwargs }) => ({
 				...(await this.createRlmSession(prompt, kwargs)),
 			})),
@@ -11922,7 +11989,12 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
+		dispatch?: RlmDispatchOptions,
 	): Promise<RlmSpawnHandle> {
+		if (dispatch && !this._subagentRuntimeHost?.supportsDispatch) {
+			throw new Error("rlm.dispatch requires the daemon runtime");
+		}
+		const operation = dispatch ? "rlm.dispatch" : "rlm.spawn";
 		// Snapshot before any await: the spawning request is the turn whose tool call is
 		// executing now. A spawn arriving outside an active run (a detached kernel task
 		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
@@ -11930,11 +12002,11 @@ export class AgentSession {
 		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
-			throw new Error(`Unsupported rlm.spawn kwargs: ${unsupportedKwargs.sort().join(", ")}`);
+			throw new Error(`Unsupported ${operation} kwargs: ${unsupportedKwargs.sort().join(", ")}`);
 		}
-		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
-		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
-		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
+		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName, operation);
+		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel, operation);
+		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking, operation);
 		if (requestedSessionName) assertDirectAgentMessageTarget(requestedSessionName);
 		if (this._rlmDepth >= this._rlmMaxDepth) {
 			throw new Error(
@@ -11963,6 +12035,11 @@ export class AgentSession {
 			modelSelection = await this._resolveRlmSubagentModel(
 				requestedModel ?? this.settingsManager.getSubagentDefaultModel(),
 			);
+			if (dispatch && (modelSelection.model.provider !== "sail" || modelSelection.model.api !== "sail-responses")) {
+				throw new Error(
+					"rlm.dispatch requires a Sail Flex model; set model or the subagent default to a sail model",
+				);
+			}
 			if (requestedThinkingLevel !== undefined) {
 				const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
 				if (!supported.includes(requestedThinkingLevel)) {
@@ -12055,6 +12132,7 @@ export class AgentSession {
 		let runningToolCount = 0;
 		let childSession: AgentSession | undefined;
 		const startedMonotonicAt = performance.now();
+		const preparationController = new AbortController();
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -12069,7 +12147,7 @@ export class AgentSession {
 			lastActivityAt: startedAt,
 			lastActivityMonotonicAt: startedMonotonicAt,
 			settled: false,
-			abort: noopRlmChildAbort,
+			abort: () => preparationController.abort(),
 			publication: createAgentMessageDeferred(),
 			settlement: createAgentMessageDeferred(),
 			deletionReservation: createAgentMessageDeferred(),
@@ -12099,7 +12177,10 @@ export class AgentSession {
 			childSession = child;
 			if (this._activeRlmChildRuns.get(run.id) !== run) return;
 			run.session = child;
-			run.abort = () => void child.abort();
+			run.abort = () => {
+				preparationController.abort();
+				void child.abort();
+			};
 			run.publication.resolve();
 			// Cancellation may have been admitted while runtime construction was
 			// blocked and run.abort was still a no-op.
@@ -12116,6 +12197,8 @@ export class AgentSession {
 				thinkingLevel: requestedThinkingLevel,
 				spawnedByRequestId,
 			}),
+			dispatch,
+			preparationSignal: preparationController.signal,
 			onSessionPublished: publishChildSession,
 		};
 
@@ -12504,11 +12587,28 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
-		return this._startRlmChildRun(prompt, kwargs, spawnCode);
+		return this._startRlmChildRun(
+			prompt,
+			kwargs,
+			spawnCode,
+			this.dispatchBinding ? { inputs: {}, sourceBinding: this.dispatchBinding } : undefined,
+		);
+	}
+
+	async dispatchRlmChild(
+		prompt: string,
+		kwargs: Record<string, unknown> = {},
+		spawnCode?: string,
+	): Promise<RlmSpawnHandle> {
+		const { inputs, ...spawnKwargs } = kwargs;
+		return this._startRlmChildRun(prompt, spawnKwargs, spawnCode, {
+			inputs: normalizeRlmDispatchInputs(inputs),
+			sourceBinding: this.dispatchBinding,
+		});
 	}
 
 	private _isRetryableError(message: AssistantMessage): boolean {
-		if (message.stopReason !== "error" || !message.errorMessage) return false;
+		if (message.stopReason !== "error" || !message.errorMessage || message.api === "sail-responses") return false;
 
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
@@ -12639,7 +12739,8 @@ export class AgentSession {
 		},
 	): Promise<boolean> {
 		const settings = this.settingsManager.getRetrySettings();
-		if (!settings.enabled) {
+		// A failed poll may leave the submitted Flex response running remotely.
+		if (message.api === "sail-responses" || !settings.enabled) {
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAuthFailureSources = [];
 			this._resolveRetry();
@@ -13017,6 +13118,7 @@ export class AgentSession {
 			transient?: boolean;
 		},
 	): Promise<BashResult> {
+		if (this.dispatchBinding) throw new Error("Dispatched sessions must run shell commands through ipython bash()");
 		// Each invocation owns its controller so abortBash reaches every in-flight command.
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
@@ -13063,6 +13165,7 @@ export class AgentSession {
 			runId?: string;
 		},
 	): Promise<void> {
+		if (this.dispatchBinding) throw new Error("Dispatched sessions must run shell commands through ipython bash()");
 		if (this.isBashRunning) {
 			throw new Error("A bash command is already running");
 		}

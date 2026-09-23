@@ -27,6 +27,7 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	/** Whether to include the model-facing rlm recursion guidance. */
 	allowRecursion?: boolean;
+	remoteExecution?: boolean;
 	/** Fixed recursive-agent depth for this session. */
 	rlmDepth?: number;
 	/** Human-readable parent name or id for child communication doctrine. */
@@ -118,6 +119,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		installedSkills: visiblePythonSkillImportNames,
 		activeTools: tools.filter((name) => name === "ipython" || name === "bash" || name === "edit"),
 		allowRecursion,
+		remoteExecution: options.remoteExecution,
 		depth: options.rlmDepth,
 		parentAgent: options.rlmParentAgent,
 	});

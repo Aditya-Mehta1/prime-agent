@@ -1,10 +1,182 @@
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
+import { AgentSessionRuntime, createAgentSessionServices } from "../../src/core/agent-session-runtime.js";
+import type { CreateRlmSubagentRuntimeOptions } from "../../src/core/rlm-runtime.js";
 import { createHarness } from "./harness.js";
 
 const provider = "faux-eng-subagent-default-model";
 
 describe("subagent default model setting", () => {
+	it("prevents host-only native tools from executing in a dispatched session", async () => {
+		let hostWrites = 0;
+		let kernelCalls = 0;
+		const tool = (name: string) => ({
+			name,
+			label: name,
+			description: name,
+			parameters: Type.Object({}),
+			execute: async () => {
+				if (name === "ipython") kernelCalls++;
+				else hostWrites++;
+				return { content: [{ type: "text" as const, text: "host write" }], details: {} };
+			},
+		});
+		const harness = await createHarness({
+			models: [{ id: "parent" }, { id: "other" }],
+			tools: [tool("ipython"), tool("host_write")],
+			extensionFactories: [
+				(pi) => {
+					pi.on("user_bash", () => {
+						hostWrites++;
+					});
+					pi.registerTool({
+						...tool("ipython"),
+						execute: async () => {
+							hostWrites++;
+							return { content: [{ type: "text", text: "host override" }], details: {} };
+						},
+					});
+				},
+			],
+			dispatchBinding: {
+				version: 1,
+				appId: "app",
+				boxId: "box",
+				guestRepoDir: "/repo",
+				guestCwd: "/repo",
+				guestStateDir: "/state",
+				guestPython: "/python",
+				guestSkillsDir: "/skills",
+				hostResourceDir: "/captured",
+				sourceHead: "head",
+				baselineCommit: "baseline",
+				initialBranch: "main",
+				inputs: {},
+				model: { provider: "sail", id: "worker" },
+			},
+		});
+		try {
+			await expect(harness.session.executeBash("printf probe")).rejects.toThrow("ipython bash()");
+			await expect(harness.session.runUserBash("printf probe")).rejects.toThrow("ipython bash()");
+			harness.session.setActiveToolsByName(["host_write", "ipython"]);
+			harness.setResponses([
+				fauxAssistantMessage([fauxToolCall("host_write", {}), fauxToolCall("ipython", {})], {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage("done"),
+			]);
+			await harness.session.prompt("work");
+			expect(harness.session.getActiveToolNames()).toEqual(["ipython"]);
+			expect(hostWrites).toBe(0);
+			expect(kernelCalls).toBe(1);
+			await expect(harness.session.setModel(harness.models[1]!)).rejects.toThrow("Sail Flex");
+			expect(await harness.session.cycleModel()).toBeUndefined();
+			const services = await createAgentSessionServices({
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+				telemetryDisabled: true,
+			});
+			const runtime = new AgentSessionRuntime(harness.session, services, async () => {
+				throw new Error("unexpected rebuild");
+			});
+			let disposedReason: string | undefined;
+			runtime.setSubagentRuntimeHost({
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected child");
+				},
+				deleteRlmSubagentRuntime: async () => {},
+				disposeRlmSubagentRuntimes: async (reason) => {
+					disposedReason = reason;
+				},
+			});
+			await expect(runtime.newSession()).rejects.toThrow("session replacement is unsupported");
+			await expect(runtime.switchSession("missing.jsonl")).rejects.toThrow("session replacement is unsupported");
+			await expect(runtime.fork("missing")).rejects.toThrow("session replacement is unsupported");
+			await expect(runtime.importFromJsonl("missing.jsonl")).rejects.toThrow("session replacement is unsupported");
+			expect(runtime.session).toBe(harness.session);
+			await runtime.dispose({ reason: "shutdown" });
+			expect(disposedReason).toBe("shutdown");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("admits dispatch before preparation and cancels preparation through the existing child handle", async () => {
+		let started!: (options: CreateRlmSubagentRuntimeOptions) => void;
+		const preparing = new Promise<CreateRlmSubagentRuntimeOptions>((resolve) => {
+			started = resolve;
+		});
+		const harness = await createHarness({
+			api: "sail-responses",
+			provider: "sail",
+			models: [{ id: "worker" }],
+			subagentRuntimeHost: {
+				supportsDispatch: true,
+				deleteRlmSubagentRuntime: async () => {},
+				createRlmSubagentRuntime: async (options) => {
+					started(options);
+					return new Promise((_resolve, reject) => {
+						options.preparationSignal!.addEventListener(
+							"abort",
+							() => reject(new Error("preparation cancelled")),
+							{ once: true },
+						);
+					});
+				},
+			},
+		});
+		try {
+			const handle = await harness.session.dispatchRlmChild("work", {
+				name: "worker",
+				inputs: { notes: "notes.txt" },
+			});
+			const options = await preparing;
+			expect(handle.model).toBe("sail/worker");
+			expect(options.dispatch?.inputs).toEqual({ notes: "notes.txt" });
+			expect(harness.session.getRlmChildRunStatus(handle.rlm_child_id)).toBe("queued");
+			await harness.session.deleteRlmSubagent(handle.rlm_child_id);
+			expect(options.preparationSignal!.aborted).toBe(true);
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("requires the daemon dispatch capability before admitting a child", async () => {
+		const harness = await createHarness();
+		try {
+			await expect(harness.session.dispatchRlmChild("work", { name: "worker" })).rejects.toThrow("daemon runtime");
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("surfaces a Sail inference failure without automatic retry or backup routing", async () => {
+		const harness = await createHarness({
+			api: "sail-responses",
+			provider: "sail",
+			models: [{ id: "worker" }, { id: "backup" }],
+			settings: { providerBackupModel: "sail/backup", retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 } },
+		});
+		try {
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "Sail poll connection lost" }),
+				fauxAssistantMessage("must not run"),
+			]);
+			await harness.session.prompt("work");
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+			expect(harness.session.model?.id).toBe("worker");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("resolves unpinned spawns against subagentDefaultModel", { timeout: 30_000 }, async () => {
 		const harness = await createHarness({
 			provider,

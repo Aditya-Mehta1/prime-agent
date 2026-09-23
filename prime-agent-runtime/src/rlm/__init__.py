@@ -184,6 +184,33 @@ async def spawn(
     return _spawn_handle_from_payload(payload)
 
 
+async def dispatch(
+    prompt: str,
+    *,
+    name: str,
+    model: str | None = None,
+    thinking: str | None = None,
+    inputs: dict[str, str | Path] | None = None,
+) -> RLMSpawnHandle:
+    """Start a child in its own Sailbox; inputs maps names to paths to copy."""
+    if not isinstance(prompt, str):
+        raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    kwargs: dict[str, Any] = {"name": name}
+    if model is not None:
+        kwargs["model"] = model
+    if thinking is not None:
+        kwargs["thinking"] = thinking
+    if inputs is not None:
+        if not isinstance(inputs, dict) or any(
+            not isinstance(key, str) or not isinstance(value, (str, Path))
+            for key, value in inputs.items()
+        ):
+            raise TypeError("inputs must map names to paths")
+        kwargs["inputs"] = {key: str(value) for key, value in inputs.items()}
+    payload = await host_request("rlm.dispatch", {"prompt": prompt, "kwargs": kwargs})
+    return _spawn_handle_from_payload(payload)
+
+
 def _model_from_payload(payload: Any) -> RLMModel:
     if not isinstance(payload, dict):
         raise RuntimeError("rlm.find_models returned an invalid model entry")
@@ -541,6 +568,17 @@ class _RLMNamespace:
     ) -> RLMSpawnHandle:
         return await spawn(prompt, name=name, model=model, thinking=thinking)
 
+    async def dispatch(
+        self,
+        prompt: str,
+        *,
+        name: str,
+        model: str | None = None,
+        thinking: str | None = None,
+        inputs: dict[str, str | Path] | None = None,
+    ) -> RLMSpawnHandle:
+        return await dispatch(prompt, name=name, model=model, thinking=thinking, inputs=inputs)
+
     async def create_session(
         self,
         prompt: str,
@@ -604,6 +642,7 @@ __all__ = [
     "RefinementEvent",
     "bash",
     "delete_subagent",
+    "dispatch",
     "emit",
     "find_models",
     "get_harness_state",

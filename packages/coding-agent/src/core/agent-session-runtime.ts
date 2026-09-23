@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { AgentSession } from "./agent-session.js";
 import type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
 import type {
@@ -8,9 +8,15 @@ import type {
 	AgentSessionServices,
 } from "./agent-session-services.js";
 import { isNoModelsAvailableMessage } from "./auth-guidance.js";
+import { loadDispatchBinding, terminateDispatchWorkspace } from "./dispatch/workspace.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
-import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
+import type {
+	CreateRlmSubagentRuntimeOptions,
+	RlmRuntimeCloseReason,
+	RlmSubagentRuntime,
+	SubagentRuntimeHost,
+} from "./rlm-runtime.js";
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
@@ -63,6 +69,7 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 export interface AgentSessionRuntimeDisposeOptions {
 	/** Set false when the session's artifact dir is deleted right after disposal (default true). */
 	kernelSnapshot?: boolean;
+	reason?: RlmRuntimeCloseReason;
 }
 
 export class AgentSessionRuntime implements SubagentRuntimeHost {
@@ -163,10 +170,22 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		this.beforeSessionInvalidate = beforeSessionInvalidate;
 	}
 
+	private assertLocalReplacement(targetSessionFile?: string): void {
+		if (
+			this.session.dispatchBinding ||
+			(targetSessionFile && loadDispatchBinding(dirname(resolve(targetSessionFile))))
+		) {
+			throw new Error(
+				"Dispatched sessions must resume through their daemon parent; session replacement is unsupported",
+			);
+		}
+	}
+
 	private async emitBeforeSwitch(
 		reason: "new" | "resume",
 		targetSessionFile?: string,
 	): Promise<{ cancelled: boolean }> {
+		this.assertLocalReplacement(targetSessionFile);
 		const runner = this.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_switch")) {
 			return { cancelled: false };
@@ -184,6 +203,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		entryId: string,
 		options: { position: "before" | "at" },
 	): Promise<{ cancelled: boolean }> {
+		this.assertLocalReplacement();
 		const runner = this.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_fork")) {
 			return { cancelled: false };
@@ -276,13 +296,13 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 	}
 
-	private async disposeSubagentRuntimes(): Promise<void> {
+	private async disposeSubagentRuntimes(reason?: RlmRuntimeCloseReason): Promise<void> {
 		const runtimes = [...this.subagentRuntimes.values()];
 		this.subagentRuntimes.clear();
 		let disposeError: unknown;
 		for (const runtime of runtimes) {
 			try {
-				await runtime.dispose();
+				await runtime.dispose({ reason });
 			} catch (error) {
 				disposeError ??= error;
 			}
@@ -292,15 +312,15 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 	}
 
-	private async disposeHostedSubagentRuntimes(): Promise<void> {
+	private async disposeHostedSubagentRuntimes(reason: RlmRuntimeCloseReason = "replaced"): Promise<void> {
 		let disposeError: unknown;
 		try {
-			await this.subagentRuntimeHost?.disposeRlmSubagentRuntimes?.();
+			await this.subagentRuntimeHost?.disposeRlmSubagentRuntimes?.(reason);
 		} catch (error) {
 			disposeError ??= error;
 		}
 		try {
-			await this.disposeSubagentRuntimes();
+			await this.disposeSubagentRuntimes(reason);
 		} catch (error) {
 			disposeError ??= error;
 		}
@@ -314,6 +334,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
+		if (options.dispatch) throw new Error("rlm.dispatch requires the daemon runtime");
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		if (options.parentSession.sessionFile) {
 			sessionManager.newSession({
@@ -371,7 +392,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			options.onSessionPublished?.(runtime.session);
 		} catch (error) {
 			this.subagentRuntimes.delete(options.id);
-			await runtime.dispose();
+			await runtime.dispose({ reason: "killed" });
 			throw error;
 		}
 		return runtime;
@@ -386,7 +407,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		this.subagentRuntimes.delete(childId);
 		const shouldDisposeStaleSession = runtime.session !== session;
 		try {
-			await runtime.dispose();
+			await runtime.dispose({ reason: "killed" });
 		} finally {
 			if (shouldDisposeStaleSession) {
 				await session.disposeAsync();
@@ -635,6 +656,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
 		const resolvedPath = resolve(inputPath);
+		this.assertLocalReplacement(resolvedPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
 		}
@@ -708,9 +730,16 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			disposeError ??= error;
 		}
 		try {
-			await this.disposeHostedSubagentRuntimes();
+			await this.disposeHostedSubagentRuntimes(options.reason);
 		} catch (error) {
 			disposeError ??= error;
+		}
+		if ((options.reason === "killed" || options.reason === "replaced") && this.session.dispatchBinding) {
+			try {
+				await terminateDispatchWorkspace(this.session.dispatchBinding);
+			} catch (error) {
+				disposeError ??= error;
+			}
 		}
 		try {
 			if (disposeError) {

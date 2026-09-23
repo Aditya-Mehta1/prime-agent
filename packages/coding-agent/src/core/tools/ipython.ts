@@ -1,10 +1,12 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { IMAGE_MIME_TYPES } from "../../utils/mime.js";
 import { resolveKernelBashShell } from "../../utils/shell.js";
+import { createDispatchKernelLauncher, prepareDispatchPythonSkills } from "../dispatch/kernel.js";
+import type { DispatchBinding } from "../dispatch/types.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
@@ -272,6 +274,8 @@ export interface IpythonToolDetails {
 }
 
 export interface IpythonToolOptions {
+	/** Execute the persistent Python kernel inside this Sailbox. */
+	dispatchBinding?: DispatchBinding;
 	/** Python override. Must have prime-agent-runtime installed. */
 	python?: string;
 	env?: Record<string, string>;
@@ -367,20 +371,24 @@ export class IpythonKernelProvisioner {
 		try {
 			const m = await pending;
 			await m.shutdown({ snapshot: this.disposeSnapshot, drainHostRequests: true });
-		} catch {
+		} catch (error) {
+			if (this.options?.dispatchBinding) throw error;
 			// a failed startup already cleaned up after itself
 		}
 	}
 
 	async kill(): Promise<void> {
 		const pending = this.managerPromise;
-		this.managerPromise = undefined;
-		this.startedManager = undefined;
 		if (!pending) return;
 		try {
 			const m = await pending;
 			await m.kill();
-		} catch {
+			this.managerPromise = undefined;
+			this.startedManager = undefined;
+		} catch (error) {
+			if (this.options?.dispatchBinding) throw error;
+			this.managerPromise = undefined;
+			this.startedManager = undefined;
 			// a failed startup already cleaned up after itself
 		}
 	}
@@ -391,6 +399,10 @@ export class IpythonKernelProvisioner {
 		}
 		// Only a terminally dead kernel drops the memo; a repairing manager (idle/starting) recovers itself.
 		if (this.startedManager?.isDefunct) {
+			if (this.options?.dispatchBinding)
+				return Promise.reject(
+					new Error("Sail kernel transport terminated; explicit cleanup is required before restarting"),
+				);
 			this.managerPromise = undefined;
 			this.startedManager = undefined;
 		}
@@ -420,7 +432,7 @@ export class IpythonKernelProvisioner {
 				() => {
 					// Clear the memo so the next ensure() retries instead of
 					// rethrowing a cached rejection forever.
-					if (this.managerPromise === startup) {
+					if (!this.options?.dispatchBinding && this.managerPromise === startup) {
 						this.managerPromise = undefined;
 					}
 					this.settleStartup();
@@ -454,33 +466,45 @@ export class IpythonKernelProvisioner {
 		try {
 			if (this.options?.readyGate) {
 				await raceWithAbort(
-					this.options.readyGate.catch(() => {}),
+					this.options.dispatchBinding ? this.options.readyGate : this.options.readyGate.catch(() => {}),
 					startupSignal,
 				);
 			}
 			const snapshotDir = this.options?.snapshotDir;
+			const binding = this.options?.dispatchBinding;
+			const snapshotPath = snapshotDir
+				? binding
+					? posix.join(snapshotDir, "kernel-state.dill")
+					: snapshotPathIn(snapshotDir)
+				: undefined;
+			const manifestPath = snapshotDir
+				? binding
+					? posix.join(snapshotDir, "kernel-state.json")
+					: manifestPathIn(snapshotDir)
+				: undefined;
+			if (binding) await prepareDispatchPythonSkills(binding, this.options?.pythonSkills ?? [], startupSignal);
 			// Always inject an absolute trusted shell (undefined only on win32
 			// without bash, where the runtime's teaching error fires instead).
-			const shellPath = resolveKernelBashShell(this.options?.shellPath);
+			const shellPath = binding ? "/bin/bash" : resolveKernelBashShell(this.options?.shellPath);
 			const commandPrefix = this.options?.commandPrefix;
 			const bootstrapCode = buildRlmBootstrapCode(this.options?.pythonSkills);
+			const env = {
+				...this.options?.env,
+				...(shellPath ? { PRIME_AGENT_BASH_SHELL: shellPath } : {}),
+				...(commandPrefix ? { PRIME_AGENT_BASH_COMMAND_PREFIX: commandPrefix } : {}),
+			};
 			const m = new ReplKernelManager({
+				processLauncher: binding ? createDispatchKernelLauncher(binding, env) : undefined,
 				python: this.options?.python,
-				cwd: this.cwd,
+				cwd: binding?.guestCwd ?? this.cwd,
 				// bash() reads these to pick its shell and command prefix.
-				env: {
-					...this.options?.env,
-					...(shellPath ? { PRIME_AGENT_BASH_SHELL: shellPath } : {}),
-					...(commandPrefix ? { PRIME_AGENT_BASH_COMMAND_PREFIX: commandPrefix } : {}),
-				},
+				env,
 				sessionId: this.options?.sessionId,
 				hostHandlers: this.options?.hostHandlers,
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
-				snapshot: snapshotDir
-					? { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) }
-					: undefined,
-				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
+				snapshot: snapshotPath && manifestPath ? { path: snapshotPath, manifestPath } : undefined,
+				stderrLogPath: snapshotDir && !binding ? join(snapshotDir, "kernel-stderr.log") : undefined,
 				bootstrapCode,
 			});
 			let pendingRestore: RestoreResult | undefined;
@@ -493,22 +517,27 @@ export class IpythonKernelProvisioner {
 				// covers only start(). Restore/bootstrap run per-kernel afterwards and are
 				// unbounded execute()s; holding the global permit across them could pin it
 				// forever on a wedged bootstrap and starve every other session's boot.
-				await withKernelBootPermit(() => {
+				const start = () => {
 					// Disposed while queued for the permit — don't spawn a kernel nobody wants.
 					if (startupSignal.aborted) throw new Error("Kernel provisioner disposed before start");
 					return m.start({
 						onBootstrapProgress: (message) => this.emitStartupProgress(message),
 						signal: startupSignal,
 					});
-				}, startupSignal);
+				};
+				if (binding) await start();
+				else await withKernelBootPermit(start, startupSignal);
 				// Revive a prior session's namespace before the bootstrap, so the bootstrap
 				// then overwrites live handles (rlm, skills) on top of anything restored.
-				if (snapshotDir) {
-					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
+				if (snapshotPath) {
+					const snapshotExisted = !binding && existsSync(snapshotPath);
 					this.emitStartupProgress("Restoring Python state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
-					if (snapshotExisted) {
-						pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
+					if (
+						snapshotExisted ||
+						(binding && restore && (restore.restored.length > 0 || restore.failed.length > 0))
+					) {
+						pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPath };
 					}
 				}
 				this.emitStartupProgress("Preparing Python runtime...");
@@ -524,7 +553,9 @@ export class IpythonKernelProvisioner {
 				// surface the failure before the teardown (final snapshot flush included)
 				// finished, or a replacement provisioner gated on this dispose could
 				// race the still-flushing kernel over the same snapshot files.
-				await m.shutdown({ snapshot: this.disposeSnapshot, drainHostRequests: true }).catch(() => undefined);
+				const cleanup = m.shutdown({ snapshot: this.disposeSnapshot, drainHostRequests: true });
+				if (binding) await cleanup;
+				else await cleanup.catch(() => undefined);
 				throw error;
 			}
 			// Only tell the model what was revived once the kernel is actually usable —
