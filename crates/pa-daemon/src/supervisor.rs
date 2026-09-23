@@ -1553,6 +1553,14 @@ impl Supervisor {
         else {
             return Err(anyhow!("launch_worker requires a create command"));
         };
+        // The shutdown gate: a create dispatched while the supervisor is
+        // stopping must never launch a worker the stop pass would miss (a
+        // late create racing a shutdown would otherwise orphan its worker
+        // process). The command surfaces the same failure as any refused
+        // create.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(anyhow!("Supervisor is shutting down"));
+        }
         let config_object = config.as_ref().and_then(Value::as_object);
         let cwd_value = config_object
             .and_then(|config| config.get("cwd"))
@@ -2131,7 +2139,12 @@ impl Supervisor {
                 // roster feed's event traffic makes easy to hit). The stop
                 // itself keeps its ordering: the accept loop still wakes
                 // only after every worker stopped (TS responds before it
-                // begins the shutdown work too).
+                // begins the shutdown work too). The shutdown gate flips
+                // synchronously — before this dispatch answers and before
+                // the spawned work runs — so no create dispatched after
+                // the shutdown can slip past it and launch a worker the
+                // stop pass would miss.
+                self.shutting_down.store(true, Ordering::SeqCst);
                 let supervisor = Arc::clone(self);
                 tokio::spawn(async move {
                     supervisor.begin_shutdown().await;
@@ -4631,5 +4644,43 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shutdown gate: a create dispatched while the supervisor stops
+    /// must fail instead of launching a worker the stop pass would miss
+    /// (a late create racing a shutdown would orphan its worker process).
+    #[tokio::test]
+    async fn a_create_while_shutting_down_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir: dir.path().join("agent"),
+        };
+        let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+        supervisor.shutting_down.store(true, Ordering::SeqCst);
+        let create = DaemonCommand::Create {
+            id: None,
+            session_path: None,
+            continue_recent: None,
+            no_session: None,
+            name: None,
+            config: None,
+            telemetry_disabled: None,
+            runtime_metadata: None,
+            lifecycle: None,
+            env: None,
+            launch_env: None,
+            rest: Default::default(),
+        };
+        let refused = supervisor
+            .launch_worker(&create, None)
+            .await
+            .err()
+            .expect("the shutting-down supervisor accepted a create");
+        assert_eq!(
+            refused.to_string(),
+            "Supervisor is shutting down",
+            "the refusal error: {refused:#}"
+        );
     }
 }

@@ -13,7 +13,7 @@
 
 use std::io::Write;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -38,6 +38,10 @@ const SPILL_PREFIX: &str = "pa-bash";
 pub(crate) struct UserBash {
     /// The user-bash claim (execute_bash only; TS `runUserBash` guard).
     running: AtomicBool,
+    /// Awaited bash runs in flight (TS `_bashAbortControllers.size`:
+    /// `execute_bash_and_wait` runs count toward `isBashRunning` without
+    /// claiming the exclusive user slot).
+    awaited: AtomicUsize,
     /// An abort was requested: the settled result reports cancelled.
     abort_requested: AtomicBool,
     /// The in-flight process (user bash or an awaited run): `abort_bash`
@@ -49,6 +53,7 @@ impl UserBash {
     pub(crate) fn new() -> Self {
         Self {
             running: AtomicBool::new(false),
+            awaited: AtomicUsize::new(0),
             abort_requested: AtomicBool::new(false),
             child: Mutex::new(None),
         }
@@ -73,8 +78,21 @@ impl UserBash {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    /// Whether a user bash or an awaited bash run is in flight (TS
+    /// `isBashRunning`: `_bashAbortControllers.size > 0 ||
+    /// `_userBashRunning`).
     pub(crate) fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.running.load(Ordering::SeqCst) || self.awaited.load(Ordering::SeqCst) > 0
+    }
+
+    /// Count one awaited run (`execute_bash_and_wait`) toward
+    /// [`Self::is_running`]; the awaited path owns no exclusive slot.
+    pub(crate) fn begin_awaited(&self) {
+        self.awaited.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn end_awaited(&self) {
+        self.awaited.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Kill the in-flight process (TS `abortBash` aborts every
@@ -232,6 +250,11 @@ impl Worker {
         };
         let user_bash = Arc::clone(&self.user_bash);
         let command = command.to_string();
+        // The awaited run counts toward the session's `isBashRunning` (TS's
+        // `executeBash` registers an abort controller, so the flag is true
+        // for its whole duration); it owns no exclusive slot, so a streamed
+        // user bash is not blocked by it.
+        user_bash.begin_awaited();
         let end = run_bash(RunBash {
             command: &command,
             cwd: &cwd,
@@ -242,6 +265,7 @@ impl Worker {
             on_chunk: None,
         })
         .await;
+        user_bash.end_awaited();
         if let Some(error) = &end.error_message {
             return response_failure(None, "execute_bash_and_wait", error, None);
         }
@@ -849,6 +873,56 @@ mod tests {
         assert_eq!(
             response.error.as_deref(),
             Some("execute_bash_and_wait requires a command")
+        );
+    }
+
+    /// The awaited run counts toward the session's `isBashRunning` (TS's
+    /// `executeBash` registers an abort controller for the run's
+    /// duration): the flag reads true while it runs and false once it
+    /// settles — without claiming the exclusive user slot.
+    #[tokio::test]
+    async fn an_awaited_bash_run_reports_running_to_the_connection_state() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let worker = created_worker(cwd.path()).await;
+        let runner = std::sync::Arc::clone(&worker);
+        let run = tokio::spawn(async move {
+            runner
+                .dispatch(
+                    "execute_bash_and_wait",
+                    &json!({ "activeSessionId": "bash-session", "command": "sleep 1" }),
+                )
+                .await
+        });
+        let mut saw_running = false;
+        for _ in 0..100 {
+            let state = worker
+                .dispatch(
+                    "get_connection_state",
+                    &json!({ "activeSessionId": "bash-session" }),
+                )
+                .await;
+            if state.data.expect("state data")["isBashRunning"] == json!(true) {
+                saw_running = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_running,
+            "the awaited run never reported isBashRunning to the connection state"
+        );
+        let response = run.await.expect("the awaited run task panicked");
+        assert!(response.success, "failed: {response:?}");
+        let state = worker
+            .dispatch(
+                "get_connection_state",
+                &json!({ "activeSessionId": "bash-session" }),
+            )
+            .await;
+        assert_eq!(
+            state.data.expect("state data")["isBashRunning"],
+            json!(false),
+            "the settled run left the flag on"
         );
     }
 
