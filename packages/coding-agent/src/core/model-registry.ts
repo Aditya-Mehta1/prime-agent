@@ -433,10 +433,7 @@ interface PrivatePrimeAuthorizationCache {
 	refreshedAt: number;
 }
 
-/**
- * Stat identity of a catalog file; equality means a cached parse is still current
- * (sessionScanStates/cron catalog precedent).
- */
+/** Stat identity of the private-authorization cache file; equality means the cached parse is still current. */
 interface CatalogFileIdentity {
 	dev: number;
 	ino: number;
@@ -497,13 +494,8 @@ export class ModelRegistry {
 	private scheduledCatalogRefresh?: Promise<void>;
 	private loadError: string | undefined = undefined;
 	private privatePrimeAuthorizationCacheSnapshot:
-		| { identity: CatalogFileIdentity; cache: PrivatePrimeAuthorizationCache | undefined }
+		| { identity: CatalogFileIdentity; cache: PrivatePrimeAuthorizationCache }
 		| undefined;
-	/**
-	 * models.json identity the current catalog was built from: undefined = absent at both bracket stats
-	 * (or no path), "unstable" = raced write or failed read/parse.
-	 */
-	private modelsJsonIdentity: CatalogFileIdentity | "unstable" | undefined = "unstable";
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
 	private onOAuthProvidersReset?: () => void;
@@ -586,22 +578,6 @@ export class ModelRegistry {
 		this.reapplyRegisteredProviders();
 	}
 
-	private isModelsJsonUnchangedSinceLastLoad(): boolean {
-		if (!this.modelsJsonPath) {
-			// No path means the catalog was built from deterministic inputs only.
-			return true;
-		}
-		const identity = statCatalogFileIdentity(this.modelsJsonPath);
-		if (!identity) {
-			return this.modelsJsonIdentity === undefined;
-		}
-		return (
-			this.modelsJsonIdentity !== undefined &&
-			this.modelsJsonIdentity !== "unstable" &&
-			isSameCatalogFileIdentity(this.modelsJsonIdentity, identity)
-		);
-	}
-
 	private reapplyRegisteredProviders(): void {
 		for (const [providerName, config] of this.registeredProviders.entries()) {
 			this.applyProviderConfig(providerName, config);
@@ -629,28 +605,12 @@ export class ModelRegistry {
 	}
 
 	private loadModels(): void {
-		// Bracket the models.json read with one stat identity so later refreshes can tell whether the inputs changed.
-		const modelsJsonIdentity = this.modelsJsonPath ? statCatalogFileIdentity(this.modelsJsonPath) : undefined;
 		const {
 			models: customModels,
 			overrides,
 			modelOverrides,
 			error,
 		} = this.modelsJsonPath ? this.loadCustomModels(this.modelsJsonPath) : emptyCustomModelsResult();
-		if (!this.modelsJsonPath) {
-			this.modelsJsonIdentity = undefined;
-		} else {
-			const after = statCatalogFileIdentity(this.modelsJsonPath);
-			if (modelsJsonIdentity === undefined && after === undefined) {
-				// Absent across the whole read: the empty custom-model result is deterministic, so absence is a stable identity.
-				this.modelsJsonIdentity = undefined;
-			} else if (!error && modelsJsonIdentity && after && isSameCatalogFileIdentity(modelsJsonIdentity, after)) {
-				this.modelsJsonIdentity = after;
-			} else {
-				// A failed read or parse must not pin its empty custom-model set.
-				this.modelsJsonIdentity = "unstable";
-			}
-		}
 
 		if (error) {
 			this.loadError = error;
@@ -1092,18 +1052,10 @@ export class ModelRegistry {
 		if (cached?.fingerprint === fingerprint) {
 			// Serve the credential-scoped cache so startup and model lists don't
 			// block on the network. Stale entries refresh in the background.
-			// cached.models is reference-stable while its file is unchanged, so an equal reference, same team,
-			// and unchanged models.json means nothing changed.
-			const authorizationUnchanged =
-				this.authorizedPrivatePrimeInferenceModels === cached.models &&
-				this.authorizedPrivatePrimeInferenceTeamId === teamId &&
-				this.authorizedPrivatePrimeInferenceModelIds.size === cached.models.length;
-			if (!authorizationUnchanged || !this.isModelsJsonUnchangedSinceLastLoad()) {
-				this.authorizedPrivatePrimeInferenceModels = cached.models;
-				this.authorizedPrivatePrimeInferenceModelIds = new Set(cached.models.map((model) => model.id));
-				this.authorizedPrivatePrimeInferenceTeamId = teamId;
-				this.reloadModelsAfterCatalogChange();
-			}
+			this.authorizedPrivatePrimeInferenceModels = cached.models;
+			this.authorizedPrivatePrimeInferenceModelIds = new Set(cached.models.map((model) => model.id));
+			this.authorizedPrivatePrimeInferenceTeamId = teamId;
+			this.reloadModelsAfterCatalogChange();
 			const cacheIsFresh = Date.now() - cached.refreshedAt < PRIVATE_PRIME_AUTHORIZATION_CACHE_TTL_MS;
 			if (isOfflineModeEnabled() || cacheIsFresh) return;
 			this.startBackgroundPrivatePrimeAuthorizationRefresh(apiKey, teamHeaders, teamId, fingerprint);
@@ -1222,9 +1174,10 @@ export class ModelRegistry {
 			return snapshot.cache;
 		}
 		const cache = this.parsePrivatePrimeAuthorizationCache(cachePath);
-		// A concurrent writer can replace the file during the read; cache only a parse bracketed by one identity.
+		// A concurrent writer can replace the file during the read, and a failed read (EMFILE, malformed) must not be
+		// pinned: snapshot only a successful parse bracketed by one identity.
 		const after = statCatalogFileIdentity(cachePath);
-		if (identity && after && isSameCatalogFileIdentity(identity, after)) {
+		if (cache && identity && after && isSameCatalogFileIdentity(identity, after)) {
 			this.privatePrimeAuthorizationCacheSnapshot = { identity: after, cache };
 		} else {
 			this.privatePrimeAuthorizationCacheSnapshot = undefined;
