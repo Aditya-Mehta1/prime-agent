@@ -96,6 +96,15 @@ def fail(message: str) -> None:
 # package_release.py, verify_release.py)
 # --------------------------------------------------------------------------
 
+# The runtime's strict model entry schema (CatalogModelSchema:
+# deny_unknown_fields, TS strictObject): one unknown key makes the strict
+# parse drop the WHOLE asset, so the packaging gate rejects it too.
+_MODEL_ENTRY_KEYS = {
+    "id", "name", "api", "provider", "baseUrl", "reasoning", "thinkingLevelMap",
+    "input", "cost", "contextWindow", "maxTokens", "featured", "compat",
+}
+
+
 def _is_finite_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) \
         and math.isfinite(value)
@@ -125,6 +134,10 @@ def validate_bundled_model_catalog(path: Path, allow_small_fixture: bool = False
         entry = f"model catalog entry [{index}]"
         if not isinstance(model, dict):
             fail(f"Invalid bundled {entry}: entries must be objects")
+        unknown = set(model) - _MODEL_ENTRY_KEYS
+        if unknown:
+            fail(f"Invalid bundled {entry}: unknown keys {sorted(unknown)} "
+                 "(the strict runtime schema rejects unknown fields)")
         for key in ("id", "name", "api", "provider"):
             if not isinstance(model.get(key), str) or not model[key]:
                 fail(f"Invalid bundled {entry}: {key} must be a non-empty string")
@@ -335,8 +348,8 @@ def validate_bundled_mcp_catalog(path: Path, allow_small_fixture: bool = False) 
         verification = raw.get("verification")
         if not isinstance(verification, dict) or set(verification) != {"status"} \
                 or verification.get("status") not in _PLUGIN_VERIFICATION_STATUSES:
-            fail(f"Invalid bundled {entry}: verification must be {status} with "
-                 "status metadata-reviewed or unverified")
+            fail(f"Invalid bundled {entry}: verification must be a "
+                 "{status: metadata-reviewed | unverified} object")
         if not isinstance(raw.get("legacyBuiltin"), bool):
             fail(f"Invalid bundled {entry}: legacyBuiltin must be a boolean")
         provenance = raw.get("provenance")
@@ -351,7 +364,8 @@ def validate_bundled_mcp_catalog(path: Path, allow_small_fixture: bool = False) 
         if oauth is not None:
             if not isinstance(oauth, dict) or set(oauth) - {"kind", "scopes"} \
                     or oauth.get("kind") != "oauth":
-                fail(f"Invalid bundled {entry}: oauth must be {kind: \"oauth\"}")
+                fail(f"Invalid bundled {entry}: oauth must carry "
+                     '{kind: "oauth"}')
             if auth["strategy"] != "oauth":
                 fail(f"Invalid bundled {entry}: oauth is only allowed on "
                      "oauth-strategy entries")

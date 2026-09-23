@@ -110,9 +110,10 @@ class DripServer:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
-                # A cap far beyond the 20 MiB limit: only the deadline or the
-                # size cap can end this read loop.
-                self.send_header("content-length", str(100 * 1024 * 1024))
+                # Under the 20 MiB cap so the size pre-check passes and the
+                # read loop actually runs: only the deadline can end it (the
+                # drip never reaches the advertised length in time).
+                self.send_header("content-length", str(4 * 1024 * 1024))
                 self.end_headers()
                 try:
                     while True:
