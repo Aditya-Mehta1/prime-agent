@@ -2713,6 +2713,22 @@ impl SessionUi {
             // hook); the other management subcommands surface through the
             // `mcp` CLI command instead of the TUI.
             "mcp" => self.handle_mcp_command(resolved, view).await?,
+            // `/plugins [search]` (TS `handlePluginsCommand` ->
+            // `showServiceCatalogPicker`): the external-services catalog
+            // picker. This client folds the catalog into the `/mcp` view
+            // (the same resolved `services` cards the daemon serves both
+            // surfaces), so the command opens that view; an argument
+            // prefills its search field like TS's initial search.
+            "plugins" => {
+                self.track_command_used("plugins");
+                self.open_mcp_view("/plugins", view).await?;
+                let search = resolved.args.trim();
+                if !search.is_empty() {
+                    if let Some(mcp) = view.mcp_view.as_mut() {
+                        mcp.paste(search);
+                    }
+                }
+            }
             // TS `handleExportCommand`: an explicit `.jsonl` path exports
             // the current branch; anything else (including no argument)
             // exports HTML.
@@ -4769,7 +4785,7 @@ impl SessionUi {
     ) -> Result<()> {
         self.track_command_used("mcp");
         if resolved.args.trim().is_empty() {
-            return self.open_mcp_view(view).await;
+            return self.open_mcp_view("/mcp", view).await;
         }
         let Some(auth) = self.client_auth.clone() else {
             self.note("/mcp is not available in this client yet", view);
@@ -4784,7 +4800,9 @@ impl SessionUi {
     /// `get_mcp_connections` roster. The request carries the kernel's tool
     /// listing (it opens each connected generic server, bounded), so it
     /// gets the wider deadline.
-    async fn open_mcp_view(&mut self, view: &mut AgentView) -> Result<()> {
+    /// `command` names the entry the user ran (`/mcp` or `/plugins`), so a
+    /// failed roster load reports the command that failed.
+    async fn open_mcp_view(&mut self, command: &str, view: &mut AgentView) -> Result<()> {
         let data = match self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS * 4),
@@ -4798,7 +4816,7 @@ impl SessionUi {
         {
             Ok(data) => data,
             Err(error) => {
-                self.note(&format!("/mcp failed: {error:#}"), view);
+                self.note(&format!("{command} failed: {error:#}"), view);
                 return Ok(());
             }
         };
@@ -5732,10 +5750,20 @@ impl SessionUi {
     /// Fire a background heartbeat-catalog refresh (TS
     /// `refreshHeartbeatCatalog`): the fetch lands through the run loop's
     /// channel into the open view; failures clear nothing — the next
-    /// `heartbeats_changed` event retries.
-    pub(crate) fn spawn_heartbeat_refresh(&self) {
+    /// `heartbeats_changed` event retries. At most one refresh runs in
+    /// flight with one queued trailing refresh (daemon-wide broadcasts can
+    /// burst; stacked concurrent requests would load the supervisor), and
+    /// every response carries the epoch it was issued under so a stale
+    /// one never overwrites a newer catalog.
+    pub(crate) fn spawn_heartbeat_refresh(&mut self) {
+        if self.heartbeat_refresh_in_flight {
+            self.heartbeat_refresh_queued = true;
+            return;
+        }
+        self.heartbeat_refresh_in_flight = true;
         let updates = self.heartbeat_updates.clone();
         let client = self.client.clone();
+        let epoch = self.heartbeat_refresh_epoch;
         tokio::spawn(async move {
             let request = DaemonCommand::HeartbeatsList {
                 id: None,
@@ -5750,12 +5778,14 @@ impl SessionUi {
             match fetched {
                 Ok(Ok(data)) => {
                     let _ = updates.send(HeartbeatsUpdate {
+                        epoch,
                         heartbeats: parse_heartbeats(&data),
                         fetch_error: None,
                     });
                 }
                 Ok(Err(error)) => {
                     let _ = updates.send(HeartbeatsUpdate {
+                        epoch,
                         heartbeats: Vec::new(),
                         fetch_error: Some(format!("{error:#}")),
                     });
@@ -8377,10 +8407,11 @@ mod loader_token_tests {
     /// `speedStats`); it only reads once a positive-span sample exists.
     #[test]
     fn speed_stats_average_rate_sums_tokens_over_spans() {
-        let mut stats = SpeedStats::default();
-        stats.tokens = 300;
-        stats.duration_ms = 1500;
-        stats.samples = 1;
+        let mut stats = SpeedStats {
+            tokens: 300,
+            duration_ms: 1500,
+            samples: 1,
+        };
         assert_eq!(stats.average_rate(), 200.0);
         stats.tokens += 100;
         stats.duration_ms += 500;
