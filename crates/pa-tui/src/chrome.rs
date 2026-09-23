@@ -98,14 +98,20 @@ pub enum ActivityGroup {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActivityDock {
-    /// The session's live descendant subagents (the whole tree).
+    /// The session's live descendant subagents (the whole tree —
+    /// subagents of subagents count).
     pub subagents: usize,
     /// How many of those descendants are actively running.
     pub subagents_running: usize,
+    /// The CURRENT session's heartbeats (nested sessions' jobs do not
+    /// surface here, operator scoping).
     pub heartbeats: usize,
     /// How many of the scoped heartbeats are paused.
     pub heartbeats_paused: usize,
-    pub bash_total: usize,
+    /// Bash processes actively running right now (the current session's
+    /// kernel registry only): finished runs never inflate the indicator
+    /// — they stay as dimmed rows inside the panel.
+    pub bash_running: usize,
     /// The active goal's token progress `(used, budget)`; `None` unless
     /// the goal is actively being pursued (a completed or idle goal
     /// carries no dock segment).
@@ -118,7 +124,7 @@ impl ActivityDock {
     pub fn visible(&self) -> bool {
         self.subagents > 0
             || self.heartbeats > 0
-            || self.bash_total > 0
+            || self.bash_running > 0
             || self.goal_tokens.is_some()
     }
 }
@@ -522,7 +528,9 @@ pub fn render_activity_dock(dock: &ActivityDock, theme: &Theme, width: usize) ->
     let groups = [
         (ActivityGroup::Subagents, subagents),
         (ActivityGroup::Heartbeats, heartbeats),
-        (ActivityGroup::Bash, format!("▸ {} bash", dock.bash_total)),
+        // Only live bash runs count in the dock's indicator (operator
+        // scoping); the panel keeps the dimmed finished rows.
+        (ActivityGroup::Bash, format!("▸ {} bash", dock.bash_running)),
     ];
     let mut line = vec![Span::raw(" ")];
     for (index, (group, text)) in groups.iter().enumerate() {
@@ -572,7 +580,7 @@ mod tests {
             subagents_running: 2,
             heartbeats: 3,
             heartbeats_paused: 1,
-            bash_total: 1,
+            bash_running: 1,
             goal_tokens: Some((18_000, Some(40_000))),
             ..ActivityDock::default()
         };

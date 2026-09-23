@@ -1,11 +1,12 @@
 //! The `/heartbeats` inline management view (TS
-//! `HeartbeatManagerComponent`): every user and agent heartbeat scoped to
-//! this session and its live RLM children, one `›`-marker row per
-//! heartbeat with its status, the selection's labeled detail block, and
-//! a per-heartbeat action pane (pause/resume, stop). Rendered
-//! inline-picker style (the `/model` geometry — a plain-text title line
-//! with the status counts, one bottom hint line) instead of the TS
-//! full-pane overlay.
+//! `HeartbeatManagerComponent`): the current session's heartbeats (the
+//! TS `scopeHeartbeatsToSession` child-session clause is not carried by
+//! the caller — operator scoping: nested sessions' heartbeats do not
+//! surface here), one `›`-marker row per heartbeat with its status, the
+//! selection's labeled detail block, and a per-heartbeat action pane
+//! (pause/resume, stop). Rendered inline-picker style (the `/model`
+//! geometry — a plain-text title line with the status counts, one
+//! bottom hint line) instead of the TS full-pane overlay.
 
 use serde_json::Value;
 

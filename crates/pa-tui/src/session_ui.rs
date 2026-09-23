@@ -948,6 +948,15 @@ impl SessionUi {
         // paused and budget-limited states).
         let goal_tokens = (goal.status == pa_types::goal::GoalStatus::Active)
             .then(|| (goal.tokens_used, goal.token_budget));
+        // The dock's bash indicator counts only runs actively running
+        // right now (operator scoping): finished runs stay as dimmed rows
+        // inside the panel, never in the indicator. The feed itself is the
+        // current session's kernel registry — nested subagents' kernels
+        // are separate and never appear here.
+        let bash_running = crate::activity_panel::parse_bash_activities(&self.bash_activities)
+            .iter()
+            .filter(|activity| activity.running())
+            .count();
         let dock = crate::chrome::ActivityDock {
             subagents: counts.total,
             subagents_running: counts.running,
@@ -957,7 +966,7 @@ impl SessionUi {
                 .iter()
                 .filter(|entry| entry.job.status == "paused")
                 .count(),
-            bash_total: crate::activity_panel::parse_bash_activities(&self.bash_activities).len(),
+            bash_running,
             goal_tokens,
             selected: self.activity_group,
             focused: self.subagents_focused,
@@ -5562,30 +5571,17 @@ impl SessionUi {
         }
     }
 
-    /// Scope a fetched catalog to this session and its roster descendants
-    /// (TS `scopeHeartbeatsToSession` over the RLM child snapshots).
+    /// Scope a fetched catalog to THIS session only (operator scoping:
+    /// nested sessions' heartbeats do not surface in the dock, the
+    /// panel, or the `/heartbeats` view — a sanctioned divergence from
+    /// TS `scopeHeartbeatsToSession`, which also kept the RLM children's
+    /// jobs; the child ids stay empty here).
     fn scope_heartbeats(&self, heartbeats: Vec<HeartbeatEntry>) -> Vec<HeartbeatEntry> {
-        let identity = crate::subagents::SessionIdentity::new(
-            (!self.active_session_id.is_empty()).then(|| self.active_session_id.clone()),
-            (!self.session_id.is_empty()).then(|| self.session_id.clone()),
-            self.session_file.clone(),
-        );
-        let summaries: Vec<&Value> = self.roster.iter().collect();
-        let child_active_session_ids: Vec<String> =
-            crate::subagents::descendant_positions(&summaries, &identity)
-                .into_iter()
-                .filter_map(|position| {
-                    summaries[position]
-                        .get("activeSessionId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect();
         scope_heartbeats(
             heartbeats,
-            identity.active_session_id.as_deref(),
-            identity.session_id.as_deref(),
-            &child_active_session_ids,
+            (!self.active_session_id.is_empty()).then(|| self.active_session_id.as_str()),
+            (!self.session_id.is_empty()).then(|| self.session_id.as_str()),
+            &[],
         )
     }
 
@@ -8098,6 +8094,44 @@ mod activity_dock_counts_tests {
             1
         );
         assert_eq!(catalog.len(), 3);
+    }
+
+    /// Operator scoping: the session wrapper passes no child session ids,
+    /// so a nested session's heartbeat drops while the session's own
+    /// rows stay (TS `scopeHeartbeatsToSession` kept the children's jobs
+    /// — the divergence lives in the caller).
+    #[test]
+    fn dock_heartbeats_scope_to_the_current_session_only() {
+        let own = entry(job("own", "active"));
+        let mut child = job("child", "active");
+        child["activeSessionId"] = json!("child-live");
+        let child = entry(child);
+        let scoped = crate::heartbeats_picker::scope_heartbeats(
+            vec![own, child],
+            Some("live-1"),
+            Some("sess-1"),
+            &[],
+        );
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].job.id, "own");
+    }
+
+    /// Operator scoping: the dock's bash indicator counts only runs
+    /// actively running right now — finished runs stay in the panel as
+    /// dimmed rows, never in the count.
+    #[test]
+    fn dock_bash_counts_only_running_runs() {
+        let activities = crate::activity_panel::parse_bash_activities(&json!({"activities": [
+            {"id":"a","command":"sleep 1","status":"running"},
+            {"id":"b","command":"echo hi","status":"finished","exitCode":0},
+            {"id":"c","command":"sleep 2","status":"running"},
+        ]}));
+        let running = activities
+            .iter()
+            .filter(|activity| activity.running())
+            .count();
+        assert_eq!(running, 2, "finished runs never inflate the indicator");
+        assert_eq!(activities.len(), 3);
     }
 }
 
