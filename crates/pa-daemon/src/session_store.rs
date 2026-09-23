@@ -70,12 +70,13 @@ impl SessionEntry {
         parent_id: Option<String>,
         used: &HashMap<String, ()>,
         fields: Value,
+        timestamp: &str,
     ) -> Self {
         SessionEntry {
             type_: type_.to_string(),
             id: new_entry_id(used),
             parent_id,
-            timestamp: crate::util::now_iso(),
+            timestamp: timestamp.to_string(),
             fields,
         }
     }
@@ -672,7 +673,13 @@ impl SessionFile {
 
     pub fn append_entry(&mut self, type_: &str, fields: Value) -> String {
         let parent_id = self.leaf_id.clone();
-        let mut entry = SessionEntry::new(type_, parent_id, &self.index_map(), fields);
+        let mut entry = SessionEntry::new(
+            type_,
+            parent_id,
+            &self.index_map(),
+            fields,
+            &crate::util::now_iso(),
+        );
         if self.window.is_some() {
             entry.id = uuid::Uuid::new_v4().to_string();
         }
@@ -753,12 +760,32 @@ impl SessionFile {
     /// durability — when it fails the entry stays indexed (a reload of
     /// the file would load it as the leaf) and the error still surfaces.
     pub fn persist_entry(&mut self, entry_type: &str, fields: Value) -> Result<String> {
+        self.persist_entry_at(entry_type, fields, &crate::util::now_iso())
+    }
+
+    /// Append one entry stamped with the given time. The interrupted-
+    /// compaction replay re-stamps the supervisor's declaration, so the
+    /// entry's timestamp is the row's stable identity: a replacement that
+    /// already persisted the disclosure but died before the supervisor
+    /// consumed the record replays the same declaration, and the create
+    /// handler recognizes its own row instead of duplicating it.
+    pub fn persist_entry_at(
+        &mut self,
+        entry_type: &str,
+        fields: Value,
+        timestamp: &str,
+    ) -> Result<String> {
         anyhow::ensure!(
             self.window.is_none() || self.path.exists(),
             "window-backed session file is missing"
         );
-        let mut entry =
-            SessionEntry::new(entry_type, self.leaf_id.clone(), &self.index_map(), fields);
+        let mut entry = SessionEntry::new(
+            entry_type,
+            self.leaf_id.clone(),
+            &self.index_map(),
+            fields,
+            timestamp,
+        );
         // A windowed index lacks the pre-window IDs, so the short minted ID
         // could collide with unloaded history; a UUID cannot (same rule as
         // `append_entry`).
@@ -1199,6 +1226,61 @@ mod tests {
             .map(|entry| entry.id.as_str())
             .collect();
         assert_eq!(chain, [first.as_str(), third.as_str()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The replay's dedup predicate is the disclosure row's fields: the
+    /// create handler recognizes the exact row wherever it came from —
+    /// this replacement's own declaration-stamped persist, an earlier
+    /// crash-replay's identical row, or the dead worker's own abort arm
+    /// (the same fields carrying the worker's persist-time stamp) — and
+    /// appends nothing. A different disclosure (another reason or
+    /// outcome) stays distinct.
+    #[test]
+    fn declaration_stamped_entry_survives_reload_as_the_same_identity() {
+        let dir = temp_dir();
+        let mut session = SessionFile::create("/tmp", None, 0);
+        let file = dir.join(session_file_name(session.session_id()));
+        session.set_path(file.clone());
+        let disclosure = json!({
+            "customType": "compaction_outcome",
+            "content": "Compaction cancelled",
+            "display": true,
+            "details": { "reason": "threshold", "outcome": "cancelled" },
+        });
+        let declared_at = "2026-09-23T06:00:00Z";
+        session
+            .persist_entry_at("custom_message", disclosure.clone(), declared_at)
+            .unwrap();
+
+        // The rebuilt transcript (a fresh open) holds the exact row: the
+        // replay's fields-only dedup matches it — the declaration stamp
+        // and any other stamp alike — so the row is not appended twice.
+        let loaded = SessionFile::open(&file).unwrap();
+        let already_disclosed =
+            |entry: &SessionEntry| entry.type_ == "custom_message" && entry.fields == disclosure;
+        assert!(loaded.entries().iter().any(already_disclosed));
+
+        // The worker's own abort arm carries the same fields under its own
+        // persist-time stamp: still the same disclosure, still not a
+        // duplicate.
+        let mut with_own_row = SessionFile::open(&file).unwrap();
+        with_own_row
+            .persist_entry("custom_message", disclosure.clone())
+            .unwrap();
+        assert!(with_own_row.entries().iter().any(already_disclosed));
+
+        // A different disclosure (a failed run's row) stays distinct.
+        let failed = json!({
+            "customType": "compaction_outcome",
+            "content": "Compaction failed: Summarization failed",
+            "display": true,
+            "details": { "reason": "threshold", "outcome": "failed" },
+        });
+        assert!(!loaded
+            .entries()
+            .iter()
+            .any(|entry| entry.type_ == "custom_message" && entry.fields == failed));
         let _ = fs::remove_dir_all(&dir);
     }
 

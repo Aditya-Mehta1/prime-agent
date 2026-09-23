@@ -88,6 +88,21 @@ pub(crate) type ShareNote = Result<GistOutcome, String>;
 /// inputs, or the failure message (TS `handleReloadCommand`'s outcome).
 pub(crate) type ReloadNote = Result<(), String>;
 
+/// One backgrounded compaction-abort outcome (the abort supervision's UI
+/// recovery): a failed abort request surfaces as the transcript note and
+/// clears the stuck compaction loader locally — when even the abort could
+/// not reach the daemon, the loader must not hang waiting for a
+/// `compaction_end` that will never come. The session id keeps a stale
+/// outcome from touching another session after `/switch` or `/new`.
+pub(crate) struct CompactionAbortNote {
+    pub(crate) active_session_id: String,
+    /// The loader generation the abort addressed: an outcome applies only
+    /// to the exact `compaction_start` that was on screen when the abort
+    /// was sent — a newer run's loader is never cleared by a stale one.
+    pub(crate) compaction_generation: u64,
+    pub(crate) outcome: Result<(), String>,
+}
+
 /// A landed heartbeat-catalog refresh for the `/heartbeats` view (TS
 /// `refreshHeartbeatCatalog`'s fetch result): the scoped, sorted rows, or
 /// the fetch error that keeps the last catalog (stale-while-revalidate).
@@ -320,6 +335,9 @@ pub(crate) struct SessionUi {
     /// Notes surfacing from background tasks (the async abort result) into
     /// the UI loop.
     notes: mpsc::UnboundedSender<String>,
+    /// Compaction-abort outcomes from the backgrounded request (the abort
+    /// supervision's UI recovery): a failed abort clears the stuck loader.
+    compaction_abort_notes: mpsc::UnboundedSender<CompactionAbortNote>,
     /// A succeeded compaction replaced the durable transcript (TS
     /// `rebuildChatFromMessages`): the next loop pass re-fetches it.
     pub(crate) transcript_stale: bool,
@@ -448,10 +466,12 @@ struct SelectionAutoScroll {
 
 impl SessionUi {
     /// Create/attach per the session selection and return the live state.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open(
         client: DaemonClient,
         options: &InteractiveOptions,
         notes: mpsc::UnboundedSender<String>,
+        compaction_abort_notes: mpsc::UnboundedSender<CompactionAbortNote>,
         share_notes: mpsc::UnboundedSender<ShareNote>,
         reload_notes: mpsc::UnboundedSender<ReloadNote>,
         catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
@@ -539,6 +559,7 @@ impl SessionUi {
             ctrl_c_hint_until: None,
             goal_view: GoalView::new(),
             notes,
+            compaction_abort_notes,
             transcript_stale: false,
             telemetry: options.telemetry.clone(),
             scroll_adoption_emitted: false,
@@ -5510,24 +5531,56 @@ impl SessionUi {
     /// `interruptOrClearInput` fires `abortCompaction()` when the
     /// compaction loader is up — the agent is not streaming during a
     /// compaction, so the interrupt cancels the run, not a turn): the
-    /// request never blocks key handling, and a failure surfaces later
-    /// as a transcript note.
-    fn abort_compaction(&self) {
+    /// request never blocks key handling. A failure surfaces later as a
+    /// transcript note and clears the stuck loader locally (the abort
+    /// supervision's UI recovery): the daemon's own `compaction_end`
+    /// normally clears it, but an abort that could not even reach the
+    /// daemon must not leave the UI waiting on an end that never comes.
+    fn abort_compaction(&self, compaction_generation: u64) {
         let client = self.client.clone();
         let active_session_id = self.active_session_id.clone();
-        let notes = self.notes.clone();
+        let abort_notes = self.compaction_abort_notes.clone();
         tokio::spawn(async move {
+            // Via the supervisor even when a direct link serves the
+            // session: the direct link IS the wedged worker in the case
+            // the supervisor's abort arm exists for.
             let result = client
-                .request_ok(DaemonCommand::AbortCompaction {
+                .request_ok_via_supervisor(DaemonCommand::AbortCompaction {
                     id: None,
-                    active_session_id,
+                    active_session_id: active_session_id.clone(),
                     rest: Default::default(),
                 })
                 .await;
             if let Err(error) = result {
-                let _ = notes.send(format!("the compaction abort failed: {error:#}"));
+                let _ = abort_notes.send(CompactionAbortNote {
+                    active_session_id,
+                    compaction_generation,
+                    outcome: Err(format!("{error:#}")),
+                });
             }
         });
+    }
+
+    /// Apply one backgrounded compaction-abort outcome: the failed note
+    /// surfaces as a transcript row and the compaction loader clears —
+    /// the local recovery when the abort never reached the daemon. An
+    /// outcome from a session this UI no longer shows (`/switch`, `/new`
+    /// mid-request), or addressed to a loader a newer `compaction_start`
+    /// has since replaced, touches nothing.
+    pub(crate) fn apply_compaction_abort_outcome(
+        &mut self,
+        note: CompactionAbortNote,
+        view: &mut AgentView,
+    ) {
+        if note.active_session_id != self.active_session_id
+            || note.compaction_generation != view.compaction_generation
+        {
+            return;
+        }
+        if let Err(error) = note.outcome {
+            self.note(&format!("the compaction abort failed: {error:#}"), view);
+            view.compaction = None;
+        }
     }
 
     /// Apply one background note (a failed abort request) to the transcript.
@@ -5894,7 +5947,7 @@ impl SessionUi {
                 // the interrupt cancels the compaction run only — the agent
                 // is not streaming, so no turn abort goes out, exactly like
                 // the TS interrupt key.
-                self.abort_compaction();
+                self.abort_compaction(view.compaction_generation);
             } else if self.turn_active {
                 self.abort_turn();
                 self.note("aborting the current turn", view);
@@ -6549,8 +6602,11 @@ impl SessionUi {
                 custom_instructions,
             } => {
                 // TS `startCompactionLoader`: the compaction loader fully
-                // replaces the working loader for the run's duration.
+                // replaces the working loader for the run's duration. The
+                // generation bump retires every in-flight abort outcome
+                // that addressed an earlier run's loader.
                 view.working = None;
+                view.compaction_generation += 1;
                 view.compaction = Some(CompactionState {
                     reason: CompactionReason::parse(&reason),
                     custom_instructions,

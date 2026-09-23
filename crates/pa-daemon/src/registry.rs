@@ -98,6 +98,11 @@ pub(crate) struct ResidentWorker {
     /// connection may flip `connected` false, so a superseded socket's
     /// late EOF cannot retire a live replacement.
     connection_epoch: AtomicU64,
+    /// The supervisor's compaction-abort token for this session's worker
+    /// (the abort supervision): armed by the forwarded
+    /// `compaction_start`, cleared by the forwarded `compaction_end`, so
+    /// an `abort_compaction` never needs the worker's own answer.
+    pub(crate) compaction: crate::compaction_supervision::CompactionSupervision,
 }
 
 /// The last-good heartbeats rows a worker answered with, tagged with the
@@ -131,6 +136,7 @@ impl ResidentWorker {
             heartbeat_snapshot_generation: AtomicU64::new(0),
             route_state_tx,
             connection_epoch: AtomicU64::new(0),
+            compaction: crate::compaction_supervision::CompactionSupervision::default(),
         })
     }
 
@@ -168,6 +174,16 @@ impl ResidentWorker {
             + 1;
         self.publish_route_state(|state| state.connected = true);
         epoch
+    }
+
+    /// Whether `epoch` is still the live connection's epoch: the abort
+    /// supervision's end-of-stream handling acts only on the current
+    /// connection's word.
+    pub(crate) fn connection_is_current(&self, epoch: u64) -> bool {
+        epoch
+            == self
+                .connection_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// A connection's pumps ended (worker death or socket close). Stale
