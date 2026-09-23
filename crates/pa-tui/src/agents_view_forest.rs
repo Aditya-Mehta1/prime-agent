@@ -1404,7 +1404,8 @@ mod tests {
         assert_eq!(rows[0].cost, 0.75);
         assert_eq!(rows[0].descendant_count, 1);
     }
-   #[test]
+
+    #[test]
     fn scored_hits_rank_before_retained_ancestors_and_relevance_first() {
         // Kevin's directive (2026-09-23): with a query active, hits sort
         // name-relevance first — a scored top-level hit renders before a
@@ -1416,7 +1417,11 @@ mod tests {
                 summary["sessionName"] = json!("zebra worker");
                 summary
             }),
-            roster_entry("kid", "running", child_summary("kid", "orch", "policy sweep")),
+            roster_entry(
+                "kid",
+                "running",
+                child_summary("kid", "orch", "policy sweep"),
+            ),
             roster_entry(
                 "cache",
                 "idle",
@@ -1488,8 +1493,7 @@ mod tests {
             ),
         ];
         let records = reconcile_unified_sessions(&roster, &[]);
-        let filtered =
-            crate::agents_view_state::filter_unified_sessions(
+        let filtered = crate::agents_view_state::filter_unified_sessions(
             &records,
             &crate::agents_view_state::parse_search_query("sweep"),
         );
