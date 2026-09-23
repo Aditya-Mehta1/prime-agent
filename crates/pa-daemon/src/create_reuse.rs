@@ -63,6 +63,28 @@ enum ReuseAnswer {
     HolderGone,
 }
 
+/// The held per-file single-flight. Dropping it releases the mutex (the
+/// next opener unblocks) and then retires the map entry when no other
+/// opener is waiting on the file: without the retirement a history-heavy
+/// daemon leaks one entry per session file ever opened. The count check
+/// runs under the map lock, so a new opener either joined this entry
+/// before the removal or starts a fresh one after it.
+pub(crate) struct OpeningGuard<'a> {
+    supervisor: &'a Supervisor,
+    key: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for OpeningGuard<'_> {
+    fn drop(&mut self) {
+        // The mutex releases first: a concurrent opener's count keeps
+        // the entry alive, so the retirement below only lands when this
+        // was the last one.
+        self.guard.take();
+        self.supervisor.retire_opening_entry(&self.key);
+    }
+}
+
 /// The residents registered for one session file, by reuse class.
 #[derive(Default)]
 struct ReuseCandidates {
@@ -84,16 +106,30 @@ fn canonical_opening_key(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
-/// Whether one resident's process is provably gone. A pid the platform
-/// cannot answer for counts as alive, like the lease's stale-owner rule:
-/// launching under an unverifiable-but-alive holder would surface the
-/// lease rejection again.
+/// Whether one resident's process is provably gone, identity-aware (the
+/// lease's stale-owner rule): a recycled pid is a DIFFERENT process, so
+/// the original holder is gone and its file is free — a pid-only check
+/// would wait the whole settle budget on an unrelated process. A pid the
+/// platform cannot answer for counts as alive: launching under an
+/// unverifiable-but-alive holder would surface the lease rejection again.
 async fn resident_process_alive(resident: &Arc<ResidentWorker>) -> bool {
-    let pid = resident.descriptor.lock().await.pid;
+    let (pid, start_id) = {
+        let descriptor = resident.descriptor.lock().await;
+        (descriptor.pid, descriptor.process_start_id.clone())
+    };
     if pid == 0 {
         return false;
     }
-    crate::lease::is_process_alive(pid as u32).unwrap_or(true)
+    if !crate::lease::is_process_alive(pid as u32).unwrap_or(true) {
+        return false;
+    }
+    match start_id.as_deref() {
+        None => true,
+        Some(expected) => match crate::lease::get_process_start_id(pid as u32) {
+            Some(current) => current == expected,
+            None => true,
+        },
+    }
 }
 
 /// The create's target session file, resolved once for the whole open:
@@ -130,7 +166,7 @@ impl Supervisor {
     pub(crate) async fn opening_guard(
         &self,
         command: &DaemonCommand,
-    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+    ) -> Result<Option<OpeningGuard>> {
         let Some(path) = create_target_file(command)? else {
             return Ok(None);
         };
@@ -140,7 +176,7 @@ impl Supervisor {
                 .opening_files
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            map.entry(key)
+            map.entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
@@ -148,12 +184,43 @@ impl Supervisor {
         // connect, create replay); the wait is bounded so a wedged sibling
         // answers the TS `worker is starting` shape instead of parking
         // the client forever.
-        match tokio::time::timeout(OPENING_LOCK_WAIT, lock.lock_owned()).await {
-            Ok(guard) => Ok(Some(guard)),
-            Err(_) => Err(anyhow!(
-                "Session \"{}\" worker is starting",
-                path.to_string_lossy()
-            )),
+        let guard = match tokio::time::timeout(OPENING_LOCK_WAIT, lock.lock_owned()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                // The abandoned wait keeps its map reference only until
+                // here: the map entry retires when its last referrer
+                // drops (the release path checks), so a timed-out waiter
+                // must not pin it.
+                drop(lock);
+                return Err(anyhow!(
+                    "Session \"{}\" worker is starting",
+                    path.to_string_lossy()
+                ));
+            }
+        };
+        Ok(Some(OpeningGuard {
+            supervisor: self,
+            key,
+            guard: Some(guard),
+        }))
+    }
+
+    /// Retire a released guard's map entry when no other opener is
+    /// waiting on the file: the Arc's strong count is the coordination
+    /// truth (the map itself plus every in-flight waiter each hold one).
+    /// Without this the map grows one entry per session file ever opened
+    /// — a history-heavy daemon would leak. A file with a live waiter
+    /// keeps its entry; the last release removes it, and the next open
+    /// starts a fresh one.
+    fn retire_opening_entry(&self, key: &str) {
+        let mut map = self
+            .opening_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = map.get(key) {
+            if Arc::strong_count(entry) == 1 {
+                map.remove(key);
+            }
         }
     }
 
