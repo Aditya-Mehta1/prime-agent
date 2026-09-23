@@ -122,6 +122,12 @@ pub(crate) enum ClientRouting {
 pub struct Supervisor {
     pub(crate) options: SupervisorOptions,
     descriptor_dir: PathBuf,
+    /// The durable session-binding table (the stale-active-id rebind
+    /// surface): every active id the supervisor has routed stays
+    /// addressable through its session's durable identity, so a client
+    /// holding a superseded id resolves to the session's current
+    /// resident instead of `Unknown active session`.
+    pub(crate) session_bindings: crate::session_bindings::SessionBindingTable,
     /// Daemon-lifecycle telemetry (`daemon event` schema v1), resolved at
     /// run start (None = opted out); never blocks supervision paths.
     telemetry: std::sync::Mutex<Option<pa_telemetry::TelemetryClient>>,
@@ -188,6 +194,7 @@ impl Supervisor {
         Ok(Supervisor {
             options,
             descriptor_dir,
+            session_bindings: crate::session_bindings::SessionBindingTable::new(),
             telemetry: std::sync::Mutex::new(None),
             registry: SessionRegistry::new(),
             events,
@@ -236,10 +243,147 @@ impl Supervisor {
 
     /// Emit a `daemon event` (best-effort, non-blocking; no-op when the
     /// daemon is opted out).
-    fn note_daemon_event(&self, kind: &str, exit_reason: Option<&str>) {
+    pub(crate) fn note_daemon_event(&self, kind: &str, exit_reason: Option<&str>) {
         if let Some(client) = &*self.telemetry.lock().unwrap() {
             pa_core::session_engine::telemetry::track_daemon_event(client, kind, exit_reason);
         }
+    }
+
+    /// Record one session binding (the stale-id rebind table). A supersede
+    /// (a new worker taking over a session file another id was bound to)
+    /// notifies the clients still attached to the superseded id through the
+    /// `session_binding` event, so they re-attach to the session's current
+    /// id and keep receiving its events.
+    fn record_session_binding(
+        &self,
+        active_session_id: &str,
+        session_id: Option<&str>,
+        session_file: Option<&str>,
+    ) {
+        if let Some((previous_ids, binding)) =
+            self.session_bindings
+                .record(active_session_id, session_id, session_file)
+        {
+            for previous in previous_ids {
+                self.log_line(&format!(
+                    "session binding superseded: {previous} -> {} (file {:?})",
+                    binding.active_session_id, binding.session_file
+                ));
+                let event = json!({
+                    "type": "session_binding",
+                    "previousActiveSessionId": previous,
+                    "activeSessionId": binding.active_session_id,
+                    "sessionId": binding.session_id,
+                    "sessionFile": binding.session_file,
+                });
+                let _ = self.events.send((
+                    ClientRouting::AttachedSession {
+                        active_session_id: previous,
+                    },
+                    event,
+                ));
+            }
+        }
+    }
+
+    /// Retarget one connection at a session's current resident after its
+    /// selector was superseded (the stale-active-id rebind seam shared by
+    /// the generic route and the admission route). The connection keeps
+    /// exactly its prior attached-ness under the current id, and a
+    /// previously-attached client is told where it now points through a
+    /// `session_binding` frame routed to the id it now holds - the
+    /// supersede-time notice raced the attach roster, so this one cannot
+    /// be dropped. A Detach never reaches the rebind: the seam answers it
+    /// supervisor-side (the stale worker is gone, and the replacement's
+    /// attach must not be dropped). Returns the current id the routed
+    /// frame must carry.
+    pub(crate) async fn rebind_connection(
+        &self,
+        selector: &str,
+        resident: &Arc<ResidentWorker>,
+        attached: &Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        let current = resident.worker_id.clone();
+        self.log_line(&format!(
+            "rebinding stale session id {selector} -> {current}"
+        ));
+        self.note_daemon_event("session_rebound", None);
+        let was_attached = {
+            let mut attached = attached.lock().unwrap();
+            let was = attached.iter().any(|id| id == selector);
+            if was {
+                attached.retain(|id| id != selector);
+                if !attached.iter().any(|id| id == &current) {
+                    attached.push(current.clone());
+                }
+            }
+            was
+        };
+        if was_attached {
+            let (session_id, session_file) = {
+                let descriptor = resident.descriptor.lock().await;
+                (
+                    descriptor.root_session_id.clone(),
+                    descriptor.session_file.clone(),
+                )
+            };
+            let _ = self.events.send((
+                ClientRouting::AttachedSession {
+                    active_session_id: current.clone(),
+                },
+                json!({
+                    "type": "session_binding",
+                    "previousActiveSessionId": selector,
+                    "activeSessionId": current,
+                    "sessionId": session_id,
+                    "sessionFile": session_file,
+                }),
+            ));
+        }
+        current
+    }
+
+    /// The current resident a superseded selector rebinds to (the
+    /// stale-id rebind seam): the binding table maps the selector to its
+    /// session's durable identity, the registry's live roster holds the
+    /// resident that identity currently belongs to. `None` keeps the
+    /// unknown-selector failure - only a binding whose session has a live
+    /// resident rebinds.
+    pub(crate) async fn binding_target(&self, selector: &str) -> Option<Arc<ResidentWorker>> {
+        let binding = self.session_bindings.binding_for(selector)?;
+        // A binding without a session id identifies no durable session:
+        // its create never completed, and whatever later owns the file
+        // path is a different session (or none at all) - rebinding into
+        // it is the foreign-session hazard, not a recovery.
+        let binding_session_id = binding.session_id.as_deref()?.to_string();
+        let session_file = binding.session_file.as_deref()?.to_string();
+        let resident = self.registry.find_by_session_file(&session_file).await?;
+        // The resident must BE the binding's session, not merely hold its
+        // file: a reused path must not let one session's stale ids
+        // rebind into the different session that now owns the path - the
+        // durable id is the identity the rebind follows.
+        let resident_session = resident.descriptor.lock().await.root_session_id.clone();
+        if resident_session.as_deref() != Some(binding_session_id.as_str()) {
+            return None;
+        }
+        // Only a connected resident rebinds: a worker mid-teardown or one
+        // left by a failed launch would answer `Session worker is not
+        // connected` instead of the unknown-session failure the client can
+        // act on.
+        if resident.cmd_tx.lock().await.is_none() {
+            return None;
+        }
+        // Only a session-ready resident rebinds: a replacement's command
+        // channel exists before its create replay finishes, so a command
+        // routed mid-replay would bounce off the worker's require-created
+        // gate instead of waiting out the replacement. `None` keeps the
+        // unknown-session failure - the client's own retry (the TUI
+        // re-attaches by the durable session id) rides the
+        // replacement-aware route and lands once the replay answers.
+        if !resident.route_state().session_ready {
+            return None;
+        }
+        Some(resident)
     }
 
     /// Bind the client socket, adopt or relaunch persisted workers, serve.
@@ -654,7 +798,7 @@ impl Supervisor {
         if let Err(error) = self.connect_worker(resident, deadline).await {
             // Never leave a spawned-but-unwired worker process behind.
             let mut child = child;
-            let _ = child.start_kill();
+            let _ = child.kill().await;
             return Err(error);
         }
         let payload = {
@@ -672,7 +816,7 @@ impl Supervisor {
             // holding its socket path against the next one).
             Err(error) => {
                 let mut child = child;
-                let _ = child.start_kill();
+                let _ = child.kill().await;
                 return Err(error);
             }
         };
@@ -683,28 +827,44 @@ impl Supervisor {
                 .route_command(resident, "shutdown", json!({}), ROUTE_TIMEOUT_MS)
                 .await;
             let mut child = child;
-            let _ = child.start_kill();
+            let _ = child.kill().await;
             return Err(anyhow!("supervisor is shutting down"));
         }
         if !response.success {
             // Same rule as the route error above: a worker whose create
             // replay failed must not be left running.
             let mut child = child;
-            let _ = child.start_kill();
+            let _ = child.kill().await;
             return Err(anyhow!(
                 "worker create failed on relaunch: {}",
                 response.error.unwrap_or_default()
             ));
         }
-        let mut descriptor = resident.descriptor.lock().await;
-        descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
-        // The persisted failure count stays: the give-up cap and any
-        // adoption decision read the real history, not a relaunch-blanked one.
-        let _ = persist_worker(&resident.descriptor_path, &descriptor);
-        drop(descriptor);
+        {
+            let mut descriptor = resident.descriptor.lock().await;
+            descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
+            // The persisted failure count stays: the give-up cap and any
+            // adoption decision read the real history, not a
+            // relaunch-blanked one.
+            let _ = persist_worker(&resident.descriptor_path, &descriptor);
+        }
         // The replayed create restored the session: routed client commands
         // may run against this worker again.
         resident.note_session_ready();
+        // The replacement is identity-complete and its session replay
+        // answered: record the binding now. The replacement's boot
+        // registration carries no session id (it races the create), so its
+        // record supersedes nothing - this is the record that retargets
+        // every stale client id at the replacement, delivered exactly
+        // when the replacement can actually serve them.
+        {
+            let descriptor = resident.descriptor.lock().await;
+            self.record_session_binding(
+                &resident.worker_id,
+                descriptor.root_session_id.as_deref(),
+                descriptor.session_file.as_deref(),
+            );
+        }
         Ok(child)
     }
 
@@ -778,7 +938,7 @@ impl Supervisor {
             probe_worker_socket(&resident.worker_id, &worker_socket, connect_deadline).await
         {
             let mut child = child;
-            let _ = child.start_kill();
+            let _ = child.kill().await;
             return Err(error);
         }
         Ok(child)
@@ -1306,22 +1466,55 @@ impl Supervisor {
         // identity in the registry (registration races the create replay).
         self.registry.insert(Arc::clone(&resident)).await;
         let deadline = worker_connect_deadline();
-        let child = self.spawn_worker_process(&resident, deadline).await?;
+        // A failed launch never leaves its half-registered resident behind:
+        // a later stale-id rebind (or resolve) must not select a worker
+        // that cannot route.
+        let child = match self.spawn_worker_process(&resident, deadline).await {
+            Ok(child) => child,
+            Err(error) => {
+                self.registry.remove(&worker_id).await;
+                // The half-launched worker's descriptor dies with the
+                // launch: a restart must not adopt it and replay its
+                // durable create after the client was told the create
+                // failed.
+                let _ = std::fs::remove_file(&descriptor_path);
+                return Err(error);
+            }
+        };
         if let Err(error) = self.connect_worker(&resident, deadline).await {
             // Never leave a spawned-but-unwired worker process behind.
             let mut child = child;
-            let _ = child.start_kill();
+            let _ = child.kill().await;
+            self.registry.remove(&worker_id).await;
+            // The half-launched worker's descriptor dies with the launch.
+            let _ = std::fs::remove_file(&descriptor_path);
             return Err(error);
         }
         let create_payload = {
             let descriptor = resident.descriptor.lock().await;
             create_command_payload(&descriptor.create_command)
         };
-        let response = self
+        let mut child = child;
+        let response = match self
             .route_command(&resident, "create", create_payload, LONG_ROUTE_TIMEOUT_MS)
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                // The connected child dies with the failed create: an
+                // unmanaged survivor would keep the session file while a
+                // retry mints a second worker over it.
+                let _ = child.kill().await;
+                self.registry.remove(&worker_id).await;
+                // The half-launched worker's descriptor dies with the launch.
+                let _ = std::fs::remove_file(&descriptor_path);
+                return Err(error);
+            }
+        };
         if !response.success {
+            let _ = child.kill().await;
             let _ = std::fs::remove_file(&descriptor_path);
+            self.registry.remove(&worker_id).await;
             return Err(anyhow!(
                 "session worker create failed: {}",
                 response.error.unwrap_or_default()
@@ -1343,8 +1536,11 @@ impl Supervisor {
                 .and_then(Value::as_str)
                 .is_some_and(|file| !file.is_empty());
             if !has_session_file {
-                // Never leave the spawned worker behind a degraded create.
+                // Never leave the spawned worker behind a degraded create:
+                // the shutdown is graceful, and the awaited kill reaps the
+                // child (the monitor that would own it is not spawned yet).
                 let _ = self.stop_worker(&resident).await;
+                let _ = child.kill().await;
                 let _ = std::fs::remove_file(&descriptor_path);
                 return Err(anyhow!("session worker create returned no session file"));
             }
@@ -1372,6 +1568,16 @@ impl Supervisor {
                 // fresh session and lose history.
                 descriptor.create_command.session_path = Some(session_file.clone());
             }
+            // The binding table learns the durable identity here: a create
+            // over a session file another worker owned (the session
+            // re-opened after its worker gave up or stopped) supersedes the
+            // old id, and the supersede notification tells the clients
+            // still attached to it to rebind.
+            self.record_session_binding(
+                &worker_id,
+                descriptor.root_session_id.as_deref(),
+                descriptor.session_file.as_deref(),
+            );
             persist_worker(&descriptor_path, &descriptor)?;
         }
         // The create completed with a validated session identity: client
@@ -2606,6 +2812,15 @@ impl Supervisor {
                 descriptor.root_session_id = Some(session_id.clone());
             }
             descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
+            // A (re-)registered worker refreshes its binding: the id stays
+            // addressable with its current durable identity across supervisor
+            // restarts, and a session file this id newly owns supersedes any
+            // earlier binding to it.
+            self.record_session_binding(
+                active_session_id,
+                descriptor.root_session_id.as_deref(),
+                descriptor.session_file.as_deref(),
+            );
             let _ = persist_worker(&resident.descriptor_path, &descriptor);
         }
         let record = self.registry.record_registration(registration).await;
@@ -3279,6 +3494,12 @@ impl Supervisor {
             );
         };
         let selector = selector.to_string();
+        // The rebind target when the selector addresses a superseded id: a
+        // binding whose session has a live resident again (a new worker took
+        // the session file over). The routed command is rewritten to the
+        // current id, so the rest of this route - and the response handling
+        // below - addresses the session's current worker.
+        let mut rebound_to: Option<String> = None;
         let resident = match self.registry.resolve(&selector).await {
             Ok(resident) => resident,
             Err(_) => {
@@ -3292,18 +3513,55 @@ impl Supervisor {
                 match self.registry.resolve(&selector).await {
                     Ok(resident) => resident,
                     Err(_) => {
-                        let message = self
-                            .restore_failure_for(&selector)
-                            .unwrap_or_else(|| format!("Unknown active session: {selector}"));
-                        return (
-                            vec![response_line(&response_failure(
-                                Some(&command_id),
-                                &type_name,
-                                &message,
-                                None,
-                            ))],
-                            false,
-                        );
+                        // The stale-active-id rebind: the selector is a
+                        // superseded id the binding table still maps to the
+                        // session's durable identity, and a live resident
+                        // owns that identity now. The command failed before
+                        // it ever reached a worker, so routing it once to
+                        // the current resident delivers it exactly once.
+                        match self.binding_target(&selector).await {
+                            Some(resident) => {
+                                // A detach addressed to a superseded id has
+                                // no worker to reach: the stale worker is
+                                // gone (its client-side state died with it),
+                                // and forwarding the detach to the
+                                // replacement would drop the very attach
+                                // the client may have just established there
+                                // (the worker keys its detach by client). The
+                                // supervisor retires the stale address
+                                // itself and answers the detach.
+                                if matches!(command, DaemonCommand::Detach { .. }) {
+                                    attached.lock().unwrap().retain(|id| id != &selector);
+                                    return (
+                                        vec![response_line(&response_success(
+                                            Some(&command_id),
+                                            &type_name,
+                                            None,
+                                        ))],
+                                        false,
+                                    );
+                                }
+                                rebound_to = Some(
+                                    self.rebind_connection(&selector, &resident, attached).await,
+                                );
+                                resident
+                            }
+                            None => {
+                                let message =
+                                    self.restore_failure_for(&selector).unwrap_or_else(|| {
+                                        format!("Unknown active session: {selector}")
+                                    });
+                                return (
+                                    vec![response_line(&response_failure(
+                                        Some(&command_id),
+                                        &type_name,
+                                        &message,
+                                        None,
+                                    ))],
+                                    false,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3383,7 +3641,7 @@ impl Supervisor {
         } else {
             ROUTE_TIMEOUT_MS
         };
-        let (worker_command, payload) = match client_command_payload(command, client_id) {
+        let (worker_command, mut payload) = match client_command_payload(command, client_id) {
             Ok(payload) => payload,
             Err(error) => {
                 return (
@@ -3397,6 +3655,20 @@ impl Supervisor {
                 )
             }
         };
+        // A rebind retargets the routed frame: the worker reads the session
+        // selector the payload carries, and the superseded id is not one it
+        // knows. A rebound reattach routes as the worker's attach - the
+        // worker has no reattach arm; the reattach semantics (detach-mark
+        // clearing, replacement snapshot purpose) live supervisor-side.
+        let mut worker_command = worker_command;
+        if let Some(current) = &rebound_to {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("activeSessionId".to_string(), json!(current));
+            }
+            if worker_command == "reattach" {
+                worker_command = "attach";
+            }
+        }
         // Client-facing routes wait out an in-flight worker replacement
         // inside the command's own budget: a command aimed at a worker that
         // crashed and is being relaunched (crash backoff, relaunch, create
@@ -3410,6 +3682,11 @@ impl Supervisor {
                 // Worker replies carry no client request id; clients match
                 // responses by the id they sent, so stamp it back here.
                 response.id = Some(command_id.clone());
+                // A rebound reattach routed as the worker's attach still
+                // answers as the command the client sent.
+                if rebound_to.is_some() && type_name == "reattach" {
+                    response.command = type_name.clone();
+                }
                 if let DaemonCommand::Attach {
                     capabilities,
                     supports_extension_ui,
@@ -3435,6 +3712,22 @@ impl Supervisor {
                                     "attach"
                                 },
                                 None,
+                            );
+                            // The binding table learns the id the worker
+                            // reports (a durable-id or file-stem attach
+                            // resolves to the worker's current id), keyed
+                            // by the session's durable identity.
+                            let (session_id, session_file) = {
+                                let descriptor = resident.descriptor.lock().await;
+                                (
+                                    descriptor.root_session_id.clone(),
+                                    descriptor.session_file.clone(),
+                                )
+                            };
+                            self.record_session_binding(
+                                &active_id,
+                                session_id.as_deref(),
+                                session_file.as_deref(),
                             );
                             let mut attached = attached.lock().unwrap();
                             if !attached.iter().any(|id| id == &active_id) {
@@ -3466,6 +3759,11 @@ impl Supervisor {
                 if let DaemonCommand::Detach { .. } = command {
                     if response.success {
                         self.note_daemon_event("detach", None);
+                        // The retire removes the RESIDENT's active id - the
+                        // id the attached vec actually holds (the selector
+                        // may be a durable-id alias for the same session).
+                        // A rebound detach never reaches this handler; the
+                        // rebind seam retires its superseded address itself.
                         attached
                             .lock()
                             .unwrap()

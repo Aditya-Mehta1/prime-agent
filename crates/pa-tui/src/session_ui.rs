@@ -337,6 +337,10 @@ pub(crate) struct SessionUi {
     /// loop arms the re-attach driver from it (TS `connection_status:
     /// "reconnecting"`).
     pub(crate) transport_lost: Option<String>,
+    /// The current active id of this session after a `session_binding`
+    /// supersede notice; the interactive loop re-attaches to it so event
+    /// routing follows the session's new worker.
+    pub(crate) pending_rebind: Option<String>,
     /// The re-attach window expired (TS terminal close after
     /// `DAEMON_RECONNECT_TIMEOUT_MS`): dispatch is blocked and submits
     /// surface the error instead of leaving the UI on a silent spinner.
@@ -508,6 +512,7 @@ impl SessionUi {
             exit_reason: "daemon_closed",
             reconnect: None,
             transport_lost: None,
+            pending_rebind: None,
             reconnection_failed: None,
             exit_guard: crate::exit_guard::ExitGuard::new(),
             escape_repeat_action: None,
@@ -591,11 +596,14 @@ impl SessionUi {
     /// supervisor issues a ticket (best effort: every failure keeps the
     /// supervisor-routed path, and a failed direct attach retries once over
     /// the supervisor).
+    ///
+    /// The NEW attach lands before the old id detaches: a failed re-attach
+    /// (a replacement mid-teardown, a dead worker) must not strand the pane
+    /// locally bound but server-detached - the previous subscription stays
+    /// until the new one exists, and the next supersede notice or the
+    /// submit-path retry re-attaches when a worker can serve the session.
     pub(crate) async fn attach_session(&mut self, active_session_id: &str) -> Result<()> {
         let previous = self.active_session_id.clone();
-        if !previous.is_empty() && previous != active_session_id {
-            let _ = self.detach().await;
-        }
         // A direct link is bound to one session: drop it when switching.
         if self
             .client
@@ -644,6 +652,22 @@ impl SessionUi {
         let attach = attach_data_from_response(&data)?;
         let reconstructed = reconstruct(&attach);
         self.active_session_id = attach.active_session_id;
+        // The new attachment exists (the snapshot above rebuilt from it):
+        // retire the superseded id's subscription now, addressed by the
+        // captured previous id (the detach must target the OLD address,
+        // not the id the pane just adopted).
+        if !previous.is_empty() && previous != self.active_session_id {
+            let _ = self
+                .bounded_request(
+                    Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                    DaemonCommand::Detach {
+                        id: None,
+                        active_session_id: Some(previous),
+                        rest: Default::default(),
+                    },
+                )
+                .await;
+        }
         self.session_id = reconstructed.session_id;
         self.session_name = reconstructed.session_name.clone();
         self.service_tier = reconstructed.service_tier.clone();
@@ -1041,19 +1065,6 @@ impl SessionUi {
             }
             crate::clipboard::OscSink::Stdout => Vec::new(),
         }
-    }
-
-    pub(crate) async fn detach(&self) -> Result<()> {
-        self.bounded_request(
-            Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
-            DaemonCommand::Detach {
-                id: None,
-                active_session_id: Some(self.active_session_id.clone()),
-                rest: Default::default(),
-            },
-        )
-        .await
-        .map(|_| ())
     }
 
     /// Detach on the agents-view handoff without blocking it: the request
@@ -1817,33 +1828,65 @@ impl SessionUi {
             return Ok(());
         }
         let images = self.collect_images_for(text, view);
-        self.bounded_request(
-            Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
-            DaemonCommand::Prompt {
-                id: None,
-                active_session_id: self.active_session_id.clone(),
-                message: text.to_string(),
-                input: pa_types::daemon::PromptInput {
-                    content: None,
-                    images,
-                    streaming_behavior: Some(match behavior {
-                        SubmitBehavior::Steer => pa_types::daemon::StreamingBehavior::Steer,
-                        SubmitBehavior::FollowUp => pa_types::daemon::StreamingBehavior::FollowUp,
-                    }),
-                    queue_if_busy: Some(true),
-                    expand_prompt_templates: None,
-                    source: None,
-                    agent_message_id: None,
-                    custom_message: None,
-                    queue_key: None,
-                    prefix_messages: None,
-                    admission_id: None,
-                },
-                rest: Default::default(),
-            },
-        )
-        .await
-        .map_err(|error| anyhow!("{error:#}"))?;
+        // One rebind attempt per submit (never a loop): a prompt refused
+        // with the unknown-session error - the held active id was
+        // superseded by a worker replacement and the supervisor could not
+        // rebind it either - re-attaches by the DURABLE session id and
+        // replays the prompt ONCE. The failed attempt never reached a
+        // worker (the unknown-session refusal precedes any routing), so
+        // the replay is exactly-once by construction.
+        let mut rebind_available = true;
+        loop {
+            let result = self
+                .bounded_request(
+                    Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                    DaemonCommand::Prompt {
+                        id: None,
+                        active_session_id: self.active_session_id.clone(),
+                        message: text.to_string(),
+                        input: pa_types::daemon::PromptInput {
+                            content: None,
+                            images: images.clone(),
+                            streaming_behavior: Some(match behavior {
+                                SubmitBehavior::Steer => pa_types::daemon::StreamingBehavior::Steer,
+                                SubmitBehavior::FollowUp => {
+                                    pa_types::daemon::StreamingBehavior::FollowUp
+                                }
+                            }),
+                            queue_if_busy: Some(true),
+                            expand_prompt_templates: None,
+                            source: None,
+                            agent_message_id: None,
+                            custom_message: None,
+                            queue_key: None,
+                            prefix_messages: None,
+                            admission_id: None,
+                        },
+                        rest: Default::default(),
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => break,
+                Err(error) => {
+                    let rendered = format!("{error:#}");
+                    if rebind_available
+                        && rendered.contains("Unknown active session")
+                        && !self.session_id.is_empty()
+                    {
+                        rebind_available = false;
+                        let durable = self.session_id.clone();
+                        if self.attach_session(&durable).await.is_ok() {
+                            // The fresh attach snapshot owns the transcript;
+                            // the replayed prompt renders on top of it.
+                            self.rebuild_view(view);
+                            continue;
+                        }
+                    }
+                    return Err(anyhow!("{rendered}"));
+                }
+            }
+        }
         // A submission while a turn runs parks in the queue behind it: the
         // queue strip shows the message until the session delivers it
         // (adoption telemetry for the follow-up queue).
@@ -6198,6 +6241,21 @@ impl SessionUi {
             DaemonClientEvent::HeartbeatsChanged => {
                 if view.heartbeats_picker.is_some() {
                     self.spawn_heartbeat_refresh();
+                }
+            }
+            // A worker replacement superseded the id this client holds:
+            // the interactive loop re-attaches to the session's current id
+            // (a silent rebind - the transcript rebuilds from the attach
+            // snapshot, no banner).
+            DaemonClientEvent::SessionBinding {
+                previous_active_session_id,
+                active_session_id,
+            } => {
+                if previous_active_session_id == self.active_session_id
+                    && !active_session_id.is_empty()
+                    && active_session_id != self.active_session_id
+                {
+                    self.pending_rebind = Some(active_session_id);
                 }
             }
             // Saved-session list frames belong to the agents-view UI; the

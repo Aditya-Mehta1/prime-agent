@@ -161,11 +161,13 @@ emitted and flushed before the TUI starts.
 ### `daemon event`
 
 Supervision lifecycle, emitted by the supervisor process. Counts only,
-never session payload.
+never session payload. `session_rebound`: a client command addressed a
+superseded active session id and the supervisor rebound it to the
+session's current worker (the stale-id rebind).
 
 | property | type | notes |
 |---|---|---|
-| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach`, `sessions_archived`, `worker_children_closed`, `catalog_refresh` |
+| `kind` | string | `worker_spawned`, `worker_exited`, `worker_restarted`, `attach`, `reattach`, `detach`, `sessions_archived`, `worker_children_closed`, `session_rebound`, `catalog_refresh` |
 | `exit_reason` | string | only for `worker_exited`: `normal` / `crash` |
 | `count` | number | only for `sessions_archived`, `worker_children_closed`, and `catalog_refresh`: how many sessions the sweep moved to the archive / how many resident RLM children the supervisor closed with a hard-killed parent worker / how many models the resolved no-cold-start chain serves after the daemon's startup catalog refresh |
 
