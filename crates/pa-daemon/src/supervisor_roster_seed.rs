@@ -691,7 +691,10 @@ pub(crate) mod tests {
         );
         let mut events = supervisor.events.subscribe();
 
-        supervisor.spawn_roster_boot_seed().await;
+        supervisor
+            .spawn_roster_boot_seed()
+            .await
+            .expect("boot seed task");
         let pushes = drain_roster_pushes(&mut events);
         assert_eq!(pushes.len(), 1, "one publish: {pushes:?}");
         let row = roster_row_for_child(&supervisor, "sub-9");
@@ -738,7 +741,10 @@ pub(crate) mod tests {
             .write_roster_summary(&live_child_summary(&root_file, &child_file), Some("w-live"));
         let _ = drain_roster_pushes(&mut events);
 
-        supervisor.spawn_roster_boot_seed().await;
+        supervisor
+            .spawn_roster_boot_seed()
+            .await
+            .expect("boot seed task");
         let pushes = drain_roster_pushes(&mut events);
         assert!(pushes.is_empty(), "a present row never reseeds: {pushes:?}");
         let row = roster_row_for_child(&supervisor, "sub-9");
@@ -788,7 +794,10 @@ pub(crate) mod tests {
         assert_eq!(pushes.len(), 1, "the immediate rows publish: {pushes:?}");
         assert_eq!(pushes[0]["changed"][0]["seededCwd"], true);
 
-        supervisor.spawn_seeded_hydration(seeded).await;
+        supervisor
+            .spawn_seeded_hydration(seeded)
+            .await
+            .expect("seeded hydration task");
         let pushes = drain_roster_pushes(&mut events);
         assert_eq!(pushes.len(), 1, "the hydrated rows publish: {pushes:?}");
         let row = roster_row_for_child(&supervisor, "sub-9");

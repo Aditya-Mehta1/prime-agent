@@ -4875,7 +4875,7 @@ mod tests {
         let seed = supervisor
             .adopt_persisted_workers(AdoptionBoot::PlainStartup)
             .await;
-        seed.await;
+        seed.await.expect("boot seed task");
         let row = supervisor
             .roster
             .lock()
