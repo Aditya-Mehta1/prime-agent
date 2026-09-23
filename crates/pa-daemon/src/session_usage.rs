@@ -354,7 +354,18 @@ mod tests {
                 cost: 0.4
             })
         );
-        assert_eq!(before, after);
+        // After the assistant entry the same attribution DOES fold: the
+        // aggregate replaces the raw block and the child spend subtracts
+        // back — the same own tokens, at the aggregate/child arithmetic's
+        // float residue (the file-order authority is TS's).
+        assert_eq!(
+            after,
+            Some(SessionUsageSummary {
+                input_tokens: 40,
+                output_tokens: 4,
+                cost: 0.7 - 0.3
+            })
+        );
     }
 
     /// `compaction` and `branch_summary` entries carry the summarization
@@ -383,13 +394,15 @@ mod tests {
                            "cost": { "input": 0.0, "output": 0.1, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.1 } }
             }),
         ]);
-        // 100 + 200 + 5 + 50 input tokens; 10 + 20 + 5 output; $1.0 + $0.3 + $0.1.
+        // 100 + 200 + 5 + 50 input tokens; 10 + 20 + 5 output. The cost
+        // sums in the fold's order: the summarization blocks accumulate
+        // first ($0.3 + $0.1), then fold into the assistant total.
         assert_eq!(
             summary,
             Some(SessionUsageSummary {
                 input_tokens: 355,
                 output_tokens: 35,
-                cost: 1.4000000000000001
+                cost: 1.0 + (0.3 + 0.1)
             })
         );
     }
@@ -432,14 +445,9 @@ mod tests {
             // Drifted child spend larger than the aggregate folds in.
             attribution("a", usage(900, 90, 0.9), usage(10, 1, 0.1)),
         ]);
-        assert_eq!(
-            summary,
-            Some(SessionUsageSummary {
-                input_tokens: 0,
-                output_tokens: 0,
-                cost: 0.0
-            })
-        );
+        // The clamp drains the session to no billable work at all, so the
+        // summary is absent (TS `sessionUsageSummaryFrom` → undefined).
+        assert_eq!(summary, None);
     }
 
     /// The map keeps first-insertion order so the cost sums stay
