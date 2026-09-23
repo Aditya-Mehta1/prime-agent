@@ -8,7 +8,6 @@ import {
 	type Context,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
-	getModel,
 	type TextContent,
 	type Usage,
 } from "@earendil-works/pi-ai";
@@ -43,10 +42,11 @@ import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { waitForHeadlessCompletion } from "../src/modes/headless-completion.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { createHarness, getAssistantTexts, getMessageText, type Harness } from "./suite/harness.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
-const model = getModel("anthropic", "claude-sonnet-4-5")!;
+const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 function userText(context: Context): string {
 	const lastMessage = context.messages[context.messages.length - 1] as AgentMessage | undefined;
@@ -566,6 +566,27 @@ describe("AgentSession rlm recursion", () => {
 		await internals._activeRlmChildRuns.get(spawned.rlm_child_id)!.settlement!.promise;
 		expect(internals._pendingRlmSubagentSessionNames.has("slow-worker")).toBe(false);
 		await expect(root.runRlmChild("respawn while retained", { name: "slow-worker" })).rejects.toThrow(unavailable);
+	});
+
+	it("admits a same-name respawn while the deleted child still unwinds", async () => {
+		const unblockUnwind = deferred<void>();
+		const root = createSession();
+		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
+		const firstRun = (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(first.rlm_child_id)!;
+		await firstRun.publication!.promise;
+		const firstChild = firstRun.session!;
+		// The blocked dispose holds the unwind open past the receipt.
+		vi.spyOn(firstChild, "disposeAsync").mockImplementation(() => unblockUnwind.promise);
+		await root.deleteRlmSubagent(first.rlm_child_id);
+		const forwarded = (
+			root as unknown as {
+				_createRlmSubagentRuntimeOptions(options: Record<string, unknown>): { ignoreSessionIds?: string[] };
+			}
+		)._createRlmSubagentRuntimeOptions({ id: "probe", prompt: "p", sessionName: "reused-worker", model });
+		// The freed id rides along for the daemon host's own name re-assert.
+		expect(forwarded.ignoreSessionIds).toContain(firstChild.sessionId);
+		await root.runRlmChild("second shard", { name: "reused-worker" });
+		unblockUnwind.resolve();
 	});
 
 	it("makes an externally restored retained child listable and deletable", async () => {
