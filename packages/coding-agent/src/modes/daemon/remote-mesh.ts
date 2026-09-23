@@ -460,11 +460,12 @@ function mergeRemoteSessions(sessions: readonly RemoteAgentSessionSummary[]): Ma
 /**
  * Family-catalog facts for a remote target: depth-0, no parent edges. Reach
  * derives exactly as for local rows: a depth-0 remote session is a sibling of
- * depth-0 locals and unrelated to everything else.
+ * depth-0 locals and unrelated to everything else. The id carries the target's
+ * host scope, so a peer that reuses a local session id is another agent.
  */
 function remoteAgentFamilyEntry(target: RemoteAgentMessageTarget): AgentFamilyCatalogEntry {
 	return {
-		id: target.sessionId,
+		id: agentMeshIdentity(target.host.tailnetHost, target.sessionId),
 		...(target.summary.sessionName ? { name: target.summary.sessionName } : {}),
 		depth: target.summary.rlmDepth ?? 0,
 		status: target.summary.rosterStatus ?? "inactive",

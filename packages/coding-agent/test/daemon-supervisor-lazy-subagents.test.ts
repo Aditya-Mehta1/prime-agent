@@ -950,5 +950,10 @@ describe("daemon supervisor remote mesh routing", () => {
 		mesh.targets[0]!.activeSessionId = "l";
 		await supervisor.handleCommand(client, send("hi twin", true));
 		expect(deliveries.at(-1)).toMatchObject({ message: "hi twin", fromRelationship: "sibling" });
+
+		// A reused session id is the reach check's identity too: still a sibling.
+		mesh.targets[0]!.sessionId = "l-s";
+		await supervisor.handleCommand(client, send("hi same session", true));
+		expect(deliveries.at(-1)).toMatchObject({ message: "hi same session", fromRelationship: "sibling" });
 	});
 });
