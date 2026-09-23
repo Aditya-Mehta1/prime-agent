@@ -106,8 +106,15 @@ pub trait InteractionTelemetry: Send + Sync {
     /// `tui image pasted`); `mime_type` is the attachment's sniffed format.
     fn image_pasted(&self, mime_type: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// A submission parked in the follow-up queue behind a running turn:
-    /// `lane` is `steering` (Enter) / `follow_up` (the follow-up key).
-    fn queued_input(&self, lane: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// `lane` is `steering` (Enter) / `follow_up` (the follow-up key);
+    /// `steering_mode` is the session's queue delivery mode (TS
+    /// `steeringMode`: `all` = batched delivery at the boundary,
+    /// `one-at-a-time` = one steer per turn).
+    fn queued_input(
+        &self,
+        lane: &'static str,
+        steering_mode: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// A parked message was edited through the queue browse (event
     /// `tui queue edited`): `action` is `select` (a browse opened a
     /// selection), `edit` (the edited text re-queued; empty text
@@ -1081,7 +1088,7 @@ pub async fn run_interactive(
                         // reaches the frame gate, and the inline paint
                         // clears `dirty` — an idle terminal would
                         // otherwise never show the armed hint.
-                        view.chrome.tray_override = session.tray_override();
+                        view.chrome.tray_override = session.tray_override(&view);
                         crate::app::draw(renderer, &mut view)?;
                         // The frame scheduler's bookkeeping follows the
                         // inline paint: the 16ms gate below now measures its
@@ -1530,13 +1537,14 @@ pub async fn run_interactive(
             hint_painted = false;
         }
 
-        // The tray override row (the Ctrl+C exit hint) follows the
-        // session's hint state on every frame. Refreshed here — after the
-        // select, right before the paint — because a loop-top refresh
-        // goes stale across the select's sleep: the expiry-deadline wake
-        // would repaint the hint with the pre-sleep value and the
-        // corrected tray would never get another paint.
-        view.chrome.tray_override = session.tray_override();
+        // The tray override row (the Ctrl+C exit hint, or the streaming
+        // follow-up hint over a draft) follows the session's hint state on
+        // every frame. Refreshed here — after the select, right before
+        // the paint — because a loop-top refresh goes stale across the
+        // select's sleep: the expiry-deadline wake would repaint the hint
+        // with the pre-sleep value and the corrected tray would never get
+        // another paint.
+        view.chrome.tray_override = session.tray_override(&view);
 
         // The frame gate (TS `scheduleRender`: at most one render per
         // MIN_RENDER_INTERVAL_MS): every state change inside the window
