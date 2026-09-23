@@ -926,6 +926,7 @@ impl Worker {
             Arc::clone(&work_notify),
             std::sync::Arc::clone(&user_bash),
             Arc::clone(&events),
+            Arc::clone(&recovery),
         ));
         // The turn runner runs for the whole process lifetime. The command
         // dispatcher keeps the engine handle too (model metadata for the
@@ -1021,19 +1022,39 @@ impl Worker {
                 let autonomous_sink: crate::agent_engine::AutonomousAdmission = {
                     let sink_core = Arc::clone(&sink_core);
                     let sink_notify = Arc::clone(&sink_notify);
+                    let sink_recovery = Arc::clone(&recovery);
                     std::sync::Arc::new(move |text| {
-                        admit_autonomous_follow_up(&sink_core, &sink_notify, text);
+                        admit_autonomous_follow_up(&sink_recovery, &sink_core, &sink_notify, text);
                     })
                 };
                 concrete.set_autonomous_admission(autonomous_sink);
                 let purge_core = Arc::clone(&core);
+                let purge_recovery = Arc::clone(&recovery);
                 let autonomous_purge: std::sync::Arc<dyn Fn() + Send + Sync> =
                     std::sync::Arc::new(move || {
-                        let mut core = purge_core.lock().unwrap();
-                        core.follow_up
-                            .retain(|item| item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY));
-                        core.steering
-                            .retain(|item| item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY));
+                        {
+                            let mut core = purge_core.lock().unwrap();
+                            core.follow_up.retain(|item| {
+                                item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY)
+                            });
+                            core.steering.retain(|item| {
+                                item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY)
+                            });
+                        }
+                        // The withdraw settles the rows: `/autonomous
+                        // off` dropping the last queued row must not
+                        // leave its admission busy=true promising a revive
+                        // work that was withdrawn (and the snapshot must
+                        // not keep replaying the withdrawn row). Mid-turn
+                        // the verdict stays busy — the in-flight turn is
+                        // live work until its own `turn_end`.
+                        checkpoint_queue_recovery(
+                            &purge_recovery,
+                            &purge_core,
+                            QueueCheckpoint::Settle {
+                                operation: "queue_purged",
+                            },
+                        );
                     });
                 concrete.set_autonomous_queue_purge(autonomous_purge);
                 let probe_core = Arc::clone(&core);
@@ -1046,17 +1067,39 @@ impl Worker {
                 let sink_core = Arc::clone(&core);
                 let sink_events = events.clone();
                 let sink_notify = Arc::clone(&work_notify);
+                let sink_recovery = Arc::clone(&recovery);
                 let sink: crate::engine::GoalAdmissionSink = Arc::new(move |work| {
-                    admit_goal_follow_up(&sink_core, &sink_events, &sink_notify, work);
+                    admit_goal_follow_up(
+                        &sink_recovery,
+                        &sink_core,
+                        &sink_events,
+                        &sink_notify,
+                        work,
+                    );
                 });
                 // TS `_clearQueuedGoalContexts`: withdraw queued minted
                 // goal-context turns (the pause/clear/start commands and
                 // the kernel's `goal.complete`).
                 let purge_core = Arc::clone(&core);
+                let purge_recovery = Arc::clone(&recovery);
                 let queue_purge: std::sync::Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    let mut core = purge_core.lock().unwrap();
-                    core.steering.retain(|item| !is_goal_context_item(item));
-                    core.follow_up.retain(|item| !is_goal_context_item(item));
+                    {
+                        let mut core = purge_core.lock().unwrap();
+                        core.steering.retain(|item| !is_goal_context_item(item));
+                        core.follow_up.retain(|item| !is_goal_context_item(item));
+                    }
+                    // Same settle as the autonomous withdraw: the
+                    // withdrawal must refresh the verdict (and the
+                    // snapshot) so a pause/clear cannot leave busy=true
+                    // over withdrawn rows (a mid-turn withdrawal stays
+                    // busy through the in-flight turn).
+                    checkpoint_queue_recovery(
+                        &purge_recovery,
+                        &purge_core,
+                        QueueCheckpoint::Settle {
+                            operation: "queue_purged",
+                        },
+                    );
                 });
                 concrete.set_goal_admission(probe, sink, queue_purge);
             }
@@ -2757,12 +2800,14 @@ impl Worker {
                 Lane::FollowUp => core.follow_up.push_back(item),
             }
             let snapshot = self.snapshot_locked(&core);
-            let lanes = queue_lanes(&core);
-            let active_session_id = core.active_session_id.clone();
-            drop(core);
-            self.persist_queue_snapshot(&active_session_id, &lanes);
             (snapshot, queued_behind_work)
         };
+        // The admission checkpoint (TS `prompt_accepted`, busy=true): the
+        // admitted prompt is undelivered live work until its turn
+        // settles, and the lane snapshot rides the same locked read.
+        self.checkpoint_queue(QueueCheckpoint::Admitted {
+            operation: "prompt_accepted",
+        });
         if queued_behind_work {
             let _ = self.emit_action_update(&snapshot);
         }
@@ -2813,10 +2858,18 @@ impl Worker {
             forced_batch: false,
         });
         let snapshot = self.snapshot_locked(&core);
-        let lanes = queue_lanes(&core);
-        let active_session_id = core.active_session_id.clone();
         drop(core);
-        self.persist_queue_snapshot(&active_session_id, &lanes);
+        // The queue-write checkpoint (busy=true): an undelivered lane is
+        // live work. The operation names are TS's journal strings
+        // (`steer_queued`/`follow_up_queued`), not this port's command
+        // names, so the journals stay comparable record-for-record.
+        let queued_operation = match lane {
+            Lane::Steering => "steer_queued",
+            Lane::FollowUp => "follow_up_queued",
+        };
+        self.checkpoint_queue(QueueCheckpoint::Admitted {
+            operation: queued_operation,
+        });
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
         let command = if lane == Lane::Steering {
@@ -2904,7 +2957,7 @@ impl Worker {
         } else {
             Lane::Steering
         };
-        let (id, queued, snapshot, lanes, active_session_id, target) = {
+        let (id, queued, snapshot, target) = {
             let mut core = self.core.lock().unwrap();
             let pending = core.steering.len() + core.follow_up.len();
             if let Err(error) =
@@ -2979,11 +3032,19 @@ impl Worker {
                 forced_batch: false,
             });
             let snapshot = self.snapshot_locked(&core);
-            let lanes = queue_lanes(&core);
-            let active_session_id = core.active_session_id.clone();
-            (id, queued, snapshot, lanes, active_session_id, target)
+            (id, queued, snapshot, target)
         };
-        self.persist_queue_snapshot(&active_session_id, &lanes);
+        // The delivery checkpoint (busy=true): the queued agent message is
+        // admitted live work — a restart must revive the worker to
+        // deliver it (agent-to-agent messages have no client that
+        // reopens the session). The operation names are TS's steer/follow-up
+        // queue strings, matching the receipt's deliveryMode.
+        self.checkpoint_queue(QueueCheckpoint::Admitted {
+            operation: match lane {
+                Lane::Steering => "steer_queued",
+                Lane::FollowUp => "follow_up_queued",
+            },
+        });
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
         let timestamp = crate::util::now_iso();
@@ -3640,6 +3701,15 @@ impl Worker {
                                 forced_batch: false,
                             });
                         }
+                        // The admission checkpoint (busy=true): the
+                        // post-compaction continuation is admitted while
+                        // the session is idle, so without this record a
+                        // kill before the turn's settle would park it on
+                        // a plain boot (the runner records nothing at
+                        // pickup).
+                        self.checkpoint_queue(QueueCheckpoint::Admitted {
+                            operation: "follow_up_queued",
+                        });
                     }
                 }
                 // The resume site: clears the suspension and wakes the
@@ -3912,10 +3982,14 @@ impl Worker {
         let steering: Vec<String> = core.steering.drain(..).map(|item| item.message).collect();
         let follow_up: Vec<String> = core.follow_up.drain(..).map(|item| item.message).collect();
         let snapshot = self.snapshot_locked(&core);
-        let lanes = queue_lanes(&core);
-        let active_session_id = core.active_session_id.clone();
         drop(core);
-        self.persist_queue_snapshot(&active_session_id, &lanes);
+        // The cleared lanes are idle again: the verdict refresh rides the
+        // same checkpoint as the snapshot (a stale busy=true from the
+        // cleared items' admission must not revive an empty session; a
+        // clear mid-turn keeps the verdict busy through the turn).
+        self.checkpoint_queue(QueueCheckpoint::Settle {
+            operation: "queue_cleared",
+        });
         let _ = self.emit_action_update(&snapshot);
         response_success(
             None,
@@ -4194,6 +4268,13 @@ impl Worker {
         let _ = journal.record_queue_snapshot(active_session_id, &lanes.steering, &lanes.follow_up);
     }
 
+    /// One queue-lane recovery checkpoint through the worker's own
+    /// journal: the lane snapshot and the busy verdict ride one locked
+    /// read (`checkpoint_queue_recovery`).
+    pub(crate) fn checkpoint_queue(&self, checkpoint: QueueCheckpoint) {
+        checkpoint_queue_recovery(&self.recovery, &self.core, checkpoint);
+    }
+
     pub(crate) fn record_recovery(&self, busy: bool, operation: &str) -> Result<()> {
         let mut guard = self.recovery.lock().unwrap();
         let Some(journal) = guard.as_mut() else {
@@ -4422,6 +4503,95 @@ fn parse_custom_message(value: Option<&Value>) -> Result<Option<Value>, String> 
     Ok(Some(value.clone()))
 }
 
+/// One queue-lane recovery checkpoint. The verdict and the persisted
+/// lane snapshot come from one locked read, so a concurrent
+/// enqueue/clear cannot be overwritten by a stale verdict and a stale
+/// snapshot cannot resurrect cleared lanes.
+#[derive(Clone, Copy)]
+pub(crate) enum QueueCheckpoint {
+    /// The lanes hold admitted live work: `busy = true` (TS
+    /// `prompt_accepted` / `steer_queued` / `follow_up_queued` /
+    /// `actions_restored`).
+    Admitted { operation: &'static str },
+    /// The verdict follows the lanes: `busy = whether lanes remain
+    /// queued` (TS `turn_end` computes the same verdict over live
+    /// work). Also used by queue mutations with no TS record (a clear,
+    /// an edit, an agent-message drain) so the journal never keeps a
+    /// stale verdict over a changed queue.
+    Settle { operation: &'static str },
+}
+
+/// Write one queue-lane recovery checkpoint: under the recovery lock
+/// (then the core lock, the documented order) the lanes are snapshotted
+/// into the journal and the busy verdict is recorded from the same
+/// read. Shared by the worker (`prompt` admission,
+/// `steer`/`follow_up`/agent-message delivery, `restore_actions`, queue
+/// clears/edits) and the turn runner (`turn_end` settle), which own the
+/// same fields.
+pub(crate) fn checkpoint_queue_recovery(
+    recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
+    core_lock: &std::sync::Mutex<SessionCore>,
+    checkpoint: QueueCheckpoint,
+) {
+    let mut guard = recovery.lock().unwrap();
+    let Some(journal) = guard.as_mut() else {
+        return;
+    };
+    // The lanes are read under the recovery lock (a microsecond core
+    // hold — never across the journal's fsyncs, which would block every
+    // concurrent command behind the write): every queue mutation that
+    // persists lands its own snapshot under this same recovery lock, so
+    // no persist can interleave between this read and the appends, and a
+    // mutating non-persist (a runner pop) is corrected by the next
+    // checkpoint's fresh read.
+    let (active_session_id, session_id, session_file, lanes, turn_in_flight) = {
+        let core = core_lock.lock().unwrap();
+        (
+            core.active_session_id.clone(),
+            core.store
+                .as_ref()
+                .map(|s| s.session_id().to_string())
+                .unwrap_or_default(),
+            core.store
+                .as_ref()
+                .map(|s| s.path.to_string_lossy().to_string()),
+            queue_lanes(&core),
+            core.busy,
+        )
+    };
+    let (busy, operation) = match checkpoint {
+        QueueCheckpoint::Admitted { operation } => (true, operation),
+        // TS computes a settled verdict from live session work
+        // (`hasLiveSessionWork` — an active session counts — plus retries
+        // and accepted prompts), never from the lanes alone: a withdrawal
+        // landing mid-turn (queue purge, clear, drop) must not flip the
+        // journal to idle while the turn still streams, or a crash in
+        // that window parks live work. The turn's own settle reads the
+        // idle flip first, so `turn_in_flight` is false at `turn_end`.
+        QueueCheckpoint::Settle { operation } => (
+            turn_in_flight || !lanes.steering.is_empty() || !lanes.follow_up.is_empty(),
+            operation,
+        ),
+    };
+    // The verdict never publishes over a snapshot that did not persist:
+    // busy=true evidence must not promise a queue the journal cannot
+    // replay (a skipped settled verdict keeps the previous record — the
+    // worst case parks like any uncheckpointed session).
+    if journal
+        .record_queue_snapshot(&active_session_id, &lanes.steering, &lanes.follow_up)
+        .is_err()
+    {
+        return;
+    }
+    let _ = journal.record(
+        &active_session_id,
+        &session_id,
+        session_file.as_deref(),
+        busy,
+        operation,
+    );
+}
+
 pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
     fn items(lane: &VecDeque<QueuedItem>) -> Vec<crate::journal::WorkerQueueItemRecord> {
         lane.iter()
@@ -4597,6 +4767,7 @@ pub(crate) fn emit_worker_event_with(
 /// admission): the runner wakes, the item runs as its own queue item after
 /// the current run settles.
 pub(crate) fn admit_autonomous_follow_up(
+    recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
     core: &Arc<Mutex<SessionCore>>,
     work_notify: &Arc<Notify>,
     text: String,
@@ -4617,10 +4788,24 @@ pub(crate) fn admit_autonomous_follow_up(
             forced_batch: false,
         });
     }
+    // The admission checkpoint (busy=true): an injected continuation
+    // admitted while idle (after the previous settle) is undelivered
+    // live work the journal must prove — the runner records nothing at
+    // pickup, so a kill between this admission and the turn's settle
+    // would otherwise read as idle and park the continuation on a
+    // plain boot.
+    checkpoint_queue_recovery(
+        recovery,
+        core,
+        QueueCheckpoint::Admitted {
+            operation: "follow_up_queued",
+        },
+    );
     work_notify.notify_waiters();
 }
 
 pub(crate) fn admit_goal_follow_up(
+    recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
     core: &Arc<Mutex<SessionCore>>,
     events: &Arc<EventPump>,
     work_notify: &Arc<Notify>,
@@ -4665,6 +4850,20 @@ pub(crate) fn admit_goal_follow_up(
             Lane::FollowUp => core.follow_up.push_back(item),
         }
     }
+    // The admission checkpoint (busy=true, TS's queue strings by lane):
+    // a minted follow-up admitted while idle is undelivered live work
+    // the journal must prove until its turn settles (same gap as the
+    // autonomous continuation above).
+    checkpoint_queue_recovery(
+        recovery,
+        core,
+        QueueCheckpoint::Admitted {
+            operation: match lane {
+                Lane::Steering => "steer_queued",
+                Lane::FollowUp => "follow_up_queued",
+            },
+        },
+    );
     // `resumeIfIdle`: the runner re-checks the queue at its loop head, so
     // the minted turn runs as the next admitted turn.
     work_notify.notify_one();
@@ -4745,6 +4944,14 @@ impl TurnRunner {
                 }
             };
             if let Some(items) = item {
+                // No pickup checkpoint by design: every path that
+                // admits work into the lanes has already recorded its
+                // busy=true evidence at admission (`prompt_accepted`,
+                // `steer_queued`/`follow_up_queued`, `actions_restored`),
+                // so the whole in-flight window reads as interrupted
+                // work without another journal write on the runner; the
+                // settle's `turn_end` verdict is what parks the session
+                // later.
                 // The pickup projection (TS `_pumpSessionInputs` emits the
                 // queue update at the action's `preparing` transition): the
                 // delivered item leaves the queue projection BEFORE its
@@ -5406,20 +5613,23 @@ impl TurnRunner {
             let core = self.core.lock().unwrap();
             self.snapshot_from(&core)
         };
-        let (lanes, lane_session_id) = {
-            let core = self.core.lock().unwrap();
-            (queue_lanes(&core), core.active_session_id.clone())
-        };
-        {
-            let mut guard = self.recovery.lock().unwrap();
-            if let Some(journal) = guard.as_mut() {
-                let _ = journal.record_queue_snapshot(
-                    &lane_session_id,
-                    &lanes.steering,
-                    &lanes.follow_up,
-                );
-            }
-        }
+        // The settle checkpoint (TS `turn_end`, busy computed): the
+        // journal's latest record must track liveness, not the last
+        // structural write. The idle flip above precedes it, so the
+        // settle's in-flight term reads false here: a turn that settled
+        // with empty lanes leaves the session idle, so an unclean kill
+        // from here on must NOT read as interrupted work; undelivered
+        // lanes stay busy (they are admitted work a revive must
+        // redeliver). The busy verdict and the queue snapshot come from
+        // one locked read, so a concurrent enqueue cannot be overwritten
+        // by a stale idle verdict.
+        checkpoint_queue_recovery(
+            &self.recovery,
+            &self.core,
+            QueueCheckpoint::Settle {
+                operation: "turn_end",
+            },
+        );
         let _ = self.emit_action_update(&snapshot);
         // A finished turn is the cue to refresh the session's status line
         // (the runner debounces a burst into one request).
@@ -9669,5 +9879,166 @@ mod replacement_gate_tests {
             "a failed open never restores the failed path: {log:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod recovery_verdict_tests {
+    use super::*;
+
+    fn worker_with_journal() -> Arc<Worker> {
+        let dir = std::env::temp_dir().join(format!("pa-worker-verdict-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "target-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let worker = Arc::new(Worker::new(config, None));
+        // The journal is opened in `serve()`; tests open it directly so the
+        // checkpoints have the same durable sink as production.
+        *worker.recovery.lock().unwrap() =
+            Some(WorkerRecoveryJournal::open(&worker.config.recovery_journal_path).unwrap());
+        worker
+    }
+
+    async fn created_worker_with_journal() -> Arc<Worker> {
+        let worker = worker_with_journal();
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        worker
+    }
+
+    fn latest_record(worker: &Worker) -> crate::journal::WorkerRecoveryRecord {
+        WorkerRecoveryJournal::read_latest(&worker.config.recovery_journal_path)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.active_session_id == "target-session")
+            .expect("session record")
+    }
+
+    /// An idle-time injected continuation is journal busy evidence: the
+    /// admission (not the pickup) proves the work, so a plain boot revives
+    /// the worker to deliver it.
+    #[tokio::test]
+    async fn idle_time_injected_admission_is_busy_evidence() {
+        let worker = created_worker_with_journal().await;
+        // Settle first: the create record's busy=true must not mask the
+        // admission's verdict.
+        worker.dispatch("clear_queue", &json!({})).await;
+        assert!(
+            !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the settled session proves nothing"
+        );
+        let notify = Arc::new(Notify::new());
+        admit_autonomous_follow_up(
+            &worker.recovery,
+            &worker.core,
+            &notify,
+            "continue the mission".to_string(),
+        );
+        assert!(
+            WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the injected admission is live work"
+        );
+        let latest = latest_record(&worker);
+        assert_eq!(latest.operation, "follow_up_queued");
+        let (steering, follow_up) = WorkerRecoveryJournal::read_queue_snapshot(
+            &worker.config.recovery_journal_path,
+            "target-session",
+        )
+        .unwrap()
+        .expect("the admission flushed its snapshot");
+        assert!(steering.is_empty(), "steering: {steering:?}");
+        assert_eq!(follow_up[0].message, "continue the mission");
+        let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+    }
+
+    /// Dropping a cancelled admission settles the verdict: the cancelled
+    /// rows leave no busy evidence and no replayable snapshot.
+    #[tokio::test]
+    async fn cancelled_admission_drop_settles_the_verdict() {
+        let worker = created_worker_with_journal().await;
+        worker.dispatch("clear_queue", &json!({})).await;
+        let admitted = worker
+            .dispatch("prompt", &json!({ "admissionId": "a1", "message": "go" }))
+            .await;
+        assert!(admitted.success, "prompt failed: {admitted:?}");
+        assert!(
+            WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the admitted prompt is live work"
+        );
+        worker.drop_queued_admitted_prompt("a1");
+        assert!(
+            !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the dropped rows leave no busy evidence"
+        );
+        let latest = latest_record(&worker);
+        assert_eq!(latest.operation, "queue_dropped");
+        let (steering, follow_up) = WorkerRecoveryJournal::read_queue_snapshot(
+            &worker.config.recovery_journal_path,
+            "target-session",
+        )
+        .unwrap()
+        .expect("the drop flushed its snapshot");
+        assert!(
+            steering.is_empty() && follow_up.is_empty(),
+            "lanes: {steering:?} {follow_up:?}"
+        );
+        let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+    }
+
+    /// A withdrawal landing mid-turn settles the rows but never the
+    /// verdict: the in-flight turn is live work (TS computes settled
+    /// busy from `isSessionActive`, never from the lanes alone), so a
+    /// crash after the withdrawal still reads interrupted. Only the
+    /// turn's own `turn_end` — after the runner's idle flip — settles
+    /// the same empty lanes back to idle.
+    #[tokio::test]
+    async fn mid_turn_withdrawal_keeps_the_in_flight_turn_busy() {
+        let worker = created_worker_with_journal().await;
+        // Mid-turn: the runner is streaming, and the withdrawal leaves
+        // nothing queued behind it.
+        worker.core.lock().unwrap().busy = true;
+        worker.dispatch("clear_queue", &json!({})).await;
+        let latest = latest_record(&worker);
+        assert_eq!(latest.operation, "queue_cleared");
+        assert!(
+            latest.busy,
+            "the in-flight turn keeps the withdrawal's verdict busy"
+        );
+        let (steering, follow_up) = WorkerRecoveryJournal::read_queue_snapshot(
+            &worker.config.recovery_journal_path,
+            "target-session",
+        )
+        .unwrap()
+        .expect("the withdrawal flushed its snapshot");
+        assert!(
+            steering.is_empty() && follow_up.is_empty(),
+            "the withdrawn rows left the snapshot: {steering:?} {follow_up:?}"
+        );
+        // The turn ends: the runner's idle flip precedes its settle, so
+        // the same empty lanes now record busy=false.
+        worker.core.lock().unwrap().busy = false;
+        worker.dispatch("clear_queue", &json!({})).await;
+        let latest = latest_record(&worker);
+        assert_eq!(latest.operation, "queue_cleared");
+        assert!(!latest.busy, "the settled turn leaves the session idle");
+        assert!(
+            !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+            "the settled session proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
     }
 }
