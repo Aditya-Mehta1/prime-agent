@@ -548,7 +548,7 @@ mod tests {
         let labeled = OnboardingPicker::new(providers(), config);
         let text = text_of(&labeled.render(&theme(), 80));
         // The fresh picker pins selection on Continue, so the caret shows.
-        assert!(text.iter().any(|row| row.trim_end() == "> Done"));
+        assert!(text.iter().any(|row| row.trim_end() == " > Done"));
     }
 
     #[test]
@@ -714,7 +714,7 @@ mod tests {
         assert!(!text[2].contains("> "), "no input prompt on the field");
         // Prompt set: the Continue row lands after the field's blank, and
         // the fresh picker keeps it selected.
-        assert!(text[5].trim_end() == "> Continue");
+        assert!(text[5].trim_end() == " > Continue");
         let note_index = text
             .iter()
             .position(|row| row.trim_end() == " Connect later with /login.")
@@ -733,7 +733,7 @@ mod tests {
         let picker = OnboardingPicker::new(providers(), config);
         let text = text_of(&picker.render(&theme(), 80));
         assert!(
-            text[3].trim_end() == "> Continue",
+            text[3].trim_end() == " > Continue",
             "no prompt shifts the rows"
         );
         assert_eq!(text.len(), 4 + 4, "no hint and no note rows follow");
