@@ -276,7 +276,10 @@ mod tests {
         let substring = score("worker").expect("name substring matches");
         let fuzzy = score("gtwy").expect("name fuzzy matches");
         assert!(exact < prefix, "exact {exact} < prefix {prefix}");
-        assert!(prefix < substring, "prefix {prefix} < substring {substring}");
+        assert!(
+            prefix < substring,
+            "prefix {prefix} < substring {substring}"
+        );
         assert!(substring < fuzzy, "substring {substring} < fuzzy {fuzzy}");
     }
 
@@ -371,8 +374,7 @@ mod tests {
         // A sprawling subsequence over a long name scores past the strict
         // ceiling and rejects (TS `STRICT_FUZZY_MAX_TOKEN_SCORE`).
         let sprawled = SessionSearchText {
-            name: "primary agent session worker running in the forest temple of doom"
-                .to_string(),
+            name: "primary agent session worker running in the forest temple of doom".to_string(),
             ..targets()
         };
         assert!(
