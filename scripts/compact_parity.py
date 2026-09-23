@@ -24,8 +24,8 @@ the cut is a few rows and the summary row lands on screen in the default
 bottom-follow view on both sides (no keybinding-dependent scrolling).
 One documented divergence (Kevin/Sebastian directive 2026-09-23, product
 improvement BEYOND TS): the expanded compaction block hangs on the branch
-grammar — the markdown body carries the dim `\u{2570}\u{2500} ` gutter on
-its first row hanging off the `\u{25c6}` header, every row after the
+grammar — the markdown body carries the dim `╰─ ` gutter on
+its first row hanging off the `◆` header, every row after the
 four-space continuation indent, the metadata row on the continuation
 indent — instead of the TS `ExpandableEventMessage`'s plain one-column
 chat inset. The diff drops the expanded block's rows from BOTH frames
@@ -187,7 +187,7 @@ def strip_compaction_expansion(frame, state):
             continue
         # The `## Summary` heading renders as its own row: the TS plain
         # inset, the Rust branch gutter.
-        if stripped in ("Summary", "\u{2570}\u{2500} Summary"):
+        if stripped in ("Summary", "╰─ Summary"):
             continue
         kept.append(line)
     return "\n".join(kept)
@@ -195,10 +195,10 @@ def strip_compaction_expansion(frame, state):
 
 def assert_compaction_branch(ts_expanded, rust_expanded):
     """The carried divergence: the Rust expanded block hangs on the branch
-    grammar (`\u{2570}\u{2500} ` gutter off the `\u{25c6}` header, the
+    grammar (`╰─ ` gutter off the `◆` header, the
     four-space continuation indent); the TS binary keeps the plain
     one-column chat inset (the baseline)."""
-    gutter = "\u{2570}\u{2500} "
+    gutter = "╰─ "
     assert " " + gutter + "Summary" in rust_expanded, (
         "rust: the expanded heading row missing the branch gutter"
     )
