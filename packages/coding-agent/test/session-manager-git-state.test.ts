@@ -76,12 +76,17 @@ describe("session git state", () => {
 			expect(await sm.recordGitStateIfChanged()).toBeUndefined();
 			expect(gitStateEntries(sm)).toHaveLength(1);
 
+			sm.appendCustomMessageEntry("extension-note", "changed the repo", true);
+			const customSha = commit(repoDir, "custom-message");
+			expect(await sm.recordGitStateIfChanged()).toBeDefined();
+			expect(gitStateEntries(sm)[1]?.git).toMatchObject({ commit: customSha });
+
 			sm.appendMessage(toolResult());
 			commit(repoDir, "concurrent");
 			const [first, second] = await Promise.all([sm.recordGitStateIfChanged(), sm.recordGitStateIfChanged()]);
 			expect(first).toBeDefined();
 			expect(second).toBeUndefined();
-			expect(gitStateEntries(sm)).toHaveLength(2);
+			expect(gitStateEntries(sm)).toHaveLength(3);
 		});
 
 		it("re-records git state on a branch that lacks it on its active path", async () => {

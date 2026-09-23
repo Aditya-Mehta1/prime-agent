@@ -1163,6 +1163,7 @@ function entryMayHaveRunTool(entry: SessionEntry): boolean {
 	switch (entry.type) {
 		case "child_usage_attributed":
 		case "custom":
+		case "custom_message":
 			return true;
 		case "message":
 			break;
