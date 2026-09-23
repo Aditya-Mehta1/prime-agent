@@ -171,9 +171,6 @@ export async function prepareDispatchWorkspace(options: PrepareDispatchOptions):
 			.filter((name) => existsSync(join(staging, "skills", name, "pyproject.toml")))
 			.map((name) => `${GUEST_INSTALL}/skills/${name}`);
 		const bootstrap = `set -eu
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq python3 python3-venv git gh ca-certificates curl
 mkdir -p ${GUEST_INSTALL} ${GUEST_STATE} /workspace
 tar --no-same-owner -xzf /tmp/prime-dispatch.tar.gz -C ${GUEST_INSTALL}
 mv ${GUEST_INSTALL}/inputs /workspace/inputs
@@ -189,7 +186,7 @@ git -C ${GUEST_REPO} add -Af
 git -C ${GUEST_REPO} commit --allow-empty -qm 'Starting working tree snapshot'
 ${capture.origin ? `git -C ${GUEST_REPO} remote add origin ${shellQuote(capture.origin)}` : ""}
 git -C ${GUEST_REPO} config credential.https://github.com.helper '!gh auth git-credential'
-python3 -m venv ${GUEST_INSTALL}/venv
+uv venv --seed --python 3.11 ${GUEST_INSTALL}/venv
 ${binding.guestPython} -m pip install -q ${[`${GUEST_INSTALL}/runtime`, "dill", ...DEFAULT_RLM_EXTRA_UV_ARGS, ...skillPackages].map(shellQuote).join(" ")}
 rm -rf ${GUEST_INSTALL}/project /tmp/prime-dispatch.tar.gz
 git -C ${GUEST_REPO} rev-parse HEAD

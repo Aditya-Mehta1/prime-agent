@@ -85,7 +85,7 @@ export class SailClient {
 				size: "s",
 				memory_limit_gib: 2,
 				state_disk_limit_gib: 8,
-				image: { base: "BASE_IMAGE_DEBIAN" },
+				image: { base: "BASE_IMAGE_DEVBOX" },
 			}),
 		});
 		return (await response.json()) as SailboxInfo;
