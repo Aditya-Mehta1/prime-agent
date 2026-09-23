@@ -1,27 +1,17 @@
-//! The agents-view session search (TS `session-view-search.ts`, redesigned
-//! per Kevin's 2026-09-23 directive): a picker filter over the session's
-//! identity fields — the display NAME (primary), the durable session ID,
-//! and the CWD — never the transcript content.
+//! The agents-view session search (TS `session-view-search.ts`, with the
+//! corpus and ranking redesigned per Kevin's 2026-09-23 directive — a
+//! deliberate TS divergence, documented in the PR): a picker over the
+//! session's identity fields — the display NAME (primary), the durable
+//! session ID, and the CWD. The first message, the transcript corpus, the
+//! recap summary, and file paths never match.
 //!
-//! TS parity: the TS product's `createUnifiedSearchableText` also joins
-//! `firstMessage`, `allMessagesText` (the capped transcript corpus), the
-//! roster recap `summary`, `sessionFile`/`path`, and `parentSessionPath`
-//! into one match corpus, so a query like "fast" surfaces every session
-//! whose transcript mentions it. Kevin's directive removes those fields:
-//! "filtering by session name is the most important. First message is
-//! annoying to filter by — it leads to many unrelated sessions showing up.
-//! Session file path (we filter by session id anyway) and the roster
-//! summary line aren't needed." This module is that deliberate divergence;
-//! the query language itself (`re:` regexes, quoted phrases, all-must-match
-//! tokens) stays TS-shaped.
-//!
-//! The matching algorithm follows the session/command-picker standard
-//! (VS Code quick-open `fuzzyScorer.ts`/`filters.ts`, Zed's project
-//! switcher, tmux choose-tree): fuzzy subsequence matching on the display
-//! label, ranked exact > prefix > contiguous substring > fuzzy, recency as
-//! the tiebreaker. VS Code `doScoreItemFuzzySingle`: "If we have a prefix
-//! match on the label, we give a much higher baseScore to elevate these
-//! matches over others."
+//! Matching follows the session/command-picker standard (VS Code
+//! quick-open `fuzzyScorer.ts` + `filters.ts`; Zed's project switcher;
+//! tmux choose-tree): tiered and ranked — identity paste > name exact >
+//! name prefix > name substring > name fuzzy (the TS subsequence scorer
+//! with its strict ceiling) > id prefix/substring > cwd basename/path —
+//! with recency as the tiebreaker. The query language stays TS-shaped:
+//! `re:` regexes, quoted contiguous phrases, and all-must-match tokens.
 
 use crate::fuzzy::fuzzy_match;
 
@@ -147,8 +137,10 @@ fn push_token(tokens: &mut Vec<SearchToken>, buffer: &mut String, kind: fn(Strin
 
 /// Score one record's targets against the query: `Some(score)` when the
 /// query matches (lower is better — the `fuzzy_match` convention), `None`
-/// otherwise. Every token must match at least one target; the score sums
-/// per-token tier scores, so a record ranks by its weakest matching token.
+/// otherwise. Every token must match at least one target (VS Code
+/// `doScoreItemFuzzyMultiple`: "we require all queries to match"), and the
+/// score sums the per-token tier scores — with the tier stride, a weaker
+/// tier costs more than any within-tier quality difference.
 pub fn score_search(targets: &SessionSearchText, query: &ParsedSearchQuery) -> Option<f64> {
     if query.matches_never {
         return None;

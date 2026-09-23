@@ -63,9 +63,8 @@ pub struct UnifiedRecord {
     /// Every key this record is reachable by (selection survival).
     pub aliases: Vec<String>,
     pub section: Section,
-    /// The picker's match targets: the name, the durable session id, and
-    /// the cwd — never the transcript content (Kevin's 2026-09-23
-    /// directive; see `agents_view_search`).
+    /// The picker's match targets: the name, the durable session id,
+    /// and the cwd (see `agents_view_search`).
     pub search: SessionSearchText,
     /// The query-relevance score behind the ranked list (lower is better);
     /// `None` for retained ancestors and unqueried rosters.
@@ -122,12 +121,10 @@ fn saved_aliases(saved: &Value) -> Vec<String> {
 }
 
 /// The picker targets of one roster entry: the session NAME (primary),
-/// the durable session ID (paste-a-prefix targeting), and the CWD. The
-/// TS corpus also joined `firstMessage`, `allMessagesText`, the recap
-/// `summary`, `sessionFile`, and `parentSessionPath`; Kevin's directive
-/// removes them ("First message is annoying to filter by — it leads to
-/// many unrelated sessions showing up."). Daemon data wins for joined
-/// records; saved rows carry the durable name for archived sessions.
+/// the durable session ID (paste-a-prefix targeting), and the CWD — the
+/// restricted corpus of `agents_view_search`. Daemon data wins for
+/// joined records; saved rows carry the durable name for archived
+/// sessions.
 fn daemon_search_text(summary: &Value) -> SessionSearchText {
     SessionSearchText {
         name: get_str(summary, "sessionName")
@@ -431,8 +428,6 @@ pub fn filter_empty_sessions(records: &[UnifiedRecord], preserved: &[&str]) -> V
         .collect()
 }
 
-/// The re-exported query API (moved to `agents_view_search`, which owns
-/// the picker's match algorithm).
 pub use crate::agents_view_search::{parse_search_query, ParsedSearchQuery, SessionSearchText};
 
 /// The keys by which a record's parent is referenced (TS `getParentKeys`).
