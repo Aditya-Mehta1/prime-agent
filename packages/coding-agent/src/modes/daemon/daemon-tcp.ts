@@ -125,9 +125,18 @@ function detectTailscaleBindAddress(): string | null {
 	return addresses.find((address) => isIP(address) === 4) ?? addresses.find((address) => isIP(address) !== 0) ?? null;
 }
 
-/** True for a bind host that listens on every interface (IPv4 or IPv6 wildcard). */
+/**
+ * True for a bind host that listens on every interface. The IPv6 side accepts
+ * every spelling of the unspecified address: `::`, `::0`, and the fully expanded
+ * `0:0:0:0:0:0:0:0` all bind the wildcard interface, so a classifier that only
+ * knows `::` would skip the plaintext-token exposure warning for the others.
+ */
 export function isWildcardBindHost(host: string): boolean {
-	return host === "0.0.0.0" || host === "::";
+	if (host === "0.0.0.0") {
+		return true;
+	}
+	// Every group is zero or compressed away; any non-zero group is a real address.
+	return isIP(host) === 6 && host.split(":").every((group) => group === "" || group === "0");
 }
 
 /** Validate one configured bind host, naming the source that supplied it. */

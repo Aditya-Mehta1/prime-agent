@@ -199,8 +199,13 @@ describe("daemon tcp bind host", () => {
 		expect(resolveDaemonTcpListenerHost("0.0.0.0", undefined, {})).toBe("0.0.0.0");
 		expect(resolveDaemonTcpListenerHost("  10.0.0.5  ", undefined, {})).toBe("10.0.0.5");
 		expect(isWildcardBindHost("0.0.0.0")).toBe(true);
-		expect(isWildcardBindHost("::")).toBe(true);
-		expect(isWildcardBindHost("100.101.102.103")).toBe(false);
+		// Every spelling of the unspecified IPv6 address binds every interface.
+		for (const wildcard of ["::", "::0", "0:0:0:0:0:0:0:0"]) {
+			expect(isWildcardBindHost(wildcard)).toBe(true);
+		}
+		for (const real of ["100.101.102.103", "127.0.0.1", "::1", "fd7a:115c:a1e0::1", "fe80::", "not-an-ip"]) {
+			expect(isWildcardBindHost(real)).toBe(false);
+		}
 	});
 });
 
