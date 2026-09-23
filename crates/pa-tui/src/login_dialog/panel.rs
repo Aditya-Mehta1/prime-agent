@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn manual_input_renders_the_field_and_submit_hints() {
         let (dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
-        dialog
+        let _pending = dialog
             .handle()
             .show_manual_input("Paste redirect URL below, or complete login in browser:");
         let frame = frame_text(&dialog);
@@ -491,7 +491,7 @@ mod tests {
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize", None);
-        dialog
+        let _pending = dialog
             .handle()
             .show_manual_input("Paste redirect URL below, or complete login in browser:");
         assert_eq!(
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn left_arrow_is_back_only_at_the_field_start() {
         let (mut dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
-        dialog
+        let _pending = dialog
             .handle()
             .show_manual_input("Paste redirect URL below, or complete login in browser:");
         // At the start: back (a cancel).
@@ -551,7 +551,7 @@ mod tests {
             LoginDialogAction::Cancelled
         );
         // A fresh field with text: mid-edit, left moves the cursor.
-        dialog
+        let _pending = dialog
             .handle()
             .show_manual_input("Paste redirect URL below, or complete login in browser:");
         dialog.handle_key("a", &kb(), &mut OscSink::Stdout);

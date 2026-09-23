@@ -546,7 +546,8 @@ mod tests {
     fn show_prompt_and_manual_input_lay_out_the_field_blocks() {
         let (handle, _) = make_handle();
         handle.show_auth("https://x.dev/a", None);
-        handle.show_manual_input("Paste redirect URL below, or complete login in browser:");
+        let _pending =
+            handle.show_manual_input("Paste redirect URL below, or complete login in browser:");
         assert_eq!(
             rows(&handle),
             vec![
@@ -563,7 +564,7 @@ mod tests {
             "the paste field is mounted"
         );
         // The prompt block: section title plus the muted example.
-        handle.show_prompt(
+        let _pending = handle.show_prompt(
             "Paste the authorization code or full redirect URL:",
             Some("http://127.0.0.1:9/callback"),
         );

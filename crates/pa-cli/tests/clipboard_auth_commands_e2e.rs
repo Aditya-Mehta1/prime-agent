@@ -1373,6 +1373,7 @@ async fn tui_mcp_login_usage_and_unavailable_notes() {
 
     // A malformed login argument: the TS usage wording, no panel.
     let auth = Arc::new(ScriptedClientAuth::new());
+    let auth_calls = Arc::clone(&auth);
     let options = command_options(
         &supervisor.socket,
         dir.path(),
@@ -1400,5 +1401,5 @@ async fn tui_mcp_login_usage_and_unavailable_notes() {
         rendered.contains("Usage: /mcp login <name> (e.g. /mcp login linear)"),
         "the usage wording renders:\n{rendered}"
     );
-    assert!(auth.calls.lock().unwrap().is_empty(), "no flow ran");
+    assert!(auth_calls.calls.lock().unwrap().is_empty(), "no flow ran");
 }
