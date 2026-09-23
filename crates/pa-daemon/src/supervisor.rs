@@ -133,7 +133,8 @@ pub struct Supervisor {
     /// waits out) the first one's worker instead of launching over it
     /// and losing the runtime session lease. Owned by the create-reuse
     /// seam (`create_reuse.rs`).
-    pub(crate) opening_files: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) opening_files:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Daemon-lifecycle telemetry (`daemon event` schema v1), resolved at
     /// run start (None = opted out); never blocks supervision paths.
     telemetry: std::sync::Mutex<Option<pa_telemetry::TelemetryClient>>,
