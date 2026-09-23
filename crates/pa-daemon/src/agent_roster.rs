@@ -85,12 +85,44 @@ impl AgentRoster {
         }
     }
 
+    /// The stale-snapshot gate for one authoritative pull (registration,
+    /// create, refresh): the pulled summary embeds the worker's counter at
+    /// snapshot time, so a counter BELOW the (worker, instance) watermark
+    /// is a stale snapshot (a delta stamped after this pull read its state
+    /// already applied) and must not write. EQUAL refreshes: no delta
+    /// intervened, and push-less changes (an attach) ride through. Keyed
+    /// by the instance the pull was routed to — a late pull from a
+    /// predecessor gates against the predecessor's saturated watermark and
+    /// drops instead of pinning the replacement's restarted counter.
+    pub(crate) fn pull_applies(&mut self, worker_id: &str, instance: &str, counter: u64) -> bool {
+        match self
+            .delta_watermarks
+            .get(&(worker_id.to_string(), instance.to_string()))
+        {
+            Some(watermark) if counter < *watermark => false,
+            _ => true,
+        }
+    }
+
     /// Saturate the watermark of one retired worker process instance: a
-    /// replacement registered with a new instance, so every delta still
-    /// in flight from the predecessor is stale by construction.
-    pub(crate) fn retire_worker_instance(&mut self, worker_id: &str, instance: &str) {
+    /// replacement registered with a new instance, so every delta and
+    /// late pull still in flight from the predecessor is stale by
+    /// construction. Bounded: the worker keeps at most this one
+    /// saturated predecessor key plus the live instance's key — older
+    /// predecessors' requests have long since timed out, so their keys
+    /// drop instead of accumulating one entry per replacement.
+    pub(crate) fn retire_worker_instance(
+        &mut self,
+        worker_id: &str,
+        retired_instance: &str,
+        live_instance: &str,
+    ) {
         self.delta_watermarks
-            .insert((worker_id.to_string(), instance.to_string()), u64::MAX);
+            .retain(|(worker, instance), _| worker != worker_id || instance == live_instance);
+        self.delta_watermarks.insert(
+            (worker_id.to_string(), retired_instance.to_string()),
+            u64::MAX,
+        );
     }
 
     /// Forget every watermark of one stopped worker (the stop path keeps
@@ -440,13 +472,34 @@ mod tests {
         // The raise never lowers the watermark.
         roster.raise_delta_watermark("w1", "i1", 3);
         assert!(!roster.accept_delta_sequence("w1", "i1", 5));
+        // The pull gate: a counter BELOW the watermark is a stale snapshot
+        // (a delta stamped after the pull read its state already applied);
+        // EQUAL refreshes apply (no delta intervened — an attach-only
+        // change rides through).
+        assert!(!roster.pull_applies("w1", "i1", 4));
+        assert!(roster.pull_applies("w1", "i1", 5));
+        assert!(roster.pull_applies("w1", "i1", 6));
+        assert!(roster.pull_applies("w1", "unknown-instance", 1));
         // A replacement registration saturates the PREDECESSOR instance's
-        // watermark: every predecessor delta still in flight is stale.
-        roster.retire_worker_instance("w1", "i1");
+        // watermark: every predecessor delta and late pull still in flight
+        // is stale — and the retirement stays BOUNDED (one saturated
+        // predecessor key per worker, never one entry per replacement).
+        roster.retire_worker_instance("w1", "i1", "i2");
         assert!(!roster.accept_delta_sequence("w1", "i1", 9_000_000));
+        assert!(!roster.pull_applies("w1", "i1", 9_000_000));
         assert!(roster.accept_delta_sequence("w1", "i2", 2));
+        roster.raise_delta_watermark("w1", "i2", 3);
+        roster.retire_worker_instance("w1", "i2", "i3");
+        assert!(!roster.accept_delta_sequence("w1", "i2", 9_000_000));
+        // The retirement stays bounded: only the NEWEST predecessor's key
+        // stays saturated. The older predecessor's key drops — a delta
+        // from two generations back would have to outlive two process
+        // replacements plus their registrations, far past its 10s link
+        // timeout, so the stale-delta protection it carried is obsolete.
+        assert!(roster.accept_delta_sequence("w1", "i1", 1));
+        assert!(roster.accept_delta_sequence("w1", "i3", 1));
         // The stop cleanup forgets every watermark of the worker.
         roster.forget_worker_sequences("w1");
-        assert!(roster.accept_delta_sequence("w1", "i1", 1));
+        assert!(roster.accept_delta_sequence("w1", "i3", 1));
     }
 }

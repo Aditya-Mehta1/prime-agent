@@ -3325,8 +3325,9 @@ impl Supervisor {
         // deltas apply again.
         if previous_worker_instance_id.as_deref() != worker_instance_id.as_deref() {
             let retired = previous_worker_instance_id.clone().unwrap_or_default();
+            let live = worker_instance_id.clone().unwrap_or_default();
             let mut roster = self.roster.lock().unwrap();
-            roster.retire_worker_instance(&resident.worker_id, &retired);
+            roster.retire_worker_instance(&resident.worker_id, &retired, &live);
         }
         // A restore pass that owns this session's roster row can settle it
         // now (spec §10.4): the live worker serves the row's waiters
@@ -3859,10 +3860,17 @@ impl Supervisor {
         };
         // The new session joins the agent roster immediately (subscribers
         // see the roster_update before their next list) — as an
-        // authoritative pull write, so its embedded counter raises the
-        // stale-delta watermark for the resident.
-        self.write_roster_summary_for_resident(&resident, &summary)
-            .await;
+        // authoritative pull write: the create's summary embeds the
+        // worker's counter, and the write raises the resident's
+        // stale-delta watermark in the same lock.
+        let instance = resident
+            .descriptor
+            .lock()
+            .await
+            .worker_instance_id
+            .clone()
+            .unwrap_or_default();
+        self.write_roster_summary_for_resident(&resident, &instance, &summary);
         // The spawn append is a ledger-append moment: the new edge can be
         // the first time this family is live in the roster (a resumed
         // parent, a supervisor restart), so the seed runs here too - after
