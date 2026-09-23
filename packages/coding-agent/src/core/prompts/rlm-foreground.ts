@@ -6,7 +6,7 @@ export const RLM_FOREGROUND_PROMPT = [
 	"",
 	"Review results, update shared context, and tell affected workers when the user changes direction.",
 	"",
-	"`await rlm.dispatch('task', name='worker')` starts a remote worker and returns a handle. Use `inputs={'name': 'local-path'}` to copy extra files or directories.",
+	"`await rlm.dispatch('task', name='worker')` starts a remote worker in its own workspace with a copy of your working tree and returns a handle. Later edits are not automatically synced between workspaces. Use `inputs={'name': 'local-path'}` to copy extra files or directories.",
 ].join("\n");
 
 /** Project instructions accompany a real workspace, including in sessions without delegation. */
@@ -22,6 +22,6 @@ export function buildForegroundProjectPrompt(workspace: string): string {
 		"",
 		"Keep the notes aligned with the user's latest decisions. Read them when resuming work or after compaction.",
 		"",
-		"Workers read project context and report findings. You update the project files yourself.",
+		"Dispatched workers receive their own copy of the project context. Workers read project context and report findings. You update the project files yourself.",
 	].join("\n");
 }
