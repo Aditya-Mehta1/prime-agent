@@ -154,6 +154,12 @@ pub struct Supervisor {
     /// accepted; this flag ensures exactly one connection runs
     /// `begin_shutdown`, even if several clients notice the shutdown.
     shutdown_started: AtomicBool,
+    /// The connection that accepted the one terminal shutdown request. Only
+    /// this connection may run the stop pass from its response-write or
+    /// disconnect paths; another client disconnecting in the response window
+    /// cannot preempt the acknowledgement or turn an update restart into a
+    /// terminal worker-descriptor sweep.
+    shutdown_owner: std::sync::Mutex<Option<String>>,
     /// The accept loop's exit flag. `shutting_down` refuses new work the
     /// moment a terminal stop begins, but the loop itself must stay up
     /// until [`Supervisor::begin_shutdown`] has stopped every resident
@@ -274,6 +280,7 @@ impl Supervisor {
             pending_session_names: std::sync::Mutex::new(std::collections::HashSet::new()),
             shutting_down: AtomicBool::new(false),
             shutdown_started: AtomicBool::new(false),
+            shutdown_owner: std::sync::Mutex::new(None),
             accept_exit: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
             log,
@@ -2103,6 +2110,7 @@ impl Supervisor {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
         let mut events = self.events.subscribe();
+        let connection_id = client_id.clone();
         // Connection state shared with the per-command dispatch tasks: the
         // envelope-overridden client id and the attached-session list (the
         // event arm reads the latter to route session events).
@@ -2141,6 +2149,7 @@ impl Supervisor {
                     let roster_subscribed = Arc::clone(&roster_subscribed);
                     let connection = Arc::clone(&connection);
                     let dispatch_tx = dispatch_tx.clone();
+                    let connection_id = connection_id.clone();
                     tokio::spawn(async move {
                         let (lines, stop) = supervisor
                             .dispatch_client(
@@ -2149,6 +2158,7 @@ impl Supervisor {
                                 &attached,
                                 &roster_subscribed,
                                 &connection,
+                                &connection_id,
                             )
                             .await;
                         let _ = dispatch_tx.send((lines, stop));
@@ -2199,10 +2209,14 @@ impl Supervisor {
             }
         }
         // A shutdown command may have been accepted just before this client
-        // disconnected (or its response write failed). Exactly one connection
-        // must still run the stop pass; `shutdown_started` makes that owner
-        // unique even when several clients observe the shutdown at once.
-        if self.shutting_down.load(Ordering::SeqCst) && !self.accept_exit.load(Ordering::SeqCst) {
+        // disconnected (or its response write failed). Only the connection
+        // that accepted the shutdown may run the stop pass from this
+        // fallback: another client disconnecting in the response window
+        // must not preempt the acknowledgement or turn an update restart
+        // into a terminal descriptor sweep.
+        let is_shutdown_owner =
+            self.shutdown_owner.lock().unwrap().as_deref() == Some(connection_id.as_str());
+        if is_shutdown_owner && !self.accept_exit.load(Ordering::SeqCst) {
             self.ensure_shutdown_started().await;
         }
         // Detach from every attached session on disconnect (a TUI exit does
@@ -2235,6 +2249,7 @@ impl Supervisor {
         attached: &Arc<std::sync::Mutex<Vec<String>>>,
         roster_subscribed: &Arc<std::sync::atomic::AtomicBool>,
         connection: &Arc<crate::input_pause_lease::ClientConnectionState>,
+        connection_id: &str,
     ) -> (Vec<Value>, bool) {
         let envelope = match parse_supervisor_command_line(line) {
             Ok(envelope) => envelope,
@@ -2351,6 +2366,7 @@ impl Supervisor {
                 attached,
                 roster_subscribed,
                 connection,
+                connection_id,
                 command_id,
                 type_name,
             )
@@ -2371,6 +2387,7 @@ impl Supervisor {
         attached: &Arc<std::sync::Mutex<Vec<String>>>,
         roster_subscribed: &Arc<std::sync::atomic::AtomicBool>,
         connection: &Arc<crate::input_pause_lease::ClientConnectionState>,
+        connection_id: &str,
         command_id: String,
         type_name: String,
     ) -> (Vec<Value>, bool) {
@@ -2392,6 +2409,7 @@ impl Supervisor {
                 // synchronously here — before the response is written — so
                 // no create dispatched after the shutdown can slip past it
                 // and launch a worker the stop pass would miss.
+                *self.shutdown_owner.lock().unwrap() = Some(connection_id.to_string());
                 self.shutting_down.store(true, Ordering::SeqCst);
                 (lines, true)
             }
@@ -3236,8 +3254,12 @@ impl Supervisor {
     /// workers from them. Contrast `begin_shutdown`, which deletes
     /// descriptors for a terminal stop.
     fn exit_for_update(self: &Arc<Self>) {
-        self.shutting_down.store(true, Ordering::SeqCst);
+        // The update exit is already complete: publish the accept-loop exit
+        // before the general shutdown gate, so a client disconnect can never
+        // observe the transient `shutting_down && !accept_exit` window and
+        // mistake the update restart for a terminal stop pass.
         self.accept_exit.store(true, Ordering::SeqCst);
+        self.shutting_down.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_one();
     }
 
