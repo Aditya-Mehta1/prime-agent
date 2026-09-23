@@ -873,8 +873,8 @@ mod tests {
     #[test]
     fn search_matches_the_restricted_corpus_case_insensitively() {
         // The picker corpus is the session NAME, the durable ID, and the
-        // CWD (Kevin's directive); the TS corpus fields — first message,
-        // transcript text, recap summary, file paths — no longer match.
+        // CWD; the TS corpus fields — first message, transcript text,
+        // recap summary, file paths — never match.
         let saved = vec![json!({
             "id": "sess-alpha",
             "path": "/x/alpha.jsonl",

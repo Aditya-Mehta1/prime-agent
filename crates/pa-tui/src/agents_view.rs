@@ -1066,10 +1066,10 @@ impl AgentsViewMode {
             })
             .collect();
         let mut display: Vec<DisplayItem> = Vec::new();
-        // Kevin's directive (2026-09-23): while a query is active the list
-        // is a ranked picker — one flat, relevance-ordered run of hits
-        // (per-row icons carry the status), not status section blocks.
-        // Without a query the sectioned layout stays TS-identical.
+        // While a query is active the list is a ranked picker: one flat,
+        // relevance-ordered run of hits (per-row icons carry the status),
+        // not status section blocks. Without a query the sectioned
+        // layout stays TS-identical.
         if !self.query.trim().is_empty() {
             display.extend(self.rows.iter().map(DisplayItem::Row));
         } else {
