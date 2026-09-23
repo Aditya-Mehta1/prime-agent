@@ -18,6 +18,8 @@ export function buildForegroundProjectPrompt(workspace: string): string {
 		"",
 		"You maintain the shared project context. Keep the goal and current work in `PROJECT.md`; put details, worker findings, and user preferences in `project/`.",
 		"",
+		"`PROJECT.md` may be empty or contain only headings at first. Fill it in as the user's goal and decisions become clear.",
+		"",
 		"Keep the notes aligned with the user's latest decisions. Read them when resuming work or after compaction.",
 		"",
 		"Workers read project context and report findings. You update the project files yourself.",
