@@ -1874,22 +1874,7 @@ export class DaemonSupervisor {
 		void this.ready.then(
 			() => {
 				if (!client.socket.destroyed && this.clients.has(client)) {
-					this.write(client, {
-						type: "daemon_hello",
-						socketPath: this.socketPath,
-						protocol: DAEMON_PROTOCOL_INFO,
-						schemaId: DAEMON_SCHEMA_ID,
-						schemaRevision: DAEMON_SCHEMA_REVISION,
-						appVersion: VERSION,
-						runtime: getDaemonRuntimeIdentity(),
-						supervisorGeneration: this.generation,
-						supervisorOwnerToken: this.ownership?.record.token,
-						supervisorPid: process.pid,
-						supervisorProcessStartId: this.ownership?.record.processStartId,
-						supervisorSocketPath: this.ownership?.record.socketPath,
-						clientId: client.id,
-						serverCapabilities: SUPERVISOR_SERVER_CAPABILITIES,
-					});
+					this.write(client, this.daemonHello(client, tcpAuthToken === undefined));
 					// daemon_hello is written only once startup completes, and the TCP
 					// listener binds before worker adoption, which can spend the whole
 					// connect budget; mesh clients wait for hello before sending their
@@ -1980,6 +1965,42 @@ export class DaemonSupervisor {
 				);
 			}
 		});
+	}
+
+	/**
+	 * The connect greeting. A TCP peer is untrusted until it authenticates, so
+	 * it receives the protocol banner only: the supervisor's ownership token,
+	 * pid, process start id, and local paths describe this machine's local
+	 * trust domain and are useless to a remote client. Local connections skip
+	 * TCP auth entirely and keep the full identity, which the update-restart
+	 * coordinator fences on.
+	 */
+	private daemonHello(
+		client: DaemonSocketClient,
+		localPeer: boolean,
+	): Extract<DaemonOutbound, { type: "daemon_hello" }> {
+		const banner = {
+			type: "daemon_hello" as const,
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaId: DAEMON_SCHEMA_ID,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
+			appVersion: VERSION,
+			clientId: client.id,
+			serverCapabilities: SUPERVISOR_SERVER_CAPABILITIES,
+		};
+		if (!localPeer) {
+			return banner;
+		}
+		return {
+			...banner,
+			socketPath: this.socketPath,
+			runtime: getDaemonRuntimeIdentity(),
+			supervisorGeneration: this.generation,
+			supervisorOwnerToken: this.ownership?.record.token,
+			supervisorPid: process.pid,
+			supervisorProcessStartId: this.ownership?.record.processStartId,
+			supervisorSocketPath: this.ownership?.record.socketPath,
+		};
 	}
 
 	/**

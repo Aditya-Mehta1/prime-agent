@@ -1,9 +1,12 @@
 import type { Socket } from "node:net";
+import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	createDaemonCommandEnvelope,
+	DAEMON_SCHEMA_ID,
+	DAEMON_SCHEMA_REVISION,
 	type DaemonCommand,
 	type DaemonResponse,
 	success,
@@ -81,6 +84,8 @@ function createHarness(
 		},
 		workers: new Map(),
 		clients: new Set(),
+		socketPath: "/tmp/test.sock",
+		generation: "generation-1",
 		connectionIds: new WeakMap(),
 		sessionInputPauseEpochs: new WeakMap(),
 		detachingInputPauseSessions: new WeakMap(),
@@ -746,5 +751,58 @@ describe("daemon supervisor tcp admission", () => {
 		expect(preReady.destroyed).toBe(true);
 		expect(supervisor.log).toHaveBeenCalledWith("Closed unauthenticated TCP client connection");
 		vi.useRealTimers();
+	});
+
+	it("greets an unauthenticated TCP peer with the protocol banner only", async () => {
+		const supervisor = createHarness() as any;
+		supervisor.handleLine = vi.fn(async () => undefined);
+		const socket = fakeTcpSocket();
+		supervisor.handleConnection(socket, { tcpAuthToken: token });
+		await waitFor(() => supervisor.write.mock.calls.length > 0);
+
+		const hello = supervisor.write.mock.calls[0][1];
+		// An exact key set: the ownership token, pids, process start id, runtime
+		// paths, and the local socket path are local-trust values a remote peer
+		// cannot act on, so they are absent until it is on this machine.
+		expect(Object.keys(hello).sort()).toEqual([
+			"appVersion",
+			"clientId",
+			"protocol",
+			"schemaId",
+			"schemaRevision",
+			"serverCapabilities",
+			"type",
+		]);
+		expect(hello.schemaId).toBe(DAEMON_SCHEMA_ID);
+		expect(hello.schemaRevision).toBe(DAEMON_SCHEMA_REVISION);
+
+		// Authenticating a line must not hand the withheld identity over afterwards.
+		socket.write(`${JSON.stringify({ id: "t1", type: "list", auth: { token } })}\n`);
+		await waitFor(() => supervisor.handleLine.mock.calls.length > 0);
+		expect(supervisor.write.mock.calls.map((call: unknown[]) => (call[1] as { type: string }).type)).toEqual([
+			"daemon_hello",
+		]);
+	});
+
+	it("keeps the full supervisor identity hello for local connections", async () => {
+		const supervisor = createHarness() as any;
+		const socket = new PassThrough() as unknown as Socket;
+		Object.assign(socket, { destroyed: false });
+		supervisor.handleConnection(socket);
+		await waitFor(() => supervisor.write.mock.calls.length > 0);
+
+		const hello = supervisor.write.mock.calls[0][1];
+		// The update-restart coordinator fences on these fields, so a local
+		// connection must keep receiving them.
+		expect(hello).toMatchObject({
+			type: "daemon_hello",
+			socketPath: "/tmp/test.sock",
+			supervisorGeneration: "generation-1",
+			supervisorOwnerToken: "test-owner",
+			supervisorProcessStartId: "test-process",
+			supervisorSocketPath: "/tmp/test.sock",
+			supervisorPid: process.pid,
+		});
+		expect(hello.runtime.executablePath).toBe(resolve(process.execPath));
 	});
 });

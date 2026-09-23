@@ -1114,13 +1114,19 @@ export type DaemonOutbound =
 	| DaemonRequestProgress
 	| {
 			type: "daemon_hello";
-			socketPath: string;
+			/** Local unix socket identity; absent on a TCP connection before it authenticates. */
+			socketPath?: string;
 			protocol: DaemonProtocolInfo;
 			schemaId?: string;
 			/** Monotonic wire-schema revision for field-sensitive compatibility checks. */
 			schemaRevision?: number;
 			/** App version of the daemon process, used to detect stale daemons after self-update. */
 			appVersion?: string;
+			/**
+			 * Local-trust identity below: the supervisor's ownership token, pid,
+			 * process start id, and filesystem paths. Written to connections on
+			 * this machine only, so an unauthenticated TCP peer cannot read them.
+			 */
 			runtime?: DaemonRuntimeIdentity;
 			/** Changes whenever the public supervisor process is replaced. */
 			supervisorGeneration?: string;
