@@ -45,8 +45,10 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery"))
 import batterylib  # noqa: E402  (the shared daemon-reap sweep)
 
-SESSION_BASE = "pmenu-base"
-SESSION_BRANCH = "pmenu-branch"
+# Per-invocation suffix: concurrent runs must not reuse (and kill) each
+# other's sessions.
+SESSION_BASE = f"pmenu-base-{os.getpid()}"
+SESSION_BRANCH = f"pmenu-branch-{os.getpid()}"
 WIDTH, HEIGHT = 110, 34
 SETTLE = 1.0
 TS_SCRIPT_MODEL = "faux-1"
@@ -212,7 +214,7 @@ def run_states(session, out_dir, label, verify_branch):
     if verify_branch:
         check(
             "slash_menu_uses_menu_grammar",
-            len(marker_rows) == 1 and "model" in pane and ("(" in pane or True),
+            len(marker_rows) == 1 and "model" in pane and "(" in pane,
             f"marker_rows={marker_rows}",
         )
     send(session, "Escape")
@@ -282,10 +284,11 @@ def run_states(session, out_dir, label, verify_branch):
             f"aborted={aborted}",
         )
     else:
+        base_interrupted = "aborted" in after and not re.search(SPINNER_CLASS, after)
         check(
             "BASE_esc_also_interrupts",
-            True,
-            "base: Esc closes the menu AND interrupts (the divergence)",
+            menu_closed and base_interrupted,
+            f"menu_closed={menu_closed} interrupted={base_interrupted}",
         )
     # Drain the turn so the later command states dispatch.
     send(session, "Escape")
@@ -427,28 +430,40 @@ def main():
         batterylib.reap_daemons(
             socket_paths=stale_sockets, needles=(args.out,), cwd_roots=(args.out,)
         )
-    if not args.skip_base:
-        if not args.base_binary:
-            raise SystemExit("set --base-binary (or PA_BASE_BINARY)")
-        sandbox = make_sandbox(os.path.join(base, "base"))
+    # Each side tears down in a finally: a wait_for timeout or a tmux
+    # error mid-run must not leak the session or its daemon, and the
+    # final reap must run even when a side raises.
+    try:
+        if not args.skip_base:
+            if not args.base_binary:
+                raise SystemExit("set --base-binary (or PA_BASE_BINARY)")
+            sandbox = make_sandbox(os.path.join(base, "base"))
+            sockets.append(os.path.join(sandbox[1], "daemon.sock"))
+            try:
+                launch(
+                    SESSION_BASE, args.base_binary, sandbox, script_path, shared_cwd
+                )
+                all_results += run_states(
+                    SESSION_BASE, args.out, "base", verify_branch=False
+                )
+            finally:
+                tmux("kill-session", "-t", SESSION_BASE, check=False)
+
+        sandbox = make_sandbox(os.path.join(base, "branch"))
         sockets.append(os.path.join(sandbox[1], "daemon.sock"))
-        launch(
-            SESSION_BASE, args.base_binary, sandbox, script_path, shared_cwd
+        try:
+            launch(
+                SESSION_BRANCH, args.branch_binary, sandbox, script_path, shared_cwd
+            )
+            all_results += run_states(
+                SESSION_BRANCH, args.out, "branch", verify_branch=True
+            )
+        finally:
+            tmux("kill-session", "-t", SESSION_BRANCH, check=False)
+    finally:
+        batterylib.reap_daemons(
+            socket_paths=sockets, needles=(args.out,), cwd_roots=(args.out,)
         )
-        all_results += run_states(SESSION_BASE, args.out, "base", verify_branch=False)
-        tmux("kill-session", "-t", SESSION_BASE, check=False)
-
-    sandbox = make_sandbox(os.path.join(base, "branch"))
-    sockets.append(os.path.join(sandbox[1], "daemon.sock"))
-    launch(
-        SESSION_BRANCH, args.branch_binary, sandbox, script_path, shared_cwd
-    )
-    all_results += run_states(SESSION_BRANCH, args.out, "branch", verify_branch=True)
-    tmux("kill-session", "-t", SESSION_BRANCH, check=False)
-
-    batterylib.reap_daemons(
-        socket_paths=sockets, needles=(args.out,), cwd_roots=(args.out,)
-    )
 
     failed = 0
     print("\n== prompt-menu harness ==")
