@@ -862,10 +862,6 @@ function normalizeMessageContent(content: string | (TextContent | ImageContent)[
 }
 
 /**
- * Whether a delivered message attaches image content. Used to route
- * image-carrying turns off session models without image input.
- */
-/**
  * Image bytes from a host-request payload, in the shape the attach-image skill
  * sends: base64 data with its mime type per image. Anything malformed is
  * dropped, so a bad payload reads as "no image" instead of failing the read.
@@ -882,6 +878,10 @@ function imageContentsFromPayload(value: unknown): ImageContent[] {
 	return images;
 }
 
+/**
+ * Whether a delivered message attaches image content. Used to route
+ * image-carrying turns off session models without image input.
+ */
 function messageCarriesImages(message: QueuedAgentMessage | AgentMessage): boolean {
 	const content = (message as { content?: unknown }).content;
 	return Array.isArray(content) && content.some((part: { type?: string }) => part?.type === "image");
@@ -2820,7 +2820,10 @@ export class AgentSession {
 	 * images, or no resolvable image model); every failure throws with the fix
 	 * named, so images never reach a model that would drop them.
 	 */
-	private async _readImagesWithVisionChild(text: string, images: ImageContent[]): Promise<string | undefined> {
+	private async _readImagesWithVisionChild(
+		text: string,
+		images: ImageContent[],
+	): Promise<{ reading: string; reference: string } | undefined> {
 		if (images.length === 0) return undefined;
 		const sessionModel = this.model;
 		if (!sessionModel || sessionModel.input.includes("image")) return undefined;
@@ -2890,7 +2893,9 @@ export class AgentSession {
 					? `[${skipped} image(s) were skipped: unsupported type, over 8 MB each, over 24 MB total, or over the per-turn count of 8]`
 					: "",
 			].filter(Boolean);
-			return `[${scope}]\n${capped}${notes.length > 0 ? `\n${notes.join("\n")}` : ""}`;
+			// The reference travels with the reading: a pin or settings change
+			// during the read must not be reported as the model that served it.
+			return { reading: `[${scope}]\n${capped}${notes.length > 0 ? `\n${notes.join("\n")}` : ""}`, reference };
 		} finally {
 			// One child per turn, deleted once its reading is in hand: the image turn
 			// leaves no child behind to collect, and the materialized files go with it.
@@ -5786,7 +5791,7 @@ export class AgentSession {
 		if (!this._needsVisionChildRead(normalized.images)) return normalized;
 		const reading = this._readImagesWithVisionChild(normalized.text, normalized.images).then((result) => {
 			if (!result) return normalized;
-			const text = normalized.text.trim() ? `${normalized.text}\n\n${result}` : result;
+			const text = normalized.text.trim() ? `${normalized.text}\n\n${result.reading}` : result.reading;
 			return { ...normalized, text, images: undefined };
 		});
 		// A caller that abandons this promise must not crash the process: the
@@ -11320,7 +11325,7 @@ export class AgentSession {
 							),
 						};
 					}
-					return { text: reading, model: this._imageTurnChildModelReference() ?? null };
+					return { text: reading.reading, model: reading.reference };
 				} catch (error) {
 					return { error: error instanceof Error ? error.message : String(error) };
 				}
