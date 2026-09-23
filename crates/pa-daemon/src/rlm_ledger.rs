@@ -522,10 +522,8 @@ impl RlmSpawnLedger {
     pub fn live_edges(&self) -> Result<Vec<RlmLedgerEdge>> {
         self.seed_once()?;
         let state = self.replay_cached()?;
-        let mut resolver = LivePathResolver::new(
-            self.agent_dir.clone(),
-            self.canonical_sessions_dir.clone(),
-        );
+        let mut resolver =
+            LivePathResolver::new(self.agent_dir.clone(), self.canonical_sessions_dir.clone());
         let mut edges = Vec::with_capacity(state.edges.len());
         for edge in &state.edges {
             if edge.deleted.is_some() {
@@ -1146,8 +1144,11 @@ mod tests {
         assert_eq!(edges.len(), 1, "{edges:?}");
         // The resolved paths are canonicalized (the sessions dir the
         // resolver anchors to is canonical).
-        let canonical =
-            |path: &Path| -> String { crate::lease::canonical_session_path(path).to_string_lossy().to_string() };
+        let canonical = |path: &Path| -> String {
+            crate::lease::canonical_session_path(path)
+                .to_string_lossy()
+                .to_string()
+        };
         assert_eq!(
             edges[0].parent,
             canonical(&live_parent),

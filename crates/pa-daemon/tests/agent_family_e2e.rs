@@ -583,7 +583,10 @@ async fn family_edges_never_cross_families_end_to_end() {
                 .or_else(|| created["data"]["id"].as_str())
                 .expect("active session id")
                 .to_string(),
-            created["data"]["sessionId"].as_str().expect("session id").to_string(),
+            created["data"]["sessionId"]
+                .as_str()
+                .expect("session id")
+                .to_string(),
             created["data"]["sessionFile"]
                 .as_str()
                 .expect("session file")
@@ -693,12 +696,10 @@ async fn family_edges_never_cross_families_end_to_end() {
     let mut handlers = HostRequestHandlers::default();
     register_agent_message_host_handlers(Arc::clone(&controller) as Arc<_>, &mut handlers);
     let broadcast = handlers.get("agent_message.send").expect("send handler");
-    let receipts = broadcast(
-        HostRequestPayload {
-            data: json!({ "message": "family update", "target": "all" }),
-            cell_source_code: None,
-        },
-    )
+    let receipts = broadcast(HostRequestPayload {
+        data: json!({ "message": "family update", "target": "all" }),
+        cell_source_code: None,
+    })
     .await
     .expect("broadcast");
     let receipt_targets: Vec<String> = receipts["receipts"]
@@ -765,17 +766,17 @@ async fn family_edges_never_cross_families_end_to_end() {
         )) as Arc<_>,
         &mut kid_handlers,
     );
-    let kid_send = kid_handlers.get("agent_message.send").expect("send handler");
-    let crossed = kid_send(
-        HostRequestPayload {
-            data: json!({
-                "message": "hello sibling",
-                "receiver_role": "sibling",
-                "receiver_name": "kid",
-            }),
-            cell_source_code: None,
-        },
-    )
+    let kid_send = kid_handlers
+        .get("agent_message.send")
+        .expect("send handler");
+    let crossed = kid_send(HostRequestPayload {
+        data: json!({
+            "message": "hello sibling",
+            "receiver_role": "sibling",
+            "receiver_name": "kid",
+        }),
+        cell_source_code: None,
+    })
     .await;
     let error = crossed.expect_err("a cross-family sibling send must not resolve");
     assert!(
@@ -785,15 +786,13 @@ async fn family_edges_never_cross_families_end_to_end() {
 
     // The parent-directed send targets the TRUE parent by its durable
     // edge — the receipt names parent-a's live id.
-    let parent_reply = kid_send(
-        HostRequestPayload {
-            data: json!({
-                "message": "parent update",
-                "receiver_role": "parent",
-            }),
-            cell_source_code: None,
-        },
-    )
+    let parent_reply = kid_send(HostRequestPayload {
+        data: json!({
+            "message": "parent update",
+            "receiver_role": "parent",
+        }),
+        cell_source_code: None,
+    })
     .await
     .expect("parent send");
     assert_eq!(
@@ -820,15 +819,22 @@ async fn family_edges_never_cross_families_end_to_end() {
         .iter()
         .find(|summary| summary.is_current)
         .expect("the caller's own row");
-    assert_eq!(current.active_session_id.as_deref(), Some(kid_a_active.as_str()));
+    assert_eq!(
+        current.active_session_id.as_deref(),
+        Some(kid_a_active.as_str())
+    );
     let parent_row = roster
         .iter()
         .find(|summary| summary.active_session_id.as_deref() == Some(parent_a_active.as_str()))
         .expect("the parent row");
-    assert_eq!(parent_row.relationship, Some(AgentFamilyRelationship::Parent));
+    assert_eq!(
+        parent_row.relationship,
+        Some(AgentFamilyRelationship::Parent)
+    );
     assert!(
-        !roster.iter().any(|summary| summary.active_session_id.as_deref()
-            == Some(kid_b_active.as_str())),
+        !roster
+            .iter()
+            .any(|summary| summary.active_session_id.as_deref() == Some(kid_b_active.as_str())),
         "another family's subagent is never in the observe roster: {roster:?}"
     );
 
@@ -838,15 +844,13 @@ async fn family_edges_never_cross_families_end_to_end() {
     let observer = Arc::new(LinkAgentObserveController::new(
         Arc::clone(&link),
         parent_a_active.clone(),
-        Arc::new(std::sync::Mutex::new(Some(
-            json!({
-                "activeSessionId": parent_a_active,
-                "sessionId": parent_a_session,
-                "sessionName": "parent-a",
-                "runtimeKind": "top-level",
-                "sessionFile": parent_a_file,
-            }),
-        ))),
+        Arc::new(std::sync::Mutex::new(Some(json!({
+            "activeSessionId": parent_a_active,
+            "sessionId": parent_a_session,
+            "sessionName": "parent-a",
+            "runtimeKind": "top-level",
+            "sessionFile": parent_a_file,
+        })))),
         Some(Arc::new(registry_a.clone())),
     ));
     let roster = observer.list_agents().await.expect("observe roster");
@@ -869,8 +873,9 @@ async fn family_edges_never_cross_families_end_to_end() {
         .expect("the own child row");
     assert_eq!(child_row.relationship, Some(AgentFamilyRelationship::Child));
     assert!(
-        !roster.iter().any(|summary| summary.active_session_id.as_deref()
-            == Some(kid_b_active.as_str())),
+        !roster
+            .iter()
+            .any(|summary| summary.active_session_id.as_deref() == Some(kid_b_active.as_str())),
         "another family's subagent is never labeled child here: {roster:?}"
     );
 }

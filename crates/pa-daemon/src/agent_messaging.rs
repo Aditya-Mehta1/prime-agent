@@ -89,7 +89,9 @@ fn row_str<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
 /// pre-migration root and the migrated root resolves to one parent).
 pub(crate) fn same_session_file(left: &str, right: &str) -> bool {
     let canonical = |path: &str| {
-        crate::lease::canonical_session_path(Path::new(path)).to_string_lossy().to_string()
+        crate::lease::canonical_session_path(Path::new(path))
+            .to_string_lossy()
+            .to_string()
     };
     if canonical(left) == canonical(right) {
         return true;
@@ -131,9 +133,11 @@ fn row_is_parent(row: &Value, identity: &FamilyIdentity) -> bool {
 /// durable parent edge points back at this session by its persisted id,
 /// its live id, or its session file.
 fn row_is_child(row: &Value, identity: &FamilyIdentity) -> bool {
-    if identity.session_id.as_deref().is_some_and(|id| {
-        row_str(row, "parentSessionId").is_some_and(|parent| parent == id)
-    }) {
+    if identity
+        .session_id
+        .as_deref()
+        .is_some_and(|id| row_str(row, "parentSessionId").is_some_and(|parent| parent == id))
+    {
         return true;
     }
     if !identity.active_session_id.is_empty()
@@ -179,7 +183,8 @@ fn row_is_sibling(row: &Value, identity: &FamilyIdentity) -> bool {
         }
     }
     if let Some(parent_path) = identity.parent_session_path.as_deref() {
-        if row_str(row, "parentSessionPath").is_some_and(|path| same_session_file(path, parent_path))
+        if row_str(row, "parentSessionPath")
+            .is_some_and(|path| same_session_file(path, parent_path))
         {
             return true;
         }

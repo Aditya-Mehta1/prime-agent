@@ -3044,7 +3044,10 @@ impl Worker {
         // child, and its messages must not render as one. The core lock is
         // scoped to the read (a std MutexGuard never rides an await).
         let from_relationship = {
-            let core = self.core.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let core = self
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             sender_is_child_of(&sender, &core).then_some(AgentFamilyRelationship::Child)
         };
         let prompt = pa_core::session_engine::agent_messaging::create_agent_session_message_prompt(
@@ -6521,21 +6524,41 @@ mod tests {
             "runtimeKind": "subagent",
             "parentSessionId": "sess-a",
         });
-        assert!(sender_parent_edge_is(&true_child, Some("sess-a"), "aaa111", None));
+        assert!(sender_parent_edge_is(
+            &true_child,
+            Some("sess-a"),
+            "aaa111",
+            None
+        ));
         let live_child = json!({
             "activeSessionId": "eee555",
             "runtimeKind": "subagent",
             "parentActiveSessionId": "aaa111",
         });
-        assert!(sender_parent_edge_is(&live_child, Some("sess-a"), "aaa111", None));
+        assert!(sender_parent_edge_is(
+            &live_child,
+            Some("sess-a"),
+            "aaa111",
+            None
+        ));
         let foreign_child = json!({
             "activeSessionId": "fff666",
             "runtimeKind": "subagent",
             "parentSessionId": "sess-zz",
         });
-        assert!(!sender_parent_edge_is(&foreign_child, Some("sess-a"), "aaa111", None));
+        assert!(!sender_parent_edge_is(
+            &foreign_child,
+            Some("sess-a"),
+            "aaa111",
+            None
+        ));
         let edgeless = json!({ "activeSessionId": "ggg777", "runtimeKind": "subagent" });
-        assert!(!sender_parent_edge_is(&edgeless, Some("sess-a"), "aaa111", None));
+        assert!(!sender_parent_edge_is(
+            &edgeless,
+            Some("sess-a"),
+            "aaa111",
+            None
+        ));
         let moved_child = json!({
             "activeSessionId": "hhh888",
             "runtimeKind": "subagent",
