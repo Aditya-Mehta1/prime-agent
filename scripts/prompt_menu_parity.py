@@ -219,8 +219,11 @@ def run_states(session, out_dir, label, verify_branch):
     time.sleep(0.4)
     clear_editor()
 
-    # (c) bare /model opens the picker
-    send(session, "/model")
+    # (c) bare /model opens the picker. The trailing space completes the
+    # command token BEFORE Enter (the base's takes_argument completion
+    # would otherwise consume Enter to append its separator; the branch's
+    # menu-only /mcp//model complete without the separator).
+    send(session, "/model ")
     send(session, "Enter")
     frames[f"{label}_c_model_picker"] = wait_for(session, "Search models", timeout=15)
     if verify_branch:
@@ -235,7 +238,7 @@ def run_states(session, out_dir, label, verify_branch):
     # (d) bare /mcp opens the connections view (the daemon may serve the
     # builtin catalog's service rows, so the frame needle is the view's
     # search field, not the empty-roster row).
-    send(session, "/mcp")
+    send(session, "/mcp ")
     send(session, "Enter")
     frames[f"{label}_d_mcp_menu"] = wait_for(
         session, "Search MCP connections", timeout=15
@@ -291,7 +294,7 @@ def run_states(session, out_dir, label, verify_branch):
     clear_editor()
 
     # (f) /model <arg> + Enter
-    send(session, "/model gpt-5.")
+    send(session, "/model gpt-5. ")
     send(session, "Enter")
     time.sleep(SETTLE + 0.6)
     frames[f"{label}_f_model_arg"] = capture(session)
