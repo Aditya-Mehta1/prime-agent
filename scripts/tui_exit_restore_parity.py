@@ -405,10 +405,14 @@ def run_scenario(side, sandbox, label, out_dir):
         time.sleep(0.5)
         baseline = stty_state(server, "BASELINE_MARKER")
         facts["stty_baseline"] = baseline
+        # The probe state file lives under the scenario's own sandbox tmp
+        # (a per-scenario name): concurrent invocations of the harness must
+        # never checksum another scenario's terminal state.
+        probe_path = os.path.join(sandbox["tmp"], f"tty_after_exit-{label}-{side}")
         probe = (
             " ; printf 'EXITCODE:%s\\r\\n' \"$?\""
-            " ; stty -g > /tmp/tty_after_exit"
-            " ; printf 'TTYCK:%s\\r\\n' \"$(cksum < /tmp/tty_after_exit)\""
+            f" ; stty -g > {probe_path}"
+            " ; printf 'TTYCK:%s\\r\\n' \"$(cksum < " + probe_path + ")\""
         )
         if label == "panic":
             # The replay surface panics mid-loop (rust sides only).
