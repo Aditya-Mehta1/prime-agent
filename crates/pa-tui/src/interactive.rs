@@ -649,6 +649,11 @@ pub async fn run_interactive(
     // here; the loop folds it into the picker catalog and any open picker.
     let (catalog_tx, mut catalog_rx) =
         mpsc::unbounded_channel::<crate::session_ui::ModelCatalogUpdate>();
+    // The background top-bar spend fetch (`get_context_tree`, TS
+    // `refreshTopBarCost`) reports here; the loop folds it into the top
+    // bar's cached session spend.
+    let (topbar_cost_tx, mut topbar_cost_rx) =
+        mpsc::unbounded_channel::<crate::session_ui::TopBarCostUpdate>();
     // Background heartbeat-catalog refreshes (`heartbeats_list` for an
     // open `/heartbeats` view) report here; the loop folds them into the
     // open view.
@@ -707,6 +712,7 @@ pub async fn run_interactive(
         share_tx,
         reload_tx,
         catalog_tx,
+        topbar_cost_tx,
         crate::session_ui::ActivityUpdates {
             heartbeats: heartbeats_tx,
             bash: bash_tx,
@@ -770,6 +776,9 @@ pub async fn run_interactive(
         session.osc_sink = crate::clipboard::OscSink::Buffer(Vec::new());
     }
     session.refresh_stats().await;
+    // TS `rebindCurrentSession` ends with `refreshTopBarCost()`: the
+    // freshly opened chat's spend fetch never blocks the open path.
+    session.refresh_topbar_cost();
     // The startup catalog fetch (TS `updateAvailableProviderCount` →
     // `getConnectionAvailableModels`): failures stay silent and the
     // composition-root snapshot keeps serving the picker.
@@ -1184,11 +1193,20 @@ pub async fn run_interactive(
                             session.rebuild_transcript(&mut view).await;
                             session.refresh_stats().await;
                             session.rebuild_tray(&mut view);
+                            // TS refreshes the top bar's spend on the
+                            // `session_status` event (throttled): the
+                            // compaction's own spend joins the total.
+                            session.refresh_topbar_cost_throttled();
                         }
-                        // A settled turn refreshes the tray's context usage.
+                        // A settled turn refreshes the tray's context usage
+                        // and the top bar's spend (TS `agent_end` fires
+                        // `refreshConnectionContextUsage` and
+                        // `refreshTopBarCost`; both stay off the blocking
+                        // path — the spend fetch is fire-and-forget).
                         if was_active && !session.turn_active {
                             session.refresh_stats().await;
                             session.rebuild_tray(&mut view);
+                            session.refresh_topbar_cost();
                         }
                         // A `session_binding` supersede notice: the session
                         // lives under a new active id, so re-attach to it -
@@ -1299,6 +1317,11 @@ pub async fn run_interactive(
             maybe_catalog = catalog_rx.recv() => {
                 if let Some(update) = maybe_catalog {
                     session.apply_model_catalog(update, &mut view);
+                }
+            }
+            maybe_topbar_cost = topbar_cost_rx.recv() => {
+                if let Some(update) = maybe_topbar_cost {
+                    session.apply_topbar_cost_update(update);
                 }
             }
             maybe_heartbeats = heartbeats_rx.recv() => {

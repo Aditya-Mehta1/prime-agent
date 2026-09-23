@@ -71,6 +71,41 @@ const ESCAPE_REPEAT_WINDOW_MS: std::time::Duration = std::time::Duration::from_m
 /// Cap on the exit-path session-stats fetch (TS `formatResumeHint` inputs):
 /// best-effort like the detach, never able to hold the exit open.
 const EXIT_STATS_TIMEOUT_MS: u64 = 500;
+/// TS `TOP_BAR_COST_REFRESH_MIN_INTERVAL_MS`: the leading-edge throttle
+/// window for the top bar's spend refresh.
+const TOP_BAR_COST_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(1_000);
+
+/// TS `topBarCost`: the cached top-bar spend, keyed to the session the
+/// fetch was issued for so a pending or failed refresh never attributes
+/// the previous session's spend to the new chat.
+#[derive(Debug, Clone, PartialEq)]
+struct TopBarCost {
+    session_id: String,
+    total: f64,
+}
+
+/// A landed background spend fetch (the `refresh_topbar_cost` task's
+/// report through the run loop's channel): the tree total for the
+/// session the request carried, or `None` when the fetch failed or
+/// carried no finite total (the cache keeps the previous value).
+pub(crate) struct TopBarCostUpdate {
+    generation: u64,
+    session_id: String,
+    total: Option<f64>,
+}
+
+/// TS `topBarCostRefresh`: the bookkeeping for the background spend
+/// fetch — a response superseded by a newer successful refresh never
+/// overwrites it, and the throttled arm skips refreshes inside the
+/// one-second window.
+#[derive(Debug, Clone, Copy, Default)]
+struct TopBarCostRefresh {
+    generation: u64,
+    last_success_generation: u64,
+    /// The last direct or throttled refresh (TS `lastRefreshAt`): the
+    /// leading-edge throttle's window anchor.
+    last_refresh_at: Option<Instant>,
+}
 
 /// How a submitted prompt travels to the session (TS `streamingBehavior`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,9 +319,21 @@ pub(crate) struct SessionUi {
     /// The parked-message browse state (TS `QueueSelection`): which queued
     /// row alt+up/alt+down selected, and its stashed editor draft.
     queue_selection: crate::queued::QueueSelection,
-    /// Context usage + cost refreshed from `get_session_stats`.
+    /// Context usage refreshed from `get_session_stats` (TS
+    /// `refreshConnectionContextUsage` over `patchConnectionState`).
     context: Option<crate::chrome::ContextUsage>,
-    cost_usd: Option<f64>,
+    /// Top-bar spend refreshed from `get_context_tree` (TS
+    /// `refreshTopBarCost` over `topBarCost`): `totalUsage.cost.total`,
+    /// cumulative across compactions and including the compaction and
+    /// branch-summary spend itself — the session-stats walk counts
+    /// assistant messages only, so it must not feed the top bar.
+    topbar_cost: Option<TopBarCost>,
+    /// The spend refresh's generation/throttle bookkeeping (TS
+    /// `topBarCostRefresh`).
+    topbar_cost_refresh: TopBarCostRefresh,
+    /// Where the background spend fetch reports (the run loop folds it
+    /// into the top bar).
+    topbar_cost_updates: mpsc::UnboundedSender<TopBarCostUpdate>,
     /// Rows of the most recent `/list` (for `/switch <n>`).
     list_rows: Vec<Value>,
     pub(crate) turn_active: bool,
@@ -535,6 +582,7 @@ impl SessionUi {
         share_notes: mpsc::UnboundedSender<ShareNote>,
         reload_notes: mpsc::UnboundedSender<ReloadNote>,
         catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
+        topbar_cost_updates: mpsc::UnboundedSender<TopBarCostUpdate>,
         activity_updates: ActivityUpdates,
     ) -> Result<SessionUi> {
         let active_session_id = match &options.session {
@@ -587,7 +635,9 @@ impl SessionUi {
             pending_queue: None,
             queue_selection: crate::queued::QueueSelection::default(),
             context: None,
-            cost_usd: None,
+            topbar_cost: None,
+            topbar_cost_refresh: TopBarCostRefresh::default(),
+            topbar_cost_updates,
             list_rows: Vec::new(),
             turn_active: false,
             steering_mode: "one-at-a-time".to_string(),
@@ -1113,7 +1163,7 @@ impl SessionUi {
         view.queue_selected = None;
         view.chrome.chat_name = self.session_display();
         view.chrome.context = self.context;
-        view.chrome.cost_usd = self.cost_usd;
+        view.chrome.cost_usd = self.session_cost();
         self.update_subagent_summary(view);
         // The rebuilt transcript invalidates the announcement row tracking;
         // the goal state itself carries over (seeded at attach).
@@ -1267,9 +1317,12 @@ impl SessionUi {
             .unwrap_or_else(|| crate::chrome::display_name(&self.cwd.to_string_lossy()))
     }
 
-    /// Refresh context usage and session spend from `get_session_stats`
-    /// (the TS tray's connection refresh): tokens, context window, percent,
-    /// and the branch total cost.
+    /// Refresh the tray's context usage from `get_session_stats` (TS
+    /// `refreshConnectionContextUsage` over `patchConnectionState`):
+    /// tokens, context window, percent. The top bar's spend is not part
+    /// of this walk — the stats walk counts assistant messages only, so
+    /// the spend refreshes from the context tree instead
+    /// ([`Self::refresh_topbar_cost`], TS `refreshTopBarCost`).
     pub(crate) async fn refresh_stats(&mut self) {
         let Ok(data) = self
             .bounded_request(
@@ -1296,14 +1349,99 @@ impl SessionUi {
                 context_window: window,
             })
         });
-        self.cost_usd = data.get("cost").and_then(Value::as_f64);
         self.dirty = true;
+    }
+
+    /// TS `refreshTopBarCostThrottled`: the leading-edge throttle for
+    /// status-driven call sites — a refresh inside the one-second window
+    /// is skipped; one that fires stamps the window (direct refreshes
+    /// stamp it too).
+    pub(crate) fn refresh_topbar_cost_throttled(&mut self) {
+        if self
+            .topbar_cost_refresh
+            .last_refresh_at
+            .is_some_and(|at| at.elapsed() < TOP_BAR_COST_REFRESH_MIN_INTERVAL)
+        {
+            return;
+        }
+        self.refresh_topbar_cost();
+    }
+
+    /// TS `refreshTopBarCost`: fire a background `get_context_tree` fetch
+    /// for the top bar's spend — `totalUsage.cost.total`, the cumulative
+    /// total including the compaction and branch-summary spend itself.
+    /// The fetch never blocks the caller (TS leaves it fire-and-forget);
+    /// the landed update applies through
+    /// [`Self::apply_topbar_cost_update`] with the generation and
+    /// session-keyed guards, and a failed fetch or a response without a
+    /// finite total keeps the previous value (the cost is cosmetic).
+    pub(crate) fn refresh_topbar_cost(&mut self) {
+        let session_id = self.active_session_id.clone();
+        self.topbar_cost_refresh.last_refresh_at = Some(Instant::now());
+        self.topbar_cost_refresh.generation += 1;
+        let generation = self.topbar_cost_refresh.generation;
+        let updates = self.topbar_cost_updates.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let fetched = tokio::time::timeout(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                client.request_ok(DaemonCommand::GetContextTree {
+                    id: None,
+                    active_session_id: session_id.clone(),
+                    rest: Default::default(),
+                }),
+            )
+            .await;
+            let total = match fetched {
+                Ok(Ok(tree)) => tree
+                    .pointer("/totalUsage/cost/total")
+                    .and_then(Value::as_f64)
+                    .filter(|total| total.is_finite()),
+                _ => None,
+            };
+            let _ = updates.send(TopBarCostUpdate {
+                generation,
+                session_id,
+                total,
+            });
+        });
+    }
+
+    /// Fold a landed spend fetch into the top bar (the run loop's drain
+    /// arm): a fetch without a finite total keeps the previous value, a
+    /// response superseded by a newer successful refresh is discarded
+    /// (TS `generation < lastSuccessGeneration`), and so is one issued
+    /// for a session that is no longer bound — the cached spend only
+    /// ever belongs to the session it was fetched for.
+    pub(crate) fn apply_topbar_cost_update(&mut self, update: TopBarCostUpdate) {
+        let Some(total) = update.total else {
+            return;
+        };
+        if update.generation < self.topbar_cost_refresh.last_success_generation {
+            return;
+        }
+        if update.session_id != self.active_session_id {
+            return;
+        }
+        self.topbar_cost_refresh.last_success_generation = update.generation;
+        self.topbar_cost = Some(TopBarCost {
+            session_id: update.session_id,
+            total,
+        });
+        self.dirty = true;
+    }
+
+    /// TS `getCostUsd`: the cached spend renders only for the session it
+    /// was fetched for (a rebind hides it until its own refresh lands).
+    fn session_cost(&self) -> Option<f64> {
+        let cost = self.topbar_cost.as_ref()?;
+        (cost.session_id == self.active_session_id).then_some(cost.total)
     }
 
     /// Re-apply the refreshed context usage and cost to the chrome state.
     pub(crate) fn rebuild_tray(&mut self, view: &mut AgentView) {
         view.chrome.context = self.context;
-        view.chrome.cost_usd = self.cost_usd;
+        view.chrome.cost_usd = self.session_cost();
         view.chrome.chat_name = self.session_display();
         self.dirty = true;
     }
@@ -3135,6 +3273,10 @@ impl SessionUi {
         // renders from scratch, then the status row lands.
         self.rebuild_transcript(view).await;
         self.refresh_stats().await;
+        self.rebuild_tray(view);
+        // The replaced session's spend refreshes for the new branch (TS
+        // `refreshTopBarCost` on the post-import rebind).
+        self.refresh_topbar_cost();
         self.note(&format!("Session imported from: {input_path}"), view);
         Ok(())
     }
@@ -4845,6 +4987,11 @@ impl SessionUi {
         match self.attach_session(&id).await {
             Ok(()) => {
                 self.rebuild_view(view, RebuildKind::Rebind);
+                // TS `rebindCurrentSession` ends with `refreshTopBarCost()`
+                // (fire-and-forget): the switched-to session's spend refresh
+                // replaces the previous chat's cache when it lands (the
+                // session-keyed getter hides the old value until then).
+                self.refresh_topbar_cost();
                 self.note(&format!("switched to session {id}"), view);
                 // The switched-to session's own restore head (if one was
                 // stashed earlier) lands after the switch note, so the
@@ -6971,6 +7118,10 @@ impl SessionUi {
             TurnUpdate::SessionInfoChanged { name } => {
                 self.session_name = name;
                 view.chrome.chat_name = self.session_display();
+                // TS `session_info_changed` also refreshes the top bar's
+                // spend (throttled): the session's spend may have changed
+                // with the info event.
+                self.refresh_topbar_cost_throttled();
                 self.dirty = true;
             }
             // `service_tier_changed`: keep the local tier state current (TS

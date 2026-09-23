@@ -681,6 +681,97 @@ mod tests {
         assert_eq!(tree["totalUsage"]["cost"]["total"].as_f64(), Some(0.0));
     }
 
+    /// `get_context_tree` totals include the compaction spend itself (TS
+    /// `computeOwnAndTotalUsage`'s compaction/branch_summary arms): a
+    /// $0.25 compaction call plus a $0.10 assistant reads $0.35 — the
+    /// top-bar source — while `get_session_stats` stays the
+    /// assistant-message walk (TS `getSessionStats`) and reports $0.10.
+    #[tokio::test]
+    async fn get_context_tree_totals_include_compaction_usage() {
+        let root = std::env::temp_dir().join(format!("pa-worker-cu-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let session_file = root.join("session.jsonl");
+        let usage = |input: u64, output: u64, total: f64| {
+            json!({
+                "input": input, "output": output, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": input + output,
+                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": total },
+            })
+        };
+        let lines = [
+            json!({
+                "type": "session", "version": 3, "id": "s1",
+                "timestamp": "2026-09-23T00:00:00.000Z", "cwd": "/tmp",
+            }),
+            json!({
+                "type": "message", "id": "e1",
+                "timestamp": "2026-09-23T00:00:01.000Z",
+                "message": { "role": "user", "content": "expensive early work" },
+            }),
+            json!({
+                "type": "compaction", "id": "e2", "parentId": "e1",
+                "timestamp": "2026-09-23T00:00:02.000Z",
+                "summary": "summary of early work", "firstKeptEntryId": "e1",
+                "tokensBefore": 6000, "usage": usage(5000, 1000, 0.25),
+            }),
+            json!({
+                "type": "message", "id": "e3", "parentId": "e2",
+                "timestamp": "2026-09-23T00:00:03.000Z",
+                "message": { "role": "user", "content": "later work" },
+            }),
+            json!({
+                "type": "message", "id": "e4", "parentId": "e3",
+                "timestamp": "2026-09-23T00:00:04.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "done" }],
+                    "usage": usage(100, 50, 0.10),
+                },
+            }),
+        ];
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&session_file, content).unwrap();
+        let worker = created_worker_at(&root, &session_file).await;
+
+        let response = worker
+            .dispatch(
+                "get_context_tree",
+                &json!({ "activeSessionId": "getter-session" }),
+            )
+            .await;
+        assert!(response.success, "failed: {response:?}");
+        let tree = response.data.expect("data");
+        assert_eq!(
+            tree["totalUsage"],
+            json!({
+                "input": 5100, "output": 1050, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": 6150,
+                "cost": {
+                    "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0,
+                    "total": 0.35,
+                },
+            })
+        );
+        // No child attributions on the branch: own and total coincide.
+        assert_eq!(tree["ownUsage"], tree["totalUsage"]);
+
+        // The stats walk stays the assistant-message total (TS
+        // `getSessionStats`): the surfaces differ by design, so the top
+        // bar must source its spend from the tree, not the stats.
+        let response = worker
+            .dispatch(
+                "get_session_stats",
+                &json!({ "activeSessionId": "getter-session" }),
+            )
+            .await;
+        let stats = response.data.expect("data");
+        assert_eq!(stats["cost"].as_f64(), Some(0.10));
+    }
+
     /// `get_context_tree` surfaces the persisted child sessions under the
     /// session's artifact tree (idle, settled, and restart-orphaned
     /// subagents all appear, with their real usage and recursive
