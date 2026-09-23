@@ -94,7 +94,7 @@ interface TailscaleStatusJson {
  * widening to a wildcard interface. Mirrors the detection core of the Tailscale
  * mesh helpers (`tailscale status --json`, `Self.Online`/`BackendState`).
  */
-export function detectTailscaleBindAddress(): string | null {
+function detectTailscaleBindAddress(): string | null {
 	const status = spawnSyncHidden("tailscale", ["status", "--json"], {
 		encoding: "utf8",
 		timeout: DAEMON_TCP_TAILSCALE_TIMEOUT_MS,

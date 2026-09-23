@@ -31,7 +31,7 @@ function tailscaleUp(addresses: string[]): void {
 }
 
 /** Point the probe at a machine with no usable tailnet address. */
-function tailscaleUnavailable(reason: "missing" | "stopped" | "unparseable"): void {
+function tailscaleUnavailable(reason: "missing" | "stopped" | "unparseable" | "no-address"): void {
 	if (reason === "missing") {
 		tailscaleProbe.result = {
 			status: -1,
@@ -44,6 +44,13 @@ function tailscaleUnavailable(reason: "missing" | "stopped" | "unparseable"): vo
 		tailscaleProbe.result = {
 			status: 0,
 			stdout: JSON.stringify({ BackendState: "Stopped", Self: { Online: false, TailscaleIPs: ["100.64.0.7"] } }),
+		};
+		return;
+	}
+	if (reason === "no-address") {
+		tailscaleProbe.result = {
+			status: 0,
+			stdout: JSON.stringify({ BackendState: "Running", Self: { Online: true, TailscaleIPs: [] } }),
 		};
 		return;
 	}
@@ -68,7 +75,6 @@ vi.mock("node:fs", async (importOriginal) => {
 
 const {
 	checkDaemonTcpLineAuth,
-	detectTailscaleBindAddress,
 	isWildcardBindHost,
 	loadOrCreateDaemonTcpToken,
 	resolveDaemonTcpListenerHost,
@@ -147,19 +153,15 @@ describe("daemon tcp port resolution", () => {
 describe("daemon tcp bind host", () => {
 	it("binds the machine's tailscale address when no source names a host", () => {
 		tailscaleUp(["fd7a:115c:a1e0::1", "100.101.102.103"]);
-		expect(detectTailscaleBindAddress()).toBe("100.101.102.103");
 		expect(resolveDaemonTcpListenerHost(undefined, undefined, {})).toBe("100.101.102.103");
 		// A tailnet without an IPv4 address still has an address worth binding.
 		tailscaleUp(["fd7a:115c:a1e0::1"]);
-		expect(detectTailscaleBindAddress()).toBe("fd7a:115c:a1e0::1");
-		tailscaleUp([]);
-		expect(detectTailscaleBindAddress()).toBeNull();
+		expect(resolveDaemonTcpListenerHost(undefined, undefined, {})).toBe("fd7a:115c:a1e0::1");
 	});
 
 	it("refuses to bind when no host is configured and this machine has no tailnet address", () => {
-		for (const reason of ["missing", "stopped", "unparseable"] as const) {
+		for (const reason of ["missing", "stopped", "unparseable", "no-address"] as const) {
 			tailscaleUnavailable(reason);
-			expect(detectTailscaleBindAddress()).toBeNull();
 			// Fail closed: a missing tailnet address must never widen to 0.0.0.0.
 			expect(() => resolveDaemonTcpListenerHost(undefined, undefined, {})).toThrow(
 				/Refusing to start the daemon TCP listener/,
