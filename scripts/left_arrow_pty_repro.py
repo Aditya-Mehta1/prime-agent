@@ -377,7 +377,7 @@ def daemon_pids_for(socket_path):
     return found
 
 
-def kill_daemons(socket_path):
+def kill_daemons(socket_path, sandbox=None):
     for pid in daemon_pids_for(socket_path):
         try:
             os.kill(pid, signal.SIGTERM)
@@ -389,6 +389,28 @@ def kill_daemons(socket_path):
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
+    # The sandbox's detached session workers outlive their supervisor
+    # (the worker's supervisor-loss timeout is five minutes): reap them
+    # too, or every scenario leaves a worker behind that the next
+    # scenario's wedge may SIGSTOP instead of its own. Resume any this
+    # scenario stopped so the TERM is observable.
+    if sandbox is not None:
+        for pid in sandbox_worker_pids(sandbox):
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except OSError:
+                pass
+        for pid in sandbox_worker_pids(sandbox):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(0.5)
+        for pid in sandbox_worker_pids(sandbox):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
 
 def sandbox_worker_pids(sandbox):
@@ -498,7 +520,7 @@ def run_scenario(side, sandbox, label, answer_policy, wedge=False):
                 os.kill(pid, signal.SIGCONT)
             except OSError:
                 pass
-        kill_daemons(socket_path)
+        kill_daemons(socket_path, sandbox)
     return facts
 
 
