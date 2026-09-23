@@ -1725,7 +1725,7 @@ mod tests {
 
         let info = read_session_info(&path).unwrap();
         assert_eq!(info.message_count, 2);
-        assert_eq!(info.model.as_deref(), Some(("p", "m")));
+        assert_eq!(info.model, Some(("p".to_string(), "m".to_string())));
         assert!(info.all_messages_text.contains("done"));
         assert_eq!(
             info.usage,
