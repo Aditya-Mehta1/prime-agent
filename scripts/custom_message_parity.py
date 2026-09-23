@@ -3,9 +3,10 @@
 against the installed TS prime-agent binary rendering the SAME session
 transcript containing every decorated custom-message row:
 
-  - a received agent message (diamond + participant + preview + body),
+  - a received agent message (marker + participant + preview + body),
   - an ipython cell that sent an agent message (the sent receipt rows
-    render below the code, body in the expanded view),
+    render below the code, body in the expanded view) plus a queued
+    receipt (undelivered),
   - a heartbeat prompt (pulse + schedule),
   - a goal-context continuation row,
   - a restored-python-kernel row,
@@ -51,6 +52,18 @@ present (collapsed labels, expanded reason bodies, no preview, and the
 diamond sharing the label's exact SGR color run per outcome) and the TS
 frames show the old generic label (the baseline the TS team is expected to
 adopt).
+
+Third documented divergence (operator directive 2026-09-23, a deliberate
+visual refresh BEYOND TS): the agent-message family renders the exchange
+arrows as its marker — RECEIVED `\u21e0` (success green), SENT `\u21e2`
+(success green), QUEUED `\u21e2` (the tool-call loading indicator's
+BashMode color) — where the TS `agentMessageSummaryLine` renders the
+accent `\u25c6` diamond for every direction. The diff canonicalizes the
+marker on BOTH sides (the glyphs fold to `<AMICON>` ahead of the frame
+diff) and the run separately asserts each side's markers: the Rust frames
+carry `\u21e0`/`\u21e2` with the received/sent markers in success green
+and the queued marker in the loading-indicator color; the TS frames carry
+the accent diamond (the baseline the TS team is expected to adopt).
 
 tmux rules: default socket only (`env -u TMUX`), cmparity-* session names,
 no kill-server; sessions are killed individually at the end.
@@ -279,7 +292,18 @@ def build_session(path, source_header, assistant_template, cwd):
                             "sessionId": "worker-session",
                             "sessionName": "Worker",
                         },
-                    }
+                    },
+                    {
+                        "id": "agentmsg_sent02",
+                        "message": "Queued ping, not yet delivered.",
+                        "deliveryStatus": "queued",
+                        "receiverRole": "sibling",
+                        "target": {
+                            "activeSessionId": "peer-active",
+                            "sessionId": "peer-session",
+                            "sessionName": "peer",
+                        },
+                    },
                 ],
             },
             "isError": False,
@@ -565,6 +589,84 @@ def assert_rlm_child_icon_colors(frames):
         )
 
 
+AGENT_MESSAGE_MARKERS = ("\u21e0", "\u21e2")
+AGENT_MESSAGE_DIRECTION_MARKERS = {
+    # The Rust marker per direction (the exchange-arrow family; the TS
+    # baseline renders the accent \u25c6 diamond for every direction).
+    "received": "\u21e0",
+    "sent": "\u21e2",
+    "queued": "\u21e2",
+}
+
+
+def canonicalize_agent_message_markers(frame):
+    """Fold the agent-message family marker spans (the fg color run, the
+    Rust \u21e0/\u21e2 or TS \u25c6 glyph, and the trailing reset — the
+    colors diverge with the glyphs, so the whole span folds) to one
+    <AMICON> token ahead of the frame diff, ONLY on agent-message rows (the
+    compaction/refinement diamonds render identically on both sides and
+    stay real in the diff); the run separately asserts each side's real
+    markers."""
+    return re.sub(
+        r"(?:\x1b\[[0-9;]*m)*[\u25c6\u21e0\u21e2]\x1b\[[0-9;]*m"
+        r"(?= (?:\x1b\[[0-9;]*m)*Agent message (?:received|sent|queued))",
+        "<AMICON>",
+        frame,
+    )
+
+
+def assert_agent_message_markers(ts_frames, rust_frames):
+    """The agent-message marker contract per side (operator directive
+    2026-09-23, the third carried divergence): the Rust frames carry the
+    exchange arrows — RECEIVED \u21e0 in success green, SENT/QUEUED \u21e2
+    (sent in success green, queued in the tool-call loading indicator's
+    BashMode color) — and never the \u25c6 diamond; the TS frames keep the
+    accent diamond baseline and show no arrows."""
+    for state in ("a_collapsed", "b_expanded"):
+        rust_plain = capture_plain_text(rust_frames[state])
+        for label, marker in AGENT_MESSAGE_DIRECTION_MARKERS.items():
+            assert f"{marker} Agent message {label}" in rust_plain, (
+                f"rust: {label} marker row missing in {state}"
+            )
+        assert "\u25c6 Agent message" not in rust_plain, (
+            f"rust: diamond still renders on an agent-message row in {state}"
+        )
+        # The escape-bearing frame: the received and sent markers render in
+        # success green, the queued marker in the loading-indicator color;
+        # none on the accent run. BashMode and Success resolve to the same
+        # prime-palette green, so the queued/sent markers share the run —
+        # what the frame can prove is the glyph per direction and that the
+        # markers are NOT accent-colored.
+        frame = rust_frames[state]
+        for label, marker in AGENT_MESSAGE_DIRECTION_MARKERS.items():
+            run = re.search(
+                r"((?:\x1b\[[0-9;]*m)+)"
+                + re.escape(marker)
+                + r"(?:\x1b\[[0-9;]*m)* (?:\x1b\[[0-9;]*m)*Agent message",
+                frame,
+            )
+            assert run, f"rust: styled {label} marker missing in {state}"
+            fg = _sgr_fg_color(run.group(1))
+            assert fg, f"rust: {label} marker carries no fg color in {state}"
+            accent = _sgr_fg_color(
+                re.search(
+                    r"((?:\x1b\[[0-9;]*m)+)\u25c6"
+                    r"(?:\x1b\[[0-9;]*m)* (?:\x1b\[[0-9;]*m)*Restored",
+                    frame,
+                ).group(1)
+            )
+            assert fg != accent, f"rust: {label} marker still accent-colored in {state}"
+        ts_plain = capture_plain_text(ts_frames[state])
+        for label in AGENT_MESSAGE_DIRECTION_MARKERS:
+            assert f"\u25c6 Agent message {label}" in ts_plain, (
+                f"ts: accent-diamond {label} row missing in {state} (baseline)"
+            )
+            for marker in AGENT_MESSAGE_MARKERS:
+                assert f"{marker} Agent message {label}" not in ts_plain, (
+                    f"ts: exchange-arrow marker rendered in {state}"
+                )
+
+
 def assert_sent_reach(side, collapsed, expanded):
     """The Ctrl+O contract for this fixture: collapsed frames show the
     agent-message and sent-receipt summaries only; the expanded frames show
@@ -752,11 +854,21 @@ def main():
             # the row divergence): the escape-bearing Rust frames carry
             # it; the TS frames have no icon to check (the generic label).
             assert_rlm_child_icon_colors(rust_frames)
+            # The marker-family divergence (see the module docstring): the
+            # per-side marker assertions own the glyphs + colors, the
+            # frame diff folds them to one canonical marker on both sides.
+            assert_agent_message_markers(ts_frames, rust_frames)
             for state in ("a_collapsed", "b_expanded"):
-                ts_norm = normalize(strip_rlm_child_rows(ts_frames[state]), base)
-                rust_norm = normalize(
-                    strip_rlm_child_rows(strip_rust_agent_message_preview(rust_frames[state])),
-                    base,
+                ts_norm = canonicalize_agent_message_markers(
+                    normalize(strip_rlm_child_rows(ts_frames[state]), base)
+                )
+                rust_norm = canonicalize_agent_message_markers(
+                    normalize(
+                        strip_rlm_child_rows(
+                            strip_rust_agent_message_preview(rust_frames[state])
+                        ),
+                        base,
+                    )
                 )
                 # The carried divergence: the Rust header shows the
                 # collapsed preview; the TS binary does not (yet).

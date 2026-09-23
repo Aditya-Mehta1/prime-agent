@@ -57,17 +57,33 @@ pub(crate) fn markdown_rows(
         .collect()
 }
 
-/// TS `agentMessageSummaryLine` (`◆ <label> · <participant>[ · <preview>]`):
-/// the accent diamond, the muted label, then the participant (and the
-/// preview when present) joined by the dim `·` separators.
+/// The agent-message family marker row. TS `agentMessageSummaryLine`
+/// renders `◆ <label> · <participant>[ · <preview>]` (an accent diamond);
+/// per the operator directive of 2026-09-23 the marker family is the
+/// exchange arrows instead (a deliberate visual refresh beyond the TS
+/// diamond — TS is expected to adopt the same markers): RECEIVED = `⇠`
+/// (U+21E0) in success green, SENT = `⇢` (U+21E2) in success green, and
+/// QUEUED = the same `⇢` in the tool-call loading indicator's color
+/// (`BashMode`, exactly what the working icon renders — waiting to
+/// deliver). The label stays muted, the participant (and the preview when
+/// present) dim, joined by the dim `·` separators.
 pub(crate) fn agent_message_summary_line(
     direction: AgentMessageDirection,
     participant: &str,
     preview: Option<&str>,
     theme: &Theme,
 ) -> Line {
+    // One marker source of truth per direction: the glyph and its color
+    // derive from the same match, so every surface that renders the family
+    // (the received transcript rows and the sent/queued ipython receipts)
+    // shares the treatment.
+    let (marker, color) = match direction {
+        AgentMessageDirection::Received => ("\u{21e0}", ThemeColor::Success),
+        AgentMessageDirection::Sent => ("\u{21e2}", ThemeColor::Success),
+        AgentMessageDirection::Queued => ("\u{21e2}", ThemeColor::BashMode),
+    };
     let mut line: Line = vec![
-        Span::styled("\u{25c6}".to_string(), theme.fg_style(ThemeColor::Accent)),
+        Span::styled(marker.to_string(), theme.fg_style(color)),
         Span::raw(" "),
         Span::styled(
             direction.label().to_string(),
@@ -323,21 +339,22 @@ mod tests {
             message: "ready".to_string(),
         };
         let rows = render_agent_message(&row, Detail::Overview, &theme(), 60, true);
-        // Leading blank + the diamond summary line with the preview.
+        // Leading blank + the marker summary line with the preview.
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].is_empty());
         let header = flat(&rows[1]);
         assert_eq!(
             header.trim_end(),
-            " \u{25c6} Agent message received \u{b7} from child model-probe \u{b7} ready"
+            " \u{21e0} Agent message received \u{b7} from child model-probe \u{b7} ready"
         );
-        // Colors: accent diamond, muted label, dim participant, preview,
-        // and the separators.
-        let accent = theme().fg_style(ThemeColor::Accent);
+        // Colors: the received marker renders in success green (the
+        // operator-directed exchange-arrow family), muted label, dim
+        // participant, preview, and the separators.
+        let success = theme().fg_style(ThemeColor::Success);
         let muted = theme().fg_style(ThemeColor::Muted);
         let dim = theme().fg_style(ThemeColor::Dim);
         assert_eq!(rows[1][0], Span::styled(" ".to_string(), Style::default()));
-        assert_eq!(rows[1][1], Span::styled("\u{25c6}".to_string(), accent));
+        assert_eq!(rows[1][1], Span::styled("\u{21e0}".to_string(), success));
         assert_eq!(
             rows[1][3],
             Span::styled("Agent message received".to_string(), muted)
@@ -364,7 +381,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(
             flat(&rows[0]).trim_end(),
-            " \u{25c6} Agent message received \u{b7} from parent root"
+            " \u{21e0} Agent message received \u{b7} from parent root"
         );
     }
 
@@ -404,10 +421,14 @@ mod tests {
             AgentMessageDirection::Queued.label(),
             "Agent message queued"
         );
-        for direction in [
-            AgentMessageDirection::Received,
-            AgentMessageDirection::Sent,
-            AgentMessageDirection::Queued,
+        // The marker family per direction (operator directive 2026-09-23):
+        // received ⇠, sent ⇢, queued ⇢ — and the queued marker carries the
+        // tool-call loading indicator's BashMode color, the sent/received
+        // markers success green.
+        for (direction, marker, color) in [
+            (AgentMessageDirection::Received, "\u{21e0}", ThemeColor::Success),
+            (AgentMessageDirection::Sent, "\u{21e2}", ThemeColor::Success),
+            (AgentMessageDirection::Queued, "\u{21e2}", ThemeColor::BashMode),
         ] {
             let row = AgentMessageRow {
                 direction,
@@ -416,9 +437,14 @@ mod tests {
             };
             let rows = render_agent_message(&row, Detail::Overview, &theme(), 80, false);
             assert!(
-                flat(&rows[0]).contains(&format!("\u{25c6} {}", direction.label())),
+                flat(&rows[0]).contains(&format!("{marker} {}", direction.label())),
                 "{direction:?} header: {}",
                 flat(&rows[0])
+            );
+            assert_eq!(
+                rows[0][1],
+                Span::styled(marker.to_string(), theme().fg_style(color)),
+                "{direction:?} marker style"
             );
         }
     }

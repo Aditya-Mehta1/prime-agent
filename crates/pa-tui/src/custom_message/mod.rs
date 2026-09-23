@@ -13,6 +13,13 @@
 //! `injected_prompt` for the injected-prompt rows, `refinement` for the
 //! refinement-outcome component).
 //!
+//! Divergence (operator directive 2026-09-23, a deliberate visual refresh
+//! beyond the TS binary): the agent-message family renders the exchange
+//! arrows as its marker — RECEIVED `⇠` (success green), SENT `⇢` (success
+//! green), QUEUED `⇢` (the tool-call loading indicator's `BashMode`
+//! color) — where the TS `agentMessageSummaryLine` renders the accent
+//! `◆` diamond. The TS side is expected to adopt the same markers.
+//!
 //! The dispatch follows the TS live path
 //! (`createDisplayedCustomMessageComponent`): non-display rows render
 //! nothing, every displayed type without a dedicated component (engine
@@ -56,7 +63,8 @@ pub const REFINEMENT_OUTCOME_CUSTOM_TYPE: &str = "refinement_outcome";
 /// Which agent-message side a row renders: the received label of the
 /// transcript custom-message rows (TS `AgentMessageComponent`), or the
 /// sent/queued receipt labels of the ipython cell output (TS
-/// `renderSentAgentMessages`).
+/// `renderSentAgentMessages`). Also picks the summary-line marker
+/// (RECEIVED `⇠`, SENT/QUEUED `⇢`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentMessageDirection {
     /// `Agent message received` (the transcript custom-message rows).
@@ -79,10 +87,12 @@ impl AgentMessageDirection {
     }
 }
 
-/// One agent-message summary row: `◆ <label> · <participant>[ · <preview>]`
-/// plus the guttered body when expanded (TS `AgentMessageComponent` for
-/// received rows; the sent/queued directions feed the ipython cell
-/// receipt rows).
+/// One agent-message summary row: `<marker> <label> · <participant>[ ·
+/// <preview>]` (RECEIVED `⇠` / SENT `⇢` / QUEUED `⇢` — see
+/// [`render::agent_message_summary_line`] for the marker family and its
+/// divergence note) plus the guttered body when expanded (TS
+/// `AgentMessageComponent` for received rows; the sent/queued directions
+/// feed the ipython cell receipt rows).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentMessageRow {
     /// Which side renders: the label text follows it.

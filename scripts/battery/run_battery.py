@@ -4255,6 +4255,17 @@ class Battery:
         # row shape and the focus text are the parity claim; the count is
         # per-implementation and can be under the 4-digit scrub above).
         text = re.sub(r"Compacted from [0-9,]+ tokens", "Compacted from <num> tokens", text)
+        # The agent-message family marker divergence (operator directive
+        # 2026-09-23): Rust renders the exchange arrows (⇠ received, ⇢
+        # sent/queued), TS keeps the ◆ diamond on the same rows. Fold the
+        # marker only on agent-message rows (the compaction/refinement
+        # diamonds render identically on both sides and stay real in the
+        # diff); the f15 flow asserts each side's actual markers.
+        text = re.sub(
+            r"[◆⇠⇢](?= Agent message (?:received|sent|queued))",
+            "<AMICON>",
+            text,
+        )
         return text
 
 
@@ -4444,11 +4455,15 @@ class Battery:
 
 
     def f15_a2a(self) -> None:
-        """agent_message send/receive: the ◆ diamond-decorated rows in both
+        """agent_message send/receive: the marker-decorated rows in both
         directions — the received row in the receiver's transcript, the sent
         summary row inside the sender's ipython cell — with participant
-        labels and the expanded preview body. Two sibling daemon sessions
-        exchange one message each way through their kernels."""
+        labels and the expanded preview body. The marker family diverges
+        (operator directive 2026-09-23): rust renders the ⇠/⇢ exchange
+        arrows, ts the ◆ diamond; the normalizer folds the marker in the
+        frame diff and the flow asserts each side's own glyph. Two sibling
+        daemon sessions exchange one message each way through their
+        kernels."""
         flow = "f15_a2a"
         reply = "f15 a2a turn reply"
         frames: dict[str, dict[str, str]] = {"ts": {}, "rust": {}}
@@ -4506,9 +4521,27 @@ class Battery:
             if "Agent message received" in settled:
                 self.record(
                     flow, "visual",
-                    f"{side.name}: a sibling agent message renders the '◆ Agent message received' row with participant label",
+                    f"{side.name}: a sibling agent message renders the marker 'Agent message received' row with participant label",
                     gap=False,
                 )
+                # The marker-family divergence (operator directive
+                # 2026-09-23): rust renders ⇠ on the received row, ts the
+                # ◆ diamond baseline; the normalizer folds the marker in the
+                # frame diff, so each side's own glyph is asserted here.
+                expected = "⇠" if side.name == "rust" else "◆"
+                if f"{expected} Agent message received" in settled:
+                    self.record(
+                        flow, "visual",
+                        f"{side.name}: the received row carries the {'⇠ exchange-arrow' if side.name == 'rust' else '◆ diamond'} marker",
+                        gap=False,
+                    )
+                else:
+                    self.record(
+                        flow, "visual",
+                        f"{side.name}: the received row carries the wrong agent-message marker (expected {expected!r})",
+                        evidence=side.root / flow / "02-received-settled.txt",
+                        lane=FLOW_LANES[flow],
+                    )
             else:
                 self.record(
                     flow, "visual",
@@ -4539,13 +4572,30 @@ class Battery:
             if "Agent message sent" in settled2 or "Agent message queued" in settled2:
                 self.record(
                     flow, "visual",
-                    f"{side.name}: the sender's ipython cell renders the '◆ Agent message sent/queued' summary row with the participant label",
+                    f"{side.name}: the sender's ipython cell renders the marker 'Agent message sent/queued' summary row with the participant label",
                     gap=False,
                 )
+                # The marker-family divergence (operator directive
+                # 2026-09-23): rust renders ⇢ on the sent/queued receipts,
+                # ts the ◆ diamond baseline.
+                expected = "⇢" if side.name == "rust" else "◆"
+                if f"{expected} Agent message sent" in settled2 or f"{expected} Agent message queued" in settled2:
+                    self.record(
+                        flow, "visual",
+                        f"{side.name}: the sent/queued receipt carries the {'⇢ exchange-arrow' if side.name == 'rust' else '◆ diamond'} marker",
+                        gap=False,
+                    )
+                else:
+                    self.record(
+                        flow, "visual",
+                        f"{side.name}: the sent/queued receipt carries the wrong agent-message marker (expected {expected!r})",
+                        evidence=side.root / flow / "04-sent-settled.txt",
+                        lane=FLOW_LANES[flow],
+                    )
             else:
                 self.record(
                     flow, "visual",
-                    f"{side.name}: the sender's ipython cell shows no '◆ Agent message sent/queued' row",
+                    f"{side.name}: the sender's ipython cell shows no 'Agent message sent/queued' row",
                     evidence=side.root / flow / "04-sent-settled.txt",
                     lane=FLOW_LANES[flow],
                 )
