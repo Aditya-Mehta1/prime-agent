@@ -302,6 +302,7 @@ export class AuthStorage {
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
 	private authCandidateMemos: Map<string, AuthSourceCandidateMemo> = new Map();
+	private changeListeners = new Set<() => void>();
 
 	private constructor(
 		private storage: AuthStorageBackend,
@@ -325,6 +326,15 @@ export class AuthStorage {
 		return AuthStorage.fromStorage(storage, options);
 	}
 
+	onChange(listener: () => void): () => void {
+		this.changeListeners.add(listener);
+		return () => this.changeListeners.delete(listener);
+	}
+
+	private notifyChanged(): void {
+		for (const listener of this.changeListeners) listener();
+	}
+
 	/**
 	 * Set a runtime API key override (not persisted to disk).
 	 * Used for CLI --api-key flag.
@@ -332,6 +342,7 @@ export class AuthStorage {
 	setRuntimeApiKey(provider: string, apiKey: string): void {
 		this.clearStaleAuthSource(provider, "runtime");
 		this.runtimeOverrides.set(provider, apiKey);
+		this.notifyChanged();
 	}
 
 	/**
@@ -340,6 +351,7 @@ export class AuthStorage {
 	removeRuntimeApiKey(provider: string): void {
 		this.clearStaleAuthSource(provider, "runtime");
 		this.runtimeOverrides.delete(provider);
+		this.notifyChanged();
 	}
 
 	/**
@@ -348,6 +360,7 @@ export class AuthStorage {
 	 */
 	setFallbackResolver(resolver: (provider: string) => string | undefined): void {
 		this.fallbackResolver = resolver;
+		this.notifyChanged();
 	}
 
 	private recordError(error: unknown): void {
@@ -663,12 +676,13 @@ export class AuthStorage {
 			stale.push(token);
 		}
 		this.staleAuthSources.set(token.provider, stale);
+		this.notifyChanged();
 		return true;
 	}
 
 	/** Forget every stale marking for a provider (explicit user re-selection). */
 	clearAuthStale(provider: string): void {
-		this.staleAuthSources.delete(provider);
+		if (this.staleAuthSources.delete(provider)) this.notifyChanged();
 	}
 
 	private clearStaleAuthSource(provider: string, source: ActiveAuthStatusSource): void {
@@ -748,6 +762,7 @@ export class AuthStorage {
 		this.clearStaleAuthSource(provider, "stored");
 		this.data[provider] = credential;
 		this.persistProviderChange(provider, credential);
+		this.notifyChanged();
 	}
 
 	/**
@@ -757,6 +772,7 @@ export class AuthStorage {
 		this.clearStaleAuthSource(provider, "stored");
 		delete this.data[provider];
 		this.persistProviderChange(provider, undefined);
+		this.notifyChanged();
 	}
 
 	/**

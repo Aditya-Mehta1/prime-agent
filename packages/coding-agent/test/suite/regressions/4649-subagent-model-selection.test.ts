@@ -135,7 +135,7 @@ describe("ENG-4649 subagent model selection", () => {
 	it("includes private Prime models authorized for the selected team", async () => {
 		const harness = await createHarness({ provider, models: [{ id: "parent-model" }] });
 		const fetchModels = vi.fn(
-			async () =>
+			async (_input: string | URL | Request) =>
 				new Response(JSON.stringify({ data: [{ id: "internal/glm-5.2-fast" }] }), {
 					status: 200,
 					headers: { "content-type": "application/json" },
@@ -151,7 +151,10 @@ describe("ENG-4649 subagent model selection", () => {
 
 			const discovered = await harness.session.findRlmModels("glm 5.2", 8);
 			expect(discovered.models.map((model) => model.selector)).toContain("prime-inference/internal/glm-5.2-fast");
-			expect(fetchModels).toHaveBeenCalledOnce();
+			const primeCatalogCalls = fetchModels.mock.calls.filter((call) =>
+				String(call[0]).includes("pinference.ai/api/v1/models"),
+			);
+			expect(primeCatalogCalls).toHaveLength(1);
 		} finally {
 			vi.unstubAllGlobals();
 			harness.cleanup();
@@ -161,7 +164,7 @@ describe("ENG-4649 subagent model selection", () => {
 	it("does not reuse an expired ChatGPT model catalog after a refresh failure", async () => {
 		const codexProvider = "openai-codex";
 		const harness = await createHarness({ provider: codexProvider, models: [{ id: "parent-model" }] });
-		const fetchModels = vi
+		const codexCatalogCalls = vi
 			.fn()
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
@@ -170,6 +173,16 @@ describe("ENG-4649 subagent model selection", () => {
 				}),
 			)
 			.mockRejectedValueOnce(new Error("offline"));
+		const fetchModels = vi.fn((input: string | URL | Request) => {
+			const url = String(input);
+			// Catalog refreshes (provider catalog, default-model pointer) run in the
+			// background; reject them so the codex discovery under test is the only
+			// source of codex models.
+			if (url.includes("prime-agent-catalog/main/")) {
+				return Promise.reject(new Error("catalog refresh offline"));
+			}
+			return codexCatalogCalls();
+		});
 		vi.stubGlobal("fetch", fetchModels);
 		let now = Date.now();
 		const dateNow = vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -181,7 +194,7 @@ describe("ENG-4649 subagent model selection", () => {
 
 			now += 300_001;
 			await expect(harness.session.findRlmModels("parent", 8)).resolves.toEqual({ models: [] });
-			expect(fetchModels).toHaveBeenCalledTimes(2);
+			expect(codexCatalogCalls).toHaveBeenCalledTimes(2);
 		} finally {
 			dateNow.mockRestore();
 			vi.unstubAllGlobals();
