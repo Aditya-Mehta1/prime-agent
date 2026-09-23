@@ -710,6 +710,24 @@ pub struct Worker {
     /// the worker rebinds the live session's jobs onto it after create
     /// and every replacement swap (TS `rebindCronJobsToState`).
     pub(crate) scheduled: std::sync::Arc<crate::scheduled_jobs::ScheduledJobs>,
+    /// Session creation is one serialized critical section (TS
+    /// `openingSessions`: a concurrent open for the same session JOINS
+    /// the in-flight one instead of racing it). Commands run on spawned
+    /// tasks, so without the gate two concurrent `create` requests could
+    /// both pass the `core.created` check while the first still awaits
+    /// its session-model restore — duplicating creation-prefix rows and
+    /// overwriting the initialized core state.
+    create_gate: tokio::sync::Mutex<()>,
+    /// Whole-session replacements are one serialized critical section
+    /// too: the teardown, the store/file swap, the session-model
+    /// restore's awaits, and the branch-context rebuild must move the
+    /// worker onto the replacement session as one unit. Two concurrent
+    /// replacements (`switch_session`/`new_session`/`import_jsonl`/
+    /// `fork`) could otherwise interleave at the restore's awaits — the
+    /// first command's rebuild landing against the second command's
+    /// session file, its restore decision rejected, the store, context,
+    /// and model left from different sessions.
+    pub(crate) replacement_gate: tokio::sync::Mutex<()>,
 }
 
 /// The kernel cron wiring the worker hands its session engine (TS
@@ -1053,6 +1071,8 @@ impl Worker {
             navigation,
             prompt_admissions,
             scheduled,
+            create_gate: tokio::sync::Mutex::new(()),
+            replacement_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1783,6 +1803,12 @@ impl Worker {
     }
 
     async fn handle_create(&self, payload: &Value) -> DaemonResponse {
+        // One create in flight at a time (TS `openingSessions`): the
+        // created check, the session-model restore's awaits, and the core
+        // initialization below are one serialized critical section, so a
+        // concurrent create joins this open and answers with the created
+        // summary below instead of racing a second initialization.
+        let _create_gate = self.create_gate.lock().await;
         {
             let core = self.core.lock().unwrap();
             if core.created {
@@ -1807,9 +1833,23 @@ impl Worker {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let name = payload.get("name").and_then(Value::as_str);
+        let flagged_model = payload.get("model").and_then(Value::as_str).is_some();
+        // TS createAgentSession's restored-from-session step: a revived
+        // session (an existing session file — scheduled wake, update
+        // restore, worker relaunch) restores the model its file pins
+        // before the startup chain. The bounded readiness wait covers the
+        // daemon boot's catalog fetch, so the revived session keeps the
+        // model it was running on instead of silently landing on the
+        // featured default while the catalog settles. An explicit model
+        // flag on the create wins instead (TS `options.model` takes
+        // priority over the saved session model): the restore is skipped
+        // entirely, so a flagged create never eats the readiness window or
+        // records a fallback that would not be used.
         // Explicit model flags from the create config are authoritative for
-        // this session (TS runtime-config propagation): the engine rebinds
-        // its selection instead of falling back to a process-wide model.
+        // this worker's session runtime config (TS runtime-config
+        // propagation): the engine rebinds its selection instead of
+        // falling back to a process-wide model, and the folded flags
+        // survive every session replacement (TS `sessionConfig`).
         let requested_thinking = match payload.get("thinking") {
             None => None,
             Some(Value::String(level)) => {
@@ -1836,7 +1876,7 @@ impl Worker {
                 );
             }
         };
-        self.engine.configure_model(EngineModelSelection {
+        self.engine.configure_create_model(EngineModelSelection {
             provider: payload
                 .get("provider")
                 .and_then(Value::as_str)
@@ -1928,18 +1968,34 @@ impl Worker {
                 };
                 match loaded {
                     Ok(mut opened) => {
+                        // The engine owns the file from here on (the open
+                        // succeeded): the session-model restore binds the
+                        // engine and records its decision only for a path
+                        // this worker actually opened — a failed open (a
+                        // held lease, an unreadable file) never leaks the
+                        // binding into a later create's session. The
+                        // create's own flags were folded before this; a
+                        // flagged create still skips the restore (an
+                        // explicit model wins end-to-end, TS
+                        // `options.model`).
+                        self.engine.set_session_file(path.clone());
+                        if !flagged_model {
+                            self.engine.restore_session_model(path).await;
+                        }
                         let restored = opened.restored_settings();
-                        let has_model_override =
-                            payload.get("provider").and_then(Value::as_str).is_some()
-                                || payload.get("model").and_then(Value::as_str).is_some();
-                        let (provider, model) = if has_model_override {
-                            (None, None)
-                        } else {
-                            restored.model.unzip()
-                        };
+                        // TS createAgentSession restores the session
+                        // file's saved thinking level when the create
+                        // carries no explicit flag (sdk.ts
+                        // `hasThinkingEntry ? existingSession.thinkingLevel`).
+                        // The saved MODEL restores through the engine's
+                        // session-model restore (the bounded readiness
+                        // window, the exact-match path, the published
+                        // fallback) — never this direct adoption, which
+                        // would bypass the window the fleet-kill
+                        // forensics pinned.
                         self.engine.configure_model(EngineModelSelection {
-                            provider,
-                            model,
+                            provider: None,
+                            model: None,
                             api_key: None,
                             thinking: requested_thinking.or_else(|| {
                                 opened
@@ -2402,6 +2458,7 @@ impl Worker {
             // TS roster summaries carry it; a not-yet-resolved engine
             // reports none).
             model: self.engine.model_metadata(),
+            model_fallback_message: self.engine.model_fallback_message(),
             runtime_kind: Some(core.runtime_kind.clone()),
             unfinished_action_count: Some(0),
         }
@@ -4533,6 +4590,7 @@ impl TurnRunner {
                     .effective_thinking_level()
                     .unwrap_or_else(|| "default".to_string()),
                 self.engine.model_metadata(),
+                self.engine.model_fallback_message(),
             )
         };
         let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
@@ -5223,6 +5281,7 @@ fn session_summary(
     core: &SessionCore,
     thinking_level: &str,
     model: Option<Value>,
+    model_fallback_message: Option<String>,
 ) -> SessionSummary {
     let store = core.store.as_ref();
     let streaming = core.busy;
@@ -5327,6 +5386,7 @@ fn session_summary(
         summary: None,
         task_state: None,
         model,
+        model_fallback_message,
         runtime_kind: Some(core.runtime_kind.clone()),
         unfinished_action_count: Some(0),
     }
@@ -5861,11 +5921,14 @@ mod tests {
     #[test]
     fn summary_lifecycle_is_message_based() {
         let empty = SessionCore::test_core(None, "/tmp".to_string());
-        assert_eq!(session_summary(&empty, "default", None).lifecycle, "draft");
+        assert_eq!(
+            session_summary(&empty, "default", None, None).lifecycle,
+            "draft"
+        );
         let mut subagent = SessionCore::test_core(None, "/tmp".to_string());
         subagent.runtime_kind = "subagent".to_string();
         assert_eq!(
-            session_summary(&subagent, "default", None).lifecycle,
+            session_summary(&subagent, "default", None, None).lifecycle,
             "live"
         );
         // The busy-flip roster delta fires before the store flushes the
@@ -5873,7 +5936,10 @@ mod tests {
         // reads the runtime's in-memory messages, which already hold it).
         let mut busy = SessionCore::test_core(None, "/tmp".to_string());
         busy.busy = true;
-        assert_eq!(session_summary(&busy, "default", None).lifecycle, "live");
+        assert_eq!(
+            session_summary(&busy, "default", None, None).lifecycle,
+            "live"
+        );
         let dir = std::env::temp_dir().join(format!("pa-worker-lc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
@@ -5887,7 +5953,7 @@ mod tests {
         session.rewrite().unwrap();
         let with_message = SessionCore::test_core(Some(session), "/tmp".to_string());
         assert_eq!(
-            session_summary(&with_message, "default", None).lifecycle,
+            session_summary(&with_message, "default", None, None).lifecycle,
             "live"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -8387,5 +8453,204 @@ mod turn_stream_tests {
             updates.iter().all(|index| *index < end[0]),
             "the flushed snapshot precedes message_end"
         );
+    }
+}
+
+#[cfg(test)]
+mod replacement_gate_tests {
+    use super::*;
+    use crate::engine::SessionEngine;
+    use std::path::Path;
+
+    /// A recording engine whose session-model restore holds open for a
+    /// fixed window (the restore's readiness awaits): the event log proves
+    /// whether two concurrent replacement commands interleave their
+    /// teardown/swap/restore/rebuild critical sections.
+    struct RecordingEngine {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SessionEngine for RecordingEngine {
+        fn restore_session_model(
+            &self,
+            session_path: &std::path::Path,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let events = std::sync::Arc::clone(&self.events);
+            let path = session_path.display().to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push(format!("restore-enter {path}"));
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                events.lock().unwrap().push(format!("restore-exit {path}"));
+            })
+        }
+
+        fn rebuild_session_context(
+            &self,
+            _: Vec<pa_types::session::FileEntry>,
+            _: pa_core::session_engine::goal_driver::GoalBranchReload,
+        ) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("rebuild".to_string());
+            Ok(())
+        }
+
+        fn run_prompt(
+            &self,
+            _: usize,
+            _: PromptRequest,
+            _: &dyn Fn() -> bool,
+            _: &mut dyn FnMut(EngineEvent) -> bool,
+        ) {
+        }
+
+        fn run_side_question(
+            &self,
+            request: crate::engine::SideQuestionRequest,
+            signal: &pa_agent::abort::AbortSignal,
+            sink: &pa_core::session_engine::side_question::SideQuestionSink,
+        ) -> crate::engine::SideQuestionOutcome {
+            ScriptedEngine::default().run_side_question(request, signal, sink)
+        }
+
+        fn run_compaction(
+            &self,
+            request: crate::engine::CompactionRequest,
+            signal: &pa_agent::abort::AbortSignal,
+        ) -> crate::engine::CompactionOutcome {
+            ScriptedEngine::default().run_compaction(request, signal)
+        }
+
+        fn run_branch_summary(
+            &self,
+            request: crate::engine::BranchSummaryRequest,
+            signal: &pa_agent::abort::AbortSignal,
+        ) -> crate::engine::BranchSummaryOutcome {
+            ScriptedEngine::default().run_branch_summary(request, signal)
+        }
+    }
+
+    fn written_session_file(dir: &Path, name: &str) -> PathBuf {
+        let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let path = dir.join(name);
+        session.set_path(path.clone());
+        session.rewrite().unwrap();
+        path
+    }
+
+    fn recording_worker(
+        dir: &Path,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Worker {
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "replacement-gate".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: Some(true),
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let mut worker = Worker::new(config, None);
+        let engine: std::sync::Arc<dyn SessionEngine> =
+            std::sync::Arc::new(RecordingEngine { events });
+        let core = std::sync::Arc::clone(&worker.core);
+        worker.engine = std::sync::Arc::clone(&engine);
+        worker.navigation = crate::session_navigation::SessionNavigation::new(engine, core);
+        worker
+    }
+
+    /// Two concurrent `switch_session` commands must not interleave their
+    /// replacement critical sections: the teardown, the store/file swap,
+    /// the restore, and the rebuild move the worker onto one session as a
+    /// unit — the second command runs only after the first settles, so
+    /// the restore windows never overlap (an overlap would leave the
+    /// store, the branch context, and the model from different sessions).
+    #[tokio::test]
+    async fn concurrent_replacements_never_interleave_their_critical_sections() {
+        let dir = std::env::temp_dir().join(format!(
+            "pa-replacement-gate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = recording_worker(&dir, std::sync::Arc::clone(&events));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": "/tmp" }))
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+
+        let file_a = written_session_file(&dir, "session-a.jsonl");
+        let file_b = written_session_file(&dir, "session-b.jsonl");
+        let payload_a = json!({ "sessionPath": file_a.to_string_lossy(), "cwdOverride": "/tmp" });
+        let payload_b = json!({ "sessionPath": file_b.to_string_lossy(), "cwdOverride": "/tmp" });
+        let (first, second) = tokio::join!(
+            worker.dispatch("switch_session", &payload_a),
+            worker.dispatch("switch_session", &payload_b)
+        );
+        assert!(first.success, "first switch failed: {first:?}");
+        assert!(second.success, "second switch failed: {second:?}");
+
+        // The restore windows never overlap: no restore may enter while
+        // another is still open.
+        let log = events.lock().unwrap().clone();
+        let mut open = false;
+        for event in &log {
+            if event.starts_with("restore-enter") {
+                assert!(
+                    !open,
+                    "a replacement restored while another was in flight: {log:?}"
+                );
+                open = true;
+            } else if event.starts_with("restore-exit") {
+                open = false;
+            }
+        }
+        assert_eq!(
+            log.iter().filter(|e| e.starts_with("rebuild")).count(),
+            2,
+            "both replacements rebuilt: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed existing-session `create` (a held lease, an unreadable
+    /// file) must never bind the engine to the failed path: the
+    /// session-model restore runs only after the file opened, so a later
+    /// create on a different session never resolves against the failed
+    /// path's model or records it in its creation prefix.
+    #[tokio::test]
+    async fn a_failed_existing_session_create_never_binds_the_engine() {
+        let dir =
+            std::env::temp_dir().join(format!("pa-create-bind-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = recording_worker(&dir, std::sync::Arc::clone(&events));
+
+        // An unreadable "session file" (a directory at the path): the
+        // existing-session arm fails its windowed open.
+        let held = dir.join("held.jsonl");
+        std::fs::create_dir_all(&held).expect("directory at the session path");
+
+        let failed = worker
+            .dispatch(
+                "create",
+                &json!({ "sessionPath": held.to_string_lossy(), "cwd": "/tmp" }),
+            )
+            .await;
+        assert!(
+            !failed.success,
+            "the unreadable path must fail the create: {failed:?}"
+        );
+
+        // The engine never bound to the failed path: no restore ran for
+        // it.
+        let log = events.lock().unwrap().clone();
+        assert!(
+            log.iter().all(|event| !event.starts_with("restore-enter")),
+            "a failed open never restores the failed path: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

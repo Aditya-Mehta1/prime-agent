@@ -24,9 +24,12 @@ uuid = { version = "1", features = ["v4", "v7"] }
 [dev-dependencies]
 filetime = "0.2"
 tempfile = "3"
-# The catalog-repo child-resolution regression writes the layer-A disk
-# cache in the pa-models snapshot shape; test-only (the crate's runtime
-# surface goes through pa-core).
+# Test-only: `ModelCatalog::with_urls` + the compiled offline Prime
+# Inference entries build the loopback catalog the session-model restore
+# tests script (the pa-core tests/common pattern, in-crate), and the
+# catalog-repo child-resolution regression writes the layer-A disk cache
+# in the pa-models snapshot shape; the crate's runtime surface goes
+# through pa-core.
 pa-models = { path = "../pa-models" }
 url = "2"
 # The MCP catalog e2e seeds the fetch lane's snapshot envelope: the real

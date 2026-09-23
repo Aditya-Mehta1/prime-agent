@@ -107,6 +107,22 @@ pub(crate) struct GoalRuntimeHandles {
         std::sync::Arc<tokio::sync::Mutex<pa_core::session::manager::SessionManager>>,
 }
 
+/// The session-model restore decision for one session file (TS
+/// `createAgentSession`'s restored-from-session step): the model the
+/// session's file pins, computed once at the create/replace seam through
+/// the bounded catalog-readiness wait, or the on-the-record fallback when
+/// the window missed (TS `modelFallbackMessage`). Scoped to
+/// `session_file`: the resolution consults it only while the engine owns
+/// that file, so a replacement flow recomputes its own instead of
+/// silently keeping the previous session's pin.
+#[derive(Clone)]
+struct RestoredSessionModel {
+    session_file: std::path::PathBuf,
+    /// `None` when the restore missed after the readiness window.
+    model: Option<(String, String)>,
+    fallback_message: Option<String>,
+}
+
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
     pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
@@ -163,6 +179,26 @@ pub struct AgentSessionEngine {
     /// (create config or worker env) and is re-bound when a session's create
     /// command carries explicit wire flags.
     selection: std::sync::RwLock<EngineModelSelection>,
+    /// TS `createAgentSession`'s restored-from-session decision, scoped to
+    /// the session file it was computed for: a revived session's saved
+    /// model (or, after a missed restore window, the on-the-record
+    /// fallback message — TS `modelFallbackMessage`). Computed once per
+    /// file at the create/replace seam (the bounded readiness wait) and
+    /// consulted by every unflagged resolution; a replacement flow that
+    /// moves the worker onto another file recomputes its own (TS
+    /// re-restores at every session boot), and an explicit create flag
+    /// wins end-to-end (the decision is never consulted).
+    restored_model: std::sync::Mutex<Option<RestoredSessionModel>>,
+    /// The session runtime config the reset returns to at every session
+    /// restore — TS `mergeAgentSessionRuntimeConfig(defaultSessionConfig,
+    /// command.config)`: the spawn-time fallback (create config or worker
+    /// env) folded with the create command's explicit flags. TS hands the
+    /// same merged config down through every replacement (`switchSession`
+    /// -> `createRuntime` -> `createAgentSession({ ...sessionConfig })`),
+    /// so a mid-session `/model` switch belongs to the session it
+    /// switched, never to the moved-to one, while the create's own flags
+    /// survive every replacement.
+    initial_selection: std::sync::RwLock<EngineModelSelection>,
     /// The session's resolved effective thinking level, computed once when
     /// the create command adopts the selection and reused afterwards.
     /// Resolved at create time (before any turn) so summary/state polls
@@ -423,7 +459,9 @@ impl AgentSessionEngine {
             turn_agent: std::sync::Mutex::new(None),
             autonomous_boundary: std::sync::Mutex::new(None),
             session_file,
-            selection: std::sync::RwLock::new(selection),
+            selection: std::sync::RwLock::new(selection.clone()),
+            restored_model: std::sync::Mutex::new(None),
+            initial_selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             service_tier: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
@@ -776,6 +814,203 @@ impl AgentSessionEngine {
         self.selection.read().expect("model selection lock").clone()
     }
 
+    /// The TS `createAgentSession` startup chain (the no-flagged-model
+    /// arm of [`Self::resolve_registry_model`]): the saved settings
+    /// default, then the featured default, then the first available
+    /// model — resolved against `registry`'s current view.
+    fn startup_chain_model(&self, registry: &pa_core::models::ModelRegistry) -> Option<Model> {
+        let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
+        let all: Vec<Model> = registry.get_all().to_vec();
+        let settings =
+            pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
+        pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: false,
+            default_provider: settings.get_default_provider(),
+            default_model_id: settings.get_default_model(),
+            all_models: &all,
+            available_models: &available,
+        })
+        .or_else(|| all.first().cloned())
+    }
+
+    /// The runtime-config reset at every session restore (TS
+    /// `switchSession` -> `createRuntime` -> `createAgentSession`): the
+    /// session's model selection returns to the session runtime config
+    /// (the spawn-time fallback folded with the create command's explicit
+    /// flags, TS's merged `sessionConfig`), so a mid-session `/model`
+    /// switch belongs to the session it switched and never to the
+    /// moved-to one — whose own file pins what it should run on.
+    ///
+    /// The cached thinking level is always dropped: it was computed
+    /// against the dropped selection (or the previous session's restored
+    /// model). TS `createAgentSession` resolves the model first and
+    /// clamps the thinking level against it, so the clamp must follow the
+    /// resolution the moved-to session actually runs on — the restore
+    /// re-resolves the level once it has recorded its decision, and the
+    /// first read after a flagged reset (an explicit selection the
+    /// restore returns early for) resolves lazily against that selection.
+    fn reset_selection_to_spawn_fallback(&self) {
+        *self
+            .effective_thinking
+            .write()
+            .expect("effective thinking lock") = None;
+        {
+            let initial = self
+                .initial_selection
+                .read()
+                .expect("initial selection lock")
+                .clone();
+            let mut current = self.selection.write().expect("model selection lock");
+            if current.provider == initial.provider
+                && current.model == initial.model
+                && current.api_key == initial.api_key
+                && current.thinking == initial.thinking
+            {
+                return;
+            }
+            *current = initial;
+        }
+    }
+
+    /// The create-time session-model restore (see
+    /// [`SessionEngine::restore_session_model`]): reset the selection to
+    /// the spawn-time fallback (the TS runtime-config reset), read the
+    /// session file's saved model context, give the in-flight
+    /// catalog/auth refreshes the bounded readiness window, and record
+    /// the decision for this file. Explicit spawn flags win (TS
+    /// `options.model`); a session with no saved model keeps the startup
+    /// chain; a restore that still misses after the window records the
+    /// fallback (`model_fallback_message`, never silent).
+    async fn restore_session_model_at(&self, session_path: &std::path::Path) {
+        // An unpersisted session (an in-memory fork or a no-session
+        // worker's replacement) has no file to read: TS restores its
+        // branch context, whose `model_change` row is the live branch's
+        // own — the model the session already runs on — so the
+        // runtime-config reset must not run with nothing to restore.
+        if session_path.as_os_str().is_empty() {
+            return;
+        }
+        self.reset_selection_to_spawn_fallback();
+        // TS `buildSessionContext()`: the session file pins the model it
+        // last ran on and the thinking level it last set. The scan is
+        // plain file work on a potentially large session file — park it
+        // on a blocking thread.
+        let path = session_path.to_path_buf();
+        let Ok(saved) = tokio::task::spawn_blocking(move || saved_session_context(&path)).await
+        else {
+            return;
+        };
+        let Some(saved) = saved else {
+            return;
+        };
+        // TS `createAgentSession` re-reads the session's saved thinking
+        // level at every boot (`hasThinkingEntry ?
+        // existingSession.thinkingLevel` — sdk.ts) when the runtime config
+        // carries no explicit flag: the moved-to session's pinned level
+        // wins over the settings/medium default. The level re-clamps
+        // against the model below (the reset dropped the cache).
+        if self.current_selection().thinking.is_none() {
+            if let Some(level) = saved.thinking {
+                self.configure_model(EngineModelSelection {
+                    thinking: Some(level),
+                    ..Default::default()
+                });
+            }
+        }
+        // An explicit create flag wins for the MODEL (TS `options.model`)
+        // — the saved thinking above still applies, then the restore skips
+        // the model's readiness window entirely.
+        if self.current_selection().model.is_some() {
+            return;
+        }
+        let Some((provider, model_id)) = saved.model else {
+            return;
+        };
+        let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
+        let mut registry =
+            pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
+        registry.load_private_authorization_from_cache();
+        let restored = pa_core::models::find_session_model_with_readiness_wait(
+            &mut registry,
+            &provider,
+            &model_id,
+            pa_core::models::SESSION_MODEL_RESTORE_READINESS_TIMEOUT_MS,
+        )
+        .await;
+        let (model, fallback_message) = match restored {
+            Some(restored) => (Some((restored.provider, restored.id)), None),
+            None => {
+                // The TS `modelFallbackMessage`: the restore miss is on the
+                // record — the startup chain owns the session, and the
+                // summary publishes what happened (never silent).
+                let fallback = self.startup_chain_model(&registry);
+                let message = match &fallback {
+                    Some(fallback) => format!(
+                        "Could not restore model {provider}/{model_id}. Using {}/{}",
+                        fallback.provider, fallback.id
+                    ),
+                    None => format!("Could not restore model {provider}/{model_id}"),
+                };
+                eprintln!("{message}");
+                (None, Some(message))
+            }
+        };
+        *self
+            .restored_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RestoredSessionModel {
+            session_file: session_path.to_path_buf(),
+            model,
+            fallback_message,
+        });
+        // The decision is on the record now, so the level must resolve
+        // against the model this session actually runs on (the restored
+        // pin, or the startup chain after a missed window) — TS
+        // `createAgentSession` resolves the model first and clamps the
+        // thinking level against it. A concurrent summary/roster read may
+        // have populated the cache against the startup chain while the
+        // restore was still awaiting: drop the cache once more so the
+        // post-decision resolution wins for every later reader (the reset
+        // dropped it too, but the window in between is concurrent).
+        *self
+            .effective_thinking
+            .write()
+            .expect("effective thinking lock") = None;
+        let _ = self.effective_thinking();
+    }
+
+    /// The restored-from-session resolution for the engine's current
+    /// session file (TS `createAgentSession`'s restored-from-session
+    /// step): a decision computed for this file resolves its pinned model
+    /// through the same exact-match path a flagged selection takes — a
+    /// catalog flap rebuilds the private route template on the same id
+    /// (`build_fallback_model`), never silently drifting to the featured
+    /// default. A decision for another file (a replacement flow that has
+    /// not recomputed yet) is ignored.
+    fn restored_model_resolution(
+        &self,
+        registry: &pa_core::models::ModelRegistry,
+    ) -> Option<Model> {
+        let decision = self
+            .restored_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let (provider, model_id) = decision.model?;
+        let current = self
+            .session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        if decision.session_file != current {
+            return None;
+        }
+        pa_core::models::resolve_cli_model(Some(&provider), &model_id, registry.get_all()).model
+    }
+
     /// Resolve the model through the composed registry.
     fn resolve_registry_model(&self) -> anyhow::Result<Model> {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
@@ -786,34 +1021,21 @@ impl AgentSessionEngine {
         // cache so create-time resolution can pick the session's private
         // model (e.g. internal/glm-5.3-fast).
         registry.load_private_authorization_from_cache();
-        let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
         let selection = self.current_selection();
         let Some(model_name) = selection.model.as_deref() else {
-            // No flagged model: the TS `createAgentSession` startup chain —
+            // No flagged model: the restored-from-session decision comes
+            // first (TS `createAgentSession`), then the startup chain —
             // the saved settings default, then the featured default, then
             // the first available model.
-            let all: Vec<Model> = registry.get_all().to_vec();
-            let settings =
-                pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
-            let startup =
-                pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
-                    cli_provider: None,
-                    cli_model: None,
-                    scoped_models: &[],
-                    is_continuing: false,
-                    default_provider: settings.get_default_provider(),
-                    default_model_id: settings.get_default_model(),
-                    all_models: &all,
-                    available_models: &available,
-                });
-            if let Some(model) = startup {
+            if let Some(model) = self.restored_model_resolution(&registry) {
                 return Ok(model);
             }
-            return all.first().cloned().ok_or_else(|| {
-                anyhow::anyhow!(
+            let Some(model) = self.startup_chain_model(&registry) else {
+                anyhow::bail!(
                     "No models available. Check your installation or add models to models.json."
-                )
-            });
+                );
+            };
+            return Ok(model);
         };
         // TS `resolveCliModel` resolves against `modelRegistry.getAll()`
         // — the full catalog, not the auth-configured list ("use *all*
@@ -886,10 +1108,12 @@ impl AgentSessionEngine {
 
     /// The effective session thinking level (the sdk.ts `createAgentSession`
     /// order): the create-config flag, then the settings default, then
-    /// "medium" — always clamped to what the model supports; a model that
-    /// cannot be resolved degrades to "off". Resolved once at create time
-    /// and cached so summary/state calls stay side-effect-free while turns
-    /// run.
+    /// "medium" — always clamped to what the model supports, where the
+    /// model is the one the session actually runs on (the restored pin
+    /// after a session-model restore, the explicit selection after a
+    /// flagged create); a model that cannot be resolved degrades to
+    /// "off". Resolved once at the create/restore seam and cached so
+    /// summary/state calls stay side-effect-free while turns run.
     fn effective_thinking(&self) -> pa_types::ai::ModelThinkingLevel {
         if let Some(level) = *self
             .effective_thinking
@@ -1127,6 +1351,35 @@ pub(crate) fn persisted_rlm_max_depth(path: Option<&str>) -> Option<u64> {
             })
             .flatten()
         })
+}
+
+/// The saved model context of a session file (TS
+/// `buildSessionContext().model`): the model the session last ran on —
+/// the last `model_change` row, else the last assistant message's
+/// provider/model. `None` when the file carries no model context (a
+/// fresh session) or cannot be read (the create flow owns that failure).
+/// The session file's saved model context (TS `buildSessionContext`): the
+/// pinned `(provider, model)` and the saved thinking level — present only
+/// when the file carries a `thinking_level_change` row (TS
+/// `hasThinkingEntry`).
+pub(crate) struct SavedSessionContext {
+    pub(crate) model: Option<(String, String)>,
+    pub(crate) thinking: Option<pa_types::ai::ModelThinkingLevel>,
+}
+
+pub(crate) fn saved_session_context(path: &std::path::Path) -> Option<SavedSessionContext> {
+    let store = crate::session_store::SessionFile::open(path).ok()?;
+    let entries = store.branch_file_entries();
+    let leaf = store.leaf_id().map(str::to_string);
+    let context = pa_core::session::build_session_context(&entries, leaf.as_deref());
+    let thinking = store
+        .has_thinking_level()
+        .then(|| pa_ai::models::thinking_level_from_str(&context.thinking_level))
+        .flatten();
+    Some(SavedSessionContext {
+        model: context.model,
+        thinking,
+    })
 }
 
 /// One artifact reference (TS `createArtifactReference` in
@@ -1508,6 +1761,49 @@ impl SessionEngine for AgentSessionEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
     }
 
+    /// TS `createAgentSession`'s restored-from-session step (sdk.ts): a
+    /// session that already ran on a model restores it before the startup
+    /// chain — the saved model context from the session file, through the
+    /// bounded readiness wait (a revived worker races the daemon boot's
+    /// catalog fetch; without the wait a private model is missing from
+    /// the cold registry and the session silently lands on the featured
+    /// default instead of the model it was running on). The worker calls
+    /// this at create, before the create-config selection is adopted: a
+    /// successful restore pins the model into the selection (the TS
+    /// session holds its restored model), an explicit create flag still
+    /// wins, and a failed restore is never silent —
+    /// [`Self::model_fallback_message`] publishes the fallback.
+    fn restore_session_model(
+        &self,
+        session_path: &std::path::Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let path = session_path.to_path_buf();
+        Box::pin(async move {
+            self.restore_session_model_at(&path).await;
+        })
+    }
+
+    /// TS `modelFallbackMessage`: the non-silent record of a revived
+    /// session's model falling back to the startup chain after the
+    /// readiness window missed. Published on the session summary while
+    /// the engine owns the file the decision was computed for.
+    fn model_fallback_message(&self) -> Option<String> {
+        let decision = self
+            .restored_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let current = self
+            .session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        if decision.session_file != current {
+            return None;
+        }
+        decision.fallback_message
+    }
+
     /// The `compact` command path (TS `compact()`'s background
     /// `_scheduleAutoRefine("compact")` on an idle session): the round
     /// runs right after the compaction answered, through the same gated
@@ -1570,6 +1866,36 @@ impl SessionEngine for AgentSessionEngine {
         // The first prompt after create builds the session against this
         // selection, so no invalidation is needed here: configure runs at
         // create time, before any turn.
+    }
+
+    fn configure_create_model(&self, selection: EngineModelSelection) {
+        // The create command's explicit flags fold into the session
+        // runtime config (TS `mergeAgentSessionRuntimeConfig`): TS hands
+        // the merged `sessionConfig` down through every replacement, so
+        // the flags must survive the runtime-config reset a session
+        // restore performs — a later `switch_session`/`fork`/`import`
+        // keeps honoring the create's selection (it wins over the
+        // moved-to file's pin, exactly like `options.model` in
+        // `createAgentSession`).
+        {
+            let mut initial = self
+                .initial_selection
+                .write()
+                .expect("initial selection lock");
+            if selection.provider.is_some() {
+                initial.provider = selection.provider.clone();
+            }
+            if selection.model.is_some() {
+                initial.model = selection.model.clone();
+            }
+            if selection.api_key.is_some() {
+                initial.api_key = selection.api_key.clone();
+            }
+            if selection.thinking.is_some() {
+                initial.thinking = selection.thinking;
+            }
+        }
+        self.configure_model(selection);
     }
 
     fn switch_model(&self, selection: EngineModelSelection) -> bool {
@@ -3975,6 +4301,45 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    /// A models.json custom-provider pair for the thinking clamp: a
+    /// reasoning model (supports the full level ladder up to `high`) and a
+    /// non-reasoning one (supports only `off`) — the restore must clamp
+    /// the requested level against whichever one the session file pins.
+    fn write_thinking_pair_models_json(agent_dir: &std::path::Path, base_url: &str) {
+        std::fs::create_dir_all(agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("models.json"),
+            serde_json::json!({
+                "providers": {
+                    "battery": {
+                        "api": "openai-completions",
+                        "baseUrl": base_url,
+                        "apiKey": "sk-battery",
+                        "models": [
+                            {
+                                "id": "mock-reason",
+                                "name": "Mock Reasoning",
+                                "api": "openai-completions",
+                                "contextWindow": 128000,
+                                "maxTokens": 4096,
+                                "reasoning": true,
+                            },
+                            {
+                                "id": "mock-plain",
+                                "name": "Mock Plain",
+                                "api": "openai-completions",
+                                "contextWindow": 128000,
+                                "maxTokens": 4096,
+                            }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn create_config_flags_reach_the_engine_model_resolution() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -6328,6 +6693,694 @@ pub(crate) mod tests {
         let model = engine.resolve_registry_model().expect("resolved model");
         assert_eq!(model.provider, "battery");
         assert_eq!(model.id, "mock-1");
+    }
+
+    /// A scripted loopback HTTP server (the pa-core tests/common pattern,
+    /// in-crate): answers from a queue of raw responses and records every
+    /// request head. Nothing leaves loopback.
+    struct MockCatalogServer {
+        port: u16,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl MockCatalogServer {
+        async fn start(responses: Vec<Vec<u8>>) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock catalog server");
+            let port = listener.local_addr().unwrap().port();
+            let requests: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(responses),
+            ));
+            let request_log = std::sync::Arc::clone(&requests);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let requests = std::sync::Arc::clone(&request_log);
+                    let queue = std::sync::Arc::clone(&queue);
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 8_192];
+                        let mut read = 0usize;
+                        loop {
+                            let Ok(n) = socket.read(&mut buffer[read..]).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            read += n;
+                            if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                            if read == buffer.len() {
+                                break;
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        requests.lock().unwrap().push(head);
+                        let response = queue.lock().unwrap().pop_front().unwrap_or_else(|| {
+                            b"HTTP/1.1 500 Drained\r\ncontent-length: 0\r\n\r\n".to_vec()
+                        });
+                        let _ = socket.write_all(&response).await;
+                        let _ = socket.flush().await;
+                    });
+                }
+            });
+            Self { port, requests }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{}", self.port, path)
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    fn catalog_ok_json(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// One auth.json with a Prime Inference key + team: the file auth the
+    /// engine's registry reads (the private-model lane's scope).
+    fn write_prime_auth(agent_dir: &std::path::Path) {
+        std::fs::create_dir_all(agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("auth.json"),
+            serde_json::json!({
+                "prime-inference": {
+                    "type": "api_key",
+                    "key": "test-key",
+                    "primeTeam": { "teamId": "team-1", "name": "Test Team" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The Prime Inference `/models` payload: every compiled offline
+    /// entry (the coverage gate keeps thin fetches out) plus the private
+    /// `internal/glm-5.3-fast` the compiled fallback lacks.
+    fn pi_payload() -> String {
+        let mut data: Vec<Value> = pa_models::transports::prime_inference_offline_entries()
+            .iter()
+            .map(|model| {
+                serde_json::json!({
+                    "id": model.id,
+                    "display_name": model.name,
+                    "pricing": {
+                        "input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0
+                    },
+                    "specs": {
+                        "context_window": model.context_window,
+                        "max_output_tokens": model.max_tokens,
+                        "supports_reasoning": model.reasoning,
+                        "modalities": { "input": ["text"], "output": ["text"] },
+                    },
+                })
+            })
+            .collect();
+        data.push(serde_json::json!({
+            "id": "internal/glm-5.3-fast",
+            "display_name": "GLM 5.3 Fast (internal)",
+            "pricing": { "input_usd_per_mtok": 0.42, "output_usd_per_mtok": 2.1 },
+            "specs": {
+                "context_window": 400_000, "max_output_tokens": 131_072,
+                "supports_reasoning": true,
+                "modalities": { "input": ["text"], "output": ["text"] },
+            },
+        }));
+        serde_json::json!({ "data": data }).to_string()
+    }
+
+    /// Install a loopback catalog for `agent_dir` (both fetch layers point
+    /// at `server`; no bundled snapshot, so the compiled fallback is the
+    /// base and only the fetches add the private team model).
+    fn install_loopback_catalog(agent_dir: &std::path::Path, server: &MockCatalogServer) {
+        let catalog = pa_models::ModelCatalog::with_urls(
+            Some(agent_dir.join("models")),
+            None,
+            &server.url("/catalog"),
+            &server.url("/api/v1"),
+        );
+        pa_core::models::install_catalog(
+            &agent_dir.join("models.json"),
+            std::sync::Arc::new(catalog),
+        );
+    }
+
+    /// A session file whose last `model_change` row pins the private team
+    /// model — what a revived worker reads at create.
+    fn session_file_pinning_private_model(dir: &std::path::Path) -> std::path::PathBuf {
+        session_file_pinning_model(dir, "prime-inference", "internal/glm-5.3-fast")
+    }
+
+    /// A session file whose last `model_change` row pins the given model —
+    /// what a revived worker reads at create (and what a replacement
+    /// flow re-restores at its session boot).
+    fn session_file_pinning_model(
+        dir: &std::path::Path,
+        provider: &str,
+        model: &str,
+    ) -> std::path::PathBuf {
+        let mut session =
+            crate::session_store::SessionFile::create(dir.to_str().unwrap_or("/tmp"), None, 0);
+        let path = dir.join(crate::session_store::session_file_name(
+            session.session_id(),
+        ));
+        session.set_path(path.clone());
+        session.append_model_change(provider, model);
+        session.rewrite().unwrap();
+        path
+    }
+
+    fn restore_test_engine(
+        dir: &std::path::Path,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> AgentSessionEngine {
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.to_path_buf(),
+            agent_dir: dir.join("agent"),
+            provider: provider.map(str::to_string),
+            model: model.map(str::to_string),
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .expect("engine")
+    }
+
+    /// The revival race this lane fixes (the 2026-09-23 05:57 fleet kill):
+    /// a revived session (scheduled wake / update restore / worker
+    /// relaunch — a create without model flags) resolves against the cold
+    /// registry and lands on the featured default while the daemon boot's
+    /// catalog fetch is still in flight. The create-time restore pins the
+    /// session's saved model after the readiness window instead.
+    #[tokio::test]
+    async fn revived_session_restores_its_pinned_model_not_the_startup_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        let pi = pi_payload();
+        let layer_a = serde_json::json!({ "schemaVersion": 1, "models": [] }).to_string();
+        let server = MockCatalogServer::start(vec![
+            catalog_ok_json(&layer_a),
+            catalog_ok_json(&pi),
+            catalog_ok_json(&pi),
+        ])
+        .await;
+        install_loopback_catalog(&agent_dir, &server);
+        let path = session_file_pinning_private_model(dir.path());
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(path.clone());
+
+        // The premise — the silent fallback the race produced: the cold
+        // registry holds only the compiled entries, so the unflagged
+        // startup chain picks the featured default (z-ai/glm-5.3), not the
+        // model the session file pins. No fetch has run.
+        let cold = engine.resolve_registry_model().expect("cold resolution");
+        assert_eq!(cold.provider, "prime-inference");
+        assert_eq!(cold.id, "z-ai/glm-5.3");
+        assert_eq!(
+            server.request_count(),
+            0,
+            "the cold resolution never fetches"
+        );
+
+        // The create-time restore: the readiness window covers the fetch,
+        // the pinned model restores and every later unflagged resolution
+        // runs on it.
+        engine.restore_session_model(&path).await;
+        let restored = engine
+            .resolve_registry_model()
+            .expect("restored resolution");
+        assert_eq!(restored.provider, "prime-inference");
+        assert_eq!(restored.id, "internal/glm-5.3-fast");
+        assert!(
+            engine.model_fallback_message().is_none(),
+            "a successful restore leaves no fallback message"
+        );
+    }
+
+    /// A restore that misses even after the readiness window falls back to
+    /// the startup chain — on the record (TS `modelFallbackMessage`), never
+    /// silent.
+    #[tokio::test]
+    async fn revived_session_fallback_is_on_the_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        // Every fetch fails instantly (the drained queue answers 500): the
+        // restore misses fast, the startup chain owns the session.
+        let server = MockCatalogServer::start(Vec::new()).await;
+        install_loopback_catalog(&agent_dir, &server);
+        let path = session_file_pinning_private_model(dir.path());
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(path.clone());
+
+        engine.restore_session_model(&path).await;
+        assert_eq!(
+            engine.model_fallback_message().as_deref(),
+            Some("Could not restore model prime-inference/internal/glm-5.3-fast. Using prime-inference/z-ai/glm-5.3"),
+            "the fallback is published, never silent"
+        );
+        let resolved = engine.resolve_registry_model().expect("startup chain");
+        assert_eq!(resolved.provider, "prime-inference");
+        assert_eq!(resolved.id, "z-ai/glm-5.3");
+    }
+
+    /// Explicit create flags are authoritative (TS `options.model`): the
+    /// saved session model never overrides a flagged selection, and a
+    /// skipped restore records no fallback.
+    #[tokio::test]
+    async fn create_flags_beat_the_saved_session_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let path = session_file_pinning_private_model(dir.path());
+        let engine = restore_test_engine(dir.path(), Some("battery"), Some("mock-1"));
+        engine.set_session_file(path.clone());
+
+        engine.restore_session_model(&path).await;
+        let resolved = engine.resolve_registry_model().expect("flagged resolution");
+        assert_eq!(resolved.provider, "battery");
+        assert_eq!(resolved.id, "mock-1");
+        assert!(engine.model_fallback_message().is_none());
+    }
+
+    /// A session with no saved model context (a fresh file) keeps the
+    /// startup chain — the restore is a no-op, nothing is recorded.
+    #[tokio::test]
+    async fn fresh_session_without_a_saved_model_keeps_the_startup_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        let server = MockCatalogServer::start(Vec::new()).await;
+        install_loopback_catalog(&agent_dir, &server);
+        // A session file with no model rows at all.
+        let mut session = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let path = dir.path().join(crate::session_store::session_file_name(
+            session.session_id(),
+        ));
+        session.set_path(path.clone());
+        session.rewrite().unwrap();
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(path.clone());
+
+        engine.restore_session_model(&path).await;
+        assert!(engine.model_fallback_message().is_none());
+        let resolved = engine.resolve_registry_model().expect("startup chain");
+        assert_eq!(resolved.id, "z-ai/glm-5.3");
+    }
+
+    /// The restore decision is scoped to the file it was computed for: a
+    /// replacement flow that moves the worker onto another file without
+    /// recomputing keeps the startup chain — the previous session's pin
+    /// never silently overrides the moved-to session (TS re-restores at
+    /// every session boot).
+    #[tokio::test]
+    async fn a_restore_decision_is_scoped_to_its_session_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        let pi = pi_payload();
+        let layer_a = serde_json::json!({ "schemaVersion": 1, "models": [] }).to_string();
+        let server = MockCatalogServer::start(vec![
+            catalog_ok_json(&layer_a),
+            catalog_ok_json(&pi),
+            catalog_ok_json(&pi),
+        ])
+        .await;
+        install_loopback_catalog(&agent_dir, &server);
+        let pinned = session_file_pinning_private_model(dir.path());
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(pinned.clone());
+        engine.restore_session_model(&pinned).await;
+        let restored = engine
+            .resolve_registry_model()
+            .expect("restored resolution");
+        assert_eq!(restored.id, "internal/glm-5.3-fast");
+
+        // The worker moves onto another file (a replacement flow that has
+        // not recomputed yet): the decision for the old file no longer
+        // applies — the startup chain owns the resolution again.
+        let mut other = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let other_path = dir
+            .path()
+            .join(crate::session_store::session_file_name(other.session_id()));
+        other.set_path(other_path.clone());
+        other.rewrite().unwrap();
+        engine.set_session_file(other_path);
+        let moved = engine.resolve_registry_model().expect("moved resolution");
+        assert_eq!(moved.id, "z-ai/glm-5.3");
+        assert!(
+            engine.model_fallback_message().is_none(),
+            "the old file's decision does not leak into the moved-to session"
+        );
+    }
+
+    /// A mid-session `/model` switch belongs to the session it switched
+    /// (TS `switchSession` -> `createRuntime` rebuilds the runtime config
+    /// from the daemon default): a replacement onto another file drops
+    /// the switch and restores the moved-to file's own pin.
+    #[tokio::test]
+    async fn a_model_switch_never_leaks_into_the_replacement_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_prime_auth(&agent_dir);
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let pi = pi_payload();
+        let layer_a = serde_json::json!({ "schemaVersion": 1, "models": [] }).to_string();
+        let server = MockCatalogServer::start(vec![
+            catalog_ok_json(&layer_a),
+            catalog_ok_json(&pi),
+            catalog_ok_json(&pi),
+        ])
+        .await;
+        install_loopback_catalog(&agent_dir, &server);
+
+        // Session A pins the private model; the worker restores it.
+        let file_a = session_file_pinning_private_model(dir.path());
+        let engine = std::sync::Arc::new(restore_test_engine(dir.path(), None, None));
+        engine.set_session_file(file_a.clone());
+        engine.restore_session_model(&file_a).await;
+        let restored = engine.resolve_registry_model().expect("restored");
+        assert_eq!(restored.id, "internal/glm-5.3-fast");
+
+        // A mid-session /model switch on session A (the worker runs the
+        // engine's synchronous switch on the blocking pool, like the turn
+        // path — a tokio context must not block on its locks).
+        let switched_engine = std::sync::Arc::clone(&engine);
+        let switched = tokio::task::spawn_blocking(move || {
+            switched_engine.switch_model(EngineModelSelection {
+                provider: Some("battery".to_string()),
+                model: Some("mock-1".to_string()),
+                api_key: None,
+                thinking: None,
+            })
+        })
+        .await
+        .expect("blocking switch");
+        assert!(switched);
+        let switched = engine.resolve_registry_model().expect("switched");
+        assert_eq!(switched.id, "mock-1");
+
+        // The replacement (switch_session/fork/import) onto another file
+        // that pins its own model: the switch does not leak — the
+        // moved-to session restores its own pin.
+        let file_b = session_file_pinning_private_model(dir.path());
+        engine.set_session_file(file_b.clone());
+        engine.restore_session_model(&file_b).await;
+        let moved = engine.resolve_registry_model().expect("moved resolution");
+        assert_eq!(
+            moved.id, "internal/glm-5.3-fast",
+            "the moved-to session's own file pin wins over the previous session's switch"
+        );
+        assert!(engine.model_fallback_message().is_none());
+    }
+
+    /// An unpersisted session (an in-memory fork, a no-session worker's
+    /// replacement) has no file to restore from: the runtime-config reset
+    /// must not run with nothing to restore — the live selection keeps
+    /// the model the session runs on (TS restores the in-memory branch's
+    /// own context).
+    #[tokio::test]
+    async fn an_unpersisted_session_keeps_its_live_selection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = std::sync::Arc::new(restore_test_engine(dir.path(), None, None));
+        engine.configure_create_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-plain".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        // A mid-session /model switch on the live session (the worker
+        // runs the engine's synchronous switch on the blocking pool).
+        let switched_engine = std::sync::Arc::clone(&engine);
+        let switched = tokio::task::spawn_blocking(move || {
+            switched_engine.switch_model(EngineModelSelection {
+                provider: Some("battery".to_string()),
+                model: Some("mock-reason".to_string()),
+                api_key: None,
+                thinking: None,
+            })
+        })
+        .await
+        .expect("blocking switch");
+        assert!(switched);
+
+        // The in-memory fork's replacement restore: an empty path is a
+        // no-op — the switch survives (never reset to the runtime config).
+        engine.restore_session_model(std::path::Path::new("")).await;
+        let resolved = engine.resolve_registry_model().expect("live selection");
+        assert_eq!(
+            (resolved.provider.as_str(), resolved.id.as_str()),
+            ("battery", "mock-reason"),
+            "the live selection survives an unpersisted replacement"
+        );
+    }
+
+    /// A replacement re-reads the moved-to session's saved thinking level
+    /// (TS `createAgentSession`: `hasThinkingEntry ?
+    /// existingSession.thinkingLevel` when the runtime config carries no
+    /// explicit flag): the pinned level replaces the settings/medium
+    /// default and clamps against the restored model.
+    #[tokio::test]
+    async fn a_replacement_restores_the_moved_to_sessions_saved_thinking_level() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = restore_test_engine(dir.path(), None, None);
+
+        // Session A pins the reasoning model at thinking `low`.
+        let mut file_a = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let path_a = dir
+            .path()
+            .join(crate::session_store::session_file_name(file_a.session_id()));
+        file_a.set_path(path_a.clone());
+        file_a.append_model_change("battery", "mock-reason");
+        file_a.append_thinking_level_change("low");
+        file_a.rewrite().unwrap();
+        engine.set_session_file(path_a.clone());
+        engine.restore_session_model(&path_a).await;
+        assert_eq!(
+            engine.effective_thinking_level().as_deref(),
+            Some("low"),
+            "the moved-to session's saved thinking level restores, not the medium default"
+        );
+
+        // Session B pins the non-reasoning model at thinking `high`: the
+        // saved level restores and clamps against the restored model.
+        let mut file_b = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let path_b = dir
+            .path()
+            .join(crate::session_store::session_file_name(file_b.session_id()));
+        file_b.set_path(path_b.clone());
+        file_b.append_model_change("battery", "mock-plain");
+        file_b.append_thinking_level_change("high");
+        file_b.rewrite().unwrap();
+        engine.set_session_file(path_b.clone());
+        engine.restore_session_model(&path_b).await;
+        assert_eq!(
+            engine.effective_thinking_level().as_deref(),
+            Some("off"),
+            "the saved level re-clamps against the restored non-reasoning model"
+        );
+    }
+
+    /// A compacted session restores the model its post-compaction
+    /// assistant message ran on (TS `buildSessionContext().model`: the
+    /// last `model_change` row before the compaction summary is
+    /// superseded; the surviving assistant message's provider/model is
+    /// the session's model context).
+    #[tokio::test]
+    async fn a_compacted_session_restores_its_post_compaction_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        let mut session = crate::session_store::SessionFile::create(
+            dir.path().to_str().unwrap_or("/tmp"),
+            None,
+            0,
+        );
+        let path = dir.path().join(crate::session_store::session_file_name(
+            session.session_id(),
+        ));
+        session.set_path(path.clone());
+        session.append_model_change("battery", "mock-reason");
+        let kept = session.append_message(serde_json::json!({
+            "role": "assistant",
+            "provider": "battery",
+            "model": "mock-plain",
+            "api": "openai-responses",
+            "content": [],
+            "stopReason": "stop",
+            "timestamp": 0u64,
+            "usage": {
+                "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 }
+            }
+        }));
+        session.append_entry(
+            "compaction",
+            serde_json::json!({
+                "summary": "summary",
+                "firstKeptEntryId": kept,
+                "tokensBefore": 100
+            }),
+        );
+        session.rewrite().unwrap();
+
+        let engine = restore_test_engine(dir.path(), None, None);
+        engine.set_session_file(path.clone());
+        engine.restore_session_model(&path).await;
+        let restored = engine
+            .resolve_registry_model()
+            .expect("restored resolution");
+        assert_eq!(
+            (restored.provider.as_str(), restored.id.as_str()),
+            ("battery", "mock-plain"),
+            "the post-compaction assistant message pins the restored model, not the superseded model_change"
+        );
+        assert!(engine.model_fallback_message().is_none());
+    }
+
+    /// The create command's explicit flags survive every session
+    /// replacement (TS hands the merged `sessionConfig` down through
+    /// `switchSession`/`fork`/`import`): a later replacement honors the
+    /// create-time selection — never the previous session's `/model`
+    /// switch, and never the moved-to file's pin (a flagged selection
+    /// skips the restore entirely, so no fallback is recorded either).
+    #[tokio::test]
+    async fn create_flags_survive_a_session_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        // The worker started without an environment model; its create
+        // command carries the explicit flag.
+        let engine = std::sync::Arc::new(restore_test_engine(dir.path(), None, None));
+        engine.configure_create_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-plain".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+
+        // A mid-session /model switch on the first session (the worker
+        // runs the engine's synchronous switch on the blocking pool — a
+        // tokio context must not block on its locks).
+        let switched_engine = std::sync::Arc::clone(&engine);
+        let switched = tokio::task::spawn_blocking(move || {
+            switched_engine.switch_model(EngineModelSelection {
+                provider: Some("battery".to_string()),
+                model: Some("mock-reason".to_string()),
+                api_key: None,
+                thinking: None,
+            })
+        })
+        .await
+        .expect("blocking switch");
+        assert!(switched);
+        let switched = engine.resolve_registry_model().expect("switched");
+        assert_eq!(switched.id, "mock-reason");
+
+        // The replacement onto a file pinning its own model: the
+        // runtime-config reset returns to the create's folded selection —
+        // the switch died with the session it switched, and the file's
+        // pin never even runs.
+        let moved = session_file_pinning_model(dir.path(), "battery", "mock-reason");
+        engine.set_session_file(moved.clone());
+        engine.restore_session_model(&moved).await;
+        let resolved = engine.resolve_registry_model().expect("flagged resolution");
+        assert_eq!(
+            (resolved.provider.as_str(), resolved.id.as_str()),
+            ("battery", "mock-plain"),
+            "the create command's flags survive the replacement"
+        );
+        assert!(
+            engine.model_fallback_message().is_none(),
+            "a flagged restore never records a fallback"
+        );
+    }
+
+    /// The restore clamps the thinking level against the model the
+    /// session actually runs on (TS `createAgentSession` resolves the
+    /// model first, then `clampThinkingLevel`): a create-time `high`
+    /// request restores a non-reasoning pin and the session runs `off`,
+    /// and a later replacement onto a reasoning pin re-clamps back to
+    /// `high` — the previous session's clamp never leaks into the
+    /// moved-to one.
+    #[tokio::test]
+    async fn a_replacement_re_clamps_the_thinking_level_against_the_restored_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_thinking_pair_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = restore_test_engine(dir.path(), None, None);
+        // The create command requested `high`.
+        engine.configure_create_model(EngineModelSelection {
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: Some(pa_types::ai::ModelThinkingLevel::High),
+        });
+
+        // The worker's first session pins the non-reasoning model: the
+        // restore records the pin and the level clamps against it.
+        let plain = session_file_pinning_model(dir.path(), "battery", "mock-plain");
+        engine.set_session_file(plain.clone());
+        engine.restore_session_model(&plain).await;
+        assert_eq!(
+            engine.effective_thinking_level().as_deref(),
+            Some("off"),
+            "the clamp follows the restored non-reasoning model, not the reset selection"
+        );
+
+        // The replacement onto a file pinning the reasoning model: the
+        // moved-to session re-clamps against its own restored pin.
+        let reason = session_file_pinning_model(dir.path(), "battery", "mock-reason");
+        engine.set_session_file(reason.clone());
+        engine.restore_session_model(&reason).await;
+        assert_eq!(
+            engine.effective_thinking_level().as_deref(),
+            Some("high"),
+            "the replacement re-clamps the requested level against its restored model"
+        );
     }
 
     #[test]

@@ -428,12 +428,46 @@ pub trait SessionEngine: Send + Sync {
         let _ = path;
     }
 
-    /// Adopt the explicit model selection carried by the session's create
-    /// config. Explicit CLI flags must be authoritative end-to-end: the
-    /// selection reached the worker over the wire, so model resolution must
-    /// honor it instead of a process-wide fallback. Engines without a model
-    /// (the scripted harness) ignore it.
+    /// TS `createAgentSession`'s restored-from-session step: a session
+    /// being revived (scheduled wake, update restore, worker relaunch)
+    /// restores the model its file pins before the startup chain, giving
+    /// the daemon boot's in-flight catalog fetch a bounded readiness
+    /// window — without it a revived session silently lands on the
+    /// startup-chain default instead of the model it was running on. The
+    /// worker calls this at create, before the create-config selection;
+    /// explicit flags win, a miss records the fallback (never silent).
+    /// Engines without a persisted model context do nothing.
+    fn restore_session_model(
+        &self,
+        _session_path: &std::path::Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// TS `modelFallbackMessage`: the on-the-record reason a revived
+    /// session's model fell back (the summary publishes it — a model
+    /// fallback must never be silent). `None` while no restore missed.
+    fn model_fallback_message(&self) -> Option<String> {
+        None
+    }
+
+    /// Merge an explicit selection over the engine's live selection (the
+    /// TS runtime-config merge semantics): explicit wire flags replace,
+    /// absent fields keep. The worker's create-time restored-settings
+    /// adoption (the session file's saved thinking level) runs through
+    /// this seam — a live merge that must NOT fold into the reset target
+    /// (the create-config seam is [`Self::configure_create_model`]).
+    /// Engines without a model (the scripted harness) ignore it.
     fn configure_model(&self, _selection: EngineModelSelection) {}
+
+    /// Adopt the explicit model selection carried by the session's create
+    /// command (TS `mergeAgentSessionRuntimeConfig(defaultSessionConfig,
+    /// command.config)`): the flags are authoritative end-to-end AND
+    /// survive every session replacement (TS hands the merged
+    /// `sessionConfig` down through `switchSession`/`fork`/`import`), so
+    /// they must outlive the live selection a `/model` switch mutates.
+    /// Engines without a model (the scripted harness) ignore it.
+    fn configure_create_model(&self, _selection: EngineModelSelection) {}
 
     /// Set the session's resolved service-tier preference before the next request.
     fn configure_service_tier(&self, _tier: Option<pa_types::ai::ServiceTier>) {}

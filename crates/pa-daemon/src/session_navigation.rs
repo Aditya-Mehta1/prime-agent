@@ -87,7 +87,12 @@ impl SessionNavigation {
             let mut core = self.core.lock().unwrap();
             core.store = Some(file);
         }
-        self.engine.set_session_file(new_path);
+        self.engine.set_session_file(new_path.clone());
+        // TS re-restores the moved-to session's saved model at its runtime
+        // recreation (`createRuntime` -> `createAgentSession`): the
+        // replacement session resolves to the model its own file pins,
+        // not the previous session's (an explicit flag still wins inside).
+        self.engine.restore_session_model(&new_path).await;
         // The replacement retired the runtime, so the rebuild parks on the
         // fresh, unbuilt session: its first build seeds the goal state
         // from the moved branch's own rows (the TS constructor's
@@ -375,6 +380,11 @@ impl Worker {
             // (the TS `releaseUncommittedLease` fallthrough).
             Err(response) => return response,
         };
+        // One replacement at a time: the teardown, the swap, the restore,
+        // and the rebuild below are one serialized critical section, so a
+        // concurrent replacement command never interleaves at the
+        // restore's awaits against this command's session.
+        let _replacement_gate = self.replacement_gate.lock().await;
         // TS `teardownForReplacement` rethrows: a failed retire (the
         // session's own kernel dispose, or a child close) fails the
         // replacement command with the old runtime already torn down.

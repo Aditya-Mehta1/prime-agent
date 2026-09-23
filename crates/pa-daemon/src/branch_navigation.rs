@@ -468,7 +468,12 @@ impl TreeNavigation {
             let mut core = self.core.lock().unwrap();
             core.store = Some(forked);
         }
-        self.engine.set_session_file(new_path);
+        self.engine.set_session_file(new_path.clone());
+        // TS re-restores the forked session's saved model at its runtime
+        // recreation (`createRuntime` -> `createAgentSession`): the fork
+        // resolves to the model its own file pins, not the previous
+        // session's (an explicit flag still wins inside).
+        self.engine.restore_session_model(&new_path).await;
         // A replacement flow retires the runtime first, so the rebuild
         // parks on the fresh, unbuilt session: its first build seeds the
         // goal state from the moved branch's own rows (the TS
@@ -581,6 +586,11 @@ impl Worker {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
+        // One replacement at a time: the fork's teardown, swap, restore,
+        // and rebuild share the replacement gate with the other
+        // whole-session replacements (a fork racing a `switch_session`
+        // interleaves the same way two switches do).
+        let _replacement_gate = self.replacement_gate.lock().await;
         if let Err(error) = self.teardown_for_replacement().await {
             return response_failure(None, "fork", &format!("{error:#}"), None);
         }
