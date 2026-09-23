@@ -200,16 +200,18 @@ class TmuxServer:
 
 def shell_prompt_back(server, timeout=20):
     """The client exited: the pane's last non-empty line is the plain
-    bash prompt again (bash --noprofile --norc: `bash-<version>$ `; the
-    flushed exit frame may sit above it and trailing blank rows below —
-    the exit frame flush is TS parity, not a failure)."""
+    bash prompt again (bash --noprofile --norc: `bash-<version>$ ` on a
+    user shell, `bash-<version># ` when the pane shell runs as root —
+    the VM harnesses do; the flushed exit frame may sit above it and
+    trailing blank rows below — the exit frame flush is TS parity, not
+    a failure)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         text = server.capture()
         lines = [line.strip() for line in text.splitlines()]
         while lines and not lines[-1]:
             lines.pop()
-        if lines and re.match(r"^bash-[\d.]+\$ ?$", lines[-1]):
+        if lines and re.match(r"^bash-[\d.]+[#$] ?$", lines[-1]):
             return True
         time.sleep(0.2)
     return False
