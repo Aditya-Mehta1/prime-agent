@@ -11,28 +11,42 @@ for (const [provider, models] of Object.entries(MODELS)) {
 	modelRegistry.set(provider, providerModels);
 }
 
-type ModelApi<
+type ModelApi<TProvider extends KnownProvider> = (typeof MODELS)[TProvider][keyof (typeof MODELS)[TProvider]] extends {
+	api: infer TApi;
+}
+	? TApi extends Api
+		? TApi
+		: Api
+	: Api;
+
+type ModelApiForId<
 	TProvider extends KnownProvider,
 	TModelId extends keyof (typeof MODELS)[TProvider],
-> = (typeof MODELS)[TProvider][TModelId] extends { api: infer TApi } ? (TApi extends Api ? TApi : never) : never;
+> = (typeof MODELS)[TProvider][TModelId] extends { api: infer TApi } ? (TApi extends Api ? TApi : Api) : Api;
 
 export function getModel<TProvider extends KnownProvider, TModelId extends keyof (typeof MODELS)[TProvider]>(
 	provider: TProvider,
 	modelId: TModelId,
-): Model<ModelApi<TProvider, TModelId>> {
+): Model<ModelApiForId<TProvider, TModelId>>;
+export function getModel<TProvider extends KnownProvider>(
+	provider: TProvider,
+	modelId: string,
+): Model<ModelApi<TProvider>> | undefined;
+export function getModel<TProvider extends KnownProvider>(
+	provider: TProvider,
+	modelId: string,
+): Model<ModelApi<TProvider>> | undefined {
 	const providerModels = modelRegistry.get(provider);
-	return providerModels?.get(modelId as string) as Model<ModelApi<TProvider, TModelId>>;
+	return providerModels?.get(modelId) as Model<ModelApi<TProvider>> | undefined;
 }
 
 export function getProviders(): KnownProvider[] {
 	return Array.from(modelRegistry.keys()) as KnownProvider[];
 }
 
-export function getModels<TProvider extends KnownProvider>(
-	provider: TProvider,
-): Model<ModelApi<TProvider, keyof (typeof MODELS)[TProvider]>>[] {
+export function getModels<TProvider extends KnownProvider>(provider: TProvider): Model<ModelApi<TProvider>>[] {
 	const models = modelRegistry.get(provider);
-	return models ? (Array.from(models.values()) as Model<ModelApi<TProvider, keyof (typeof MODELS)[TProvider]>>[]) : [];
+	return models ? (Array.from(models.values()) as Model<ModelApi<TProvider>>[]) : [];
 }
 
 /** Whether a model's provider accepts (and honors) a requested service tier. */

@@ -409,6 +409,9 @@ export interface RlmChildAgentSnapshot {
 	error?: string;
 }
 
+/** The observable state rlm_child_update events dedup on. */
+type RlmChildStableSnapshot = Omit<RlmChildAgentSnapshot, "lastActivityAt" | "activityStaleMs">;
+
 export type CompactionReason = "manual" | "threshold" | "overflow" | "requested";
 
 export type AgentSessionEvent =
@@ -1036,6 +1039,8 @@ type AutonomousRuntimeSnapshot = Pick<
 interface RlmChildRun {
 	id: string;
 	prompt: string;
+	/** rlmChildLabel(prompt), computed once: the prompt never changes. */
+	label: string;
 	sessionName: string;
 	sessionDir: string;
 	model: Model<Api>;
@@ -1085,7 +1090,7 @@ interface RlmChildRun {
 	completeDeletion?: () => Promise<void>;
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
-	lastEmittedUpdate?: string;
+	lastEmittedUpdate?: RlmChildStableSnapshot;
 	/** Monotonic time of the last streamed-delta emit; other event kinds still emit at once. */
 	lastStreamedUpdateMonotonicAt?: number;
 	unsubscribe?: () => void;
@@ -1096,11 +1101,27 @@ interface RetainedRlmChild {
 	run?: RlmChildRun;
 }
 
+/**
+ * A delete receipt frees the name once the child runtime is bound and only the
+ * detached deletion unwind remains. A deleted startup without a bound session
+ * still reserves its name until that startup settles, because the queued
+ * runtime work can still surface under it.
+ */
+function freedRlmChildSessionId(run: RlmChildRun): string | undefined {
+	return run.detachedDeletion !== undefined ? run.session?.sessionId : undefined;
+}
+
 interface RlmSubagentModelSelection {
 	model: Model<Api>;
 }
 
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+
+/**
+ * No-model sentinel for a tombstoned run-less deletion: mirrors the agent core's
+ * unknown/unknown placeholder. Only the snapshot's `provider/id` string reads it.
+ */
+const UNKNOWN_RLM_CHILD_MODEL = { provider: "unknown", id: "unknown" } as Model<Api>;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 /** Minimum spacing between accepted progress notes from one child session. */
 const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
@@ -1341,6 +1362,39 @@ export function rlmChildLabel(prompt: string): string {
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
 }
 
+/** `satisfies` makes a field without a compare entry a compile error, not a silently suppressed rlm_child_update. */
+const RLM_CHILD_STABLE_SNAPSHOT_KEYS = Object.keys({
+	id: true,
+	parentId: true,
+	activeSessionId: true,
+	sessionName: true,
+	model: true,
+	label: true,
+	status: true,
+	durationMs: true,
+	answerPreview: true,
+	toolUseCount: true,
+	tokenCount: true,
+	recap: true,
+	sessionDir: true,
+	activity: true,
+	repliedSinceTask: true,
+	progressNote: true,
+	error: true,
+} satisfies Record<keyof RlmChildStableSnapshot, true>) as (keyof RlmChildStableSnapshot)[];
+
+/** Fields are primitives except activity, compared by value because each delta assigns a fresh activity object. */
+function rlmChildStableFieldsEqual(a: RlmChildStableSnapshot, b: RlmChildStableSnapshot): boolean {
+	for (const key of RLM_CHILD_STABLE_SNAPSHOT_KEYS) {
+		if (key === "activity") {
+			if (a.activity?.kind !== b.activity?.kind || a.activity?.toolName !== b.activity?.toolName) return false;
+		} else if (a[key] !== b[key]) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /**
  * Record a tracked child activity on both clocks: lastActivityAt stays
  * wall-clock ms for snapshots, and its monotonic twin bounds staleness so a
@@ -1478,11 +1532,8 @@ export class AgentSession {
 
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
-	private _lastSessionActionSnapshot: SessionActionSnapshot = {
-		queuedCount: 0,
-		steering: [],
-		followUps: [],
-	};
+	/** Serialized last-emitted queue snapshot, so a mutation pays one stringify, not two. */
+	private _lastSessionActionSnapshot = JSON.stringify({ queuedCount: 0, steering: [], followUps: [] });
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
@@ -1673,6 +1724,11 @@ export class AgentSession {
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _rlmChildSessions = new Map<string, RetainedRlmChild>();
 	private _deletedRlmChildIds = new Set<string>();
+	// An accepted delete outlives the run it cancelled: once the run is removed
+	// from both lookup maps, this tombstone keeps the child's identity so collect
+	// can still answer with its settled cancelled envelope.
+	// Entries live until the parent session is disposed, like _deletedRlmChildIds.
+	private _deletedRlmChildRuns = new Map<string, RlmChildRun>();
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
 	private _rlmChildCleanupFailures = new Map<string, RlmSubagentRegistryEntry>();
@@ -2041,8 +2097,9 @@ export class AgentSession {
 
 	private _emitQueueUpdate(): void {
 		const actions = this.getSessionActionSnapshot();
-		if (JSON.stringify(actions) === JSON.stringify(this._lastSessionActionSnapshot)) return;
-		this._lastSessionActionSnapshot = actions;
+		const serialized = JSON.stringify(actions);
+		if (serialized === this._lastSessionActionSnapshot) return;
+		this._lastSessionActionSnapshot = serialized;
 		this._emit({ type: "session_action_update", actions });
 	}
 
@@ -5075,6 +5132,7 @@ export class AgentSession {
 		this._rlmChildSessions.clear();
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
+		this._deletedRlmChildRuns.clear();
 		try {
 			await this._ipythonKernelProvisioner?.dispose({ snapshot: kernelSnapshot });
 		} catch {
@@ -5144,6 +5202,7 @@ export class AgentSession {
 			this._rlmChildSessions.clear();
 			this._rlmChildCleanupFailures.clear();
 			this._deletedRlmChildIds.clear();
+			this._deletedRlmChildRuns.clear();
 			this._pendingNextTurnMessages = [];
 			const deliveryError = new Error("Session disposed before prompt delivery.");
 			const completionError = new Error("Session disposed before prompt completion.");
@@ -11203,6 +11262,7 @@ export class AgentSession {
 		thinkingLevel?: ThinkingLevel;
 		spawnedByRequestId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
+		const freedSessionIds = this._freedRlmChildSessionIds();
 		return {
 			parentSession: this,
 			id: options.id,
@@ -11224,6 +11284,10 @@ export class AgentSession {
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
 			spawnedByRequestId: options.spawnedByRequestId,
+			// The daemon host re-asserts the name at the runtime boundary
+			// against a catalog that still lists the unwinding child, so the
+			// receipt's freed ids must survive that second check.
+			...(freedSessionIds.length > 0 ? { ignoreSessionIds: freedSessionIds } : {}),
 		};
 	}
 
@@ -11511,7 +11575,9 @@ export class AgentSession {
 	 * never rejects on timeout — a timeout returns the current snapshots so
 	 * the caller can end its turn, poll, or retry. `targets` are child ids or
 	 * session names; an empty list means every direct child that is not being
-	 * deleted.
+	 * deleted. A target whose delete receipt already returned resolves
+	 * immediately to a settled cancelled envelope instead of an
+	 * unknown-selector error.
 	 */
 	async collectRlmChildren(targets: string[], timeoutMs: number): Promise<RlmCollectResult> {
 		const candidates = new Map<string, RlmChildRun>();
@@ -11527,6 +11593,31 @@ export class AgentSession {
 			}
 		}
 		const runs = new Map<string, RlmChildRun>();
+		// Deleted targets resolve immediately to cancelled envelopes: their delete
+		// receipt already accepted the cancellation, so waiting for the detached
+		// unwind (or reporting an unsettled snapshot) would only mislead callers.
+		// Only detachedDeletion marks an accepted delete. A run merely reserved in
+		// _deletingRlmChildren is still inside delete preflight and can surface a
+		// passive-selector conflict that fails the delete, so it stays hidden from
+		// collect like every other selector view until the delete settles. That
+		// preflight reservation also blocks the deleted fallback: a reused name
+		// makes the previous generation's accepted delete match the same selector,
+		// and answering with its cancelled envelope would report a run that is not
+		// the target while the new delete can still fail and leave it live. The
+		// selector throws no-match instead, exactly like a fresh-name collect
+		// racing its own delete preflight. An accepted delete keeps its
+		// _deletingRlmChildren reservation until the unwind settles, so only a
+		// reservation without detachedDeletion blocks the fallback. Once the
+		// unwind does settle, the run leaves both lookup maps and only its
+		// _deletedRlmChildRuns tombstone still carries the receipt-bound identity,
+		// so a later collect keeps answering with the same cancelled envelope. A
+		// mid-preflight run blocks tombstone matches too: that delete can still
+		// fail and leave a live replacement under the reused selector. The same
+		// protection must not end at preflight: a run-less retained child is
+		// invisible to candidates, yet while it is live it owns its reused name, so
+		// the deleted generation of that name never answers for it. A live
+		// replacement of a reused name always beats the deleted-generation fallback.
+		const deletedRuns = new Map<string, RlmChildRun>();
 		if (targets.length === 0) {
 			for (const [childId, run] of candidates) {
 				if (!run.detachedDeletion && !this._deletingRlmChildren.has(run.id)) {
@@ -11542,7 +11633,64 @@ export class AgentSession {
 						this._rlmChildRunMatchesTarget(run, target),
 				);
 				if (matches.length === 0) {
-					throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
+					// Mid-preflight runs stay hidden and must not fall through to the
+					// deleted generation of the same selector. An accepted delete keeps
+					// its reservation until the unwind settles, so only a reservation
+					// without detachedDeletion is still inside preflight.
+					const candidatePreflight = [...candidates.values()].some(
+						(run) =>
+							run.detachedDeletion === undefined &&
+							this._deletingRlmChildren.has(run.id) &&
+							this._rlmChildRunMatchesTarget(run, target),
+					);
+					// A run-less retained child is invisible to candidates, so its own
+					// reservation is the only preflight signal. A reservation is kept past
+					// the receipt only for an accepted delete with an active run, and the
+					// accepted run-less delete is excluded by its tombstone, so a visible
+					// run-less reservation is still inside preflight.
+					const runlessPreflight = [...this._deletingRlmChildren].some(
+						([childId, reservation]) =>
+							!candidates.has(childId) &&
+							!this._deletedRlmChildRuns.has(childId) &&
+							this._rlmSubagentMatchesTarget(reservation.subagent, target),
+					);
+					const preflight = candidatePreflight || runlessPreflight;
+					// A live run-less retained child (a daemon-hydrated child, for example)
+					// never enters candidates, so without this scan the deleted generation
+					// of a reused name would answer for it. While the replacement stays
+					// resident it owns the selector: a reservation or receipt may hide it
+					// from listings, and a failed delete cleanup hides it from listings
+					// only — it never returned a receipt, so both deleted-generation
+					// fallbacks stay silent and the selector throws no-match, exactly
+					// like the mid-preflight convention.
+					const liveRunlessMatch = [...this._rlmChildSessions].some(
+						([childId, retained]) =>
+							!retained.run &&
+							!candidates.has(childId) &&
+							!this._deletingRlmChildren.has(childId) &&
+							!this._deletedRlmChildIds.has(childId) &&
+							(childId === target ||
+								retained.session.sessionId === target ||
+								retained.session.sessionName === target),
+					);
+					// A run still mid-unwind stays in candidates; one whose unwind already
+					// finished is reachable only through its tombstone.
+					const unwoundMatches = [...candidates.values()].filter(
+						(run) => run.detachedDeletion && this._rlmChildRunMatchesTarget(run, target),
+					);
+					const unwoundIds = new Set(unwoundMatches.map((run) => run.id));
+					const tombstoneMatches = [...this._deletedRlmChildRuns.values()].filter(
+						(run) => !unwoundIds.has(run.id) && this._rlmDeletedRunMatchesTarget(run, target),
+					);
+					const deletedMatches = preflight || liveRunlessMatch ? [] : [...unwoundMatches, ...tombstoneMatches];
+					if (deletedMatches.length === 0) {
+						throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
+					}
+					if (deletedMatches.length > 1) {
+						throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
+					}
+					deletedRuns.set(deletedMatches[0].id, deletedMatches[0]);
+					continue;
 				}
 				if (matches.length > 1) {
 					throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
@@ -11575,7 +11723,12 @@ export class AgentSession {
 				}),
 			);
 		}
-		return { results: [...runs.values()].map((run) => this._rlmCollectEntryForRun(run)) };
+		return {
+			results: [
+				...[...runs.values()].map((run) => this._rlmCollectEntryForRun(run)),
+				...[...deletedRuns.values()].map((run) => this._rlmDeletedCollectEntryForRun(run)),
+			],
+		};
 	}
 
 	private _rlmChildRunMatchesTarget(run: RlmChildRun, target: string): boolean {
@@ -11585,6 +11738,17 @@ export class AgentSession {
 			run.sessionName === target ||
 			session?.sessionId === target ||
 			session?.sessionName === target
+		);
+	}
+
+	/**
+	 * Tombstoned runs have no session object left, so registry identity stands in
+	 * for the session selectors a mid-unwind run still answered to.
+	 */
+	private _rlmDeletedRunMatchesTarget(run: RlmChildRun, target: string): boolean {
+		return (
+			this._rlmChildRunMatchesTarget(run, target) ||
+			(run.detachedDeletion !== undefined && this._rlmSubagentMatchesTarget(run.detachedDeletion, target))
 		);
 	}
 
@@ -11601,6 +11765,22 @@ export class AgentSession {
 			duration_ms: snapshot.durationMs,
 			tool_use_count: snapshot.toolUseCount,
 			replied_since_task: snapshot.repliedSinceTask,
+		};
+	}
+
+	/**
+	 * Typed envelope for a target whose delete receipt already returned. The
+	 * detached unwind may still hold the run unsettled; the parent-facing
+	 * projection is terminal regardless, so the entry reports cancellation as a
+	 * settled answer instead of a snapshot that invites re-polling.
+	 */
+	private _rlmDeletedCollectEntryForRun(run: RlmChildRun): RlmCollectResultEntry {
+		const entry = this._rlmCollectEntryForRun(run);
+		return {
+			...entry,
+			status: "cancelled",
+			settled: true,
+			error: entry.error ?? "Deleted by parent orchestrator",
 		};
 	}
 
@@ -11657,6 +11837,17 @@ export class AgentSession {
 	}
 
 	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
+		// Freeing a name at the delete receipt reaches two transient selector
+		// states, both inherent to that design and recoverable, so neither is
+		// guarded away: (a) while an old generation with an accepted delete
+		// still unwinds, its reservation matches the reused name and unions
+		// with the live replacement below, so a name delete of the replacement
+		// throws ambiguous until the unwind settles; the replacement stays
+		// deletable by child id. (b) if that old generation's detached cleanup
+		// fails after a replacement took the name, the cleanup-failure entry
+		// keeps the name blocked for new spawns even after the replacement is
+		// deleted, until the failed delete is retried by child id and the
+		// cleanup succeeds.
 		const inFlight = [...this._deletingRlmChildren.values()].filter(({ subagent }) =>
 			this._rlmSubagentMatchesTarget(subagent, target),
 		);
@@ -11841,6 +12032,13 @@ export class AgentSession {
 	}
 
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
+		// Every removal of an accepted-delete run funnels through here, so the
+		// tombstone covers the settled unwind, an already-settled errored delete, and
+		// the no-run retained delete. Other removals keep no tombstone: only a delete
+		// receipt promises a collectable cancelled envelope.
+		if (run?.detachedDeletion) {
+			this._deletedRlmChildRuns.set(childId, run);
+		}
 		run?.unsubscribe?.();
 		this._rlmChildUnsubscribes.get(childId)?.();
 		this._rlmChildUnsubscribes.delete(childId);
@@ -11854,6 +12052,14 @@ export class AgentSession {
 			run.abort = noopRlmChildAbort;
 			run.unsubscribe = undefined;
 			run.session = undefined;
+			if (run.detachedDeletion) {
+				// Tombstones only need the label (derived from prompt) and the last
+				// progress note to build the cancelled collect envelope. Strip the
+				// full values so a long-lived parent with many deletions does not
+				// accumulate unbounded memory.
+				run.prompt = rlmChildLabel(run.prompt);
+				run.progressNotes = run.progressNotes.slice(-1);
+			}
 		}
 	}
 
@@ -11871,6 +12077,44 @@ export class AgentSession {
 				error: "Deleted by parent orchestrator",
 			},
 		});
+	}
+
+	/**
+	 * Accepted-delete marker for a child removed without an active run: a retained
+	 * completed child, or a daemon-hydrated passive child that never had one. The
+	 * retained run is reused when the parent still holds it, because it is already
+	 * out of both lookup maps by removal time and the tombstone is its only
+	 * remaining reader; otherwise the tombstone carries the registry snapshot.
+	 */
+	private _runForRetainedRlmChildDeletion(
+		childId: string,
+		subagent: RlmSubagentRegistryEntry,
+		retained: RetainedRlmChild | undefined,
+	): RlmChildRun {
+		if (retained?.run) {
+			retained.run.detachedDeletion = subagent;
+			return retained.run;
+		}
+		return {
+			id: childId,
+			prompt: subagent.label ?? "",
+			label: rlmChildLabel(subagent.label ?? ""),
+			sessionName: subagent.session_name,
+			sessionDir: subagent.session_dir,
+			model: retained?.session.model ?? this.model ?? UNKNOWN_RLM_CHILD_MODEL,
+			status: "cancelled",
+			durationMs: subagent.duration_ms,
+			answerPreview: subagent.answer_preview,
+			toolUseCount: subagent.tool_use_count ?? 0,
+			progressNotes: subagent.progress_note ? [subagent.progress_note] : [],
+			error: "Deleted by parent orchestrator",
+			abort: noopRlmChildAbort,
+			publication: createAgentMessageDeferred(),
+			settlement: createAgentMessageDeferred(),
+			settled: true,
+			deletionReservation: createAgentMessageDeferred(),
+			detachedDeletion: subagent,
+		};
 	}
 
 	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
@@ -11915,20 +12159,22 @@ export class AgentSession {
 		}
 
 		this._emitRlmSubagentRemoval(subagent);
-		const retained = this._rlmChildSessions.get(childId)?.session;
+		const retained = this._rlmChildSessions.get(childId);
 		try {
-			await this._deleteRlmSubagentSession(childId, retained);
+			await this._deleteRlmSubagentSession(childId, retained?.session);
 		} catch (error) {
 			if (this._disposed || this._disposing) {
 				this._removeRlmSubagentTracking(childId);
-				void retained?.disposeAsync().catch(() => undefined);
+				void retained?.session.disposeAsync().catch(() => undefined);
 			} else {
 				this._rlmChildCleanupFailures.set(childId, subagent);
 			}
 			throw error;
 		}
 		this._deletedRlmChildIds.add(childId);
-		this._removeRlmSubagentTracking(childId);
+		// The receipt promises a collectable cancelled envelope, so a child deleted
+		// without an active run still needs its accepted-delete tombstone.
+		this._removeRlmSubagentTracking(childId, this._runForRetainedRlmChildDeletion(childId, subagent, retained));
 		return { subagent };
 	}
 
@@ -11977,17 +12223,14 @@ export class AgentSession {
 		};
 	}
 
-	private _rlmChildSnapshotForRun(
-		run: RlmChildRun,
-		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
-	): RlmChildAgentSnapshot {
+	private _rlmChildStableSnapshotForRun(run: RlmChildRun, child: AgentSession | undefined): RlmChildStableSnapshot {
 		const model = child?.model ?? run.model;
 		return {
 			id: run.id,
 			parentId: this._rlmParentNodeId,
 			sessionName: child?.sessionName ?? run.sessionName,
 			model: `${model.provider}/${model.id}`,
-			label: rlmChildLabel(run.prompt),
+			label: run.label,
 			status: run.status,
 			durationMs: run.durationMs,
 			answerPreview: run.answerPreview,
@@ -11998,9 +12241,18 @@ export class AgentSession {
 			activity: run.activity,
 			repliedSinceTask: child?._repliedToParentSinceTask,
 			progressNote: run.progressNotes.at(-1),
+			error: run.error,
+		};
+	}
+
+	private _rlmChildSnapshotForRun(
+		run: RlmChildRun,
+		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
+	): RlmChildAgentSnapshot {
+		return {
+			...this._rlmChildStableSnapshotForRun(run, child),
 			lastActivityAt: run.lastActivityAt,
 			activityStaleMs: rlmActivityStaleMs(run.status, run.activity, run.lastActivityAt, run.lastActivityMonotonicAt),
-			error: run.error,
 		};
 	}
 
@@ -12237,16 +12489,43 @@ export class AgentSession {
 		return cancelled;
 	}
 
+	/**
+	 * Session ids of every child whose delete receipt already returned. Both the
+	 * name-availability check and the spawn options the daemon host re-asserts
+	 * with must ignore the same set, or a same-name respawn that admission
+	 * allowed fails later inside the detached child startup.
+	 */
+	private _freedRlmChildSessionIds(): string[] {
+		const freed = new Set<string>();
+		for (const run of this._activeRlmChildRuns.values()) {
+			const sessionId = freedRlmChildSessionId(run);
+			if (sessionId) freed.add(sessionId);
+		}
+		for (const { session, run } of this._rlmChildSessions.values()) {
+			if (run && freedRlmChildSessionId(run)) freed.add(session.sessionId);
+		}
+		return [...freed];
+	}
+
 	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
 		const depth = this._rlmDepth + 1;
 		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
 		}
+		// A daemon catalog still lists the closing child under its old name while
+		// the detached unwind runs, which is after the delete receipt returned.
+		// Forward every freed session id so both controller paths below admit the
+		// immediate same-name respawn the receipt already promised.
+		const ignoreSessionIds = new Set(this._freedRlmChildSessionIds());
 		const localConflict =
 			[...this._activeRlmChildRuns.values()].some(
-				(run) => run.session?.sessionName === name || (!run.session && run.sessionName === name),
+				(run) =>
+					freedRlmChildSessionId(run) === undefined &&
+					(run.session?.sessionName === name || (!run.session && run.sessionName === name)),
 			) ||
-			[...this._rlmChildSessions.values()].some(({ session }) => session.sessionName === name) ||
+			[...this._rlmChildSessions.values()].some(
+				({ session, run }) => !run?.detachedDeletion && session.sessionName === name,
+			) ||
 			[...this._rlmChildCleanupFailures.values()].some((entry) => entry.session_name === name);
 		if (localConflict) {
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
@@ -12258,6 +12537,7 @@ export class AgentSession {
 			depth,
 			parentSessionId: this.sessionId,
 			parentSessionPath: this.sessionFile,
+			...(ignoreSessionIds.size > 0 ? { ignoreSessionIds: [...ignoreSessionIds] } : {}),
 		};
 		if (controller.assertSessionNameAvailable) {
 			await controller.assertSessionNameAvailable(input);
@@ -12479,6 +12759,7 @@ export class AgentSession {
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
+			label: rlmChildLabel(prompt),
 			sessionName,
 			sessionDir: childSessionDir,
 			model: modelSelection.model,
@@ -12501,17 +12782,18 @@ export class AgentSession {
 		this._activeRlmChildRuns.set(run.id, run);
 		this._unsettledRlmChildRuns.add(run);
 		const emitChildUpdate = () => {
-			const child = this._rlmChildSnapshotForRun(run);
 			// Dedup compares observable child state, not clock-derived fields:
 			// lastActivityAt advances on every streamed token delta and
 			// activityStaleMs is recomputed on each snapshot build, so including
 			// either would re-emit on every delta once answerPreview saturates its
-			// cap. Emitted snapshots still carry both fields fresh.
-			const { lastActivityAt: _lastActivityAt, activityStaleMs: _activityStaleMs, ...stable } = child;
-			const serialized = JSON.stringify(stable);
-			if (serialized === run.lastEmittedUpdate) return;
-			run.lastEmittedUpdate = serialized;
-			this._emit({ type: "rlm_child_update", child });
+			// cap. Streamed deltas would otherwise pay a snapshot build plus a serialization
+			// each; only a detected change builds the fresh snapshot, which carries both clock fields.
+			const child = run.session ?? this._rlmChildSessions.get(run.id)?.session;
+			const next = this._rlmChildStableSnapshotForRun(run, child);
+			if (run.lastEmittedUpdate && rlmChildStableFieldsEqual(run.lastEmittedUpdate, next)) return;
+			// next holds run.activity by reference; safe because activity objects are replaced, never mutated.
+			run.lastEmittedUpdate = next;
+			this._emit({ type: "rlm_child_update", child: this._rlmChildSnapshotForRun(run, child) });
 		};
 		run.emitUpdate = emitChildUpdate;
 		emitChildUpdate();
@@ -14706,7 +14988,7 @@ export class AgentSession {
 					children: [],
 				}),
 				id: run.id,
-				label: rlmChildLabel(run.prompt),
+				label: run.label,
 				status: run.status,
 			});
 		}

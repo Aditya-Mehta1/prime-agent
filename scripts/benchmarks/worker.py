@@ -202,6 +202,13 @@ def prepare(request: Request, side: Side) -> None:
     actual = run_as("builder", ["git", "rev-parse", "HEAD"], SOURCE).strip()
     if actual != request.sha:
         raise RuntimeError("Checkout did not resolve to the requested commit")
+    run_as(
+        "builder",
+        ["npm", "run", "--if-present", "catalog:assets"],
+        SOURCE,
+        timeout=120,
+        log=log,
+    )
     for package in ("tui", "ai", "agent", "coding-agent"):
         run_as(
             "builder",
