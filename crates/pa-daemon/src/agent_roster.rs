@@ -95,13 +95,10 @@ impl AgentRoster {
     /// predecessor gates against the predecessor's saturated watermark and
     /// drops instead of pinning the replacement's restarted counter.
     pub(crate) fn pull_applies(&mut self, worker_id: &str, instance: &str, counter: u64) -> bool {
-        match self
+        !self
             .delta_watermarks
             .get(&(worker_id.to_string(), instance.to_string()))
-        {
-            Some(watermark) if counter < *watermark => false,
-            _ => true,
-        }
+            .is_some_and(|watermark| counter < *watermark)
     }
 
     /// Saturate the watermark of one retired worker process instance: a

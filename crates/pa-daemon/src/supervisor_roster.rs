@@ -214,22 +214,6 @@ impl Supervisor {
         response_success(Some(command_id), type_name, None)
     }
 
-    /// Write one summary into the roster and push the change to
-    /// subscribers. Returns the classified entry.
-    pub(crate) fn write_roster_summary(
-        &self,
-        summary: &Value,
-        worker_id: Option<&str>,
-    ) -> Option<AgentRosterEntry> {
-        let entry = self
-            .roster
-            .lock()
-            .unwrap()
-            .write_summary(summary.clone(), worker_id, None);
-        self.push_roster_update(vec![entry.clone()], Vec::new());
-        Some(entry)
-    }
-
     /// The authoritative pull write (registration, adoption, create,
     /// refresh): the stale-snapshot gate, the write, and the
     /// watermark raise are ONE roster-lock critical section — a delta
