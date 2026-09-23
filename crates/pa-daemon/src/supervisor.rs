@@ -2122,7 +2122,20 @@ impl Supervisor {
                     .events
                     .send((ClientRouting::Broadcast, closing.clone()));
                 lines.push(closing);
-                self.begin_shutdown().await;
+                // Answer first, then shut down: the dispatch returns while
+                // the worker stops run on their own task, so the connection
+                // loop always writes this response before the accept loop's
+                // exit path can end the process (awaiting the stop here
+                // held the response in the exit window, where the process
+                // teardown could close the client first — a race the live
+                // roster feed's event traffic makes easy to hit). The stop
+                // itself keeps its ordering: the accept loop still wakes
+                // only after every worker stopped (TS responds before it
+                // begins the shutdown work too).
+                let supervisor = Arc::clone(self);
+                tokio::spawn(async move {
+                    supervisor.begin_shutdown().await;
+                });
                 (lines, true)
             }
             DaemonCommand::List {
