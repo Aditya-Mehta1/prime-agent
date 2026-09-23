@@ -1,0 +1,3 @@
+- Refresh the catalog-defined default model in the background so a slow or unreachable catalog host never delays model discovery.
+- getExecutableModels() no longer blocks subagent discovery on the provider catalog request while keeping the bounded settlement wait.
+- Disposing a session now releases its session-owned ModelRegistry auth-change subscription and catalog refresh timer, closing a listener leak across repeated session creation.

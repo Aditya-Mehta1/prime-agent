@@ -1,0 +1,2 @@
+- Removed the models exporter and its scripts: catalog data logic now lives in prime-agent-catalog, and this repo consumes the generated catalog.
+- Dropped the now-unused yaml devDependency left behind by the exporter removal.
