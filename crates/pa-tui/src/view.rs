@@ -934,8 +934,8 @@ impl AgentView {
         lines.extend(editor_rows);
         lines.push(render_tray(&self.chrome, &self.theme, width));
         if let Some(dock) = &self.chrome.activity {
-            if let Some(row) = crate::chrome::render_activity_dock(dock, &self.theme, width) {
-                lines.push(row);
+            if let Some(frame) = crate::chrome::render_activity_dock(dock, &self.theme, width) {
+                lines.extend(frame);
             }
         }
         lines
