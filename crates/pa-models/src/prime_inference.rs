@@ -254,9 +254,14 @@ fn positive_integer(value: Option<u64>) -> Option<u64> {
 fn parse_string_array(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
     let items = value?.as_array()?;
     let mut entries: Vec<String> = Vec::with_capacity(items.len());
+    // Membership goes through a HashSet (a hostile-but-valid item with tens
+    // of thousands of unique strings must not turn the synchronous refresh
+    // parse quadratic); `entries` keeps the first-occurrence order.
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(items.len());
     for item in items {
         if let Some(text) = item.as_str() {
-            if !text.is_empty() && !entries.iter().any(|seen| seen == text) {
+            if !text.is_empty() && seen.insert(text) {
                 entries.push(text.to_string());
             }
         }
