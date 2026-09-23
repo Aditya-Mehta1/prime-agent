@@ -28,16 +28,24 @@ pub(crate) fn branch_content_width(width: usize) -> usize {
 }
 
 /// Prefix already-wrapped rows with the branch grammar: the first row
-/// carries the dim gutter, the rest the continuation indent, both after
-/// the one-column chat margin.
+/// that carries content gets the dim gutter, every other row the
+/// continuation indent, both after the one-column chat margin.
 pub(crate) fn branch_rows(lines: Vec<Line>, theme: &crate::theme::Theme) -> Vec<Line> {
     let dim = theme.fg_style(crate::theme::ThemeColor::Dim);
+    // `render_markdown` can emit leading empty rows (a summary beginning
+    // with a blank line), so the gutter must hang off the first row that
+    // actually carries content, not the vector's first row.
+    let mut first_content = true;
     lines
         .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
+        .map(|mut line| {
+            let use_gutter = first_content
+                && line.iter().any(|span| !span.content.trim().is_empty());
+            if use_gutter {
+                first_content = false;
+            }
             let mut row: Line = vec![Span::raw(" ")];
-            if index == 0 {
+            if use_gutter {
                 row.push(Span::styled(BRANCH_GUTTER.to_string(), dim));
             } else {
                 row.push(Span::raw(BRANCH_CONTINUATION.to_string()));
@@ -70,8 +78,8 @@ pub(crate) fn split_line_on_newlines(line: &Line) -> Vec<Line> {
 /// One branch-indented block over pre-styled spans: empty content renders
 /// nothing; otherwise each newline-joined source line wraps at the branch
 /// content width (styles preserved through the wrap), the first rendered
-/// row carries the dim gutter, the rest the continuation indent, and every
-/// row truncates to the full width.
+/// content row carries the dim gutter, the rest the continuation indent,
+/// and every row truncates to the full width.
 pub(crate) fn branch_block(line: Line, theme: &crate::theme::Theme, width: usize) -> Vec<Line> {
     let flat: String = line.iter().map(|span| span.content.as_str()).collect();
     if flat.trim().is_empty() {
@@ -140,6 +148,18 @@ mod tests {
             theme().fg_style(crate::theme::ThemeColor::Success)
         );
         assert_eq!(flat(&rows)[1].trim_start(), "second line");
+    }
+
+    #[test]
+    fn gutter_hangs_off_the_first_nonblank_row() {
+        // A summary beginning with a blank line: `render_markdown` emits
+        // the leading empty row first, so the gutter must land on the
+        // first row that carries content, not the first vector row.
+        let line = vec![Span::raw("\nthe session story")];
+        let rows = branch_block(line, &theme(), 40);
+        let flat = flat(&rows);
+        assert_eq!(flat[0], "    ", "the blank row carries the continuation: {flat:?}");
+        assert_eq!(flat[1], " \u{2570}\u{2500} the session story");
     }
 
     #[test]

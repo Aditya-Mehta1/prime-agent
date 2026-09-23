@@ -240,6 +240,10 @@ fn visit_summary(
         SummaryRows::Paint(output) => {
             let painted = crate::markdown::render_markdown(summary, content_width, &md);
             for row in crate::branch::branch_rows(painted, theme) {
+                // At tiny widths the branch prefix alone (the chat margin
+                // plus the gutter) outgrows the viewport, so clip before
+                // padding: `pad_to` only pads, never truncates.
+                let row = crate::width::truncate_line(&row, width, "");
                 output.push(crate::chat::pad_to(
                     row,
                     width,
@@ -290,6 +294,9 @@ fn continuation_text_rows(
                 line.into_iter()
                     .map(|span| Span::styled(span.content, style)),
             );
+            // The continuation indent alone can outgrow a tiny viewport
+            // (widths 0..=4 wrap to one column): clip before padding.
+            let row = crate::width::truncate_line(&row, width, "");
             crate::chat::pad_to(row, width, ratatui::style::Style::default())
         })
         .collect::<Vec<Line>>();
@@ -531,6 +538,37 @@ mod tests {
         assert_eq!(rows[1][1].style, theme().fg_style(ThemeColor::Dim));
         assert_eq!(rows[3][0].style, ratatui::style::Style::default());
         assert_eq!(rows[5][0].style, ratatui::style::Style::default());
+    }
+
+    #[test]
+    fn expanded_branch_rows_never_overflow_narrow_viewports() {
+        // Widths 0..=4 wrap the markdown to one column, then the branch
+        // prefix (the chat margin plus the gutter) alone is wider than the
+        // viewport: the painted branch rows must clip to `width`, never
+        // overflow it. The header rows keep `render_text_rows`'s own
+        // geometry (outside this fix), so the check targets the branch
+        // block rows that follow them.
+        let theme = theme();
+        let header = theme.fg_style(ThemeColor::RefinementHeader);
+        for width in 0..=4usize {
+            let rows = render_compaction_summary(
+                "## Summary\nthe session story",
+                100,
+                None,
+                true,
+                &theme,
+                width,
+            );
+            let header_rows = crate::chat::render_text_rows("\u{25c6} Context compacted", header, width);
+            assert!(
+                rows.len() > header_rows.len(),
+                "width={width} renders the branch block after the header"
+            );
+            for row in &rows[header_rows.len()..] {
+                let used: usize = row.iter().map(|span| str_width(&span.content)).sum();
+                assert!(used <= width, "width={width} row is {used} cols wide");
+            }
+        }
     }
 
     #[test]
