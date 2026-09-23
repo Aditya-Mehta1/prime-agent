@@ -39,6 +39,14 @@ switch the session model with `/model` or configure `imageModel`. Set
 `images.blockImages: true` to drop images everywhere instead of routing or
 refusing.
 
+A user-attached image (pasted into the prompt, a steer, or a follow-up) on a
+text-only session model is read by one bounded child pinned to the image model
+instead of the session model: the child gets the image plus the user's message,
+and only its text result enters the session. `/image-model` shows or sets that
+model for the current session; `/image-model <model>` pins it until the session
+ends, and `/image-model off` returns to the setting. The pin is session-scoped
+and runtime-only, so it never rewrites `imageModel` in settings.json.
+
 ### Autonomous Runs
 
 | Setting | Type | Default | Description |

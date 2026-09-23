@@ -55,6 +55,7 @@ export function formatImageModelRequiredMessage(sessionModelId: string): string 
 		"",
 		"Pick one:",
 		`- Switch the session model to an image-capable one with /model, or`,
+		`- Set an image model for this session with /image-model <model>, or`,
 		`- Set imageModel in settings.json to an image-capable model ("provider/model-id" or a bare id), e.g. "anthropic/claude-sonnet-4-5"`,
 		"",
 		"Then resend the message. Without it the request would silently drop the images.",
@@ -66,6 +67,40 @@ export function formatImageModelUnusableMessage(reference: string): string {
 		`imageModel "${reference}" could not be resolved to an available, image-capable, authenticated model.`,
 		"",
 		"Fix the imageModel setting (settings.json) or authenticate the provider, then resend the message.",
+	].join("\n");
+}
+
+/**
+ * Why an explicit image-model reference could not serve image turns. The three
+ * causes need different fixes, so `/image-model` reports the specific one
+ * instead of the generic routing message above.
+ */
+export type ImageModelReferenceProblem = "unresolved" | "text-only" | "unauthenticated";
+
+const IMAGE_MODEL_REFERENCE_PROBLEM_MESSAGES: Record<ImageModelReferenceProblem, (reference: string) => string> = {
+	unresolved: (reference) =>
+		`No model matches "${reference}". Use "provider/model-id" or a bare id, or browse models with /model.`,
+	"text-only": (reference) => `"${reference}" does not accept image input, so it cannot serve image turns.`,
+	unauthenticated: (reference) =>
+		`"${reference}" has no configured credentials. Authenticate its provider with /login, then retry.`,
+};
+
+export function formatImageModelReferenceRejectedMessage(
+	reference: string,
+	problem: ImageModelReferenceProblem,
+): string {
+	return IMAGE_MODEL_REFERENCE_PROBLEM_MESSAGES[problem](reference);
+}
+
+/**
+ * The image-turn child never answered. The images are still unread, so the turn
+ * is stopped and the setting that picks the image model is named as the fix.
+ */
+export function formatImageTurnChildTimeoutMessage(reference: string, timeoutMs: number): string {
+	return [
+		`The image model "${reference}" did not finish reading the attached image(s) within ${Math.round(timeoutMs / 1000)}s, so the turn was stopped before the images reached a model that cannot see them.`,
+		"",
+		"Retry, or point the image model at a faster model with /image-model (or imageModel in settings.json).",
 	].join("\n");
 }
 

@@ -628,6 +628,7 @@ export type DaemonCommand =
 	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
+	| { id?: string; type: "set_image_model"; activeSessionId: string; imageModel: string | null }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
 	| { id?: string; type: "set_service_tier"; activeSessionId: string; serviceTier: ServiceTier }
 	| { id?: string; type: "cycle_thinking_level"; activeSessionId: string }
@@ -822,6 +823,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	set_model: LEGACY_DAEMON_COMMAND,
 	cycle_model: LEGACY_DAEMON_COMMAND,
 	set_scoped_models: LEGACY_DAEMON_COMMAND,
+	set_image_model: LEGACY_DAEMON_COMMAND,
 	set_thinking_level: LEGACY_DAEMON_COMMAND,
 	set_service_tier: LEGACY_DAEMON_COMMAND,
 	cycle_thinking_level: LEGACY_DAEMON_COMMAND,
@@ -941,6 +943,7 @@ export const DAEMON_COMMAND_PLANE = {
 	set_model: "session",
 	cycle_model: "session",
 	set_scoped_models: "session",
+	set_image_model: "session",
 	set_thinking_level: "session",
 	set_service_tier: "session",
 	cycle_thinking_level: "session",

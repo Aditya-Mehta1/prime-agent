@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -77,6 +77,9 @@ import {
 import {
 	addLoginGuidanceToAuthError,
 	formatAuthenticationFailedMessage,
+	formatImageModelReferenceRejectedMessage,
+	formatImageModelUnusableMessage,
+	formatImageTurnChildTimeoutMessage,
 	formatNoApiKeyFoundMessage,
 	formatNoModelSelectedMessage,
 	isLikelyAuthenticationError,
@@ -180,7 +183,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import { resolveImageModelOverride } from "./image-model-routing.js";
+import { resolveImageModelOverride, resolveImageModelReference } from "./image-model-routing.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
@@ -1129,6 +1132,16 @@ const RLM_CHILD_PROGRESS_NOTE_RING_MAX = 5;
 const RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS = 10 * 60_000;
 /** Hard cap for answer previews carried into kernel roster entries. */
 const RLM_REGISTRY_ANSWER_PREVIEW_MAX_LENGTH = 200;
+
+/**
+ * Limits for the image-turn child that reads images a session model cannot see.
+ * One child serves every image in the turn, so the image count and the reading
+ * length are capped to keep both the spawn and the text the session keeps
+ * bounded; the child itself is bounded by the RLM depth limit.
+ */
+const IMAGE_TURN_CHILD_MAX_IMAGES = 8;
+const IMAGE_TURN_CHILD_TIMEOUT_MS = 180_000;
+const IMAGE_TURN_READING_MAX_CHARS = 4000;
 /** Hard cap for labels carried into kernel roster entries (snapshots keep the full prompt). */
 const RLM_REGISTRY_LABEL_MAX_LENGTH = 200;
 
@@ -1525,6 +1538,13 @@ export class AgentSession {
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
 	}>;
+
+	/**
+	 * Session-scoped image-model reference set by /image-model; unset falls back
+	 * to settings.imageModel. Switching sessions builds a new AgentSession, so
+	 * the override never outlives the session it was set in.
+	 */
+	private _imageModelOverride: string | undefined;
 
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
@@ -2696,9 +2716,105 @@ export class AgentSession {
 	}
 
 	/**
+	 * Image model this session routes to: the /image-model override when set,
+	 * settings.imageModel otherwise. One owner, so routing and the capability
+	 * the kernel reports cannot disagree about precedence.
+	 */
+	private _imageModelReference(): string | undefined {
+		return this._imageModelOverride ?? this.settingsManager.getImageModel();
+	}
+
+	/**
+	 * Image model the image-turn child is pinned to, as the "provider/id" spawn
+	 * selector. Undefined when nothing resolves, so the caller leaves the images
+	 * on the turn and the routing path reports the actionable settings error.
+	 */
+	private _imageTurnChildModelReference(): string | undefined {
+		const reference = this._imageModelReference();
+		if (!reference) return undefined;
+		const resolution = resolveImageModelReference({
+			reference,
+			availableModels: this._modelRegistry.getAvailable(),
+			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
+		});
+		return resolution.ok ? `${resolution.model.provider}/${resolution.model.id}` : undefined;
+	}
+
+	/**
+	 * Focused prompt for the image-turn child: the materialized image paths and
+	 * the user's own message. The session transcript is deliberately absent -
+	 * re-reading it is what made the in-place routed turn cost 10x more than the
+	 * child that only needs the image plus the question.
+	 */
+	private _imageTurnChildPrompt(paths: string[], text: string): string {
+		return [
+			`Read the ${paths.length === 1 ? "image" : `${paths.length} images`} listed below and report what ${paths.length === 1 ? "it shows" : "they show"}, for a reader who cannot see ${paths.length === 1 ? "it" : "them"}.`,
+			"Transcribe the text they contain and describe the data, layout, or state that matters for the request.",
+			"Load each path with the attach_image skill. Do not modify any file.",
+			"",
+			...paths.map((path, index) => `${paths.length === 1 ? "Image" : `Image ${index + 1}`}: ${path}`),
+			"",
+			"The request these images belong to:",
+			text.trim() || "(no message accompanied the images)",
+		].join("\n");
+	}
+
+	/**
+	 * Read one turn's images with a single bounded child pinned to the image
+	 * model, and return the text the session keeps in their place. Undefined
+	 * leaves the images on the turn (a vision-capable session model, blocked
+	 * images, or no resolvable image model); every failure throws with the fix
+	 * named, so images never reach a model that would drop them.
+	 */
+	private async _readTurnImagesWithChild(text: string, images: ImageContent[]): Promise<string | undefined> {
+		if (images.length === 0) return undefined;
+		const sessionModel = this.model;
+		if (!sessionModel || sessionModel.input.includes("image")) return undefined;
+		if (this.settingsManager.getBlockImages()) return undefined;
+		const reference = this._imageTurnChildModelReference();
+		if (!reference) return undefined;
+
+		const dir = mkdtempSync(join(tmpdir(), "prime-agent-image-turn-"));
+		let childId: string | undefined;
+		try {
+			// Pasted images are inline base64 with no path, so they are materialized
+			// here for the child to open.
+			const paths = images.slice(0, IMAGE_TURN_CHILD_MAX_IMAGES).map((image, index) => {
+				const filePath = join(dir, `image-${index + 1}.${image.mimeType.split("/")[1] ?? "png"}`);
+				writeFileSync(filePath, Buffer.from(image.data, "base64"));
+				return filePath;
+			});
+			const child = await this.runRlmChild(this._imageTurnChildPrompt(paths, text), { model: reference });
+			childId = child.rlm_child_id;
+			const collected = await this.collectRlmChildren([childId], IMAGE_TURN_CHILD_TIMEOUT_MS);
+			const entry = collected.results.find((result) => result.rlm_child_id === childId);
+			if (!entry?.settled) {
+				throw new Error(formatImageTurnChildTimeoutMessage(reference, IMAGE_TURN_CHILD_TIMEOUT_MS));
+			}
+			if (entry.status !== "done") {
+				throw new Error(entry.error ?? formatImageModelUnusableMessage(reference));
+			}
+			const reading = this._rlmChildSessions.get(childId)?.session?.getLastAssistantText()?.trim();
+			const reported = reading || entry.answer_preview?.trim();
+			if (!reported) throw new Error(formatImageModelUnusableMessage(reference));
+			const capped =
+				reported.length > IMAGE_TURN_READING_MAX_CHARS
+					? `${reported.slice(0, IMAGE_TURN_READING_MAX_CHARS)}\n[reading truncated]`
+					: reported;
+			return `[${paths.length === 1 ? "image" : `${paths.length} images`} read by ${reference}]\n${capped}`;
+		} finally {
+			// One child per turn, deleted once its reading is in hand: the image turn
+			// leaves no child behind to collect, and the materialized files go with it.
+			if (childId) await this.deleteRlmSubagent(childId).catch(() => undefined);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	/**
 	 * Routing decision for a dispatched turn batch: when any delivered message
 	 * attaches images and the session model has no image input, serve the turn
-	 * on the user-configured imageModel (settings.imageModel) instead.
+	 * on the image model instead - the session override set by /image-model when
+	 * present, settings.imageModel otherwise.
 	 *
 	 * The override is stored on the agent, so retries and post-compaction
 	 * continuations of the routed turn keep serving it; the next dispatch
@@ -2719,7 +2835,7 @@ export class AgentSession {
 			sessionModel,
 			thinkingLevel: this.thinkingLevel,
 			serviceTier: this.serviceTier,
-			imageModelReference: this.settingsManager.getImageModel(),
+			imageModelReference: this._imageModelReference(),
 			availableModels: this._modelRegistry.getAvailable(),
 			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
 			blockImages: this.settingsManager.getBlockImages(),
@@ -5379,6 +5495,47 @@ export class AgentSession {
 		this._scopedModels = scopedModels;
 	}
 
+	/** Image-model reference this session routes image turns to, if it overrides the setting. */
+	get imageModelOverride(): string | undefined {
+		return this._imageModelOverride;
+	}
+
+	/**
+	 * Set or clear the session-scoped image-model override. The reference is
+	 * validated here so an unusable one never reaches the session: routing would
+	 * otherwise fail every image turn with the less specific settings message.
+	 * Throws with the specific problem; nothing is stored when it does. Returns
+	 * the resolved model, or undefined when the override is cleared.
+	 */
+	setImageModelOverride(reference: string | undefined): Model<Api> | undefined {
+		const trimmed = reference?.trim();
+		if (!trimmed) {
+			this._imageModelOverride = undefined;
+			return undefined;
+		}
+		// The candidate list is the one image turns are served from, so a pin is
+		// accepted only when it would actually route. A bare id that several
+		// providers share stays ambiguous there; the full catalog then only
+		// classifies the failure, so the refusal can still name the real problem.
+		const available = resolveImageModelReference({
+			reference: trimmed,
+			availableModels: this._modelRegistry.getAvailable(),
+			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
+		});
+		const resolution = available.ok
+			? available
+			: resolveImageModelReference({
+					reference: trimmed,
+					availableModels: this._modelRegistry.getAll(),
+					hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
+				});
+		if (!resolution.ok) {
+			throw new Error(formatImageModelReferenceRejectedMessage(trimmed, resolution.problem));
+		}
+		this._imageModelOverride = trimmed;
+		return resolution.model;
+	}
+
 	get promptTemplates(): ReadonlyArray<PromptTemplate> {
 		return this._resourceLoader.getPrompts().prompts;
 	}
@@ -5506,7 +5663,38 @@ export class AgentSession {
 		throw new Error(`Unknown command: /${parsed.name}. Did you mean /${suggestion}?`);
 	}
 
+	/**
+	 * Single funnel for every submitted turn: a prompt, steer, or follow-up
+	 * whose images the session model cannot see is read by one bounded child
+	 * pinned to the image model first, and the reading text stands in for the
+	 * images. Doing it here means the images never reach the transcript or a
+	 * provider request, and the session model still serves the turn, so the
+	 * session prefix cache stays warm and grows by one short text block.
+	 */
 	private _normalizeSubmission(
+		text: string,
+		images: ImageContent[] | undefined,
+		policy: SubmissionNormalizationPolicy,
+	): NormalizedSubmission | Promise<NormalizedSubmission> {
+		const normalized = this._normalizeSubmissionInner(text, images, policy);
+		if (normalized instanceof Promise) {
+			return normalized.then((result) => this._withImageTurnReading(result));
+		}
+		return this._withImageTurnReading(normalized);
+	}
+
+	private _withImageTurnReading(
+		normalized: NormalizedSubmission,
+	): NormalizedSubmission | Promise<NormalizedSubmission> {
+		if (normalized.kind !== "prompt" || !normalized.images?.length) return normalized;
+		return this._readTurnImagesWithChild(normalized.text, normalized.images).then((reading) => {
+			if (!reading) return normalized;
+			const text = normalized.text.trim() ? `${normalized.text}\n\n${reading}` : reading;
+			return { ...normalized, text, images: undefined };
+		});
+	}
+
+	private _normalizeSubmissionInner(
 		text: string,
 		images: ImageContent[] | undefined,
 		policy: SubmissionNormalizationPolicy,

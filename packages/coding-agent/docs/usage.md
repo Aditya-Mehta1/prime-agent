@@ -39,6 +39,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 |---------|-------------|
 | `/login`, `/logout` | Manage OAuth or API-key credentials |
 | `/model` | Switch models |
+| `/image-model [model\|off]` | Show or pin the model that reads this session's attached images |
 | `/effort` | Set the reasoning/thinking level |
 | `/scoped-models` | Enable/disable models for Alt+M cycling |
 | `/settings` | Thinking level, theme, message delivery, transport |

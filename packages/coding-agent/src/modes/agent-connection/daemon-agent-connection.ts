@@ -1506,6 +1506,15 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
+	async setImageModel(reference: string | null): Promise<AgentConnectionModel | undefined> {
+		const model = await this.requestData<AgentConnectionModel | null>({
+			type: "set_image_model",
+			activeSessionId: this.activeSessionId,
+			imageModel: reference,
+		});
+		return model ?? undefined;
+	}
+
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
 		await this.requestOk({ type: "set_thinking_level", activeSessionId: this.activeSessionId, level });
 	}

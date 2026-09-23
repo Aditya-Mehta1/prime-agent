@@ -489,6 +489,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.setScopedModels(scopedModels);
 	}
 
+	async setImageModel(reference: string | null): Promise<AgentConnectionModel | undefined> {
+		return this.session.setImageModelOverride(reference ?? undefined);
+	}
+
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
 		this.session.setThinkingLevel(level);
 	}

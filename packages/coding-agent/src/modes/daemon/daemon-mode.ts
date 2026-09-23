@@ -351,6 +351,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"set_model",
 	"cycle_model",
 	"set_scoped_models",
+	"set_image_model",
 	"set_thinking_level",
 	"set_service_tier",
 	"cycle_thinking_level",
@@ -5274,6 +5275,18 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.setScopedModels(command.scopedModels);
 				return success(command.id, "set_scoped_models");
+			}
+
+			case "set_image_model": {
+				const state = this.getSessionState(command.activeSessionId);
+				const session = state.runtime.session;
+				if (command.imageModel !== null) {
+					// Refresh first so a reference authenticated since the catalog was
+					// last read still resolves, mirroring set_model.
+					await session.modelRegistry.refreshAvailableModels();
+				}
+				const imageModel = session.setImageModelOverride(command.imageModel ?? undefined);
+				return success(command.id, "set_image_model", imageModel ?? null);
 			}
 
 			case "set_thinking_level": {
