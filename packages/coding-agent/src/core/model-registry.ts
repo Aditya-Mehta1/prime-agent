@@ -470,6 +470,7 @@ export class ModelRegistry {
 	private readonly providerCatalog: CatalogCache<Model<Api>[]>;
 	private catalogRefreshTimer?: ReturnType<typeof setInterval>;
 	private scheduledCatalogRefresh?: Promise<void>;
+	private unsubscribeAuthChange?: () => void;
 	private loadError: string | undefined = undefined;
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
@@ -490,10 +491,10 @@ export class ModelRegistry {
 		);
 		this.loadModels();
 		const reference = new WeakRef(this);
-		const unsubscribe = authStorage.onChange(() => {
+		this.unsubscribeAuthChange = authStorage.onChange(() => {
 			const registry = reference.deref();
 			if (registry) void registry.scheduleCatalogRefresh().catch(() => {});
-			else unsubscribe();
+			else this.unsubscribeAuthChange?.();
 		});
 	}
 
@@ -507,6 +508,21 @@ export class ModelRegistry {
 
 	static inMemory(authStorage: AuthStorage): ModelRegistry {
 		return new ModelRegistry(authStorage, undefined);
+	}
+
+	/**
+	 * Release the auth-change subscription and the hourly catalog refresh timer.
+	 * Owners call this when they discard the registry (session disposal); the
+	 * WeakRef self-cleanup below only removes the listener after the NEXT auth
+	 * change, which may never come.
+	 */
+	dispose(): void {
+		if (this.catalogRefreshTimer) {
+			clearInterval(this.catalogRefreshTimer);
+			this.catalogRefreshTimer = undefined;
+		}
+		this.unsubscribeAuthChange?.();
+		this.unsubscribeAuthChange = undefined;
 	}
 
 	/**
@@ -928,9 +944,9 @@ export class ModelRegistry {
 
 	private async refreshProviderCatalog(force: boolean): Promise<void> {
 		await this.providerCatalog.refresh("public", { force });
-		// The catalog-defined default model rides the same cadence; failures keep the
-		// cached value and never block model discovery.
-		await refreshDefaultModelCatalog(force).catch(() => undefined);
+		// The catalog-defined default model rides the same cadence and refreshes in
+		// the background; a slow or unreachable host never blocks model discovery.
+		void refreshDefaultModelCatalog(force).catch(() => undefined);
 		this.reloadModelsAfterCatalogChange();
 	}
 
@@ -1235,7 +1251,10 @@ export class ModelRegistry {
 
 	async getExecutableModels(): Promise<Model<Api>[]> {
 		this.startCatalogRefreshTimer();
-		await this.refreshProviderCatalog(false);
+		// Kick the provider catalog refresh off now but never block discovery on it:
+		// refreshAvailableModels() tracks the same request and the bounded wait
+		// below observes its settlement.
+		void this.refreshProviderCatalog(false).catch(() => undefined);
 		// Subagent discovery must start the same credential-scoped Prime Inference
 		// refresh as the picker, even when no picker has opened in this session.
 		await this.refreshAvailableModels();

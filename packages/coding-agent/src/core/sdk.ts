@@ -393,6 +393,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		initialGoal: options.initialGoal,
 	});
 	if (!options.mcpManager) session.registerDisposeCallback(() => mcpManager.dispose());
+	if (!options.modelRegistry) session.registerDisposeCallback(() => modelRegistry.dispose());
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

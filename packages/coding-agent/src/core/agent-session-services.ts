@@ -104,6 +104,11 @@ export interface AgentSessionServices {
 	 * sessions; only the owner disposes the manager.
 	 */
 	ownsMcpManager: boolean;
+	/**
+	 * True only when this services object created its own ModelRegistry (not an
+	 * injected one); only the owner disposes the registry.
+	 */
+	ownsModelRegistry: boolean;
 }
 
 function applyExtensionFlagValues(
@@ -242,6 +247,7 @@ export async function createAgentSessionServices(
 		mcpManager,
 		diagnostics,
 		ownsMcpManager: mcpManager === ownedMcpManager,
+		ownsModelRegistry: options.modelRegistry === undefined,
 	};
 }
 
@@ -295,6 +301,9 @@ export async function createAgentSessionFromServices(
 	});
 	if (options.services.ownsMcpManager) {
 		result.session.registerDisposeCallback(() => options.services.mcpManager.dispose());
+	}
+	if (options.services.ownsModelRegistry) {
+		result.session.registerDisposeCallback(() => options.services.modelRegistry.dispose());
 	}
 	if (result.session.rlmDepth === 0 && !options.telemetryDisabled) {
 		installAgentTelemetry(result.session, {

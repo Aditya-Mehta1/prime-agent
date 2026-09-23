@@ -764,6 +764,30 @@ describe("ModelRegistry", () => {
 			await registry.waitForPendingModelRefreshes(1_000).catch(() => undefined);
 		});
 
+		test("dispose unsubscribes the auth-change catalog refresh listener", async () => {
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			let providerCatalogRequests = 0;
+			vi.stubGlobal(
+				"fetch",
+				vi.fn((input: string | URL | Request) => {
+					if (String(input).includes("prime-agent-catalog/main/models/catalog.v1.json"))
+						providerCatalogRequests++;
+					return new Promise<Response>(() => {});
+				}),
+			);
+
+			// Before disposal an auth change schedules a forced catalog refresh.
+			authStorage.setRuntimeApiKey("openai", "key-1");
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(providerCatalogRequests).toBe(1);
+
+			// A discarded registry must not keep reacting to auth changes.
+			registry.dispose();
+			authStorage.setRuntimeApiKey("openai", "key-2");
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(providerCatalogRequests).toBe(1);
+		});
+
 		test("model catalog includes unauthenticated public models and hides private Prime routes", async () => {
 			const savedPrimeApiKey = process.env.PRIME_API_KEY;
 			const savedOpenAiApiKey = process.env.OPENAI_API_KEY;
