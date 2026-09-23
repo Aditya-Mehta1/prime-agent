@@ -9,6 +9,7 @@ mod panel;
 
 pub use panel::{LoginDialog, LoginDialogAction};
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -142,7 +143,9 @@ impl LoginDialogState {
             .iter()
             .find(|prefix| lower.starts_with(*prefix))
             .map(|prefix| prefix.len())?;
-        let code = trimmed[prefix..].trim_start();
+        // `get` keeps an exotic case-folding length change a plain text
+        // row instead of a panic.
+        let code = trimmed.get(prefix..)?.trim_start();
         (!code.is_empty()).then_some(code)
     }
 
