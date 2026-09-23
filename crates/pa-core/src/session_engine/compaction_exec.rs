@@ -181,6 +181,25 @@ pub fn add_assistant_usage(total: &mut pa_types::ai::Usage, usage: &pa_types::ai
     total.cost.total = add_cost(total.cost.total, usage.cost.total);
 }
 
+/// Remove one usage block from a total, clamping every field at zero (TS
+/// `subtractAssistantUsage`: "Remove a previously added usage, clamping at
+/// zero to absorb attribution drift").
+pub fn subtract_assistant_usage(total: &mut pa_types::ai::Usage, usage: &pa_types::ai::Usage) {
+    total.input = total.input.saturating_sub(usage.input);
+    total.output = total.output.saturating_sub(usage.output);
+    total.cache_read = total.cache_read.saturating_sub(usage.cache_read);
+    total.cache_write = total.cache_write.saturating_sub(usage.cache_write);
+    total.total_tokens = total.total_tokens.saturating_sub(usage.total_tokens);
+    let sub_cost = |left: pa_types::JsNumber, right: pa_types::JsNumber| {
+        pa_types::JsNumber::from((left.as_f64() - right.as_f64()).max(0.0))
+    };
+    total.cost.input = sub_cost(total.cost.input, usage.cost.input);
+    total.cost.output = sub_cost(total.cost.output, usage.cost.output);
+    total.cost.cache_read = sub_cost(total.cost.cache_read, usage.cost.cache_read);
+    total.cost.cache_write = sub_cost(total.cost.cache_write, usage.cost.cache_write);
+    total.cost.total = sub_cost(total.cost.total, usage.cost.total);
+}
+
 /// The compaction's billed usage summed over its wire calls (TS `compact`'s
 /// slice loop: `usage ??= emptyUsage(); addAssistantUsage(...)`). A run with
 /// no wire calls (the no-history split arm) records no usage.
