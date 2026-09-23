@@ -413,6 +413,12 @@ def run_scenario(side, sandbox, label, out_dir):
             " ; printf 'EXITCODE:%s\\r\\n' \"$?\""
             f" ; stty -g > {probe_path}"
             " ; printf 'TTYCK:%s\\r\\n' \"$(cksum < " + probe_path + ")\""
+            # The canonical-mode marker: a poisoned start ends in the
+            # cooked-tty REPAIR, whose `stty sane` reconstruction is cooked
+            # but not byte-identical to the pre-poison baseline — the mode
+            # is the invariant there, the exact state everywhere else.
+            " ; if stty -a | grep -q ' -icanon'; then printf 'TTYMODE:raw\\r\\n';"
+            " else printf 'TTYMODE:cooked\\r\\n'; fi"
         )
         if label == "panic":
             # The replay surface panics mid-loop (rust sides only).
@@ -463,14 +469,20 @@ def run_scenario(side, sandbox, label, out_dir):
         exit_probe = parse_exit_probe(server.capture(history=-100))
         facts["exit_code"] = exit_probe.get("exit_code")
         facts["tty_cksum"] = exit_probe.get("tty_cksum")
+        facts["tty_mode"] = exit_probe.get("tty_mode")
         # (i) the alternate screen is left.
         facts["alternate_on_after"] = server.alternate_on()
         # (ii) the tty is cooked: the exit probe's state matches the sane
-        # baseline (the poisoned scenario additionally proves the poison
-        # took effect before the launch — its own probe line records it).
-        facts["stty_matches_sane"] = (
-            facts["tty_cksum"] is not None and facts["tty_cksum"] == baseline
-        )
+        # baseline — except a poisoned start, where the exit's cooked-tty
+        # repair rebuilds a `stty sane`-equivalent mode that is cooked but
+        # not byte-identical to the pre-poison baseline; the mode is the
+        # invariant there.
+        if label == "poisoned":
+            facts["stty_matches_sane"] = facts["tty_mode"] == "cooked"
+        else:
+            facts["stty_matches_sane"] = (
+                facts["tty_cksum"] is not None and facts["tty_cksum"] == baseline
+            )
         # (iii) no escape bytes leak into the typed line.
         leak_text = typed_clean(server)
         facts["typed_visible"] = leak_text is not None
@@ -507,6 +519,9 @@ def parse_exit_probe(capture_text):
         m = re.search(r"TTYCK:(\d+ \d+)", line)
         if m:
             probe["tty_cksum"] = m.group(1)
+        m = re.search(r"TTYMODE:(raw|cooked)", line)
+        if m:
+            probe["tty_mode"] = m.group(1)
     return probe
 
 
@@ -525,7 +540,7 @@ def gate_facts(key, facts):
     if label != "panic" and facts.get("settled") is not True:
         failures.append(f"{key}:no-settle")
         return failures
-    expected_exit = 101 if label == "panic" else 0
+    expected_exit = 101 if label == "panic" else (1 if label == "error-exit" else 0)
     if facts.get("exit_code") != expected_exit:
         failures.append(f"{key}:exit-code={facts.get('exit_code')}")
     if label == "panic":
