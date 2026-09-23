@@ -65,11 +65,12 @@ impl LoginDialog {
             match row {
                 ContentRow::Blank => lines.push(vec![Span::raw(" ")]),
                 ContentRow::Text { text, color, bold } => {
-                    let mut span = theme_row_span(theme, color, text);
+                    let mut span = theme_row_span(theme, *color, text);
                     if *bold {
                         span = theme.bold(span);
                     }
-                    for wrapped in wrap_line(&[span], inner) {
+                    let span_line: Line = vec![span];
+                    for wrapped in wrap_line(&span_line, inner) {
                         let mut row = vec![Span::raw(" ")];
                         row.extend(wrapped);
                         lines.push(truncate_line(&row, width, ""));
