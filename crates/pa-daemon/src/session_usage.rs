@@ -285,7 +285,7 @@ mod tests {
         json!({ "type": "message", "id": id, "message": { "role": role, "usage": usage } })
     }
 
-    fn attribution(target: &str, child: Value, aggregate: Value) -> Value {
+    fn attribution(target: &str, child: Usage, aggregate: Usage) -> Value {
         json!({
             "type": "child_usage_attributed", "targetId": target,
             "childUsage": child, "aggregateUsage": aggregate
@@ -406,8 +406,9 @@ mod tests {
             }))
         };
         let summary = scan_summary(&[line("a", 0.1), line("b", 0.2), line("c", 0.3)]);
-        assert_eq!(summary.map(|s| s.cost), Some(0.1 + 0.2 + 0.3));
-        assert_eq!(summary.map(|s| s.cost), Some(0.6000000000000001));
+        let cost = summary.as_ref().map(|summary| summary.cost);
+        assert_eq!(cost, Some(0.1 + 0.2 + 0.3));
+        assert_eq!(cost, Some(0.6000000000000001));
     }
 
     /// The standalone whole-file scan reads the same fold from disk;
