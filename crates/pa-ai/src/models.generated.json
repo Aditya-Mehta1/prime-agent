@@ -24945,8 +24945,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -24980,8 +24979,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -25015,8 +25013,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -25050,8 +25047,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -25085,8 +25081,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -25120,8 +25115,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -25156,8 +25150,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -25192,8 +25185,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -25228,8 +25220,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {
@@ -25264,8 +25255,7 @@
     "supportsDeveloperRole": false,
     "supportsReasoningEffort": false,
     "maxTokensField": "max_tokens",
-    "supportsStrictMode": false,
-    "thinkingFormat": "zai"
+    "supportsStrictMode": false
    },
    "reasoning": true,
    "thinkingLevelMap": {

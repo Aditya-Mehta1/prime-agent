@@ -334,3 +334,73 @@ pub(crate) fn build_headers(
     let _ = conversation_id;
     headers
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models_generated;
+    use crate::types::{Message, StreamOptions, UserMessage, UserMessageContent};
+
+    /// Assemble params for a compiled catalog model with reasoning requested
+    /// (the TS fix #2459 regression shape: thinking high).
+    fn reasoning_params(provider: &str, model_id: &str) -> Map<String, Value> {
+        let model = models_generated::get_model(provider, model_id)
+            .unwrap_or_else(|| panic!("compiled catalog carries {provider}/{model_id}"));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserMessageContent::Text("Hi".into()),
+                timestamp: 1,
+                rest: Default::default(),
+            })],
+            tools: None,
+        };
+        let mut options = OpenAICompletionsOptions::from_base(StreamOptions {
+            api_key: Some("test".into()),
+            ..Default::default()
+        });
+        options.reasoning_effort = Some(ModelThinkingLevel::High);
+        let params = build_params(
+            model,
+            &context,
+            Some(&options),
+            &crate::providers::openai_completions::get_compat(model),
+            CacheRetention::None,
+            None,
+        );
+        match params {
+            Value::Object(map) => map,
+            _ => panic!("build_params returns a JSON object"),
+        }
+    }
+
+    /// Port of the TS regression (#2459): Prime Inference rejects
+    /// `enable_thinking` on GLM routes with a 400 on every request, so the
+    /// catalog compat must shape the request without any thinking parameter.
+    #[test]
+    fn sends_no_thinking_parameter_to_prime_inference_glm_routes() {
+        for model_id in ["z-ai/glm-5.3", "z-ai/glm-5.3-flash"] {
+            let params = reasoning_params("prime-inference", model_id);
+            for key in [
+                "enable_thinking",
+                "reasoning_effort",
+                "reasoning",
+                "chat_template_kwargs",
+            ] {
+                assert!(
+                    !params.contains_key(key),
+                    "{model_id}: request must not carry {key}"
+                );
+            }
+        }
+    }
+
+    /// The direct z.ai routes keep the toggle: their compat still selects the
+    /// zai thinking format, so reasoning requests send `enable_thinking`.
+    #[test]
+    fn keeps_the_zai_thinking_toggle_on_direct_zai_routes() {
+        let params = reasoning_params("zai", "glm-5.3");
+        assert_eq!(params.get("enable_thinking"), Some(&json!(true)));
+    }
+}
