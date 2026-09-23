@@ -180,7 +180,7 @@ impl AgentSession {
             .subscribe(move |event, _signal| {
                 let persistence = persistence.clone();
                 Box::pin(async move {
-                    persist_event(&persistence, event).await;
+                    persist_event(&persistence, event).await?;
                     Ok(())
                 })
             })
@@ -424,7 +424,7 @@ impl AgentSession {
         let kernel_state = match self.kernel_state.as_ref() {
             Some(probe) => {
                 ipython_state::sync_after_compaction(probe.as_ref(), &self.session, &self.agent)
-                    .await
+                    .await?
             }
             None => None,
         };
@@ -451,18 +451,21 @@ impl AgentSession {
         reason: crate::session_engine::messages::CompactionOutcomeReason,
         outcome: crate::session_engine::messages::CompactionOutcomeKind,
         content: &str,
-    ) -> pa_types::session::CustomMessage {
+    ) -> anyhow::Result<pa_types::session::CustomMessage> {
         let row = crate::session_engine::messages::create_compaction_outcome_message(
             content, reason, outcome,
         );
         {
             let mut session = self.session.lock().await;
-            session.append_custom_message(
+            let (_, write_error) = session.append_custom_message_retained(
                 &row.custom_type,
                 row.content.clone(),
                 row.display,
                 row.details.clone(),
             );
+            if let Some(error) = write_error {
+                eprintln!("pa-core: compaction outcome row not persisted: {error}");
+            }
         }
         // TS pushes the row onto `agent.state.messages` after the append:
         // the live context owns the disclosure; the loop's converter filters
@@ -475,7 +478,7 @@ impl AgentSession {
             messages.push(loop_message);
             self.agent.set_messages(messages).await;
         }
-        row
+        Ok(row)
     }
 
     /// Rebuild the live loop context from a durable branch (TS
@@ -514,19 +517,23 @@ impl AgentSession {
         api_key: Option<String>,
         global_harness_dir: std::path::PathBuf,
     ) -> anyhow::Result<crate::refinement::RefinementResult> {
+        let snapshot = self.session.lock().await.history_snapshot();
+        let entries = snapshot.await?;
+        let messages: Vec<SessionAgentMessage> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                FileEntry::Message { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
         let result = {
             let mut session = self.session.lock().await;
-            let messages: Vec<SessionAgentMessage> = session
-                .get_all_entries()
-                .iter()
-                .filter_map(|entry| match entry {
-                    FileEntry::Message { message, .. } => Some(message.clone()),
-                    _ => None,
-                })
-                .collect();
             refine::execute_refinement(
                 &mut session,
-                &messages,
+                refine::RefinementTranscript {
+                    messages: &messages,
+                    historical_entries: &entries,
+                },
                 &global_harness_dir,
                 model,
                 options,
@@ -769,9 +776,36 @@ impl AgentSession {
         self.session.lock().await.get_session_id().to_string()
     }
 
+    /// Restore a verified retained context without loading older transcript bodies.
+    pub async fn restore_windowed_context(
+        &self,
+        window: crate::session::window::WindowedSessionStore,
+    ) {
+        let messages = {
+            let mut session = self.session.lock().await;
+            session.adopt_window(window);
+            session.active_context().messages
+        };
+        self.agent
+            .set_messages(
+                messages
+                    .iter()
+                    .filter_map(session_message_to_loop)
+                    .collect(),
+            )
+            .await;
+    }
+
     /// Persisted entries (for UI resume and inspection).
     pub async fn entries(&self) -> Vec<FileEntry> {
-        self.session.lock().await.get_entries().to_vec()
+        self.session
+            .lock()
+            .await
+            .retained_entries()
+            .iter()
+            .filter(|entry| !matches!(entry, FileEntry::Header { .. }))
+            .cloned()
+            .collect()
     }
 
     /// Model change bookkeeping (mirrors appendModelChange). The resolved
@@ -789,7 +823,7 @@ impl AgentSession {
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         self.agent.set_model(wire).await;
         let mut session = self.session.lock().await;
-        session.append_model_change(provider, model_id);
+        session.append_model_change(provider, model_id)?;
         Ok(())
     }
 
@@ -797,30 +831,44 @@ impl AgentSession {
     pub async fn set_thinking_level(&self, level: ThinkingLevel) -> anyhow::Result<()> {
         self.agent.set_thinking_level(level).await;
         let mut session = self.session.lock().await;
-        session.append_thinking_level_change(&format!("{level:?}").to_lowercase());
+        session.append_thinking_level_change(&format!("{level:?}").to_lowercase())?;
         Ok(())
     }
 }
 
-async fn persist_event(session: &Arc<tokio::sync::Mutex<SessionManager>>, event: AgentEvent) {
+async fn persist_event(
+    session: &Arc<tokio::sync::Mutex<SessionManager>>,
+    event: AgentEvent,
+) -> std::io::Result<()> {
     match event {
         AgentEvent::MessageEnd { message, .. } => {
             let Some(session_message) = loop_message_to_session(&message) else {
-                return;
+                return Ok(());
             };
             let mut session = session.lock().await;
-            match session_message {
+            // TS `_processAgentEvent` runs on `_agentEventQueue`, whose
+            // `.catch(() => {})` swallows persistence failures, and its
+            // `_appendEntry` keeps the row in the in-memory session when the
+            // disk write throws. The loop has already reduced this event into
+            // live agent state, so a failed write must retain the row here
+            // too: propagating would fail the run, append an error assistant
+            // row that exists in neither store, and leave live context that
+            // disappears on reopen.
+            let write_error = match session_message {
                 SessionAgentMessage::Custom(custom) => {
-                    session.append_custom_message(
-                        &custom.custom_type,
-                        custom.content.clone(),
-                        custom.display,
-                        custom.details.clone(),
-                    );
+                    session
+                        .append_custom_message_retained(
+                            &custom.custom_type,
+                            custom.content.clone(),
+                            custom.display,
+                            custom.details.clone(),
+                        )
+                        .1
                 }
-                other => {
-                    session.append_message(other);
-                }
+                other => session.append_message_retained(other).1,
+            };
+            if let Some(error) = write_error {
+                eprintln!("pa-core: message row not persisted: {error}");
             }
         }
         // Git state is captured at both run boundaries, exactly like the TS
@@ -833,6 +881,7 @@ async fn persist_event(session: &Arc<tokio::sync::Mutex<SessionManager>>, event:
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Convert a loop message to its persisted form via the shared wire shape.
@@ -1779,7 +1828,8 @@ mod compaction_outcome_tests {
                 CompactionOutcomeKind::Failed,
                 "Requested compaction failed: Summarization failed",
             )
-            .await;
+            .await
+            .unwrap();
         // The entry chain owns the row (context rebuilds read it).
         let entries = session.entries().await;
         let outcome_entries: Vec<_> = entries
@@ -1840,7 +1890,7 @@ mod compaction_outcome_tests {
         let sessions = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         let mut manager = SessionManager::persisted(tmp.path(), &sessions);
-        manager.append_message(seeded_assistant());
+        manager.append_message(seeded_assistant()).unwrap();
         let file = manager.get_session_file().unwrap().to_path_buf();
         assert!(file.exists(), "the session file materialized");
         // Replace the session file with a directory at the same path: every
@@ -1855,7 +1905,8 @@ mod compaction_outcome_tests {
                 CompactionOutcomeKind::Skipped,
                 "Auto-compaction skipped: Already compacted",
             )
-            .await;
+            .await
+            .unwrap();
         // The write failed (the file path is a directory) — but the entry
         // chain and a context rebuild keep the disclosure.
         let entries = session.entries().await;
@@ -1876,6 +1927,65 @@ mod compaction_outcome_tests {
                 .iter()
                 .any(|message| matches!(message, SessionAgentMessage::Custom(custom) if custom.custom_type == "compaction_outcome")),
             "a rebuild cannot drop the disclosure"
+        );
+    }
+
+    /// The subscriber arm (TS `_processAgentEvent` on `_agentEventQueue`
+    /// whose `.catch(() => {})` swallows persistence failures) never fails
+    /// the run for a write error: the loop already owns the row in live
+    /// state, so the session retains it and the error only logs — no error
+    /// assistant row lands in either store.
+    #[tokio::test]
+    async fn message_end_persist_failure_retains_the_row_and_swallows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut manager = SessionManager::persisted(tmp.path(), &sessions);
+        manager.append_message(seeded_assistant()).unwrap();
+        let file = manager.get_session_file().unwrap().to_path_buf();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let session = scripted_session_over(manager).await;
+        let before = session
+            .session
+            .lock()
+            .await
+            .get_all_entries()
+            .to_vec()
+            .len();
+        persist_event(
+            &session.session,
+            AgentEvent::MessageEnd {
+                message: AgentMessage::user("retained after the failed write"),
+            },
+        )
+        .await
+        .expect("a failed disk write must not fail the event queue");
+        let guard = session.session.lock().await;
+        let entries = guard.get_all_entries().to_vec();
+        drop(guard);
+        assert_eq!(entries.len(), before + 1, "the row stays live-indexed");
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry, FileEntry::Message {
+                    message: SessionAgentMessage::Assistant(assistant),
+                    ..
+                } if assistant.error_message.is_some())),
+            "no phantom error row for a persistence failure"
+        );
+        let context = crate::session::build_session_context(
+            &entries,
+            entries
+                .last()
+                .and_then(|entry| entry.id().map(str::to_owned))
+                .as_deref(),
+        );
+        assert!(
+            serde_json::to_string(&context.messages)
+                .unwrap()
+                .contains("retained after the failed write"),
+            "a context rebuild keeps the retained row"
         );
     }
 }

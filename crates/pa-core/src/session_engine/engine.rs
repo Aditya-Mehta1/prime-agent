@@ -14,7 +14,6 @@ use pa_agent::types::{Model, ThinkingLevel};
 use crate::resources::{load_resources, ResourceLoaderOptions};
 use crate::session::manager::SessionManager;
 use crate::skills::PromptTemplate;
-use pa_types::session::FileEntry;
 
 use pa_telemetry::base_properties;
 
@@ -567,27 +566,21 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let (existing_messages, has_thinking_entry, has_service_tier_entry) = {
         let session = wiring.session.lock().await;
         let messages = super::compact_session::rebuilt_context_after_compaction(&session);
-        let has_thinking_entry = session
-            .get_all_entries()
-            .iter()
-            .any(|entry| matches!(entry, FileEntry::ThinkingLevelChange { .. }));
-        let has_service_tier_entry = session
-            .get_all_entries()
-            .iter()
-            .any(|entry| matches!(entry, FileEntry::ServiceTierChange { .. }));
+        let has_thinking_entry = session.has_thinking_level();
+        let has_service_tier_entry = session.has_service_tier();
         (messages, has_thinking_entry, has_service_tier_entry)
     };
     let thinking_level = config.thinking_level.unwrap_or(ThinkingLevel::Off);
     {
         let mut session = wiring.session.lock().await;
         if existing_messages.is_empty() {
-            session.append_model_change(&model.provider, &model.id);
-            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase());
+            session.append_model_change(&model.provider, &model.id)?;
+            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase())?;
         } else if !has_thinking_entry {
-            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase());
+            session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase())?;
         }
         if existing_messages.is_empty() || !has_service_tier_entry {
-            session.append_service_tier_change(Some(service_tier_preference));
+            session.append_service_tier_change(Some(service_tier_preference))?;
         }
     }
     // The loop consumes agent-side messages; session entries cross through

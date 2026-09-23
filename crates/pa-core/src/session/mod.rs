@@ -3,6 +3,8 @@ pub mod discovery;
 pub mod manager;
 pub mod manager_ext;
 pub mod tree;
+pub mod window;
+mod window_cache;
 
 use std::collections::HashMap;
 
@@ -300,10 +302,15 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
         return empty_context();
     };
 
-    // Path from root to leaf.
+    // Path from root to leaf. A corrupt file can hold a parent cycle;
+    // the walk must terminate anyway.
     let mut path: Vec<usize> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     let mut current = Some(leaf_index);
     while let Some(index) = current {
+        if !visited.insert(index) {
+            break;
+        }
         path.push(index);
         current = entries[index]
             .parent_id()

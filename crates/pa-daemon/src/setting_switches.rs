@@ -175,8 +175,10 @@ impl Worker {
                 let mut core = core.lock().unwrap();
                 if let Some(store) = core.store.as_mut() {
                     // TS `appendModelChange` records every switch.
-                    let _ = store.append_model_change(&provider, &model_id);
-                    let _ = store.rewrite();
+                    let _ = store.persist_entry(
+                        "model_change",
+                        json!({ "provider": provider, "modelId": model_id }),
+                    );
                 }
                 core.cwd.clone()
             };
@@ -234,6 +236,9 @@ impl Worker {
         };
         let effective = effective_service_tier(Some(previous), fast_mode).unwrap_or(previous);
         if effective != previous {
+            // The engine's request slot must follow the clamp, or requests
+            // keep the previous tier after cycling to a model without it.
+            self.engine.configure_service_tier(Some(effective));
             self.emit_worker_event(json!({
                 "type": "service_tier_changed",
                 "serviceTier": service_tier_wire_name(effective),
@@ -372,13 +377,13 @@ impl Worker {
                     // The same durable row the creation prefix writes (TS
                     // `appendServiceTierChange`).
                     let _ = store
-                        .append_entry("service_tier_change", json!({ "serviceTier": effective }));
-                    let _ = store.rewrite();
+                        .persist_entry("service_tier_change", json!({ "serviceTier": effective }));
                 }
                 cwd = core.cwd.clone();
             }
             (preference_changed, effective_changed, cwd)
         };
+        self.engine.configure_service_tier(Some(effective));
         if preference_changed && fast_mode {
             // TS persists the default only when the model keeps fast mode.
             let mut settings =

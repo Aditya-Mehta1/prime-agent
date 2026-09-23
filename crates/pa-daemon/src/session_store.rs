@@ -11,8 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+#[path = "session_store_window_tests.rs"]
+mod window_tests;
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
 /// Entry types that represent user intent (vs daemon bookkeeping).
@@ -85,6 +89,23 @@ pub struct SessionFile {
     pub(crate) entries: Vec<SessionEntry>,
     pub(crate) by_id: HashMap<String, usize>,
     pub(crate) leaf_id: Option<String>,
+    pub(crate) window: Option<SessionWindow>,
+    pub(crate) lease: Option<std::sync::Arc<crate::lease::SessionLease>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionWindow {
+    message_count: usize,
+    first_message: Option<String>,
+    loaded_entries: usize,
+    compaction_count: usize,
+    has_thinking_level: bool,
+    has_service_tier: bool,
+    model: Option<(String, String)>,
+    thinking_level: String,
+    service_tier: Option<pa_types::ai::ServiceTier>,
+    retained_ids: std::collections::HashSet<String>,
+    pub(crate) older_path_stats: pa_core::session::window::WindowStats,
 }
 
 pub fn session_file_name(session_id: &str) -> String {
@@ -106,8 +127,9 @@ pub fn parse_session_entries(content: &str) -> Vec<Value> {
 
 /// Read the first line of a session file and parse it as a header.
 pub fn read_session_header(path: &Path) -> Option<SessionHeader> {
-    let content = fs::read_to_string(path).ok()?;
-    let first = content.lines().next()?;
+    let file = fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file).read_line(&mut first).ok()?;
     let value: Value = serde_json::from_str(first.trim()).ok()?;
     if value.get("type").and_then(Value::as_str) != Some("session") {
         return None;
@@ -144,6 +166,8 @@ impl SessionFile {
             entries: Vec::new(),
             by_id: HashMap::new(),
             leaf_id: None,
+            window: None,
+            lease: None,
         };
         for line in lines {
             let trimmed = line.trim();
@@ -157,6 +181,104 @@ impl SessionFile {
             }
         }
         Ok(file)
+    }
+
+    /// Load the verified compacted context without decoding old message bodies.
+    pub fn open_windowed(path: &Path) -> Result<Self> {
+        let Some(window) = pa_core::session::window::WindowedSessionStore::open(path)? else {
+            return Self::open(path);
+        };
+        let header = window
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                pa_types::session::FileEntry::Header { header } => Some(header.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("window has no session header"))?;
+        let mut file = Self {
+            path: path.to_owned(),
+            header,
+            entries: Vec::new(),
+            by_id: HashMap::new(),
+            leaf_id: None,
+            window: None,
+            lease: None,
+        };
+        for line in window.metadata_entries().iter().chain(window.raw_entries()) {
+            let Ok(entry) = serde_json::from_str(line) else {
+                return Self::open(path);
+            };
+            file.push_index(entry);
+        }
+        file.leaf_id = Some(window.leaf_id().to_owned());
+        let context = window.context();
+        file.window = Some(SessionWindow {
+            message_count: window.message_count(),
+            first_message: window
+                .first_user_message()
+                .map(message_text)
+                .filter(|text| !text.is_empty()),
+            loaded_entries: file.entries.len(),
+            compaction_count: window.compaction_count(),
+            has_thinking_level: window.has_thinking_level(),
+            has_service_tier: window.has_service_tier(),
+            model: context.model,
+            thinking_level: context.thinking_level,
+            service_tier: context.service_tier,
+            retained_ids: window
+                .raw_entries()
+                .iter()
+                .filter_map(|raw| {
+                    serde_json::from_str::<SessionEntry>(raw)
+                        .ok()
+                        .map(|entry| entry.id)
+                })
+                .collect(),
+            older_path_stats: window.older_path_stats().clone(),
+        });
+        Ok(file)
+    }
+
+    #[cfg(test)]
+    fn ensure_full_history(&mut self) -> Result<()> {
+        if self.window.is_some() {
+            let full = Self::open(&self.path)?;
+            self.install_full_history(full);
+        }
+        Ok(())
+    }
+
+    /// Merge appends made while the disk snapshot loaded without holding the store lock.
+    pub(crate) fn install_full_history(&mut self, mut full: Self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        for entry in &self.entries[window.loaded_entries..] {
+            if !full.by_id.contains_key(&entry.id) {
+                full.push_index(entry.clone());
+            }
+        }
+        full.leaf_id.clone_from(&self.leaf_id);
+        full.lease = self.lease.clone();
+        *self = full;
+    }
+
+    /// Persist only the newly appended creation records on a resumed file.
+    pub(crate) fn persist_appended(&self, start: usize) -> Result<()> {
+        let mut bytes = Vec::new();
+        for entry in &self.entries[start..] {
+            write_line(&mut bytes, entry)?;
+        }
+        match &self.lease {
+            Some(lease) => lease.append(&self.path, &bytes)?,
+            None => pa_core::session::window::append_cached(
+                &self.path,
+                &bytes,
+                pa_core::session::window::AppendOwnership::Unleased,
+            )?,
+        }
+        Ok(())
     }
 
     /// Create a new in-memory session; persisted with the first flush.
@@ -177,6 +299,8 @@ impl SessionFile {
             entries: Vec::new(),
             by_id: HashMap::new(),
             leaf_id: None,
+            window: None,
+            lease: None,
         }
     }
 
@@ -216,6 +340,12 @@ impl SessionFile {
         let mut path = Vec::new();
         let mut current = self.leaf_id.as_deref().and_then(|id| self.entry(id));
         while let Some(entry) = current {
+            if let Some(window) = &self.window {
+                let index = self.by_id[&entry.id];
+                if index < window.loaded_entries && !window.retained_ids.contains(&entry.id) {
+                    break;
+                }
+            }
             path.push(entry);
             current = entry.parent_id.as_deref().and_then(|id| self.entry(id));
         }
@@ -270,6 +400,92 @@ impl SessionFile {
             .into_iter()
             .map(|position| &self.entries[position])
             .collect()
+    }
+
+    pub(crate) fn restored_settings(&self) -> pa_core::session::SessionContext {
+        let entries = self.branch_file_entries();
+        let mut context = pa_core::session::build_session_context(&entries, self.leaf_id());
+        if let Some(window) = &self.window {
+            context.model = window.model.clone();
+            context.thinking_level = window.thinking_level.clone();
+            context.service_tier = window.service_tier;
+            for entry in &self.entries[window.loaded_entries..] {
+                match entry.type_.as_str() {
+                    "model_change" => {
+                        if let (Some(provider), Some(model)) = (
+                            entry.fields.get("provider").and_then(Value::as_str),
+                            entry.fields.get("modelId").and_then(Value::as_str),
+                        ) {
+                            context.model = Some((provider.to_owned(), model.to_owned()));
+                        }
+                    }
+                    "message" => {
+                        if let Some(message) = entry.fields.get("message").filter(|message| {
+                            message.get("role").and_then(Value::as_str) == Some("assistant")
+                        }) {
+                            if let (Some(provider), Some(model)) = (
+                                message.get("provider").and_then(Value::as_str),
+                                message.get("model").and_then(Value::as_str),
+                            ) {
+                                context.model = Some((provider.to_owned(), model.to_owned()));
+                            }
+                        }
+                    }
+                    "thinking_level_change" => {
+                        if let Some(level) =
+                            entry.fields.get("thinkingLevel").and_then(Value::as_str)
+                        {
+                            context.thinking_level = level.to_owned();
+                        }
+                    }
+                    "service_tier_change" => {
+                        context.service_tier = entry
+                            .fields
+                            .get("serviceTier")
+                            .and_then(|tier| serde_json::from_value(tier.clone()).ok());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        context
+    }
+
+    pub(crate) fn has_thinking_level(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.has_thinking_level)
+            || self
+                .branch()
+                .iter()
+                .any(|entry| entry.type_ == "thinking_level_change")
+    }
+
+    pub(crate) fn has_service_tier(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.has_service_tier)
+            || self
+                .branch()
+                .iter()
+                .any(|entry| entry.type_ == "service_tier_change")
+    }
+
+    pub(crate) fn compaction_count(&self) -> usize {
+        match &self.window {
+            Some(window) => {
+                window.compaction_count
+                    + self.entries[window.loaded_entries..]
+                        .iter()
+                        .filter(|entry| entry.type_ == "compaction")
+                        .count()
+            }
+            None => self
+                .entries
+                .iter()
+                .filter(|entry| entry.type_ == "compaction")
+                .count(),
+        }
     }
 
     /// Session name from the latest `session_info` entry.
@@ -399,10 +615,26 @@ impl SessionFile {
     }
 
     pub fn message_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.type_ == "message").count()
+        match &self.window {
+            Some(window) => {
+                window.message_count
+                    + self.entries[window.loaded_entries..]
+                        .iter()
+                        .filter(|entry| entry.type_ == "message")
+                        .count()
+            }
+            None => self
+                .entries
+                .iter()
+                .filter(|entry| entry.type_ == "message")
+                .count(),
+        }
     }
 
     pub fn first_message(&self) -> Option<String> {
+        if let Some(window) = &self.window {
+            return window.first_message.clone();
+        }
         self.entries
             .iter()
             .filter(|e| e.type_ == "message")
@@ -440,7 +672,10 @@ impl SessionFile {
 
     pub fn append_entry(&mut self, type_: &str, fields: Value) -> String {
         let parent_id = self.leaf_id.clone();
-        let entry = SessionEntry::new(type_, parent_id, &self.index_map(), fields);
+        let mut entry = SessionEntry::new(type_, parent_id, &self.index_map(), fields);
+        if self.window.is_some() {
+            entry.id = uuid::Uuid::new_v4().to_string();
+        }
         let id = entry.id.clone();
         self.push_index(entry);
         id
@@ -477,6 +712,10 @@ impl SessionFile {
 
     /// Write the full file atomically (header + every entry), like `_rewriteFile`.
     pub fn rewrite(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.window.is_none(),
+            "full history required before rewriting session"
+        );
         let path = self.path.as_path();
         let Some(path) = (if path.as_os_str().is_empty() {
             None
@@ -514,21 +753,34 @@ impl SessionFile {
     /// durability — when it fails the entry stays indexed (a reload of
     /// the file would load it as the leaf) and the error still surfaces.
     pub fn persist_entry(&mut self, entry_type: &str, fields: Value) -> Result<String> {
-        let entry = SessionEntry::new(entry_type, self.leaf_id.clone(), &self.index_map(), fields);
+        anyhow::ensure!(
+            self.window.is_none() || self.path.exists(),
+            "window-backed session file is missing"
+        );
+        let mut entry =
+            SessionEntry::new(entry_type, self.leaf_id.clone(), &self.index_map(), fields);
+        // A windowed index lacks the pre-window IDs, so the short minted ID
+        // could collide with unloaded history; a UUID cannot (same rule as
+        // `append_entry`).
+        if self.window.is_some() {
+            entry.id = uuid::Uuid::new_v4().to_string();
+        }
         let id = entry.id.clone();
         if !self.path.as_os_str().is_empty() && self.path.exists() {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .with_context(|| format!("append to {}", self.path.display()))?;
-            let mut writer = std::io::BufWriter::new(file);
-            write_line(&mut writer, &entry)?;
-            writer.flush()?;
-            // The line is in the file now: index it before the durability
-            // barrier so the in-memory leaf matches what a reload sees.
+            let mut bytes = Vec::new();
+            write_line(&mut bytes, &entry)?;
+            match &self.lease {
+                Some(lease) => lease.append(&self.path, &bytes)?,
+                None => pa_core::session::window::append_cached(
+                    &self.path,
+                    &bytes,
+                    pa_core::session::window::AppendOwnership::Unleased,
+                )
+                .with_context(|| format!("append to {}", self.path.display()))?,
+            }
+            // The line is in the file now: index it so the in-memory leaf
+            // matches what a reload sees (the write left no index state).
             self.push_index(entry);
-            writer.get_ref().sync_data()?;
         } else {
             // The rewrite path serializes the whole index, so the entry must
             // be indexed first; a failed rewrite rolls the index back.
@@ -546,6 +798,9 @@ impl SessionFile {
 
     /// Point the session at a concrete file path (after `create`), preserving entries.
     pub fn set_path(&mut self, path: PathBuf) {
+        if self.path != path {
+            self.lease = None;
+        }
         self.path = path;
     }
 }

@@ -168,6 +168,7 @@ pub struct AgentSessionEngine {
     /// Resolved at create time (before any turn) so summary/state polls
     /// during a live turn stay side-effect-free.
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
+    service_tier: std::sync::RwLock<Option<pa_types::ai::ServiceTier>>,
     /// Built once on the first prompt, reused across prompts, shared
     /// behind an Arc: a running model turn (the admission in
     /// `run_turn_once`), a compaction summarizer, and a refinement run
@@ -416,6 +417,7 @@ impl AgentSessionEngine {
             session_file,
             selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
+            service_tier: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
             session_build: tokio::sync::Mutex::new(()),
             pending_branch: std::sync::Mutex::new(None),
@@ -568,7 +570,10 @@ impl AgentSessionEngine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            crate::goal_state_persist::persisted_goal_state(path.as_deref())
+            tokio::task::spawn_blocking(move || {
+                crate::goal_state_persist::persisted_goal_state(path.as_deref())
+            })
+            .await?
         };
         if let Some(state) = seed {
             let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
@@ -582,29 +587,44 @@ impl AgentSessionEngine {
             built.session.rebuild_branch_context(entries).await?;
             return Ok(());
         }
-        // A recovery build rebuilds its branch from the durable store (TS
-        // one-store recovery: the owned-session worker respawns with
-        // `--resume <sessionFile>` — `createRpcRecoveryArgs` — so the
-        // session's branch, and the compaction walk that reads it, see
-        // the full durable history, never a fresh empty branch). The
-        // daemon worker owns the file writes while the engine keeps an
-        // in-memory manager, so the build adopts the durable branch
-        // here: the walk and the live loop context read the same history
-        // TS's single store holds. A missing or unreadable file keeps
-        // the fresh branch (the worker create fails on a bad store
-        // before any of this runs).
+        // Restore the retained context and certified metadata without loading
+        // discarded message bodies. Unsupported files use the ordinary reader.
         let session_file = self
             .session_file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let durable_branch = session_file
-            .as_deref()
-            .and_then(|path| crate::session_store::SessionFile::open(path).ok())
-            .map(|store| store.branch_file_entries())
-            .filter(|entries| !entries.is_empty());
-        if let Some(entries) = durable_branch {
-            built.session.rebuild_branch_context(entries).await?;
+        if let Some(path) = session_file {
+            let (window, branch) = tokio::task::spawn_blocking(move || {
+                match pa_core::session::window::WindowedSessionStore::open(&path) {
+                    Ok(Some(window)) => (Some(window), None),
+                    Ok(None) | Err(_) => (
+                        None,
+                        crate::session_store::SessionFile::open(&path)
+                            .ok()
+                            .map(|store| store.branch_file_entries()),
+                    ),
+                }
+            })
+            .await?;
+            if let Some(window) = window {
+                built.session.restore_windowed_context(window).await;
+                // This worker holds the session's runtime lease for the
+                // engine's lifetime: its durable appends may certify the
+                // window cache incrementally (exactly one writer per
+                // lease), and the lease's release flushes the certified
+                // snapshot to the sidecar for the next warm open.
+                built
+                    .session
+                    .shared_persistence()
+                    .lock()
+                    .await
+                    .set_append_ownership(
+                        pa_core::session::window::AppendOwnership::SessionLeaseHeld,
+                    );
+            } else if let Some(entries) = branch.filter(|entries| !entries.is_empty()) {
+                built.session.rebuild_branch_context(entries).await?;
+            }
         }
         Ok(())
     }
@@ -937,6 +957,7 @@ impl AgentSessionEngine {
         {
             let mut target = self.provider_target.write().expect("provider target lock");
             *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                 api_key: self.resolve_request_api_key(model),
                 model: model.clone(),
             });
@@ -1152,10 +1173,12 @@ impl AgentSessionEngine {
                 let mut manager = self
                     .runtime
                     .block_on(async { handles.session.lock().await });
-                manager.append_custom_entry(
+                if let Err(error) = manager.append_custom_entry(
                     "rlm_max_depth_state",
                     Some(json!({ "maxDepth": max_depth })),
-                );
+                ) {
+                    eprintln!("pa-daemon: failed to persist rlm_max_depth_state: {error:#}");
+                }
             }
             None => {
                 *self
@@ -1188,10 +1211,12 @@ impl AgentSessionEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(max_depth) = pending {
-            manager.append_custom_entry(
+            if let Err(error) = manager.append_custom_entry(
                 "rlm_max_depth_state",
                 Some(json!({ "maxDepth": max_depth })),
-            );
+            ) {
+                eprintln!("pa-daemon: failed to flush pending rlm_max_depth_state: {error:#}");
+            }
         }
     }
 
@@ -1318,8 +1343,17 @@ impl SessionEngine for AgentSessionEngine {
             let mut session = handles.session.lock().await;
             // The mint persists the `thread_goal_state` entry (TS
             // `_setGoalState`) and consumes one continuation slot; an
-            // inactive or objective-less goal mints nothing.
-            let message = driver.next_continuation_message(&mut session)?;
+            // inactive or objective-less goal mints nothing. A failed
+            // persist ends the boundary without a continuation (TS
+            // `_maybeResumeGoalContinuationAfterRlmWork`'s catch: the
+            // hook must not reject; the unchanged count retries).
+            let message = match driver.next_continuation_message(&mut session) {
+                Ok(message) => message,
+                Err(error) => {
+                    eprintln!("pa-daemon: goal continuation mint persist failed: {error:#}");
+                    None
+                }
+            }?;
             let goal_update = self.publish_goal_state(driver.state());
             Some((
                 crate::engine::PromptRequest {
@@ -1451,6 +1485,18 @@ impl SessionEngine for AgentSessionEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary);
     }
 
+    fn configure_service_tier(&self, tier: Option<pa_types::ai::ServiceTier>) {
+        *self.service_tier.write().expect("service tier lock") = tier;
+        if let Some(target) = self
+            .provider_target
+            .write()
+            .expect("provider target lock")
+            .as_mut()
+        {
+            target.service_tier = tier;
+        }
+    }
+
     fn configure_model(&self, selection: EngineModelSelection) {
         // Merge like the TS runtime config: explicit wire flags replace the
         // current selection; absent fields keep it.
@@ -1494,6 +1540,7 @@ impl SessionEngine for AgentSessionEngine {
         {
             let mut target = self.provider_target.write().expect("provider target lock");
             *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                 api_key: self.resolve_request_api_key(&model),
                 model: model.clone(),
             });
@@ -2713,6 +2760,7 @@ impl AgentSessionEngine {
                             let mut target =
                                 self.provider_target.write().expect("provider target lock");
                             *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                                 api_key: self.resolve_request_api_key(&next),
                                 model: next.clone(),
                             });
@@ -2723,7 +2771,7 @@ impl AgentSessionEngine {
                             .await;
                         if let Some(persistence) = persistence {
                             let mut session = persistence.lock().await;
-                            session.append_model_change(&next.provider, &next.id);
+                            session.append_model_change(&next.provider, &next.id)?;
                         }
                         Ok(())
                     }
@@ -2745,6 +2793,7 @@ impl AgentSessionEngine {
                             let mut target =
                                 self.provider_target.write().expect("provider target lock");
                             *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
                                 api_key: primary_api_key,
                                 model: primary_model.clone(),
                             });
@@ -2756,7 +2805,7 @@ impl AgentSessionEngine {
                             session.append_model_change(
                                 &primary_model.provider,
                                 &primary_model.id,
-                            );
+                            )?;
                         }
                         Ok(Some(format!(
                             "{}/{}",
@@ -3362,17 +3411,28 @@ impl AgentSessionEngine {
                                         // `goal_update` with the next emit),
                                         // and the natural boundary mints the
                                         // budget-limit wrap-up steer.
-                                        if driver.record_assistant_usage(
-                                            &mut session,
-                                            &message_id,
-                                            &message.usage,
-                                        ) == pa_core::session_engine::goal_driver::UsageOutcome::BudgetReached
+                                        // TS `_shouldStopAfterTurn`'s catch:
+                                        // goal accounting must not interrupt
+                                        // the core agent loop; a failed
+                                        // persist only warns.
+                                        match driver
+                                            .record_assistant_usage(&mut session, &message_id, &message.usage)
                                         {
-                                            // TS `_shouldStopAfterTurn`'s budget
-                                            // arm arms the wrap-up steer: the
-                                            // natural boundary reads it.
-                                            goal_budget_crossed
-                                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                                            Ok(
+                                                pa_core::session_engine::goal_driver::UsageOutcome::BudgetReached,
+                                            ) => {
+                                                // TS `_shouldStopAfterTurn`'s budget
+                                                // arm arms the wrap-up steer: the
+                                                // natural boundary reads it.
+                                                goal_budget_crossed
+                                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                eprintln!(
+                                                    "pa-daemon: goal usage accounting persist failed: {error:#}"
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -4450,7 +4510,7 @@ pub(crate) mod tests {
         engine.runtime.block_on(async {
             let mut driver = handles.driver.lock().await;
             let mut session = handles.session.lock().await;
-            driver.complete(&mut session);
+            driver.complete(&mut session).unwrap();
         });
         let mut turn_events: Vec<EngineEvent> = Vec::new();
         admit_request(&engine, request, &mut turn_events);
@@ -4735,14 +4795,16 @@ pub(crate) mod tests {
         assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
     }
 
-    /// The engine session's entries as their persisted wire shapes.
+    /// The engine session's entries as their persisted wire shapes (the
+    /// hydrating snapshot: a windowed manager holds only the suffix).
     fn engine_session_entries(engine: &AgentSessionEngine) -> Vec<pa_types::session::FileEntry> {
         let guard = engine.session.blocking_lock();
         let core = guard.as_deref().expect("session built");
         let persistence = core.session.shared_persistence();
-        engine
-            .runtime
-            .block_on(async { persistence.lock().await.get_all_entries().to_vec() })
+        engine.runtime.block_on(async {
+            let snapshot = persistence.lock().await.history_snapshot();
+            snapshot.await.expect("history snapshot")
+        })
     }
 
     /// An injected custom turn (wire `customMessage`, the RLM child
@@ -5810,9 +5872,10 @@ pub(crate) mod tests {
             return false;
         };
         let persistence = core.session.shared_persistence();
-        let entries = engine
-            .runtime
-            .block_on(async { persistence.lock().await.get_entries() });
+        let entries = engine.runtime.block_on(async {
+            let snapshot = persistence.lock().await.history_snapshot();
+            snapshot.await.expect("history snapshot")
+        });
         entries
             .iter()
             .any(|entry| matches!(entry, pa_types::session::FileEntry::Compaction { .. }))

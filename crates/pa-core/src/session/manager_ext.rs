@@ -58,7 +58,7 @@ impl SessionManager {
         summary: &str,
         task_state: Option<pa_types::session::AgentTaskState>,
         based_on_message_count: usize,
-    ) -> String {
+    ) -> std::io::Result<String> {
         let base = self.next_base();
         let id = base.id.clone().unwrap_or_default();
         self.append_entry(FileEntry::AgentStatus {
@@ -70,18 +70,18 @@ impl SessionManager {
                 },
             },
             base,
-        });
-        id
+        })?;
+        Ok(id)
     }
 
-    pub fn append_git_state(&mut self, git: GitContext) -> String {
+    pub fn append_git_state(&mut self, git: GitContext) -> std::io::Result<String> {
         let base = self.next_base();
         let id = base.id.clone().unwrap_or_default();
         self.append_entry(FileEntry::GitState {
             payload: GitStateEntry { git },
             base,
-        });
-        id
+        })?;
+        Ok(id)
     }
 
     /// Append git state when it changed on the active branch.
@@ -95,11 +95,11 @@ impl SessionManager {
                 return None;
             }
         }
-        Some(self.append_git_state(git))
+        self.append_git_state(git).ok()
     }
 
     fn active_git_context(&self) -> Option<GitContext> {
-        if let Some(context) = self.walk_to_root_first_match("git_state") {
+        if let Some(context) = self.latest_git_context() {
             return Some(context);
         }
         match self.get_header() {
@@ -108,35 +108,9 @@ impl SessionManager {
         }
     }
 
-    /// Walk leaf-to-root on the active branch; first matching entry payload.
-    fn walk_to_root_first_match(&self, kind: &str) -> Option<GitContext> {
-        let mut current = self.get_leaf_id().map(str::to_string);
-        while let Some(id) = current {
-            let Some(entry) = self.get_entry_by_id(&id) else {
-                break;
-            };
-            if let FileEntry::GitState { payload, .. } = entry {
-                return Some(payload.git.clone());
-            }
-            current = entry.parent_id().map(str::to_string);
-        }
-        let _ = kind;
-        None
-    }
-
-    /// Latest agent status on the active branch (leaf-to-root walk).
+    /// Latest agent status on the active branch.
     pub fn get_latest_agent_status(&self) -> Option<AgentStatus> {
-        let mut current = self.get_leaf_id().map(str::to_string);
-        while let Some(id) = current {
-            let Some(entry) = self.get_entry_by_id(&id) else {
-                break;
-            };
-            if let FileEntry::AgentStatus { payload, .. } = entry {
-                return Some(payload.status.clone());
-            }
-            current = entry.parent_id().map(str::to_string);
-        }
-        None
+        self.latest_agent_status_entry()
     }
 
     pub fn append_custom_message_entry(
@@ -145,7 +119,7 @@ impl SessionManager {
         content: pa_types::ai::UserContent,
         display: bool,
         details: Option<serde_json::Value>,
-    ) -> String {
+    ) -> std::io::Result<String> {
         let base = self.next_base();
         let id = base.id.clone().unwrap_or_default();
         self.append_entry(FileEntry::CustomMessage {
@@ -157,12 +131,16 @@ impl SessionManager {
                 rest: Default::default(),
             },
             base,
-        });
-        id
+        })?;
+        Ok(id)
     }
 
     /// Append a label change for a target entry.
-    pub fn append_label_change(&mut self, target_id: &str, label: Option<&str>) -> String {
+    pub fn append_label_change(
+        &mut self,
+        target_id: &str,
+        label: Option<&str>,
+    ) -> std::io::Result<String> {
         assert!(
             self.get_entry_by_id(target_id).is_some(),
             "Entry {target_id} not found"
@@ -176,9 +154,9 @@ impl SessionManager {
                 label: label.map(str::to_string),
             },
             base,
-        });
+        })?;
         self.apply_label_entry(target_id, label, &timestamp);
-        id
+        Ok(id)
     }
 
     /// `getFlatTree`: every entry in file order with its active label and
@@ -254,7 +232,8 @@ impl SessionManager {
         details: Option<serde_json::Value>,
         from_hook: Option<bool>,
         usage: Option<pa_types::ai::Usage>,
-    ) -> String {
+    ) -> std::io::Result<String> {
+        let previous_leaf = self.get_leaf_id().map(str::to_string);
         if let Some(branch_from_id) = branch_from_id {
             assert!(
                 self.get_entry_by_id(branch_from_id).is_some(),
@@ -266,7 +245,7 @@ impl SessionManager {
         }
         let base = self.next_base();
         let id = base.id.clone().unwrap_or_default();
-        self.append_entry(FileEntry::BranchSummary {
+        let appended = self.append_entry(FileEntry::BranchSummary {
             payload: pa_types::session::BranchSummaryEntry {
                 from_id: branch_from_id
                     .map(str::to_string)
@@ -278,7 +257,12 @@ impl SessionManager {
             },
             base,
         });
-        id
+        if let Err(error) = appended {
+            // The move must not outlive the failed append.
+            self.set_leaf_id(previous_leaf.as_deref());
+            return Err(error);
+        }
+        Ok(id)
     }
 }
 
@@ -351,14 +335,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("sessions");
         let mut manager = SessionManager::persisted(tmp.path(), &dir);
-        let a = manager.append_message(user("first"));
-        let b = manager.append_message(assistant());
+        let a = manager.append_message(user("first")).unwrap();
+        let b = manager.append_message(assistant()).unwrap();
         assert_eq!(manager.get_branch(None).len(), 2);
         // Branch from a: the path is just [a].
         manager.branch(&a);
         assert_eq!(manager.get_branch(None).len(), 1);
         // Append after branching creates a sibling of b.
-        let summary_id = manager.branch_with_summary(Some(&a), "went back", None, None, None);
+        let summary_id = manager
+            .branch_with_summary(Some(&a), "went back", None, None, None)
+            .unwrap();
         assert!(manager.get_entry_by_id(&summary_id).is_some());
         // b still exists (sibling branch).
         assert!(manager.get_entry_by_id(&b).is_some());
@@ -369,10 +355,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut manager = SessionManager::in_memory(tmp.path());
         // Creation prefix only: no user content.
-        manager.append_model_change("openai", "m");
-        manager.append_thinking_level_change("medium");
+        manager.append_model_change("openai", "m").unwrap();
+        manager.append_thinking_level_change("medium").unwrap();
         assert!(!manager.has_user_content());
-        manager.append_message(user("real content"));
+        manager.append_message(user("real content")).unwrap();
         assert!(manager.has_user_content());
     }
 
@@ -380,19 +366,21 @@ mod tests {
     fn labels_and_status_on_active_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let mut manager = SessionManager::in_memory(tmp.path());
-        let a = manager.append_message(user("first"));
-        let label_entry = manager.append_label_change(&a, Some("checkpoint"));
+        let a = manager.append_message(user("first")).unwrap();
+        let label_entry = manager.append_label_change(&a, Some("checkpoint")).unwrap();
         assert!(manager.get_entry_by_id(&label_entry).is_some());
         assert_eq!(manager.get_label(&a).as_deref(), Some("checkpoint"));
         // Clear the label.
-        manager.append_label_change(&a, None);
+        manager.append_label_change(&a, None).unwrap();
         assert_eq!(manager.get_label(&a), None);
         // Agent status visible on the active branch.
-        let status_id = manager.append_agent_status(
-            "working",
-            Some(pa_types::session::AgentTaskState::NeedsInput),
-            3,
-        );
+        let status_id = manager
+            .append_agent_status(
+                "working",
+                Some(pa_types::session::AgentTaskState::NeedsInput),
+                3,
+            )
+            .unwrap();
         assert!(manager.get_entry_by_id(&status_id).is_some());
         let status = manager.get_latest_agent_status().unwrap();
         assert_eq!(status.summary, "working");
