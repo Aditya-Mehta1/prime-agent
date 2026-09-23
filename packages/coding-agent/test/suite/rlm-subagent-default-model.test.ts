@@ -109,14 +109,15 @@ describe("subagent default model setting", () => {
 	});
 
 	it.each(["dispatch", "spawn"] as const)(
-		"admits remote %s and cancels through the existing child handle",
+		"admits foreground dispatch or remote spawn (%s) and cancels through the child handle",
 		async (operation) => {
 			let started!: (options: CreateRlmSubagentRuntimeOptions) => void;
 			const preparing = new Promise<CreateRlmSubagentRuntimeOptions>((resolve) => {
 				started = resolve;
 			});
 			const harness = await createHarness({
-				dispatchBinding: remoteBinding,
+				dispatchBinding: operation === "spawn" ? remoteBinding : undefined,
+				rlmDepth: operation === "spawn" ? 1 : 0,
 				api: "sail-responses",
 				provider: "sail",
 				models: [{ id: "worker" }],

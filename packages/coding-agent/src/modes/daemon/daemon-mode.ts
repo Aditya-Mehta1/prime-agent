@@ -2937,11 +2937,9 @@ export class AgentDaemon {
 			options.preparationSignal?.throwIfAborted();
 			if (options.dispatch) {
 				dispatchBinding = await prepareDispatchWorkspace({
-					sourceCwd:
-						options.parentSession.dispatchBinding?.guestCwd ?? options.parentSession.sessionManager.getCwd(),
+					sourceCwd: options.parentSession.sessionManager.getCwd(),
 					sessionDir: options.sessionDir,
 					inputs: options.dispatch.inputs,
-					sourceBinding: options.parentSession.dispatchBinding,
 					signal: options.preparationSignal,
 				});
 			} else if (options.parentSession.dispatchBinding) {

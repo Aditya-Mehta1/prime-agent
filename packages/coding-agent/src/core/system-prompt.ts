@@ -3,6 +3,7 @@
  */
 
 import { buildChildAgentDoctrine, buildRlmPrompt, buildSubagentGuidance } from "./prompts/index.js";
+import { RLM_FOREGROUND_PROMPT } from "./prompts/rlm-foreground.js";
 import { REFINE_SKILL_NAME } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
@@ -58,12 +59,16 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const day = String(now.getDate()).padStart(2, "0");
 	const date = `${year}-${month}-${day}`;
 
-	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
-
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
 	const tools = selectedTools ?? ["ipython"];
 	const hasIpython = tools.includes("ipython");
+	const foregroundSection =
+		(options.rlmDepth ?? 0) === 0 && (allowRecursion ?? true) && hasIpython ? RLM_FOREGROUND_PROMPT : "";
+	const appendSection = [foregroundSection, appendSystemPrompt]
+		.filter(Boolean)
+		.map((section) => `\n\n${section}`)
+		.join("");
 	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
 	const visiblePythonSkillImportNames = getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName);
 	const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);

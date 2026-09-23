@@ -115,14 +115,6 @@ export class SailClient {
 		);
 	}
 
-	async readFile(boxId: string, path: string, signal?: AbortSignal): Promise<Buffer> {
-		const response = await this.request(
-			`/sailboxes/${encodeURIComponent(boxId)}/files?${new URLSearchParams({ path })}`,
-			{ signal },
-		);
-		return Buffer.from(await response.arrayBuffer());
-	}
-
 	async *exec(boxId: string, options: SailExecOptions, signal?: AbortSignal): AsyncGenerator<SailExecEvent> {
 		const response = await this.request(`/sailboxes/${encodeURIComponent(boxId)}/exec`, {
 			method: "POST",

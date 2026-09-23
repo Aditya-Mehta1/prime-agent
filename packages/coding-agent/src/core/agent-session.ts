@@ -12593,6 +12593,9 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		if (this._rlmDepth !== 0) {
+			throw new Error("rlm.dispatch is available only to the foreground agent (depth 0)");
+		}
 		const { inputs, ...spawnKwargs } = kwargs;
 		return this._startRlmChildRun(prompt, spawnKwargs, spawnCode, {
 			inputs: normalizeRlmDispatchInputs(inputs),

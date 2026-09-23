@@ -75,64 +75,6 @@ export async function captureLocalProject(sourceCwd: string, destination: string
 	return { sourceHead, cwdRelative, origin };
 }
 
-const REMOTE_CAPTURE = `import json, os, pathlib, shutil, subprocess, sys, tarfile
-original_cwd, out = sys.argv[1:]
-cwd = original_cwd
-def git(*args):
-    return subprocess.check_output(['git', '-C', cwd, *args]).decode()
-root = git('rev-parse', '--show-toplevel').strip()
-cwd = root
-head = git('rev-parse', 'HEAD').strip()
-if any(line.startswith('160000 ') for line in git('ls-files', '--stage').splitlines()):
-    raise RuntimeError('Dispatch MVP does not copy Git submodules')
-os.makedirs(out + '/tree')
-for name in set(git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\\0')):
-    if not name: continue
-    source = pathlib.Path(root) / name
-    target = pathlib.Path(out) / 'tree' / name
-    if not source.exists() and not source.is_symlink(): continue
-    if source.is_dir() and not source.is_symlink(): raise RuntimeError('Cannot snapshot directory entry: ' + name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target, follow_symlinks=False)
-subprocess.check_call(['git', '-C', root, 'bundle', 'create', out + '/base.bundle', 'HEAD'])
-try: origin = git('remote', 'get-url', 'origin').strip()
-except subprocess.CalledProcessError: origin = ''
-with tarfile.open(out + '.tar.gz', 'w:gz', dereference=False) as archive:
-    archive.add(out, arcname='.')
-print(json.dumps(dict(sourceHead=head, cwdRelative=os.path.relpath(original_cwd, root), origin=origin)))
-`;
-
-async function captureRemoteProject(
-	client: SailClient,
-	source: DispatchBinding,
-	destination: string,
-	signal?: AbortSignal,
-): Promise<CapturedProject> {
-	const path = `/tmp/prime-capture-${randomUUID()}`;
-	try {
-		const result = await client.run(
-			source.boxId,
-			{
-				command: `${shellQuote(source.guestPython)} -c ${shellQuote(REMOTE_CAPTURE)} ${shellQuote(source.guestCwd)} ${shellQuote(path)}`,
-			},
-			signal,
-		);
-		const metadata = JSON.parse(result.stdout.trim()) as CapturedProject;
-		metadata.origin = safeOrigin(metadata.origin);
-		await writeFile(
-			join(destination, "remote.tar.gz"),
-			await client.readFile(source.boxId, `${path}.tar.gz`, signal),
-		);
-		await executeFile("tar", ["-xzf", join(destination, "remote.tar.gz"), "-C", destination]);
-		await rm(join(destination, "remote.tar.gz"));
-		return metadata;
-	} finally {
-		await client
-			.run(source.boxId, { command: `rm -rf -- ${shellQuote(path)} ${shellQuote(`${path}.tar.gz`)}`, timeout: 30 })
-			.catch(() => undefined);
-	}
-}
-
 function copyFilter(source: string): boolean {
 	return ![".git", "__pycache__", ".venv", "node_modules", ".pytest_cache"].includes(basename(source));
 }
@@ -150,44 +92,20 @@ function findRuntime(): string {
 }
 
 async function captureInputs(
-	client: SailClient,
 	inputs: Record<string, string>,
 	sourceCwd: string,
 	destination: string,
-	sourceBinding?: DispatchBinding,
-	signal?: AbortSignal,
 ): Promise<Record<string, string>> {
 	const paths: Record<string, string> = {};
 	for (const [name, path] of Object.entries(inputs)) {
 		if (!/^[a-zA-Z0-9_-]+$/.test(name)) throw new Error(`Invalid dispatch input name: ${name}`);
-		const target = join(destination, name);
-		if (sourceBinding) {
-			const source = path.startsWith("/") ? path : `${sourceBinding.guestCwd}/${path}`;
-			const archive = `/tmp/prime-input-${randomUUID()}.tar.gz`;
-			try {
-				await client.run(
-					sourceBinding.boxId,
-					{
-						command: `tar -czf ${shellQuote(archive)} --exclude=.git -C ${shellQuote(dirname(source))} -- ${shellQuote(basename(source))}`,
-					},
-					signal,
-				);
-				const localArchive = `${target}.tar.gz`;
-				await writeFile(localArchive, await client.readFile(sourceBinding.boxId, archive, signal));
-				await mkdir(target, { recursive: true });
-				await executeFile("tar", ["-xzf", localArchive, "-C", target]);
-				await rm(localArchive);
-				paths[name] = `/workspace/inputs/${name}/${basename(source)}`;
-			} finally {
-				await client
-					.run(sourceBinding.boxId, { command: `rm -f -- ${shellQuote(archive)}`, timeout: 30 })
-					.catch(() => undefined);
-			}
-		} else {
-			const source = resolve(sourceCwd, path);
-			await cp(source, target, { recursive: true, dereference: false, verbatimSymlinks: true, filter: copyFilter });
-			paths[name] = `/workspace/inputs/${name}`;
-		}
+		await cp(resolve(sourceCwd, path), join(destination, name), {
+			recursive: true,
+			dereference: false,
+			verbatimSymlinks: true,
+			filter: copyFilter,
+		});
+		paths[name] = `/workspace/inputs/${name}`;
 	}
 	return paths;
 }
@@ -196,7 +114,6 @@ export interface PrepareDispatchOptions {
 	sourceCwd: string;
 	sessionDir: string;
 	inputs?: Record<string, string>;
-	sourceBinding?: DispatchBinding;
 	signal?: AbortSignal;
 }
 
@@ -209,21 +126,12 @@ export async function prepareDispatchWorkspace(options: PrepareDispatchOptions):
 		options.signal?.throwIfAborted();
 		const project = join(staging, "project");
 		await mkdir(project);
-		const capture = options.sourceBinding
-			? await captureRemoteProject(client, options.sourceBinding, project, options.signal)
-			: await captureLocalProject(options.sourceCwd, project);
+		const capture = await captureLocalProject(options.sourceCwd, project);
 		const runtime = join(staging, "runtime");
 		await cp(findRuntime(), runtime, { recursive: true, filter: copyFilter });
 		await cp(getBundledSkillsDir(), join(staging, "skills"), { recursive: true, filter: copyFilter });
 		await mkdir(join(staging, "inputs"));
-		const inputs = await captureInputs(
-			client,
-			options.inputs ?? {},
-			options.sourceCwd,
-			join(staging, "inputs"),
-			options.sourceBinding,
-			options.signal,
-		);
+		const inputs = await captureInputs(options.inputs ?? {}, options.sourceCwd, join(staging, "inputs"));
 		const branch = `dispatch/${randomUUID()}`;
 		const app = await client.findApp();
 		options.signal?.throwIfAborted();
@@ -239,7 +147,7 @@ export async function prepareDispatchWorkspace(options: PrepareDispatchOptions):
 			guestStateDir: `${GUEST_STATE}/${basename(options.sessionDir)}`,
 			guestPython: `${GUEST_INSTALL}/venv/bin/python`,
 			guestSkillsDir: `${GUEST_INSTALL}/skills`,
-			hostResourceDir: options.sourceBinding?.hostResourceDir ?? resolve(options.sourceCwd),
+			hostResourceDir: resolve(options.sourceCwd),
 			sourceHead: capture.sourceHead,
 			baselineCommit: "",
 			initialBranch: branch,
