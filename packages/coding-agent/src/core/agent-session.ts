@@ -208,8 +208,10 @@ import {
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { findExactModelReferenceMatch } from "./model-resolver.js";
+import { ensureForegroundProjectWorkspace, PROJECT_INPUT_NAME } from "./project-workspace.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
+import { buildForegroundProjectPrompt } from "./prompts/rlm-foreground.js";
 import {
 	isAgentLifecycleFailure,
 	isFauxProviderQueueExhausted,
@@ -1539,6 +1541,7 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
+	private readonly _projectWorkspaceDir?: string;
 	readonly dispatchBinding?: DispatchBinding;
 	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
@@ -1658,6 +1661,10 @@ export class AgentSession {
 		this._serializedRefine = config.serializedRefine ?? false;
 		this._rlmSessionDir = config.rlmSessionDir;
 		this.dispatchBinding = config.dispatchBinding;
+		this._projectWorkspaceDir =
+			this._rlmDepth === 0
+				? ensureForegroundProjectWorkspace(this.sessionManager.getSessionArtifactDir())
+				: undefined;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
 		this._semanticEdges = new SemanticEdgeRecorder({
@@ -5124,6 +5131,9 @@ export class AgentSession {
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
 		const appendSystemPrompt =
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
+		const projectPrompt = this._projectWorkspaceDir
+			? buildForegroundProjectPrompt(this._projectWorkspaceDir)
+			: undefined;
 		const loadedSkills = this._modelVisibleSkills();
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
@@ -5150,7 +5160,7 @@ export class AgentSession {
 					]
 						.filter(Boolean)
 						.join("\n\n")
-				: appendSystemPrompt,
+				: [appendSystemPrompt, projectPrompt].filter(Boolean).join("\n\n"),
 			messagesPath: this.dispatchBinding ? "host-managed; use agent_observe" : this.sessionManager.getSessionFile(),
 			selectedTools: validToolNames,
 			toolSnippets,
@@ -12337,7 +12347,15 @@ export class AgentSession {
 					}
 				});
 				run.unsubscribe = unsubscribeChildEvents;
-				const content = `[task from parent]\n\n${prompt}`;
+				const projectWorkspace = child.dispatchBinding?.inputs[PROJECT_INPUT_NAME] ?? this._projectWorkspaceDir;
+				const projectContext = projectWorkspace
+					? `\n\nProject context: ${projectWorkspace}. Read PROJECT.md and relevant project/ notes. Treat these files as read-only; report findings to your parent, who maintains them.`
+					: "";
+				const parentHistory =
+					!child.dispatchBinding && this._rlmDepth === 0
+						? `\nRetained foreground session: ${this.sessionManager.getSessionFile() ?? "unavailable"}; current branch leaf: ${this.sessionManager.getLeafId() ?? "none"}. Read this branch when your task needs the full prior conversation.`
+						: "";
+				const content = `[task from parent]\n\n${prompt}${projectContext}${parentHistory}`;
 				const spawnMessage: AgentSessionMessage = {
 					role: "custom",
 					customType: AGENT_MESSAGE_CUSTOM_TYPE,
@@ -12597,8 +12615,15 @@ export class AgentSession {
 			throw new Error("rlm.dispatch is available only to the foreground agent (depth 0)");
 		}
 		const { inputs, ...spawnKwargs } = kwargs;
+		const dispatchInputs = normalizeRlmDispatchInputs(inputs);
+		if (this._projectWorkspaceDir) {
+			if (PROJECT_INPUT_NAME in dispatchInputs) {
+				throw new Error(`rlm.dispatch input name ${PROJECT_INPUT_NAME} is reserved for the foreground project`);
+			}
+			dispatchInputs[PROJECT_INPUT_NAME] = this._projectWorkspaceDir;
+		}
 		return this._startRlmChildRun(prompt, spawnKwargs, spawnCode, {
-			inputs: normalizeRlmDispatchInputs(inputs),
+			inputs: dispatchInputs,
 		});
 	}
 
