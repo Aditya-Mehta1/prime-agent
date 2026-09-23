@@ -544,7 +544,7 @@ fn concurrent_creates_for_one_file_share_a_single_launch() {
         .iter()
         .filter(|row| {
             row.get("sessionFile").and_then(Value::as_str)
-                == Some(session_path.to_string_lossy().as_str())
+                == Some(session_path.to_string_lossy().as_ref())
         })
         .collect();
     assert_eq!(
