@@ -150,7 +150,7 @@ impl Supervisor {
             if !resident_process_alive(&resident).await {
                 return Ok(None);
             }
-            self.await_stop_settled(&resident).await?;
+            self.await_stop_settled(&resident, &path_text).await?;
             return Ok(None);
         }
 
@@ -206,10 +206,14 @@ impl Supervisor {
 
     /// Wait for a stopping worker's teardown: the resident leaves the
     /// registry, or its process dies (either frees the file for the
-    /// launch). Past the settle budget the open answers the TS `worker is
-    /// stopping` shape — never the lease rejection a racing launch would
-    /// surface.
-    async fn await_stop_settled(self: &Arc<Self>, resident: &Arc<ResidentWorker>) -> Result<()> {
+    /// launch). Past the settle budget the open answers the TS
+    /// `Session "{path}" worker is stopping` shape — never the lease
+    /// rejection a racing launch would surface.
+    async fn await_stop_settled(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        session_path: &str,
+    ) -> Result<()> {
         let deadline = tokio::time::Instant::now() + STOP_SETTLE_WAIT;
         loop {
             if self.registry.get(&resident.worker_id).await.is_none()
@@ -218,10 +222,7 @@ impl Supervisor {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!(
-                    "Session worker \"{}\" is stopping; retry opening the session shortly",
-                    resident.worker_id
-                );
+                bail!("Session \"{session_path}\" worker is stopping");
             }
             tokio::time::sleep(STOP_SETTLE_POLL).await;
         }
