@@ -108,7 +108,7 @@ impl LoginDialog {
 
     /// One key press (TS `handleInput`): the armed exit keys, the copy
     /// binding, cancel/back, the pending resolutions, then the field.
-    pub fn handle_key(
+    pub(crate) fn handle_key(
         &mut self,
         key: &str,
         kb: &KeybindingsManager,
@@ -334,14 +334,14 @@ mod tests {
         (capture, recorder)
     }
 
-    fn dialog(
+    fn make_dialog(
         options: LoginDialogOptions,
         succeed: bool,
     ) -> (LoginDialog, Arc<RecordingClipboard>) {
         // The wording tests render the bare URL row, so pin the
         // capability gate off regardless of the host terminal.
         crate::hyperlinks::set_hyperlinks_override(Some(false));
-        let handle = crate::login_dialog::LoginDialogHandle::new(options, kb(), Box::new(|| {}));
+        let handle = crate::login_dialog::LoginDialogHandle::new(options, Box::new(|| {}));
         let (clipboard, recorder) = recording_clipboard(succeed);
         (LoginDialog::new(handle, clipboard), recorder)
     }
@@ -365,7 +365,7 @@ mod tests {
     /// default bindings).
     #[test]
     fn renders_the_ts_panel_wording() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize?state=x", None);
@@ -387,7 +387,7 @@ mod tests {
     /// panel (TS `providerNameOverride`).
     #[test]
     fn set_provider_name_titles_the_label() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog.handle().set_provider_name("Linear");
         dialog
             .handle()
@@ -405,7 +405,7 @@ mod tests {
             hide_title: true,
             on_exit: true,
         };
-        let (mut dialog, _) = dialog(options, true);
+        let (dialog, _) = make_dialog(options, true);
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize", None);
@@ -423,7 +423,7 @@ mod tests {
     /// `isTextEntryKeybinding`).
     #[test]
     fn manual_input_renders_the_field_and_submit_hints() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_manual_input("Paste redirect URL below, or complete login in browser:");
@@ -453,7 +453,7 @@ mod tests {
     /// reports the TS success status.
     #[test]
     fn copy_binding_fires_the_clipboard_and_reports_copied() {
-        let (mut dialog, recorder) = dialog(LoginDialogOptions::new("linear"), true);
+        let (mut dialog, recorder) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize", None);
@@ -473,7 +473,7 @@ mod tests {
     /// hint to `retry` (TS `getAuthActionsText("failed")`).
     #[test]
     fn failed_copy_reports_the_error_status_and_retry_label() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), false);
+        let (mut dialog, _) = make_dialog(LoginDialogOptions::new("linear"), false);
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize", None);
@@ -487,7 +487,7 @@ mod tests {
     /// binding types into the field instead (TS `isPrintableInput`).
     #[test]
     fn printable_keys_type_into_the_field_never_copy() {
-        let (mut dialog, recorder) = dialog(LoginDialogOptions::new("linear"), true);
+        let (mut dialog, recorder) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize", None);
@@ -507,7 +507,7 @@ mod tests {
     /// `Input`'s `tui.input.submit` -> `onSubmit`).
     #[tokio::test]
     async fn enter_submits_the_pending_input_with_the_typed_value() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (mut dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         let pending = dialog
             .handle()
             .show_manual_input("Paste redirect URL below, or complete login in browser:");
@@ -526,7 +526,7 @@ mod tests {
     /// cancelled) and the key reports the cancel.
     #[tokio::test]
     async fn cancel_aborts_the_pending_flow() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (mut dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         let pending = dialog
             .handle()
             .show_manual_input("Paste redirect URL below, or complete login in browser:");
@@ -541,7 +541,7 @@ mod tests {
     /// `shouldTreatAsBack`); mid-edit it moves the cursor.
     #[test]
     fn left_arrow_is_back_only_at_the_field_start() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (mut dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_manual_input("Paste redirect URL below, or complete login in browser:");
@@ -584,7 +584,7 @@ mod tests {
             hide_title: true,
             on_exit: true,
         };
-        let (mut dialog, _) = dialog(options, true);
+        let (mut dialog, _) = make_dialog(options, true);
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize", None);
@@ -597,7 +597,7 @@ mod tests {
             LoginDialogAction::Exit
         );
         // Unarmed: ctrl+c is the cancel binding instead.
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (mut dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize", None);
@@ -612,7 +612,7 @@ mod tests {
     /// the pending continue.
     #[tokio::test]
     async fn info_and_continue_screens_render_their_hints() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_info(&["Signed in to the browser flow.".to_string()]);
@@ -643,7 +643,7 @@ mod tests {
     /// The verification-code block renders the label and the bold code.
     #[test]
     fn verification_code_renders_the_label_and_bold_code() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_auth("https://fixture.example/authorize", Some("Code: ABC-123"));
@@ -655,7 +655,7 @@ mod tests {
     /// The waiting screen renders the accent row.
     #[test]
     fn waiting_renders_the_accent_row() {
-        let (mut dialog, _) = dialog(LoginDialogOptions::new("linear"), true);
+        let (dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_waiting("Waiting for browser authentication...");

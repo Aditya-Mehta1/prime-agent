@@ -4668,11 +4668,7 @@ impl SessionUi {
             let _ = login_notes.send(LoginDialogNote::Rendered);
         });
         let options = crate::login_dialog::LoginDialogOptions::new(server);
-        let handle = crate::login_dialog::LoginDialogHandle::new(
-            options,
-            view.editor.keybindings().clone(),
-            request_render,
-        );
+        let handle = crate::login_dialog::LoginDialogHandle::new(options, request_render);
         self.pending_login_dialog = Some(handle.clone());
         let (auth, server) = (auth.0.clone(), server.to_string());
         let login_notes = self.login_notes.clone();

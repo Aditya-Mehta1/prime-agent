@@ -535,7 +535,6 @@ mod tests {
 
         let handle = pa_tui::login_dialog::LoginDialogHandle::new(
             pa_tui::login_dialog::LoginDialogOptions::new("fixture"),
-            pa_tui::keybindings::KeybindingsManager::new(),
             Box::new(|| {}),
         );
         let browser_urls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -581,7 +580,6 @@ mod tests {
         let auth = TerminalMcpAuth::new(dir.path().to_path_buf(), agent_dir.clone());
         let handle = pa_tui::login_dialog::LoginDialogHandle::new(
             pa_tui::login_dialog::LoginDialogOptions::new("nope"),
-            pa_tui::keybindings::KeybindingsManager::new(),
             Box::new(|| {}),
         );
         let error = auth

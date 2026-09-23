@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 
 use crate::clipboard::OscSink;
-use crate::keybindings::KeybindingsManager;
 use crate::search_input::SearchInput;
 
 /// A pending answer the flow awaits (the TS show* promises).
@@ -185,7 +184,6 @@ pub struct LoginDialogHandle {
 
 pub(crate) struct LoginDialogInner {
     pub(crate) state: Mutex<LoginDialogState>,
-    pub(crate) kb: KeybindingsManager,
     pub(crate) request_render: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -212,11 +210,7 @@ pub(crate) fn lock_state(this: &LoginDialogInner) -> std::sync::MutexGuard<'_, L
 }
 
 impl LoginDialogHandle {
-    pub fn new(
-        options: LoginDialogOptions,
-        kb: KeybindingsManager,
-        request_render: Box<dyn Fn() + Send + Sync>,
-    ) -> Self {
+    pub fn new(options: LoginDialogOptions, request_render: Box<dyn Fn() + Send + Sync>) -> Self {
         LoginDialogHandle {
             inner: Arc::new(LoginDialogInner {
                 state: Mutex::new(LoginDialogState {
@@ -230,7 +224,6 @@ impl LoginDialogHandle {
                     pending_input: None,
                     pending_continue: None,
                 }),
-                kb,
                 request_render,
             }),
         }
@@ -401,7 +394,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn handle() -> (LoginDialogHandle, std::sync::Arc<AtomicUsize>) {
+    fn make_handle() -> (LoginDialogHandle, std::sync::Arc<AtomicUsize>) {
         let renders = std::sync::Arc::new(AtomicUsize::new(0));
         let counting = {
             let renders = std::sync::Arc::clone(&renders);
@@ -410,11 +403,7 @@ mod tests {
             }) as Box<dyn Fn() + Send + Sync>
         };
         (
-            LoginDialogHandle::new(
-                LoginDialogOptions::new("linear"),
-                KeybindingsManager::new(),
-                counting,
-            ),
+            LoginDialogHandle::new(LoginDialogOptions::new("linear"), counting),
             renders,
         )
     }
@@ -440,7 +429,7 @@ mod tests {
     /// are muted rows.
     #[test]
     fn show_progress_titles_the_first_section() {
-        let (handle, renders) = handle();
+        let (handle, renders) = make_handle();
         handle.show_progress("Discovered https://fixture.example");
         handle.show_progress("Exchanging authorization code for tokens…");
         assert_eq!(
@@ -459,7 +448,7 @@ mod tests {
     /// instructions (or the TS browser fallback).
     #[test]
     fn show_auth_renders_url_instructions_and_fallback() {
-        let (handle, _) = handle();
+        let (handle, _) = make_handle();
         let url = "https://fixture.example/authorize?code_challenge=x";
         handle.show_progress("Discovered https://fixture.example");
         handle.show_auth(url, Some("Complete login in your browser."));
@@ -495,7 +484,7 @@ mod tests {
     #[test]
     fn show_auth_links_the_url_only_in_capable_terminals() {
         crate::hyperlinks::set_hyperlinks_override(Some(true));
-        let (handle, _) = handle();
+        let (handle, _) = make_handle();
         handle.show_auth("https://fixture.example/authorize", None);
         let linked = rows(&handle)[1];
         assert_eq!(
@@ -507,7 +496,7 @@ mod tests {
             )
         );
         crate::hyperlinks::set_hyperlinks_override(Some(false));
-        let (handle, _) = handle();
+        let (handle, _) = make_handle();
         handle.show_auth("https://fixture.example/authorize", None);
         assert_eq!(
             rows(&handle)[1],
@@ -521,7 +510,7 @@ mod tests {
     /// a blank row, the muted "Verification code" label, a bold code.
     #[test]
     fn show_auth_parses_verification_codes() {
-        let (handle, _) = handle();
+        let (handle, _) = make_handle();
         handle.show_auth("https://x.dev/a", Some("Code: ABC-123"));
         assert_eq!(
             rows(&handle),
@@ -555,7 +544,7 @@ mod tests {
     /// `showPrompt`): the prompt, the field, and the placeholder example.
     #[test]
     fn show_prompt_and_manual_input_lay_out_the_field_blocks() {
-        let (handle, _) = handle();
+        let (handle, _) = make_handle();
         handle.show_auth("https://x.dev/a", None);
         handle.show_manual_input("Paste redirect URL below, or complete login in browser:");
         assert_eq!(
@@ -589,7 +578,7 @@ mod tests {
     /// flow settles instead of waiting on an unmounted panel.
     #[tokio::test]
     async fn abort_resolves_pending_answers_as_cancelled() {
-        let (handle, _) = handle();
+        let (handle, _) = make_handle();
         let input =
             handle.show_manual_input("Paste redirect URL below, or complete login in browser:");
         let continuing = handle.show_continue_info(&["Connected to the browser flow.".to_string()]);
@@ -602,7 +591,7 @@ mod tests {
     /// floating auth-actions row.
     #[test]
     fn show_waiting_renders_the_accent_row() {
-        let (handle, _) = handle();
+        let (handle, _) = make_handle();
         handle.show_auth("https://x.dev/a", None);
         handle.show_waiting("Waiting for browser authentication...");
         assert_eq!(
@@ -623,7 +612,7 @@ mod tests {
     /// repaints.
     #[test]
     fn set_provider_name_retitles_and_renders() {
-        let (handle, renders) = handle();
+        let (handle, renders) = make_handle();
         handle.set_provider_name("Linear");
         assert_eq!(lock_state(&handle.inner).options.provider, "Linear");
         assert_eq!(renders.load(Ordering::SeqCst), 1);
