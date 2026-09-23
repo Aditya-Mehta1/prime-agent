@@ -938,6 +938,15 @@ impl AgentView {
                 lines.push(row);
             }
         }
+        // The `/speed` footer (TS `footerSlot`, the main container's last
+        // child): a dim row only while the display is on with a sample.
+        if let Some(speed) = &self.chrome.speed_text {
+            lines.push(crate::chrome::render_speed_footer(
+                speed,
+                &self.theme,
+                width,
+            ));
+        }
         lines
     }
 
