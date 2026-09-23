@@ -12,7 +12,7 @@ import type {
 } from "openai/resources/chat/completions.js";
 import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
 import { resolveCacheRetention } from "../cache-retention.js";
-import { getEnvApiKey, getPrimeTeamId } from "../env-api-keys.js";
+import { getEnvApiKey } from "../env-api-keys.js";
 import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
 	AssistantMessage,
