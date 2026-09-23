@@ -505,6 +505,7 @@ mod tests {
                 message(
                     "assistant",
                     json!({
+                        "provider": "prime-inference", "model": "internal/glm-5.3-fast",
                         "content": [{ "type": "text", "text": "hi" }],
                         "stopReason": "stop",
                         "usage": spent,
