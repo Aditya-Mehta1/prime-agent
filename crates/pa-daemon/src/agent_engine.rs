@@ -124,6 +124,26 @@ struct RestoredSessionModel {
     fallback_message: Option<String>,
 }
 
+/// The daemon-side adapter onto the engine's attribution producer: the
+/// children registry's observation sites deliver per-origin batches
+/// through this sink (pa-core owns the target row and the durable
+/// append).
+struct ProducerUsageSink(
+    std::sync::Arc<pa_core::session_engine::rlm_usage::RlmChildUsageAttributions>,
+);
+
+impl pa_core::session_engine::rlm_usage::RlmChildUsageSink for ProducerUsageSink {
+    fn record(
+        &self,
+        report: pa_core::session_engine::rlm_usage::RlmChildUsageReport,
+    ) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let producer = std::sync::Arc::clone(&self.0);
+        Box::pin(async move {
+            producer.record_child_usage(report).await;
+        })
+    }
+}
+
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
     pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
@@ -607,6 +627,16 @@ impl AgentSessionEngine {
         // The in-run autonomous continuation hook (the natural mint rides
         // the agent loop; the goal seam keeps its own boundary mint).
         self.install_autonomous_continuation_hook_on(built.session.agent());
+        // The children registry's usage observation feeds the engine's
+        // attribution producer (TS `flushPendingChildUsageAttribution`'s
+        // Rust seam): one sink per build, replacing the retired engine's
+        // (a rebuild closes the old children first, so no observation
+        // crosses the swap).
+        if let Some(children) = &self.children {
+            children.set_usage_sink(std::sync::Arc::new(ProducerUsageSink(
+                std::sync::Arc::clone(&built.rlm_usage),
+            )));
+        }
         // The eager-abort target rides the same mirror (see
         // [`Self::turn_agent`]).
         *self.turn_agent.lock().expect("turn agent lock") =
