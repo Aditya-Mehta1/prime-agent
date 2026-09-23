@@ -68,9 +68,13 @@ four-space continuation indent after, instead of the TS
 `ExpandableEventMessage`'s plain one-column chat inset (the same grammar
 the expanded ipython cells and the agent-message bodies use). The diff
 drops the refinement row's expanded rows from BOTH frames (the collapsed
-row keeps byte-parity) and the run separately asserts the Rust expanded
-rows carry the branch and the TS frames keep the plain-inset baseline
-(the shape the TS team is expected to adopt).
+row keeps byte-parity), but the dropped rows do not leave the comparison:
+their visible content must match word for word (whitespace collapsed, the
+gutter glyphs dropped — the intended divergence is the indentation and
+the wrap points it forces, never the Title/Description/section values
+themselves). The run separately asserts the Rust expanded rows carry the
+branch and the TS frames keep the plain-inset baseline (the shape the TS
+team is expected to adopt).
 
 tmux rules: default socket only (`env -u TMUX`), cmparity-* session names,
 no kill-server; sessions are killed individually at the end.
@@ -675,7 +679,7 @@ def assert_skill_reach(side, collapsed, expanded):
 # the module docstring): the needles cover the expanded block's rows —
 # the expanded summary, the meta, the edit section (label, fields, diff
 # content) — all unique to the expanded state; the collapsed rows carry no
-# branch geometry and stay in the diff.
+# branch geometry and stay in the byte diff.
 REFINEMENT_EXPANSION_NEEDLES = [
     "Create one local memory.",  # the expanded summary (branch-guttered Rust)
     "Refinement refine_cmparity",  # the meta row
@@ -685,22 +689,55 @@ REFINEMENT_EXPANSION_NEEDLES = [
 ]
 
 
-def strip_refinement_expansion(frame, state):
-    """Drop the refinement row's expanded rows from BOTH frames (the
-    expanded-state divergence; the collapsed state is untouched). The
-    field-label rows match by exact stripped text (an indented `Title`
-    on the Rust side, a plain-inset `Title` on the TS side)."""
+def split_refinement_expansion(frame, state):
+    """Split the refinement row's expanded rows out of the frame,
+    returning `(kept, removed)`.
+
+    The kept rows byte-diff (the expanded state's rows hang on the
+    branch grammar on the Rust side — the carried indent divergence; the
+    collapsed state is untouched). The removed rows do NOT leave the
+    comparison: `assert_refinement_content` matches their visible
+    content word for word, so a truncated, omitted, or changed
+    Title/Description/section value fails the run instead of vanishing
+    from the byte diff. The field-label rows match by exact stripped
+    text (an indented `Title` on the Rust side, a plain-inset `Title` on
+    the TS side)."""
     if state != "b_expanded":
-        return frame
-    kept = []
+        return frame, []
+    kept, removed = [], []
     for line in frame.split("\n"):
         plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
         if any(needle in plain for needle in REFINEMENT_EXPANSION_NEEDLES):
+            removed.append(line)
             continue
         if plain.strip() in ("Title", "Description"):
+            removed.append(line)
             continue
         kept.append(line)
-    return "\n".join(kept)
+    return "\n".join(kept), removed
+
+
+def assert_refinement_content(ts_removed, rust_removed):
+    """The removed expansion rows' visible content must match between the
+    products: ANSI-stripped, the branch gutter glyphs dropped, whitespace
+    collapsed. The intended divergence is the indentation and the wrap
+    points the narrower branch content width forces — never the values
+    themselves, so the comparison is over words, not bytes. A frame that
+    never rendered the block fails loudly (the removed set is empty)."""
+
+    def collapsed_content(rows):
+        text = capture_plain_text("\n".join(rows))
+        return re.sub(r"\s+", " ", text.replace("╰─", " ")).strip()
+
+    ts = collapsed_content(ts_removed)
+    rust = collapsed_content(rust_removed)
+    assert ts, "ts: the refinement expansion rows are missing from the frame"
+    assert rust, "rust: the refinement expansion rows are missing from the frame"
+    assert ts == rust, (
+        "the refinement expansion content differs:\n"
+        f"  ts:   {ts}\n"
+        f"  rust: {rust}"
+    )
 
 
 def assert_refinement_branch(side, collapsed, expanded):
@@ -734,29 +771,36 @@ def assert_refinement_branch(side, collapsed, expanded):
 
 
 def align_frame_tops(left, right):
-    """Trim each frame's leading rows down to the first row both frames
-    show.
+    """Trim the scroll-leak rows a bottom-pinned viewport shows, and only
+    those.
 
     The compared frames are bottom-pinned viewport windows; a row-count
-    delta anywhere in the expanded content (a carried divergence, a
-    strip's unequal removal) shifts one window's top over the other's —
-    the tops leak rows the other side scrolled off, which is a window
-    artifact, not a row-shape divergence. Real divergences below the
-    first shared row still diff."""
-    def first_shared_index(a, b):
-        for i, row in enumerate(a):
-            if not row.strip():
-                continue
-            if any(row == other for other in b):
-                return i
-        return None
-
+    delta anywhere in the content shifts one window's top over the
+    other's — the longer frame's top rows are rows the shorter side
+    scrolled off, a window artifact, not a row-shape divergence. The
+    bottom is the anchor: the trailing rows are the same pane tail on
+    both sides, so a proven common suffix must cover the whole length
+    difference before any top row is dropped, and then only the length
+    difference itself comes off the longer frame's top. No row is ever
+    dropped because it exists somewhere in the other frame — a real
+    top-of-screen regression still diffs."""
     left_rows, right_rows = left.split("\n"), right.split("\n")
-    i = first_shared_index(left_rows, right_rows)
-    j = first_shared_index(right_rows, left_rows)
-    if i is not None and j is not None:
-        return "\n".join(left_rows[i:]), "\n".join(right_rows[j:])
-    return left, right
+    n, m = len(left_rows), len(right_rows)
+    if n == m:
+        return left, right
+    longer, shorter = (left_rows, right_rows) if n > m else (right_rows, left_rows)
+    delta = abs(n - m)
+    # Prove the bottoms correspond: count the longest common suffix.
+    suffix = 0
+    while suffix < min(n, m) and longer[len(longer) - 1 - suffix] == shorter[len(shorter) - 1 - suffix]:
+        suffix += 1
+    if suffix < delta:
+        # No proven bottom anchor covering the leak: leave both frames
+        # whole so the diff surfaces every differing row.
+        return left, right
+    if n > m:
+        return "\n".join(left_rows[delta:]), right
+    return left, "\n".join(right_rows[delta:])
 
 
 def diff_lines(left, right):
@@ -977,17 +1021,20 @@ def main():
                 # it; the TS frames have no icon to check (the generic label).
                 assert_rlm_child_icon_colors(rust_frames)
             for state in ("a_collapsed", "b_expanded"):
-                ts_norm = normalize(
-                    strip_refinement_expansion(strip_rlm_child_rows(ts_frames[state]), state),
-                    base,
+                ts_kept, ts_removed = split_refinement_expansion(
+                    strip_rlm_child_rows(ts_frames[state]), state
                 )
-                rust_norm = normalize(
-                    strip_refinement_expansion(
-                        strip_rlm_child_rows(strip_rust_agent_message_preview(rust_frames[state])),
-                        state,
-                    ),
-                    base,
+                rust_kept, rust_removed = split_refinement_expansion(
+                    strip_rlm_child_rows(strip_rust_agent_message_preview(rust_frames[state])),
+                    state,
                 )
+                # The expanded block's rows leave the byte diff (the
+                # carried indent divergence) but not the comparison: their
+                # content must match word for word.
+                if state == "b_expanded":
+                    assert_refinement_content(ts_removed, rust_removed)
+                ts_norm = normalize(ts_kept, base)
+                rust_norm = normalize(rust_kept, base)
                 # The carried divergence: the Rust header shows the
                 # collapsed preview; the TS binary does not (yet).
                 rust_plain = capture_plain_text(rust_frames[state])

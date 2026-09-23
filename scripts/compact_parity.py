@@ -28,16 +28,21 @@ grammar — the markdown body carries the dim `╰─ ` gutter on
 its first row hanging off the `◆` header, every row after the
 four-space continuation indent, the metadata row on the continuation
 indent — instead of the TS `ExpandableEventMessage`'s plain one-column
-chat inset. The diff drops the expanded block's rows from BOTH frames
-(the collapsed loader/summary rows keep byte-parity) and the run
-separately asserts the Rust expanded rows carry the branch and the TS
-frames keep the plain-inset baseline.
+chat inset. The expanded state therefore compares by content, not bytes:
+from the `◆ Context compacted` header down, every visible word must match
+with whitespace collapsed — the intended divergence is the indentation and
+the wrap points it forces, never the summary text itself, so a truncated,
+omitted, or changed body fails the run instead of hiding behind the
+divergence. The run separately asserts the Rust expanded rows carry the
+branch and the TS frames keep the plain-inset baseline; the collapsed
+states keep the byte-for-byte frame diff.
 Frames are normalized for volatile content (versions, session ids,
 durations, spinners) and diffed; the exit code is non-zero when any state
 differs.
 
-tmux rules: default socket only (`env -u TMUX`), cpparity-* session names,
-no kill-server; sessions are killed individually at the end.
+tmux rules: a private `-L` socket (the shared server's panes inherit the
+box daemon env and hijack the Rust side's supervisor socket), cpparity-*
+session names on it; the private server dies with the run.
 """
 
 import argparse
@@ -114,8 +119,38 @@ STATES = [
 ]
 
 
+# An isolated tmux server: panes inherit the SERVER's environment, and a
+# server started from an agent session carries that agent's environment —
+# a herdr `SHELL` auto-launches a live agent in every pane, and a
+# `PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET` makes the Rust TUI
+# attach to a foreign supervisor instead of the harness's own sandbox
+# daemon. The private socket plus the scrubbed client environment below
+# keep the harness panes self-contained; the server dies with the run.
+TMUX_SOCKET = f"compact-parity-{os.getpid()}"
+
+
+def tmux_client_env():
+    """The environment the harness's private tmux server and panes run
+    with: this process's environment minus every prime-agent/herdr
+    variable, and a plain login shell as the pane default (the first
+    installed one; the box has zsh, a bare VM has bash)."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("PRIME_AGENT_", "HERDR_"))}
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
+    env["SHELL"] = next(
+        (shell for shell in ("/bin/zsh", "/bin/bash") if os.path.exists(shell)),
+        "/bin/sh",
+    )
+    return env
+
+
 def tmux(*args, check=True):
-    result = subprocess.run(["env", "-u", "TMUX", "tmux", *args], capture_output=True, text=True)
+    result = subprocess.run(
+        ["tmux", "-L", TMUX_SOCKET, *args],
+        capture_output=True,
+        text=True,
+        env=tmux_client_env(),
+    )
     if check and result.returncode != 0:
         raise RuntimeError(f"tmux {' '.join(args)} failed: {result.stderr}")
     return result.stdout
@@ -127,6 +162,11 @@ def capture(session):
 
 def capture_plain(session):
     return tmux("capture-pane", "-p", "-t", session)
+
+
+def capture_plain_text(frame):
+    """Strip ANSI codes so content assertions match the visible text."""
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", frame)
 
 
 def normalize(frame, root):
@@ -169,10 +209,10 @@ def normalize(frame, root):
     # tmux places trailing resets (foreground 39m, background 49m) at either
     # the end of the row whose styled text just ended or before the next
     # row's default margin; both describe default cells, so drop them.
-    frame = re.sub("\x1b\[39m\n", "\n", frame)
-    frame = re.sub("\n\x1b\[39m(?= )", "\n", frame)
-    frame = re.sub("\x1b\[49m\n", "\n", frame)
-    frame = re.sub("\n\x1b\[49m(?= )", "\n", frame)
+    frame = re.sub(r"\x1b\[39m\n", "\n", frame)
+    frame = re.sub(r"\n\x1b\[39m(?= )", "\n", frame)
+    frame = re.sub(r"\x1b\[49m\n", "\n", frame)
+    frame = re.sub(r"\n\x1b\[49m(?= )", "\n", frame)
     # The tray right side is right-aligned against differing token counts;
     # collapse the alignment padding so the row compares by content.
     frame = re.sub(
@@ -188,34 +228,30 @@ def normalize(frame, root):
     return frame
 
 
-# The expanded compaction block's rows (the carried divergence, see the
-# module docstring). The body needle matches the collapsed summary's
-# whitespace-collapsed text too, so the strip only ever runs on the
-# expanded state.
-COMPACTION_EXPANSION_NEEDLES = [
-    "the session story of the compacted parity session",
-    "Padding sentence to pace the stream",
-    "Compacted from",
-]
+def expanded_block_signature(frame):
+    """The expanded compaction block's content signature: every visible
+    word from the `◆ Context compacted` header down, ANSI-stripped, the
+    branch gutter glyphs dropped, whitespace collapsed.
 
-
-def strip_compaction_expansion(frame, state):
-    """Drop the compaction block's expanded rows from BOTH frames (the
-    expanded-state divergence; the collapsed states are untouched)."""
-    if state != "d_expanded":
-        return frame
-    kept = []
-    for line in frame.split("\n"):
-        plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
-        stripped = plain.strip()
-        if any(needle in plain for needle in COMPACTION_EXPANSION_NEEDLES):
-            continue
-        # The `## Summary` heading renders as its own row: the TS plain
-        # inset, the Rust branch gutter.
-        if stripped in ("Summary", "╰─ Summary"):
-            continue
-        kept.append(line)
-    return "\n".join(kept)
+    The expanded state's intended divergence is indentation (the branch
+    grammar vs the TS plain inset) plus the wrap points the narrower
+    branch content width forces; the block's CONTENT — the heading, the
+    summary body, the metadata row, the focus text — must match word for
+    word. Comparing by collapsed content is what makes that a real check:
+    a byte diff of the diverged block can only fail by design, and
+    dropping the block's rows from the comparison would let a truncated
+    or changed summary body pass. Rows above the header stay out of the
+    signature: the bottom-pinned windows sit at different tops when the
+    diverged block's row counts differ (a window artifact, not content),
+    and those transcript rows are byte-diffed by the settled
+    `c_post_compact` state."""
+    plain = capture_plain_text(frame)
+    rows = plain.split("\n")
+    start = next((i for i, row in enumerate(rows) if "Context compacted" in row), None)
+    if start is None:
+        return None
+    block = "\n".join(rows[start:]).replace("╰─", " ")
+    return re.sub(r"\s+", " ", block).strip()
 
 
 def assert_compaction_branch(ts_expanded, rust_expanded):
@@ -227,8 +263,12 @@ def assert_compaction_branch(ts_expanded, rust_expanded):
     assert " " + gutter + "Summary" in rust_expanded, (
         "rust: the expanded heading row missing the branch gutter"
     )
-    assert " " + gutter + "the session story" in rust_expanded, (
-        "rust: the expanded body missing the branch gutter on its first row"
+    # The faux summary opens with `## Summary`, so the heading row is
+    # the one row the gutter hangs on (the branch grammar's first
+    # content row); the story paragraph sits on the continuation indent
+    # behind it.
+    assert "    the session story" in rust_expanded, (
+        "rust: the expanded body missing the continuation indent"
     )
     assert "    Compacted from" in rust_expanded, (
         "rust: the metadata row missing the continuation indent"
@@ -239,34 +279,51 @@ def assert_compaction_branch(ts_expanded, rust_expanded):
 
 
 def align_frame_tops(left, right):
-    """Trim each frame's leading rows down to the first row both frames
-    show.
+    """Trim the scroll-leak rows a bottom-pinned viewport shows, and only
+    those.
 
     The compared frames are bottom-pinned viewport windows; a row-count
-    delta anywhere in the expanded content (a carried divergence, a
-    strip's unequal removal) shifts one window's top over the other's —
-    the tops leak rows the other side scrolled off, which is a window
-    artifact, not a row-shape divergence. Real divergences below the
-    first shared row still diff."""
-    def first_shared_index(a, b):
-        for i, row in enumerate(a):
-            if not row.strip():
-                continue
-            if any(row == other for other in b):
-                return i
-        return None
-
+    delta anywhere in the content shifts one window's top over the
+    other's — the longer frame's top rows are rows the shorter side
+    scrolled off, a window artifact, not a row-shape divergence. The
+    bottom is the anchor: the trailing rows are the same pane tail on
+    both sides, so a proven common suffix must cover the whole length
+    difference before any top row is dropped, and then only the length
+    difference itself comes off the longer frame's top. No row is ever
+    dropped because it exists somewhere in the other frame — a real
+    top-of-screen regression still diffs."""
     left_rows, right_rows = left.split("\n"), right.split("\n")
-    i = first_shared_index(left_rows, right_rows)
-    j = first_shared_index(right_rows, left_rows)
-    if i is not None and j is not None:
-        return "\n".join(left_rows[i:]), "\n".join(right_rows[j:])
-    return left, right
+    n, m = len(left_rows), len(right_rows)
+    if n == m:
+        return left, right
+    longer, shorter = (left_rows, right_rows) if n > m else (right_rows, left_rows)
+    delta = abs(n - m)
+    # Prove the bottoms correspond: count the longest common suffix.
+    suffix = 0
+    while suffix < min(n, m) and longer[len(longer) - 1 - suffix] == shorter[len(shorter) - 1 - suffix]:
+        suffix += 1
+    if suffix < delta:
+        # No proven bottom anchor covering the leak: leave both frames
+        # whole so the diff surfaces every differing row.
+        return left, right
+    if n > m:
+        return "\n".join(left_rows[delta:]), right
+    return left, "\n".join(right_rows[delta:])
 
 
 def diff_lines(left, right):
     return "\n".join(
         difflib.unified_diff(left.split("\n"), right.split("\n"), fromfile="ts", tofile="rust", lineterm="", n=1)
+    )
+
+
+def diff_words(left, right):
+    """A readable report for the content-signature compare: a word-level
+    unified diff (the signatures are single collapsed lines)."""
+    return "\n".join(
+        difflib.unified_diff(
+            (left or "").split(), (right or "").split(), fromfile="ts", tofile="rust", lineterm="", n=2
+        )
     )
 
 
@@ -360,10 +417,10 @@ def launch(binary, sandbox, shared_cwd, script_path, out_dir):
         HEIGHT,
         "-c",
         shared_cwd,
-        # A plain shell: the box tmux default-shell is herdr's prime-agent
-        # launcher (every new pane boots a live agent TUI, hijacking the
-        # harness's send-keys contract). herdr's documented opt-out keeps
-        # the pane a plain interactive shell.
+        # The scrubbed client environment keeps the pane a plain shell (a
+        # herdr `SHELL` auto-launches a live agent in every pane); the
+        # explicit opt-out belt-and-braces covers a server started
+        # outside the harness with the wrapper still installed.
         "-e",
         "HERDR_PLAIN_SHELL=1",
     )
@@ -516,9 +573,25 @@ def main():
         for state, _ in STATES:
             if state not in ts_frames or state not in rust_frames:
                 continue
-            ts_norm = normalize(strip_compaction_expansion(ts_frames[state], state), base)
-            rust_norm = normalize(strip_compaction_expansion(rust_frames[state], state), base)
+            ts_norm = normalize(ts_frames[state], base)
+            rust_norm = normalize(rust_frames[state], base)
             name = f"{state}-{WIDTH}x{HEIGHT}"
+            if state == "d_expanded":
+                # The expanded block hangs on the branch grammar (the
+                # documented divergence): its content is compared, not
+                # its bytes — see `expanded_block_signature`.
+                ts_sig = expanded_block_signature(ts_norm)
+                rust_sig = expanded_block_signature(rust_norm)
+                if ts_sig is not None and ts_sig == rust_sig:
+                    print(f"PASS {name}")
+                else:
+                    print(f"FAIL {name}")
+                    report = os.path.join(out_dir, f"diff-{name}.txt")
+                    with open(report, "w") as f:
+                        f.write(diff_words(ts_sig, rust_sig))
+                    print(f"  diff: {report}")
+                    failures.append(name)
+                continue
             ts_norm, rust_norm = align_frame_tops(ts_norm, rust_norm)
             if ts_norm == rust_norm:
                 print(f"PASS {name}")
@@ -530,6 +603,9 @@ def main():
                 print(f"  diff: {report}")
                 failures.append(name)
     finally:
+        # The private tmux server dies with the run (its sessions were
+        # killed individually in launch(); this only sweeps the socket).
+        tmux("kill-server", check=False)
         # Rmtree alone leaks the scenario daemons (a killed TUI pane does
         # not take its detached daemon/supervisor pair down; #223): sweep
         # every daemon this run spawned before deleting the sandbox.
