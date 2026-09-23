@@ -36,6 +36,11 @@ use serde_json::{json, Value};
 use crate::registry::ResidentWorker;
 use crate::supervisor::{Supervisor, ROUTE_TIMEOUT_MS, WORKER_NOT_CONNECTED};
 
+/// How many settled teardown waits one open re-checks before it answers
+/// the typed `worker is {state}` error (a holder that never dies must
+/// not ping-pong the open).
+const SETTLED_WAIT_ROUNDS: usize = 2;
+
 /// How long an open waits for a stopping worker's teardown before it
 /// answers the `worker is stopping` error (the dying process still holds
 /// the session lease; a launch inside the window reproduces the bare
@@ -43,6 +48,14 @@ use crate::supervisor::{Supervisor, ROUTE_TIMEOUT_MS, WORKER_NOT_CONNECTED};
 const STOP_SETTLE_WAIT: Duration = Duration::from_secs(10);
 /// The stop-settle poll cadence.
 const STOP_SETTLE_POLL: Duration = Duration::from_millis(50);
+
+/// What reusing one resident answered: the live binding's summary, or a
+/// holder whose teardown frees the file (the caller settles it and
+/// re-checks the file's residents before launching).
+enum ReuseAnswer {
+    Summary(Value),
+    HolderGone,
+}
 
 /// The residents registered for one session file, by reuse class.
 #[derive(Default)]
@@ -74,7 +87,7 @@ impl Supervisor {
     /// LIVE binding (the resident's root summary — the exact create
     /// response shape the client's attach consumes) instead of launching.
     /// `Ok(None)` keeps the launch path (a fresh file, no live resident,
-    /// a no-session create, or a resident that went away mid-wait).
+    /// a no-session create, or a holder whose teardown freed the file).
     pub(crate) async fn reuse_live_worker_for_create(
         self: &Arc<Self>,
         command: &DaemonCommand,
@@ -105,71 +118,78 @@ impl Supervisor {
             return Ok(None);
         }
         let path_text = path.to_string_lossy().to_string();
-        let residents = self.registry.list_by_session_file(&path_text).await;
-        let mut candidates = ReuseCandidates::default();
-        for resident in residents {
-            let state = resident.route_state();
-            if self.is_stopping(&resident) || state.retired {
-                candidates.stopping.get_or_insert(resident);
-            } else if state.connected && state.session_ready {
-                candidates.ready.get_or_insert(resident);
-            } else {
-                candidates.waitable.get_or_insert(resident);
-            }
-        }
 
-        // The live binding answers first: a ready resident is the session's
-        // current worker, and the open is an attach to it.
-        if let Some(resident) = candidates.ready.clone() {
-            if let Some(rejection) =
-                client_owned_conflict(&resident, *lifecycle, client_id, &path_text).await
-            {
-                return Err(anyhow!(rejection));
+        // A settled teardown can hand the file straight to a concurrent
+        // opener's successor: each wait re-checks the file's residents
+        // before launching over it, so the open attaches to that
+        // successor instead of racing it. Bounded — a holder that never
+        // dies answers the typed error, never a ping-pong.
+        let mut settled_waits = 0;
+        loop {
+            let residents = self.registry.list_by_session_file(&path_text).await;
+            let mut candidates = ReuseCandidates::default();
+            for resident in residents {
+                let state = resident.route_state();
+                if self.is_stopping(&resident) || state.retired {
+                    candidates.stopping.get_or_insert(resident);
+                } else if state.connected && state.session_ready {
+                    candidates.ready.get_or_insert(resident);
+                } else {
+                    candidates.waitable.get_or_insert(resident);
+                }
             }
-            return self.reuse_ready_summary(&resident, &path_text).await;
-        }
 
-        // A resident whose replacement is still coming: wait it out inside
-        // the create's route budget, then reuse — the same
-        // replacement-aware wait every client-facing route applies.
-        if let Some(resident) = candidates.waitable.clone() {
-            if let Some(rejection) =
-                client_owned_conflict(&resident, *lifecycle, client_id, &path_text).await
-            {
-                return Err(anyhow!(rejection));
+            // The live binding answers first: a ready resident is the
+            // session's current worker, and the open is an attach to it.
+            for class in [&candidates.ready, &candidates.waitable] {
+                let Some(resident) = class else {
+                    continue;
+                };
+                if let Some(rejection) =
+                    client_owned_conflict(resident, *lifecycle, client_id, &path_text).await
+                {
+                    return Err(anyhow!(rejection));
+                }
+                match self.reuse_summary_or_holder(resident, &path_text).await? {
+                    ReuseAnswer::Summary(summary) => return Ok(Some(summary)),
+                    // The routed resident went away with no successor:
+                    // its teardown settles below, then the re-check runs.
+                    ReuseAnswer::HolderGone => break,
+                }
             }
-            return self.reuse_ready_summary(&resident, &path_text).await;
-        }
 
-        // A stopping or retired resident still owns the lease until its
-        // teardown completes: wait out the settle window so the fresh
-        // launch lands on a free file instead of the lease rejection. A
-        // provably-dead process (a give-up, a crashed child before its
-        // monitor reaps it) never blocks the launch.
-        if let Some(resident) = candidates.stopping.clone() {
-            if !resident_process_alive(&resident).await {
+            // A stopping or retired resident still owns the lease until
+            // its process dies: wait out the settle window so the fresh
+            // launch lands on a free file instead of the lease
+            // rejection.
+            let Some(holder) = candidates.stopping.clone() else {
+                // No resident serves the file: the launch path (a stale
+                // binding rebinds through `record_session_binding` at
+                // create success).
                 return Ok(None);
+            };
+            settled_waits += 1;
+            if settled_waits > SETTLED_WAIT_ROUNDS {
+                bail!(
+                    "Session \"{path_text}\" worker is {}",
+                    self.effective_reuse_state(&holder).await
+                );
             }
-            self.await_stop_settled(&resident, &path_text).await?;
-            return Ok(None);
+            self.await_holder_gone(&holder, &path_text).await?;
         }
-
-        // No resident serves the file: the launch path (a stale binding
-        // rebinds through `record_session_binding` at create success).
-        Ok(None)
     }
 
     /// The summary a reused worker answers the create with: the live
     /// binding's root state. The route is replacement-aware, so an open
     /// landing mid-replay attaches once the replacement's create replay
-    /// completed. `Ok(None)` (the worker went away with no successor)
-    /// keeps the launch path; the never-ready worker answers the TS
-    /// `worker is {state}` shape.
-    async fn reuse_ready_summary(
+    /// completed. A worker that goes away with no successor answers
+    /// [`ReuseAnswer::HolderGone`] (its teardown frees the file); the
+    /// never-ready worker answers the TS `worker is {state}` shape.
+    async fn reuse_summary_or_holder(
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
         session_path: &str,
-    ) -> Result<Option<Value>> {
+    ) -> Result<ReuseAnswer> {
         match self
             .route_command_ready(resident, "get_state", json!({}), ROUTE_TIMEOUT_MS)
             .await
@@ -177,18 +197,20 @@ impl Supervisor {
             Ok(response) => {
                 let data = response.data.filter(|data| data.is_object());
                 match (response.success, data) {
-                    (true, Some(data)) => Ok(Some(data)),
+                    (true, Some(data)) => Ok(ReuseAnswer::Summary(data)),
                     _ => Err(anyhow!(
                         "Session \"{session_path}\" worker is unavailable for reuse: \
                          assigned root session is missing"
                     )),
                 }
             }
-            Err(error) if error.to_string() == WORKER_NOT_CONNECTED => {
-                // The worker retired with no successor in flight: the
-                // launch path owns the file (its lease holder is gone).
-                Ok(None)
-            }
+            // The worker retired with no successor in flight. Its registry
+            // row may already be gone while its process still holds the
+            // lease, so the launch waits for the confirmed death — the
+            // caller re-checks the file's residents once the holder is
+            // gone and attaches to any successor a concurrent opener
+            // launched meanwhile.
+            Err(error) if error.to_string() == WORKER_NOT_CONNECTED => Ok(ReuseAnswer::HolderGone),
             Err(_) => {
                 let state = self.effective_reuse_state(resident).await;
                 let detail = {
@@ -204,25 +226,28 @@ impl Supervisor {
         }
     }
 
-    /// Wait for a stopping worker's teardown: the resident leaves the
-    /// registry, or its process dies (either frees the file for the
-    /// launch). Past the settle budget the open answers the TS
-    /// `Session "{path}" worker is stopping` shape — never the lease
-    /// rejection a racing launch would surface.
-    async fn await_stop_settled(
+    /// Wait until a holder that will not serve the create again is
+    /// confirmed gone: only the process death frees the session file (the
+    /// registry row leaves first — `stop_worker` drops it while the child
+    /// is still exiting, and a launch inside that window resurfaces the
+    /// lease rejection this seam exists to remove). Past the settle
+    /// budget the open answers the TS `Session "{path}" worker is
+    /// {state}` shape — never the lease rejection.
+    async fn await_holder_gone(
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
         session_path: &str,
     ) -> Result<()> {
         let deadline = tokio::time::Instant::now() + STOP_SETTLE_WAIT;
         loop {
-            if self.registry.get(&resident.worker_id).await.is_none()
-                || !resident_process_alive(resident).await
-            {
+            if !resident_process_alive(resident).await {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!("Session \"{session_path}\" worker is stopping");
+                bail!(
+                    "Session \"{session_path}\" worker is {}",
+                    self.effective_reuse_state(resident).await
+                );
             }
             tokio::time::sleep(STOP_SETTLE_POLL).await;
         }
