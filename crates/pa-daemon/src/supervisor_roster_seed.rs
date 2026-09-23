@@ -20,12 +20,9 @@ use crate::supervisor::Supervisor;
 impl Supervisor {
     /// TS `seedRosterLedger`: seed passivated ledger-descended children
     /// into the live roster. Runs exactly once per boot, in the
-    /// background, after adoption settles ([`Self::spawn_roster_boot_seed`]):
-    /// the Rust registry only holds the seed roots once adoption inserted
-    /// the residents (TS runs its seed before adoption over its
-    /// descriptor-loaded workers map; the Rust accept loop is
-    /// deliberately serving before and during adoption either way). Roots
-    /// are the resident workers' session files; only live edges
+    /// background, after adoption settles ([`Self::spawn_roster_boot_seed`])
+    /// so the registry holds the seed roots. Roots are the resident
+    /// workers' session files; only live edges
     /// descending from a root seed (descent is membership at any step of
     /// the parent walk, so a worker registered mid-tree seeds its
     /// descendants, never its siblings or ancestors); a row already
@@ -64,9 +61,9 @@ impl Supervisor {
                 continue;
             }
             // Hydration reads one child at a time, outside the roster
-            // lock (TS: a large ledger must not fan out into concurrent
-            // reads).
-            let candidate = candidate.hydrate();
+            // lock and on the blocking pool (TS: a large ledger must
+            // not fan out into concurrent reads).
+            let candidate = candidate.hydrate().await;
             let mut roster = self.roster.lock().unwrap();
             // Re-check under the lock: the Rust seed runs beside live
             // workers (TS seeds before adoption), so a worker row can
@@ -216,7 +213,7 @@ impl Supervisor {
             let mut summary = entry.summary.clone();
             // Hydration reads one child at a time, outside the roster
             // lock; an unreadable file keeps the marker row as-is.
-            if !hydrate_summary_display(&mut summary, Path::new(&file)) {
+            if !hydrate_summary_display(&mut summary, PathBuf::from(file)).await {
                 continue;
             }
             {
@@ -294,15 +291,15 @@ impl SeededRosterEntry {
     /// The one lazy hydration read (TS `hydratedSeedEntry`): the child
     /// file's display fields only - topology stays the edge's. An
     /// unreadable file keeps the dirname fallback and the `seededCwd`
-    /// marker for a later retry.
-    fn hydrate(mut self) -> Self {
+    /// marker until a live worker's row replaces it.
+    async fn hydrate(mut self) -> Self {
         let file = self
             .summary
             .get("sessionFile")
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_default();
-        if hydrate_summary_display(&mut self.summary, Path::new(&file)) {
+        if hydrate_summary_display(&mut self.summary, PathBuf::from(file)).await {
             self.seeded_cwd = false;
         }
         self
@@ -314,9 +311,14 @@ impl SeededRosterEntry {
 /// persisted model selector, and the persisted thinking level, the same
 /// rows a live worker's summary reports (so a passivated subagent keeps
 /// rendering "model:level" in the agents view) - and nothing else.
-/// Returns whether the file read.
-fn hydrate_summary_display(summary: &mut Value, file: &Path) -> bool {
-    let Some(info) = read_session_info(file) else {
+/// Returns whether the file read. The transcript parse runs on the
+/// blocking pool so a large child JSONL never parks a Tokio worker.
+async fn hydrate_summary_display(summary: &mut Value, file: PathBuf) -> bool {
+    let info = tokio::task::spawn_blocking(move || read_session_info(&file))
+        .await
+        .ok()
+        .flatten();
+    let Some(info) = info else {
         return false;
     };
     if let Some(object) = summary.as_object_mut() {
@@ -432,8 +434,8 @@ pub(crate) mod tests {
         ));
     }
 
-    #[test]
-    fn seeded_rows_shape_matches_the_ts_entry() {
+    #[tokio::test]
+    async fn seeded_rows_shape_matches_the_ts_entry() {
         let dir = std::env::temp_dir().join(format!("pa-seed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let child = dir.join("sub-9.jsonl");
@@ -451,7 +453,8 @@ pub(crate) mod tests {
             1,
             "worker-a",
         ))
-        .hydrate();
+        .hydrate()
+        .await;
         // The hydrated row: cwd from the child file, no seed marker.
         assert!(!candidate.seeded_cwd);
         assert_eq!(candidate.summary["cwd"], "/tmp/project");
@@ -487,7 +490,8 @@ pub(crate) mod tests {
             2,
             "w",
         ))
-        .hydrate();
+        .hydrate()
+        .await;
         assert!(missing.seeded_cwd);
         assert_eq!(missing.summary["cwd"], "/artifacts/gone");
         assert_eq!(missing.summary["sessionId"], "sub-x");

@@ -24,8 +24,7 @@ impl Supervisor {
     /// the boot seed and the create path's family seed
     /// (`supervisor_roster_seed.rs`) publish `roster_update` for rows
     /// that land between subscribes, so the answer itself never reads
-    /// the ledger or a transcript - a per-switch reseed scaled with the
-    /// whole family.
+    /// the ledger or a transcript.
     pub(crate) fn handle_roster_subscribe(
         &self,
         command_id: &str,
@@ -145,9 +144,8 @@ impl Supervisor {
     /// surviving resident root passivates - its summary keeps every
     /// durable display field (model, thinking level, cwd) and drops only
     /// the live-only fields (TS `passivatedWorkerRosterEntry`); a
-    /// top-level row is removed, exactly like the remove+reseed this
-    /// replaces (the reseed never resurrected roots, and a roster that
-    /// passivated every stopped top-level row would grow forever).
+    /// top-level row is removed (a roster that passivated every stopped
+    /// top-level row would grow forever).
     pub(crate) async fn passivate_roster_worker(
         self: &Arc<Self>,
         worker_id: &str,
@@ -177,6 +175,15 @@ impl Supervisor {
         {
             let mut roster = self.roster.lock().unwrap();
             for entry in owned {
+                // The snapshot predates the ledger/roots awaits: a
+                // resumed worker can replace a row meanwhile, and only
+                // rows this worker still owns settle here.
+                if !roster
+                    .get(&entry.agent_id)
+                    .is_some_and(|current| current.worker_id.as_deref() == Some(worker_id))
+                {
+                    continue;
+                }
                 let subagent = entry
                     .summary
                     .get("rlmChildId")
