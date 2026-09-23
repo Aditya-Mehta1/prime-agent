@@ -3729,6 +3729,17 @@ impl Supervisor {
         {
             self.assert_session_name_available(name).await?;
         }
+        // TS `createOrReuseWorker`'s reuse seam: an open of a session file
+        // a live worker already serves answers the LIVE binding (the
+        // client attaches next) instead of launching a second worker over
+        // the same file — a launch the runtime session lease would reject
+        // with `Session is already active`. `None` keeps the launch path.
+        if let Some(summary) = self
+            .reuse_live_worker_for_create(command, &client_id)
+            .await?
+        {
+            return Ok(summary);
+        }
         let (resident, create_summary) = self.launch_worker(command, Some(client_id)).await?;
         // Spawn admission is the moment the supervisor knows the child's
         // edge firsthand. The ledger is the only topology store, so the

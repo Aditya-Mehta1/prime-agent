@@ -990,7 +990,12 @@ fn spawn_supervisor_detached(socket_path: &Path, spawn_cwd: &Path, exe: &Path) -
         .env_remove(pa_daemon::worker::WORKER_SUPERVISOR_SOCKET_ENV)
         .env_remove(pa_daemon::worker::WORKER_SOCKET_ENV)
         .env_remove(pa_daemon::worker::WORKER_INSTANCE_ID_ENV)
-        .env_remove(pa_daemon::worker::WORKER_SCRIPT_ENV);
+        .env_remove(pa_daemon::worker::WORKER_SCRIPT_ENV)
+        // A lease owner id inherited from an ancestor (a CLI running
+        // inside a worker's env) would name a stale session in every
+        // lease this daemon's workers write — TS `daemon-launch.ts`
+        // deletes the same var before spawning the supervisor.
+        .env_remove(pa_daemon::lease::SESSION_LEASE_OWNER_ID_ENV);
     // Detached: own process group, reaped by init, survives this CLI.
     pa_core::platform::process::set_new_process_group(&mut command);
     command
