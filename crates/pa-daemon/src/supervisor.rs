@@ -3731,12 +3731,6 @@ impl Supervisor {
         command: &DaemonCommand,
         client_id: String,
     ) -> Result<Value> {
-        if let DaemonCommand::Create {
-            name: Some(name), ..
-        } = command
-        {
-            self.assert_session_name_available(name).await?;
-        }
         // The per-file open single-flight (TS `openingWorkers`): one
         // create at a time per session file. A concurrent open waits
         // behind this one and then reuses the worker it launched — both
@@ -3747,17 +3741,27 @@ impl Supervisor {
         // client attaches next) instead of launching a second worker over
         // the same file — a launch the runtime session lease would reject
         // with `Session is already active`. `None` keeps the launch path.
+        // The seam runs BEFORE the name check (TS reserves names only on
+        // the fresh-launch path): a named open of an already-active
+        // session reuses it — its own name is not a conflict.
         if let Some(summary) = self
             .reuse_live_worker_for_create(command, &client_id)
             .await?
         {
             return Ok(summary);
         }
+        if let DaemonCommand::Create {
+            name: Some(name), ..
+        } = command
+        {
+            self.assert_session_name_available(name).await?;
+        }
         let (resident, create_summary) = self.launch_worker(command, Some(client_id)).await?;
         // The launch registered its worker (the registry insert precedes
-        // the spawn): the single-flight releases here so a concurrent
-        // open's classification finds the freshly-launched resident.
-        drop(_opening_guard);
+        // the spawn). The single-flight stays held through the spawn
+        // admission below: an admission failure tears the resident down,
+        // and a concurrent open that had just reused it would hold a
+        // summary for a worker that no longer exists.
         // Spawn admission is the moment the supervisor knows the child's
         // edge firsthand. The ledger is the only topology store, so the
         // append's outcome is load-bearing: admission fails if the spawn
@@ -3778,6 +3782,9 @@ impl Supervisor {
             let _ = self.stop_worker(&resident).await;
             return Err(error);
         }
+        // The admission settled: the single-flight may release (a
+        // concurrent open's classification now finds a durable resident).
+        drop(_opening_guard);
         // The response still matches attach/list rows exactly: prefer a
         // fresh get_state, but a degraded one falls back to the
         // authoritative create summary instead of failing the spawn (the
