@@ -1278,13 +1278,12 @@ async fn tui_mcp_login_mounts_the_dialog_and_settles_the_note() {
         rendered.contains("Login to Fixture"),
         "the panel titles the provider label:\n{rendered}"
     );
+    // The pre-auth progress rows are transient (TS `showAuth`'s
+    // `startContent` clears them); the post-paste exchange row stays on
+    // the panel until the flow settles.
     assert!(
-        rendered.contains("Preparing authentication"),
-        "the first progress call adds the section title:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("Discovered https://fixture.example"),
-        "the progress row renders:\n{rendered}"
+        rendered.contains("Exchanging authorization code for tokens…"),
+        "the post-paste progress row renders:\n{rendered}"
     );
     assert!(
         rendered.contains("Complete the sign-in in your browser."),
