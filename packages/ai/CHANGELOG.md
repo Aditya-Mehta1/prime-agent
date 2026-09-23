@@ -1,7 +1,18 @@
 # Changelog
 
-## [0.9.6] - 2026-09-21
+## [0.9.6] - 2026-09-23
 
+- Bumped the Claude Code client version claimed by Anthropic subscription (OAuth) requests from 2.1.261 to 2.1.281: the API gates newer models on the claimed client version and rejects claude-opus-5.5 (and other gated models) with a 400 for anything below 2.280.
+- Changed model generation into a catalog exporter that refreshes reviewed provider catalog entries without adding unreviewed models.
+- Changed Fireworks and Azure OpenAI catalog export to sync from models.dev whitelist policies.
+- Changed the model catalog exporter to refresh curated provider metadata from models.dev where provider slugs map cleanly.
+- Added YAML whitelist and manual policy files for model catalog exports.
+- Claude Opus 5.5 is always-on adaptive like the Fable/Mythos models: it rejects `thinking: {type: "disabled"}` and non-default sampling params with a 400, so the Anthropic and Bedrock providers stop sending both and the thinking-payload tests cover the release id.
+- The model rows themselves ship from the prime-agent-catalog repo (add model: claude-opus-5-5, gpt-6-sol, gpt-6-luna); no compiled-catalog regen is needed.
+- Changed Prime Inference models to take their reasoning controls from the live catalog's `supported_parameters` and `reasoning` metadata: effort routes send only their declared `reasoning_effort` values, toggle-only routes switch reasoning through the declared `reasoning` object, and mandatory routes hide the off level instead of sending disables the gateway rejects.
+- Removed the provider-side Prime Inference team lookup: `X-Prime-Team-ID` now comes only from the caller, so a request with no team header no longer picks up `PRIME_TEAM_ID` or `team_id` from the Prime CLI profile (`~/.prime/config.json`).
+- Added `supportsServiceTier`/`clampServiceTier` as the single service-tier eligibility predicate, service_tier forwarding on the OpenAI-completions path for OpenAI and OpenRouter, and shared service-tier pricing: direct-OpenAI completions costs adjust by the tier the response reports as served, while OpenRouter completions record OpenRouter's reported billed cost (including the upstream bill for BYOK requests) ([RES-1326](https://linear.app/primeintellect/issue/RES-1326)).
+- Removed import-audit dossier fields from MCP catalog parsing and fallback data.
 - Removed vitest retry masking from the AI provider and attach-image tests, and deleted the live-only provider matrices those retries covered.
 - Removed the unused `userProvenance` authoring helper from the public mcp exports.
 - Closed a catalog honesty gap found in live testing: Hugging Face `/mcp` login failed at connect ("no compatible client authentication method (advertised: client_secret_basic, client_secret_post)") because readiness classified providers one-click without ever checking the advertised `token_endpoint_auth_methods_supported`. The engine's fail-closed client-auth decision is now the single source of truth: `decideClientAuthMethod` is exported from `packages/ai/src/mcp/oauth.ts` (the runtime `negotiateAuthMethod` refactors onto it) and the importer runs the same decision through `tokenAuthMethodsSupportPublicClient` / `tokenAuthMethodsSupportConfiguredClient`, so classification and the connect-time gate can never diverge (ENG-6108).
