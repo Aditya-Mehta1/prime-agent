@@ -1392,6 +1392,7 @@ export async function main(args: string[], options?: MainOptions) {
 				socketPath: parsed.daemonSocket,
 				defaultSessionConfig: daemonDefaultSessionConfig,
 				...(parsed.daemonPort !== undefined ? { tcpPort: parsed.daemonPort } : {}),
+				...(parsed.daemonBindHost !== undefined ? { tcpBindHost: parsed.daemonBindHost } : {}),
 			});
 		}
 		return;

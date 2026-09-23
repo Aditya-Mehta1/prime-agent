@@ -144,7 +144,9 @@ import {
 	DAEMON_TCP_MAX_CONNECTIONS,
 	DAEMON_TCP_MAX_LINE_CHARS,
 	DAEMON_TCP_PRE_READY_TIMEOUT_MS,
+	isWildcardBindHost,
 	loadOrCreateDaemonTcpToken,
+	resolveDaemonTcpListenerHost,
 	resolveDaemonTcpPort,
 } from "./daemon-tcp.js";
 import {
@@ -456,6 +458,8 @@ interface DaemonSupervisorOptions {
 	descriptorDir?: string;
 	/** Explicit `--daemon-port` override; env and settings resolve inside the supervisor. */
 	tcpPort?: number;
+	/** Explicit `--daemon-bind` override; env, settings, and the tailnet address resolve inside the supervisor. */
+	tcpBindHost?: string;
 }
 
 interface PersistedSupervisorConfig {
@@ -765,6 +769,8 @@ export class DaemonSupervisor {
 	private tcpPort?: number;
 	/** The `--daemon-port` CLI flag verbatim, so a relaunch restores it; env/settings-derived ports re-resolve on their own. */
 	private tcpPortFlag?: number;
+	/** The `--daemon-bind` CLI flag verbatim, for the same reason as `tcpPortFlag`. */
+	private tcpBindHostFlag?: string;
 	private readonly ready: Promise<void>;
 	private markReady: () => void = () => {};
 	private rejectReady: (error: Error) => void = () => {};
@@ -867,6 +873,7 @@ export class DaemonSupervisor {
 		this.tcpPort = resolveDaemonTcpPort(options.tcpPort, this.settingsManager.getDaemonPort());
 		this.tcpPortFlag =
 			options.tcpPort !== undefined && this.tcpPort === options.tcpPort ? options.tcpPort : undefined;
+		this.tcpBindHostFlag = options.tcpBindHost;
 	}
 
 	async start(): Promise<void> {
@@ -987,6 +994,13 @@ export class DaemonSupervisor {
 	 * difference is that every command line must carry the per-machine token.
 	 * Binding failures (busy port, corrupt token file) fail startup loudly
 	 * instead of leaving a silently unreachable mesh daemon.
+	 *
+	 * The token and every authenticated command cross this socket in plaintext,
+	 * so the listener defaults to this machine's Tailscale address: the tailnet
+	 * encrypts node-to-node traffic, while a wildcard bind would hand the same
+	 * token to every on-path peer on the LAN. A wider interface requires an
+	 * explicit bind host, and a missing tailnet address refuses to start
+	 * (fail closed) rather than falling back to 0.0.0.0.
 	 */
 	private async startTcpListener(): Promise<void> {
 		const port = this.tcpPort;
@@ -996,6 +1010,12 @@ export class DaemonSupervisor {
 		const agentDir = this.defaultSessionConfig.agentDir;
 		if (!agentDir) {
 			throw new Error("Daemon supervisor config is missing agentDir");
+		}
+		const host = resolveDaemonTcpListenerHost(this.tcpBindHostFlag, this.settingsManager.getDaemonTcpBindHost());
+		if (isWildcardBindHost(host)) {
+			this.log(
+				`Daemon TCP listener is binding every interface (${host}): the per-machine token and its commands travel in plaintext, so any on-path peer can capture them. Use the tailnet address unless this network is trusted.`,
+			);
 		}
 		const tokenRecord = loadOrCreateDaemonTcpToken(agentDir);
 		const server = createServer((socket) => this.handleConnection(socket, { tcpAuthToken: tokenRecord.token }));
@@ -1013,11 +1033,11 @@ export class DaemonSupervisor {
 			};
 			server.once("error", onError);
 			server.once("listening", onListening);
-			server.listen({ port, host: "0.0.0.0" });
+			server.listen({ port, host });
 		});
 		this.tcpServer = server;
 		server.on("error", (error) => this.log(`Daemon TCP listener error: ${error.message}`));
-		this.log(`Prime Agent daemon TCP listener listening on 0.0.0.0:${port} (token file: ${tokenRecord.tokenPath})`);
+		this.log(`Prime Agent daemon TCP listener listening on ${host}:${port} (token file: ${tokenRecord.tokenPath})`);
 	}
 
 	private log(message: string): void {
@@ -7800,6 +7820,7 @@ export class DaemonSupervisor {
 				"--daemon-socket",
 				this.socketPath,
 				...(this.tcpPortFlag !== undefined ? ["--daemon-port", String(this.tcpPortFlag)] : []),
+				...(this.tcpBindHostFlag !== undefined ? ["--daemon-bind", this.tcpBindHostFlag] : []),
 			]);
 			const environment = createCliSubprocessEnv();
 			delete environment[DAEMON_CATALOG_ROLE_ENV];

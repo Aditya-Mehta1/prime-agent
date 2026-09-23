@@ -1,9 +1,15 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { join } from "node:path";
+import { spawnSyncHidden } from "../../utils/child-process.js";
 
 /** Environment variable checked for the daemon TCP port (after the CLI flag, before settings). */
 const DAEMON_TCP_PORT_ENV = "PRIME_AGENT_DAEMON_PORT";
+/** Environment variable checked for the daemon TCP bind host (after the CLI flag, before settings). */
+const DAEMON_TCP_BIND_HOST_ENV = "PRIME_AGENT_DAEMON_BIND_HOST";
+/** Budget for the one `tailscale status` call that resolves the default bind host. */
+const DAEMON_TCP_TAILSCALE_TIMEOUT_MS = 15_000;
 
 /** Upper bound for one TCP command line; an oversized line closes the connection. */
 export const DAEMON_TCP_MAX_LINE_CHARS = 1024 * 1024;
@@ -73,6 +79,100 @@ export function resolveDaemonTcpPort(
 		return explicit;
 	}
 	return daemonTcpPortFromEnv(env) ?? settingsPort;
+}
+
+/** The subset of `tailscale status --json` output this module reads. */
+interface TailscaleStatusJson {
+	BackendState?: string;
+	Self?: { Online?: boolean; TailscaleIPs?: unknown };
+}
+
+/**
+ * Resolve this machine's own Tailscale address for the default listener bind.
+ * Returns null when the CLI is missing, the node is not up on a tailnet, or the
+ * status carries no usable address, so the caller can refuse to bind instead of
+ * widening to a wildcard interface. Mirrors the detection core of the Tailscale
+ * mesh helpers (`tailscale status --json`, `Self.Online`/`BackendState`).
+ */
+export function detectTailscaleBindAddress(): string | null {
+	const status = spawnSyncHidden("tailscale", ["status", "--json"], {
+		encoding: "utf8",
+		timeout: DAEMON_TCP_TAILSCALE_TIMEOUT_MS,
+		killSignal: "SIGKILL",
+	});
+	if (status.error || status.status !== 0) {
+		return null;
+	}
+	let parsed: TailscaleStatusJson;
+	try {
+		parsed = JSON.parse(status.stdout ?? "") as TailscaleStatusJson;
+	} catch {
+		return null;
+	}
+	if (parsed === null || typeof parsed !== "object") {
+		return null;
+	}
+	// BackendState covers a daemon that is Running but currently offline (its
+	// address stays assigned); anything else has no tailnet address to bind.
+	if (parsed.Self?.Online !== true && parsed.BackendState !== "Running") {
+		return null;
+	}
+	const addresses = Array.isArray(parsed.Self?.TailscaleIPs)
+		? parsed.Self.TailscaleIPs.filter((address): address is string => typeof address === "string")
+		: [];
+	// Tailscale assigns both a CGNAT IPv4 and an IPv6 address; IPv4 is the one
+	// every peer on the tailnet can reach without extra configuration.
+	return addresses.find((address) => isIP(address) === 4) ?? addresses.find((address) => isIP(address) !== 0) ?? null;
+}
+
+/** True for a bind host that listens on every interface (IPv4 or IPv6 wildcard). */
+export function isWildcardBindHost(host: string): boolean {
+	return host === "0.0.0.0" || host === "::";
+}
+
+/** Validate one configured bind host, naming the source that supplied it. */
+function daemonTcpBindHostFromSource(raw: string, source: string): string {
+	const host = raw.trim();
+	if (isIP(host) === 0) {
+		throw new Error(`Invalid ${source}: "${raw}" (expected an IP address, e.g. the tailnet address of this machine)`);
+	}
+	return host;
+}
+
+/**
+ * Resolve the host the daemon TCP listener binds. Precedence mirrors the port:
+ * explicit CLI flag > env var > settings `daemonTcpBindHost`, and the machine's
+ * Tailscale address when none of them is set. The token and every authenticated
+ * command travel in plaintext, so the listener only widens past the tailnet when
+ * a source above asks for it explicitly; a wildcard default is never returned.
+ * Throws when no source provides a host and this machine has no tailnet address,
+ * so the caller fails closed instead of exposing the port on every interface.
+ */
+export function resolveDaemonTcpListenerHost(
+	explicit: string | undefined,
+	settingsHost: string | undefined,
+	env: Record<string, string | undefined> = process.env,
+): string {
+	const candidates: [string | undefined, string][] = [
+		[explicit, "--daemon-bind"],
+		[env[DAEMON_TCP_BIND_HOST_ENV], DAEMON_TCP_BIND_HOST_ENV],
+		[settingsHost, "settings daemonTcpBindHost"],
+	];
+	for (const [value, source] of candidates) {
+		if (value !== undefined && value !== "") {
+			return daemonTcpBindHostFromSource(value, source);
+		}
+	}
+	const tailscaleAddress = detectTailscaleBindAddress();
+	if (tailscaleAddress === null) {
+		throw new Error(
+			"Refusing to start the daemon TCP listener: this machine has no Tailscale address to bind and no bind host was configured. " +
+				"The per-machine token travels in plaintext over TCP, so the listener binds the tailnet only. " +
+				`Set ${DAEMON_TCP_BIND_HOST_ENV}, the --daemon-bind flag, or settings daemonTcpBindHost to the local address to listen on ` +
+				"(only when that network is trusted), or unset the daemon port to disable the listener.",
+		);
+	}
+	return tailscaleAddress;
 }
 
 /** Timing-safe token comparison that does not leak length differences. */

@@ -5,6 +5,51 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const tokenRace = vi.hoisted(() => ({ armed: false, winnerToken: "" }));
 
+/** Stands in for the one `tailscale status --json` probe the bind host resolution makes. */
+const tailscaleProbe = vi.hoisted(() => ({ calls: 0, result: undefined as unknown }));
+
+vi.mock("../src/utils/child-process.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/utils/child-process.js")>();
+	return {
+		...actual,
+		spawnSyncHidden: (command: string) => {
+			tailscaleProbe.calls++;
+			if (command !== "tailscale") {
+				throw new Error(`unexpected command in bind host test: ${command}`);
+			}
+			return tailscaleProbe.result;
+		},
+	};
+});
+
+/** Point the probe at a node that is up on a tailnet with these own addresses. */
+function tailscaleUp(addresses: string[]): void {
+	tailscaleProbe.result = {
+		status: 0,
+		stdout: JSON.stringify({ BackendState: "Running", Self: { Online: true, TailscaleIPs: addresses } }),
+	};
+}
+
+/** Point the probe at a machine with no usable tailnet address. */
+function tailscaleUnavailable(reason: "missing" | "stopped" | "unparseable"): void {
+	if (reason === "missing") {
+		tailscaleProbe.result = {
+			status: -1,
+			stdout: "",
+			error: Object.assign(new Error("spawn tailscale ENOENT"), { code: "ENOENT" }),
+		};
+		return;
+	}
+	if (reason === "stopped") {
+		tailscaleProbe.result = {
+			status: 0,
+			stdout: JSON.stringify({ BackendState: "Stopped", Self: { Online: false, TailscaleIPs: ["100.64.0.7"] } }),
+		};
+		return;
+	}
+	tailscaleProbe.result = { status: 0, stdout: "not json at all" };
+}
+
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	return {
@@ -21,15 +66,22 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
-const { checkDaemonTcpLineAuth, loadOrCreateDaemonTcpToken, resolveDaemonTcpPort } = await import(
-	"../src/modes/daemon/daemon-tcp.js"
-);
+const {
+	checkDaemonTcpLineAuth,
+	detectTailscaleBindAddress,
+	isWildcardBindHost,
+	loadOrCreateDaemonTcpToken,
+	resolveDaemonTcpListenerHost,
+	resolveDaemonTcpPort,
+} = await import("../src/modes/daemon/daemon-tcp.js");
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 	tokenRace.armed = false;
+	tailscaleProbe.calls = 0;
+	tailscaleProbe.result = undefined;
 });
 
 function tempAgentDir(): string {
@@ -89,6 +141,64 @@ describe("daemon tcp port resolution", () => {
 		expect(() => resolveDaemonTcpPort(undefined, undefined, { PRIME_AGENT_DAEMON_PORT: "not-a-port" })).toThrow(
 			/PRIME_AGENT_DAEMON_PORT/,
 		);
+	});
+});
+
+describe("daemon tcp bind host", () => {
+	it("binds the machine's tailscale address when no source names a host", () => {
+		tailscaleUp(["fd7a:115c:a1e0::1", "100.101.102.103"]);
+		expect(detectTailscaleBindAddress()).toBe("100.101.102.103");
+		expect(resolveDaemonTcpListenerHost(undefined, undefined, {})).toBe("100.101.102.103");
+		// A tailnet without an IPv4 address still has an address worth binding.
+		tailscaleUp(["fd7a:115c:a1e0::1"]);
+		expect(detectTailscaleBindAddress()).toBe("fd7a:115c:a1e0::1");
+		tailscaleUp([]);
+		expect(detectTailscaleBindAddress()).toBeNull();
+	});
+
+	it("refuses to bind when no host is configured and this machine has no tailnet address", () => {
+		for (const reason of ["missing", "stopped", "unparseable"] as const) {
+			tailscaleUnavailable(reason);
+			expect(detectTailscaleBindAddress()).toBeNull();
+			// Fail closed: a missing tailnet address must never widen to 0.0.0.0.
+			expect(() => resolveDaemonTcpListenerHost(undefined, undefined, {})).toThrow(
+				/Refusing to start the daemon TCP listener/,
+			);
+			expect(() => resolveDaemonTcpListenerHost(undefined, undefined, {})).toThrow(/--daemon-bind/);
+			expect(() => resolveDaemonTcpListenerHost(undefined, undefined, {})).toThrow(/daemonTcpBindHost/);
+		}
+	});
+
+	it("prefers the flag > env > settings without probing tailscale", () => {
+		tailscaleUp(["100.64.0.7"]);
+		tailscaleProbe.calls = 0;
+		expect(resolveDaemonTcpListenerHost("10.0.0.5", "10.0.0.7", { PRIME_AGENT_DAEMON_BIND_HOST: "10.0.0.6" })).toBe(
+			"10.0.0.5",
+		);
+		expect(resolveDaemonTcpListenerHost(undefined, "10.0.0.7", { PRIME_AGENT_DAEMON_BIND_HOST: "10.0.0.6" })).toBe(
+			"10.0.0.6",
+		);
+		expect(resolveDaemonTcpListenerHost(undefined, "10.0.0.7", {})).toBe("10.0.0.7");
+		// An explicit host is trusted as given, so the probe never runs.
+		expect(resolveDaemonTcpListenerHost("10.0.0.5", undefined, {})).toBe("10.0.0.5");
+		expect(tailscaleProbe.calls).toBe(0);
+	});
+
+	it("rejects a host that is not an address and names the source", () => {
+		expect(() => resolveDaemonTcpListenerHost("daemon.tailnet.ts.net", undefined, {})).toThrow(/--daemon-bind/);
+		expect(() => resolveDaemonTcpListenerHost(undefined, undefined, { PRIME_AGENT_DAEMON_BIND_HOST: "lan" })).toThrow(
+			/PRIME_AGENT_DAEMON_BIND_HOST/,
+		);
+		expect(() => resolveDaemonTcpListenerHost(undefined, "not-an-ip", {})).toThrow(/daemonTcpBindHost/);
+	});
+
+	it("accepts an explicit wildcard, trims configured hosts, and flags wildcards", () => {
+		tailscaleUnavailable("missing");
+		expect(resolveDaemonTcpListenerHost("0.0.0.0", undefined, {})).toBe("0.0.0.0");
+		expect(resolveDaemonTcpListenerHost("  10.0.0.5  ", undefined, {})).toBe("10.0.0.5");
+		expect(isWildcardBindHost("0.0.0.0")).toBe(true);
+		expect(isWildcardBindHost("::")).toBe(true);
+		expect(isWildcardBindHost("100.101.102.103")).toBe(false);
 	});
 });
 

@@ -264,11 +264,19 @@ export interface Settings {
 	requestTiming?: boolean;
 	/**
 	 * TCP port for the optional daemon mesh listener (read from the global
-	 * scope only). When set, the daemon listens on 0.0.0.0:<port> in addition
-	 * to the unix socket, requiring the per-machine token on every command.
+	 * scope only). When set, the daemon listens on the machine's Tailscale
+	 * address at this port in addition to the unix socket, requiring the
+	 * per-machine token on every command.
 	 * Default: unset - no TCP listener.
 	 */
 	daemonPort?: number;
+	/**
+	 * Address the daemon TCP listener binds (read from the global scope only).
+	 * Default: the machine's Tailscale address. TCP carries the per-machine
+	 * token in plaintext, so set this only to a trusted interface; 0.0.0.0
+	 * exposes the token to every on-path peer.
+	 */
+	daemonTcpBindHost?: string;
 }
 
 export interface AgentTracesSettings {
@@ -926,6 +934,11 @@ export class SettingsManager {
 	getDaemonPort(): number | undefined {
 		const port: unknown = this.globalSettings.daemonPort;
 		return typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535 ? port : undefined;
+	}
+
+	getDaemonTcpBindHost(): string | undefined {
+		const host: unknown = this.globalSettings.daemonTcpBindHost;
+		return typeof host === "string" && host.trim() !== "" ? host.trim() : undefined;
 	}
 
 	setRlmMaxDepth(maxDepth: number): void {

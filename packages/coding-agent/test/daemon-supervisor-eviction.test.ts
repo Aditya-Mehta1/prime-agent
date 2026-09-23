@@ -1357,6 +1357,7 @@ describe("daemon supervisor tcp teardown", () => {
 
 		const restarting = makeSupervisor() as any;
 		restarting.tcpPortFlag = 4100;
+		restarting.tcpBindHostFlag = "100.101.102.103";
 		const relaunchTcp = createServer(() => {});
 		await new Promise<void>((resolve) => relaunchTcp.listen(0, "127.0.0.1", () => resolve()));
 		restarting.tcpServer = relaunchTcp;
@@ -1373,7 +1374,9 @@ describe("daemon supervisor tcp teardown", () => {
 			await expect(restarting.shutdown(0, false, true)).rejects.toThrow("exit 0");
 			expect(spawnCalls).toHaveLength(1);
 			expect(spawnCalls[0]!.portReleased).toBe(true);
-			expect(spawnCalls[0]!.args).toEqual(expect.arrayContaining(["--mode", "daemon", "--daemon-port", "4100"]));
+			expect(spawnCalls[0]!.args).toEqual(
+				expect.arrayContaining(["--mode", "daemon", "--daemon-port", "4100", "--daemon-bind", "100.101.102.103"]),
+			);
 		} finally {
 			exit.mockRestore();
 			if (relaunchTcp.listening) relaunchTcp.close();
