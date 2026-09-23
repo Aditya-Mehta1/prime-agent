@@ -328,12 +328,20 @@ fn speed_command_toggles_the_footer_readout() {
         "the enable note rendered:\n{all}"
     );
     assert!(
-        all.contains(" tok/s"),
-        "the footer readout rendered after the completed response:\n{all}"
-    );
-    assert!(
         all.contains("Speed display off"),
         "the disable note rendered:\n{all}"
+    );
+    // The readout row: a dock line that starts with the rate (the dim
+    // footer renders exactly the speed text) — distinct from the status
+    // notes, which carry "tok/s" mid-sentence.
+    let readout_row = |frame: &str| {
+        frame.lines().any(|line| {
+            line.trim_start().starts_with(|c: char| c.is_ascii_digit()) && line.contains("tok/s")
+        })
+    };
+    assert!(
+        frames.iter().any(|frame| readout_row(frame)),
+        "the footer readout rendered after the completed response:\n{all}"
     );
     let tail = frames
         .iter()
@@ -341,7 +349,7 @@ fn speed_command_toggles_the_footer_readout() {
         .find(|frame| frame.contains("all done"))
         .expect("the second turn's completed message rendered");
     assert!(
-        !tail.contains(" tok/s"),
+        !readout_row(tail),
         "the readout is gone after /speed off:\n{tail}"
     );
 }
