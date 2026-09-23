@@ -479,11 +479,14 @@ export class ModelRegistry {
 		readonly authStorage: AuthStorage,
 		private modelsJsonPath: string | undefined,
 	) {
-		const cachePath = (name: string) => (modelsJsonPath ? join(dirname(modelsJsonPath), name) : undefined);
+		const cachePath = (name: string) => (modelsJsonPath ? join(dirname(modelsJsonPath), "models", name) : undefined);
+		const legacyCachePaths = (name: string) =>
+			modelsJsonPath ? [join(dirname(modelsJsonPath), name), join(dirname(modelsJsonPath), "catalog", name)] : [];
 		this.providerCatalog = new CatalogCache(
 			PROVIDER_MODEL_CATALOG_URL,
 			cachePath("provider-model-catalog.v1.json"),
 			(payload) => parseProviderModelCatalog(payload, this.bundledCatalogModels),
+			legacyCachePaths("provider-model-catalog.v1.json"),
 		);
 		this.loadModels();
 		const reference = new WeakRef(this);
@@ -557,7 +560,9 @@ export class ModelRegistry {
 	}
 
 	private primeInferenceCatalogCachePath(): string | undefined {
-		return this.modelsJsonPath ? join(dirname(this.modelsJsonPath), "prime-inference-models-cache.json") : undefined;
+		return this.modelsJsonPath
+			? join(dirname(this.modelsJsonPath), "models", "prime-inference-models-cache.json")
+			: undefined;
 	}
 
 	private bundledPrimeInferenceModels(): Model<"openai-completions">[] {
@@ -867,6 +872,7 @@ export class ModelRegistry {
 	 * return from the disk/bundled fallback immediately and refresh in the background.
 	 */
 	async refreshAvailableModels(): Promise<Model<Api>[]> {
+		this.startCatalogRefreshTimer();
 		return this.runSerializedEntitlementRefresh(async () => {
 			const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
 			const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
@@ -1230,7 +1236,10 @@ export class ModelRegistry {
 	async getExecutableModels(): Promise<Model<Api>[]> {
 		this.startCatalogRefreshTimer();
 		await this.refreshProviderCatalog(false);
-		await this.runSerializedEntitlementRefresh(() => this.refreshPrivatePrimeInferenceAuthorization());
+		// Subagent discovery must start the same credential-scoped Prime Inference
+		// refresh as the picker, even when no picker has opened in this session.
+		await this.refreshAvailableModels();
+		await this.waitForPendingModelRefreshes(5_000);
 		const availableModels = this.getAvailable();
 		const codexModels = availableModels.filter((model) => model.provider === "openai-codex");
 		if (codexModels.length === 0) {
