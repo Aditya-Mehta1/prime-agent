@@ -19,6 +19,20 @@ use crate::rlm_ledger::RlmLedgerEdge;
 use crate::session_store::read_session_info;
 use crate::supervisor::{ClientRouting, Supervisor, ROUTE_TIMEOUT_MS};
 
+/// The parsed `worker_roster_delta` frame (worker-authenticated): the
+/// slim session summary plus the stale-delta ordering fields — the
+/// worker's monotonic sequence (stamped under its push-order lock together
+/// with the snapshot) and the sending worker process instance (the
+/// watermark key: a replacement process restarts the counter under a new
+/// instance).
+pub(crate) struct WorkerRosterDelta {
+    pub worker_token: String,
+    pub summary: Value,
+    pub removed: Vec<String>,
+    pub sequence: Option<u64>,
+    pub worker_instance_id: Option<String>,
+}
+
 impl Supervisor {
     /// `roster_subscribe` (TS: sets the client flag and answers with the
     /// full roster snapshot; the caller stores the flag). The ledger seed
@@ -145,13 +159,16 @@ impl Supervisor {
         self: &Arc<Self>,
         command_id: &str,
         type_name: &str,
-        worker_token: &str,
-        summary: Value,
-        removed: Vec<String>,
-        sequence: Option<u64>,
-        worker_instance_id: Option<&str>,
+        delta: WorkerRosterDelta,
     ) -> DaemonResponse {
-        let Some(resident) = self.registry.find_by_token(worker_token).await else {
+        let WorkerRosterDelta {
+            worker_token,
+            summary,
+            removed,
+            sequence,
+            worker_instance_id,
+        } = delta;
+        let Some(resident) = self.registry.find_by_token(&worker_token).await else {
             return response_failure(
                 Some(command_id),
                 type_name,
@@ -518,33 +535,43 @@ mod tests {
                 .map(|entry| entry.summary["thinkingLevel"].clone())
                 .expect("the roster entry")
         };
-        let summary = |level: &str| {
+        fn summary(level: &str) -> Value {
             serde_json::json!({
                 "sessionId": "s1",
                 "activeSessionId": "s1",
                 "activity": "idle",
                 "thinkingLevel": level,
             })
-        };
-        let delta = |token: &str, level: &str, sequence: Option<u64>, instance: &str| {
-            supervisor.handle_worker_roster_delta(
-                "d",
-                "worker_roster_delta",
-                token,
-                summary(level),
-                Vec::new(),
-                sequence,
-                Some(instance),
-            )
-        };
+        }
+        async fn delta(
+            supervisor: &Arc<Supervisor>,
+            token: &str,
+            level: &str,
+            sequence: Option<u64>,
+            instance: &str,
+        ) -> DaemonResponse {
+            supervisor
+                .handle_worker_roster_delta(
+                    "d",
+                    "worker_roster_delta",
+                    WorkerRosterDelta {
+                        worker_token: token.to_string(),
+                        summary: summary(level),
+                        removed: Vec::new(),
+                        sequence,
+                        worker_instance_id: Some(instance.to_string()),
+                    },
+                )
+                .await
+        }
 
         // In-order deltas apply (the newer level lands).
-        let applied = delta("seq-token", "high", Some(2), "i1").await;
+        let applied = delta(&supervisor, "seq-token", "high", Some(2), "i1").await;
         assert!(applied.success, "sequence 2 applies: {applied:?}");
         assert_eq!(entry_level(), serde_json::json!("high"));
         // The delayed older snapshot (sequence 1, delivered after 2) answers
         // success but never overwrites the newer state.
-        let stale = delta("seq-token", "low", Some(1), "i1").await;
+        let stale = delta(&supervisor, "seq-token", "low", Some(1), "i1").await;
         assert!(
             stale.success,
             "a stale delta still answers success: {stale:?}"
@@ -555,7 +582,7 @@ mod tests {
             "the stale snapshot never overwrites the newer one"
         );
         // A newer sequence applies again.
-        let applied = delta("seq-token", "low", Some(3), "i1").await;
+        let applied = delta(&supervisor, "seq-token", "low", Some(3), "i1").await;
         assert!(applied.success, "sequence 3 applies: {applied:?}");
         assert_eq!(entry_level(), serde_json::json!("low"));
         // The authoritative pull raises the watermark to the summary's
@@ -576,7 +603,7 @@ mod tests {
             .await;
         assert!(pull.expect("pull entry").summary["thinkingLevel"] == serde_json::json!("off"));
         assert_eq!(entry_level(), serde_json::json!("off"));
-        let stale = delta("seq-token", "high", Some(4), "i1").await;
+        let stale = delta(&supervisor, "seq-token", "high", Some(4), "i1").await;
         assert!(
             stale.success,
             "the in-flight delta answers success: {stale:?}"
@@ -589,18 +616,18 @@ mod tests {
         // A replacement process (a new instance, counter restarted)
         // applies: its sequences are never compared against the
         // predecessor's watermark.
-        let replacement = delta("seq-token", "medium", Some(1), "i2").await;
+        let replacement = delta(&supervisor, "seq-token", "medium", Some(1), "i2").await;
         assert!(
             replacement.success,
             "the replacement applies: {replacement:?}"
         );
         assert_eq!(entry_level(), serde_json::json!("medium"));
         // An unsequenced delta applies (a caller that stamped nothing).
-        let unsequenced = delta("seq-token", "low", None, "i2").await;
+        let unsequenced = delta(&supervisor, "seq-token", "low", None, "i2").await;
         assert!(unsequenced.success, "unsequenced applies: {unsequenced:?}");
         assert_eq!(entry_level(), serde_json::json!("low"));
         // A wrong token still fails authentication, before the gate.
-        let rejected = delta("wrong-token", "high", Some(9), "i2").await;
+        let rejected = delta(&supervisor, "wrong-token", "high", Some(9), "i2").await;
         assert!(
             !rejected.success,
             "authentication still gates: {rejected:?}"

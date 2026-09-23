@@ -188,22 +188,38 @@ impl Client {
         }
     }
 
-    /// Whether any `roster_update` arrives inside the quiet window (with
-    /// the buffered pushes drained first so the window only counts new
-    /// frames).
-    fn roster_push_within(&mut self, window: Duration) -> bool {
-        if !self.roster_updates.is_empty() {
-            return true;
+    /// Drain buffered and live `roster_update` pushes until the socket
+    /// stays quiet for the window: the create's `SessionCreated`
+    /// re-registration refreshes the roster row with the persisted session
+    /// id (a benign idempotent push that can land any time after the
+    /// create), so a quiet-window measurement drains it first.
+    fn drain_roster_pushes(&mut self, quiet: Duration) {
+        self.roster_updates.clear();
+        let mut last_line = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if self.try_read_line().is_some() {
+                last_line = Instant::now();
+            } else if Instant::now() - last_line >= quiet {
+                return;
+            }
         }
+    }
+
+    /// The `roster_update` pushes that arrive inside the window (any
+    /// buffered push counts as an in-window arrival too).
+    fn roster_pushes_within(&mut self, window: Duration) -> Vec<Value> {
+        let mut seen = Vec::new();
+        seen.append(&mut self.roster_updates);
         let deadline = Instant::now() + window;
         while Instant::now() < deadline {
             if let Some(line) = self.try_read_line() {
                 if line["type"] == "roster_update" {
-                    return true;
+                    seen.push(line);
                 }
             }
         }
-        false
+        seen
     }
 }
 
@@ -528,6 +544,13 @@ fn unchanged_thinking_level_answers_without_a_roster_push() {
         "subscribe failed: {subscribed}"
     );
 
+    // Drain the create's benign roster pushes first (the `SessionCreated`
+    // re-registration refresh carries the persisted session id), so the
+    // quiet window below only measures `set_thinking_level` pushes.
+    harness
+        .client
+        .drain_roster_pushes(Duration::from_millis(600));
+
     // low again: no change, success, and no push inside the quiet window.
     harness.client.send_command(
         "stl-same",
@@ -538,10 +561,11 @@ fn unchanged_thinking_level_answers_without_a_roster_push() {
         applied["success"], true,
         "unchanged set_thinking_level failed: {applied}"
     );
+    let pushed = harness
+        .client
+        .roster_pushes_within(Duration::from_millis(1500));
     assert!(
-        !harness
-            .client
-            .roster_push_within(Duration::from_millis(1500)),
-        "an unchanged level must not flush the roster (only effective changes do)"
+        pushed.is_empty(),
+        "an unchanged level must not flush the roster (only effective changes do): {pushed:?}"
     );
 }

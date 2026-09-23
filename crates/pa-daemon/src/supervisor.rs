@@ -2320,11 +2320,13 @@ impl Supervisor {
                     .handle_worker_roster_delta(
                         &command_id,
                         &type_name,
-                        worker_token,
-                        summary.clone(),
-                        removed.clone().unwrap_or_default(),
-                        *sequence,
-                        worker_instance_id.as_deref(),
+                        crate::supervisor_roster::WorkerRosterDelta {
+                            worker_token: worker_token.clone(),
+                            summary: summary.clone(),
+                            removed: removed.clone().unwrap_or_default(),
+                            sequence: *sequence,
+                            worker_instance_id: worker_instance_id.clone(),
+                        },
                     )
                     .await;
                 (vec![response_line(&response)], false)
