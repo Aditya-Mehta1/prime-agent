@@ -11,15 +11,12 @@
 //! and the cancellation reason as the expandable body — where the TS
 //! binary still shows the generic muted `RLM child status` label over the
 //! full content markdown. The TS side is expected to adopt the same rows.
-<<<<<<< HEAD
-=======
 //!
 //! Second divergence (operator directive 2026-09-23): the heartbeat prompt
 //! row renders the `◷` clock glyph — the unified activity dock's
 //! Heartbeats group icon (`chrome.rs::render_activity_dock`) — where the
 //! TS binary still renders the `♥` heart. The TS side is expected to
 //! adopt the same glyph.
->>>>>>> origin/rust
 
 use super::render::{markdown_rows, spacer, text_rows, truncate_text};
 use super::{
