@@ -426,9 +426,17 @@ mod tests {
         // tool-call loading indicator's BashMode color, the sent/received
         // markers success green.
         for (direction, marker, color) in [
-            (AgentMessageDirection::Received, "\u{21e0}", ThemeColor::Success),
+            (
+                AgentMessageDirection::Received,
+                "\u{21e0}",
+                ThemeColor::Success,
+            ),
             (AgentMessageDirection::Sent, "\u{21e2}", ThemeColor::Success),
-            (AgentMessageDirection::Queued, "\u{21e2}", ThemeColor::BashMode),
+            (
+                AgentMessageDirection::Queued,
+                "\u{21e2}",
+                ThemeColor::BashMode,
+            ),
         ] {
             let row = AgentMessageRow {
                 direction,
