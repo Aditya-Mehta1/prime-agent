@@ -135,6 +135,15 @@ pub trait InteractionTelemetry: Send + Sync {
         excluded: bool,
         side_conversation: bool,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// A dispatched bang run settled (event `tui bash bang executed`):
+    /// `duration_bucket` is `lt_5s` / `5_to_30s` / `30s_plus` /
+    /// `unknown`, `exit_class` is `zero` / `nonzero` / `cancelled` /
+    /// `failed` / `unknown` — primitives only.
+    fn bash_bang_executed(
+        &self,
+        duration_bucket: &'static str,
+        exit_class: &'static str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// A prompt-stash transition (`tui prompt stash`): `action` is
     /// `agents_view` / `session_switch` (a draft stashed on the way out)
     /// or `restored` (a stashed draft returned to the editor);
@@ -753,7 +762,7 @@ pub async fn run_interactive(
     // The scoped heartbeat catalog seeds the tray heartbeat label (TS
     // refreshes the catalog on chat open; failures stay silent).
     session.spawn_heartbeat_refresh();
-    session.rebuild_view(&mut view);
+    session.rebuild_view(&mut view, crate::session_ui::RebuildKind::Rebind);
     if let Some(notice) = check_tmux_keyboard_setup().await {
         view.push_entry(crate::chat::ChatEntry::Status {
             text: format!("\u{26a0} {notice}"),
@@ -821,6 +830,11 @@ pub async fn run_interactive(
     // first): a quiet turn only dirties when the 80ms phase advances, not
     // on every loop tick.
     let mut last_pulse_phase: usize = usize::MAX;
+    // Whether the Ctrl+C exit hint painted a frame that the expiry must
+    // clear (TS `showCtrlCExitHint`'s timer repaints it away; without the
+    // flag the loop cannot tell an armed hint from one that just
+    // expired between iterations).
+    let mut hint_painted = false;
     let mut running = true;
     let mut headless_done = false;
     let mut wait_idle_deadline: Option<Instant> = None;
@@ -831,16 +845,15 @@ pub async fn run_interactive(
     // restore still in flight). UI input keeps flowing while reconnecting,
     // so the user can leave with Ctrl+C instead of riding out the window.
     let mut reconnect: Option<ReconnectLoop> = None;
+    // Set once the event channel has returned None (a closed connection's
+    // recv() resolves None instantly and forever — see the events arm).
+    let mut events_closed = false;
     // The session re-attach driver: armed when the direct worker link dies
     // (a killed or crashed worker); it re-attaches through the supervisor
     // so the respawned worker serves the session again.
     let mut session_reconnect: Option<SessionReconnect> = None;
 
     while running {
-        // The tray override row (the Ctrl+C exit hint) follows the session's
-        // hint state on every frame.
-        view.chrome.tray_override = session.tray_override();
-
         // The enhanced-key modes settle once per run: the kitty probe
         // answered, or the modifyOtherKeys fallback fired. One adoption
         // event reports the established combination.
@@ -1048,6 +1061,14 @@ pub async fn run_interactive(
                 // delays the switch.
                 if let Some(renderer) = renderer.is_terminal_mut() {
                     if !session.open_agents_view && session.pending_selection.is_none() {
+                        // The inline paint must reflect tray state the
+                        // handled key just armed (the Ctrl+C exit hint:
+                        // TS `showCtrlCExitHint` requestRender's on the
+                        // key). The loop's refresh below the select only
+                        // reaches the frame gate, and the inline paint
+                        // clears `dirty` — an idle terminal would
+                        // otherwise never show the armed hint.
+                        view.chrome.tray_override = session.tray_override();
                         crate::app::draw(renderer, &mut view)?;
                         // The frame scheduler's bookkeeping follows the
                         // inline paint: the 16ms gate below now measures its
@@ -1112,7 +1133,19 @@ pub async fn run_interactive(
 
         let was_active = session.turn_active;
         tokio::select! {
-            maybe_event = events.recv() => {
+            maybe_event = async {
+                // A closed channel's recv() resolves None instantly and
+                // forever; while the reconnect driver owns the run (§10.2)
+                // that always-ready arm would hot-spin the loop and starve
+                // the tokio timers (the reconnect tick, the frame
+                // deadline). Park the arm instead: the tick drives the
+                // retries until the successor connection replaces the
+                // channel.
+                if events_closed && reconnect.is_some() {
+                    std::future::pending::<()>().await;
+                }
+                events.recv().await
+            } => {
                 match maybe_event {
                     Some(event) => {
                         session.apply_client_event(event, &mut view);
@@ -1194,6 +1227,7 @@ pub async fn run_interactive(
                         }
                     }
                     None => {
+                        events_closed = true;
                         if let Some(update) = session.reconnect.take() {
                             // §10: an update restart closed the daemon; the
                             // UI stays mounted and reconnects.
@@ -1283,6 +1317,7 @@ pub async fn run_interactive(
                         {
                             Ok(Ok(())) => {
                                 events = fresh_events;
+                                events_closed = false;
                                 session.reconnect = None;
                                 reconnect = None;
                                 session.dirty = true;
@@ -1338,7 +1373,10 @@ pub async fn run_interactive(
                         // `session_resynced`), then the reconnected status
                         // lands on the rebuilt chat (TS
                         // `connection_status: "connected"`).
-                        session.rebuild_view(&mut view);
+                        session.rebuild_view(
+                            &mut view,
+                            crate::session_ui::RebuildKind::Resync,
+                        );
                         session.note_as(
                             "Daemon reconnected",
                             crate::chat::StatusKind::Info,
@@ -1449,6 +1487,27 @@ pub async fn run_interactive(
             last_pulse_phase = usize::MAX;
         }
 
+        // The Ctrl+C exit hint expires on a timer (TS
+        // `showCtrlCExitHint`'s setTimeout requestRender): once the
+        // window passed, the hint row repaints away. The deadline arm
+        // lives AFTER the frame gate (a draw resets `render_deadline`,
+        // so an arm placed here would be wiped by the same iteration's
+        // paint and a fully idle loop would never wake at the expiry).
+        if session.ctrl_c_hint_expiry().is_some() {
+            hint_painted = true;
+        } else if hint_painted {
+            session.dirty = true;
+            hint_painted = false;
+        }
+
+        // The tray override row (the Ctrl+C exit hint) follows the
+        // session's hint state on every frame. Refreshed here — after the
+        // select, right before the paint — because a loop-top refresh
+        // goes stale across the select's sleep: the expiry-deadline wake
+        // would repaint the hint with the pre-sleep value and the
+        // corrected tray would never get another paint.
+        view.chrome.tray_override = session.tray_override();
+
         // The frame gate (TS `scheduleRender`: at most one render per
         // MIN_RENDER_INTERVAL_MS): every state change inside the window
         // coalesces into the next frame — a stream burst renders at most
@@ -1484,6 +1543,14 @@ pub async fn run_interactive(
             // (the spinner's next phase boundary) stays: the select needs
             // that wakeup even when nothing else is dirty.
             render_deadline = None;
+        }
+        // The armed exit hint's expiry wakeup (see the pre-gate check):
+        // armed after the gate so the paint above cannot wipe it — an
+        // otherwise idle loop must still wake once to clear the hint row.
+        if let Some(until) = session.ctrl_c_hint_expiry() {
+            if render_deadline.is_none_or(|deadline| deadline > until) {
+                render_deadline = Some(until);
+            }
         }
         if session.exit_requested {
             session.exit_reason = "session_request";
