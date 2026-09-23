@@ -49,8 +49,14 @@ fn older_path_stats_fold_child_usage_attributions() {
         "aggregateUsage":{"input":150,"output":15,"cacheRead":5,"cacheWrite":0,"totalTokens":115,
         "cost":{"input":0.15,"output":0.015,"cacheRead":0,"cacheWrite":0,"total":0.165}}}));
     rows.push(json!({"type":"message","id":"leaf","parentId":"attr","message":{"role":"user","content":"latest","timestamp":0}}));
-    let body: String = rows.into_iter().map(|row| row.to_string() + "
-").collect();
+    let body: String = rows
+        .into_iter()
+        .map(|row| {
+            row.to_string()
+                + "
+"
+        })
+        .collect();
     std::fs::write(&path, &body).unwrap();
     let store = WindowedSessionStore::open(&path).unwrap().unwrap();
     // The discarded assistant reports the aggregate (150/15/5, $0.165),
@@ -59,7 +65,12 @@ fn older_path_stats_fold_child_usage_attributions() {
     assert_eq!(stats.assistant_messages, 1);
     assert_eq!(stats.user_messages, 210);
     assert_eq!(
-        (stats.input, stats.output, stats.cache_read, stats.cache_write),
+        (
+            stats.input,
+            stats.output,
+            stats.cache_read,
+            stats.cache_write
+        ),
         (150, 15, 5, 0)
     );
     assert!((stats.cost - 0.165).abs() < 1e-9);

@@ -1427,7 +1427,10 @@ mod tests {
         assert_eq!(row.fields["message"]["usage"]["input"], json!(15));
         assert_eq!(row.fields["message"]["usage"]["output"], json!(3));
         assert_eq!(row.fields["message"]["usage"]["totalTokens"], json!(12));
-        assert_eq!(row.fields["message"]["usage"]["cost"]["total"].as_f64(), Some(0.01));
+        assert_eq!(
+            row.fields["message"]["usage"]["cost"]["total"].as_f64(),
+            Some(0.01)
+        );
     }
 
     #[test]

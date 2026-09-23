@@ -716,7 +716,10 @@ mod tests {
         assert_eq!(tree["totalUsage"]["output"], json!(5863));
         assert_eq!(tree["totalUsage"]["cacheRead"], json!(18560));
         assert_eq!(tree["totalUsage"]["totalTokens"], json!(23032));
-        assert_eq!(tree["totalUsage"]["cost"]["total"].as_f64(), Some(0.0089957));
+        assert_eq!(
+            tree["totalUsage"]["cost"]["total"].as_f64(),
+            Some(0.0089957)
+        );
         // `get_session_stats` reports the same folded totals over the
         // gap-bridged branch.
         let stats = worker
