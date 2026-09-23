@@ -559,7 +559,8 @@ mod tests {
                 &theme,
                 width,
             );
-            let header_rows = crate::chat::render_text_rows("\u{25c6} Context compacted", header, width);
+            let header_rows =
+                crate::chat::render_text_rows("\u{25c6} Context compacted", header, width);
             assert!(
                 rows.len() > header_rows.len(),
                 "width={width} renders the branch block after the header"

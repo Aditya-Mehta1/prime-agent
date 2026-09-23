@@ -39,8 +39,8 @@ pub(crate) fn branch_rows(lines: Vec<Line>, theme: &crate::theme::Theme) -> Vec<
     lines
         .into_iter()
         .map(|mut line| {
-            let use_gutter = first_content
-                && line.iter().any(|span| !span.content.trim().is_empty());
+            let use_gutter =
+                first_content && line.iter().any(|span| !span.content.trim().is_empty());
             if use_gutter {
                 first_content = false;
             }
@@ -158,7 +158,10 @@ mod tests {
         let line = vec![Span::raw("\nthe session story")];
         let rows = branch_block(line, &theme(), 40);
         let flat = flat(&rows);
-        assert_eq!(flat[0], "    ", "the blank row carries the continuation: {flat:?}");
+        assert_eq!(
+            flat[0], "    ",
+            "the blank row carries the continuation: {flat:?}"
+        );
         assert_eq!(flat[1], " \u{2570}\u{2500} the session story");
     }
 
