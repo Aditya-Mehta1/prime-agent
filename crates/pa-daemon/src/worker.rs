@@ -265,6 +265,51 @@ pub(crate) fn restored_turn_policy(payload: &Value) -> TurnPolicy {
     }
 }
 
+/// The wire text of an aborted turn's settle (the `turn_end` error frame
+/// and the waiting prompt's failure): the turn was aborted before an
+/// assistant message was produced (a user abort, a queued-input
+/// suspension).
+pub(crate) const ABORTED_TURN_SETTLE_ERROR: &str = "No response produced.";
+
+/// The wire text of a prompt cancelled before delivery (the
+/// queue-invisible abort path).
+pub(crate) const PROMPT_ABORTED_BEFORE_DELIVERY: &str = "Prompt aborted before delivery.";
+
+/// The wire text of a queued prompt deleted through a queue mutation (TS
+/// `QueuedMessageError` verbatim).
+pub(crate) const QUEUED_PROMPT_DELETED: &str = "Queued prompt was deleted before delivery.";
+
+/// The typed settle of one queued prompt, as the waiting caller's `done`
+/// channel carries it. The variants classify the settle without reading
+/// the (provider-controllable) error text: an aborted turn is not a
+/// provider failure, and a withdrawn prompt never ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnSettle {
+    /// The turn ran to its settle.
+    Completed,
+    /// The turn was aborted before an assistant message was produced.
+    Aborted,
+    /// The queued prompt was withdrawn before delivery (the abort
+    /// cancel, a queue edit deleting the row); the text is the
+    /// wire-facing reason.
+    Withdrawn(String),
+    /// The turn settled with an error; the text surfaces to the waiting
+    /// caller.
+    Failed(String),
+}
+
+impl TurnSettle {
+    /// The wire-facing failure text of the settle (`None` when the
+    /// settle is a success).
+    pub(crate) fn wire_error(&self) -> Option<String> {
+        match self {
+            TurnSettle::Completed => None,
+            TurnSettle::Aborted => Some(ABORTED_TURN_SETTLE_ERROR.to_string()),
+            TurnSettle::Withdrawn(text) | TurnSettle::Failed(text) => Some(text.clone()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct QueuedItem {
     pub(crate) message: String,
@@ -293,7 +338,7 @@ pub(crate) struct QueuedItem {
     /// Images attached to the prompt (wire `images`: base64 payload plus
     /// mime type), admitted with the message as multimodal content.
     pub(crate) images: Vec<pa_agent::types::ImageContent>,
-    pub(crate) done: Option<oneshot::Sender<Result<(), String>>>,
+    pub(crate) done: Option<oneshot::Sender<TurnSettle>>,
     /// TS `payload.queueVisible`: the item shows in the queue projection
     /// and its delivery projects the active-action phase transitions
     /// (steer/follow-up lanes, agent-message deliveries, prompt-behind-work,
@@ -388,7 +433,11 @@ pub(crate) struct SessionCore {
     /// `priority` to `default` on models without fast mode.
     pub(crate) service_tier: Option<pa_types::ai::ServiceTier>,
     /// The queue delivery modes (TS `agent.steeringMode` / `followUpMode`):
-    /// `"all"` or `"one-at-a-time"`.
+    /// `"all"` or `"one-at-a-time"`. The steering default is `"all"`
+    /// (every queued steer co-delivers as ONE turn at the next
+    /// tool-call boundary; `"one-at-a-time"` stays selectable via the
+    /// setting). The follow-up default is `"one-at-a-time"` (follow-ups
+    /// drain when the session goes idle, one per turn).
     pub(crate) steering_mode: String,
     pub(crate) follow_up_mode: String,
     /// The one-shot forced steering batch (TS `_forcedAllSteeringActionIds`
@@ -466,7 +515,7 @@ impl SessionCore {
             parent_session_id: None,
             child_script: None,
             service_tier: None,
-            steering_mode: "one-at-a-time".to_string(),
+            steering_mode: "all".to_string(),
             follow_up_mode: "one-at-a-time".to_string(),
             forced_all_steering: false,
             scoped_models: Vec::new(),
@@ -863,7 +912,7 @@ impl Worker {
             parent_session_id: None,
             child_script: None,
             service_tier: None,
-            steering_mode: "one-at-a-time".to_string(),
+            steering_mode: "all".to_string(),
             follow_up_mode: "one-at-a-time".to_string(),
             forced_all_steering: false,
             scoped_models: Vec::new(),
@@ -2816,8 +2865,10 @@ impl Worker {
             return response_success(None, "prompt", None);
         }
         match done_rx.await {
-            Ok(Ok(())) => response_success(None, "prompt_and_wait", None),
-            Ok(Err(error)) => response_failure(None, "prompt_and_wait", &error, None),
+            Ok(settle) => match settle.wire_error() {
+                None => response_success(None, "prompt_and_wait", None),
+                Some(error) => response_failure(None, "prompt_and_wait", &error, None),
+            },
             Err(_) => response_failure(None, "prompt_and_wait", "Prompt did not complete", None),
         }
     }
@@ -3547,7 +3598,9 @@ impl Worker {
                             let _ = self.prompt_admissions.cancel(id);
                         }
                         if let Some(done) = item.done {
-                            let _ = done.send(Err("Prompt aborted before delivery.".to_string()));
+                            let _ = done.send(TurnSettle::Withdrawn(
+                                PROMPT_ABORTED_BEFORE_DELIVERY.to_string(),
+                            ));
                         }
                     }
                 }
@@ -5140,11 +5193,9 @@ impl TurnRunner {
             .iter()
             .filter_map(|item| item.admission_id.clone())
             .collect();
-        let items_done: Vec<oneshot::Sender<Result<(), String>>> =
+        let items_done: Vec<oneshot::Sender<TurnSettle>> =
             items.into_iter().filter_map(|item| item.done).collect();
-        let turn_outcome = Arc::new(std::sync::Mutex::new(
-            None::<std::result::Result<(), String>>,
-        ));
+        let turn_outcome = Arc::new(std::sync::Mutex::new(None::<TurnSettle>));
         let turn_outcome_slot = Arc::clone(&turn_outcome);
         // Whether the engine surfaced any `agent_end` boundary this item
         // (each agent run ends with one — retried and continued runs
@@ -5219,6 +5270,7 @@ impl TurnRunner {
                         | EngineEvent::TurnEnd { .. }
                         | EngineEvent::AgentEnd { .. }
                         | EngineEvent::Done(_)
+                        | EngineEvent::DoneAborted
                 );
                 let mut core = core.lock().unwrap();
                 if core.abort_requested
@@ -5306,14 +5358,24 @@ impl TurnRunner {
                     }
                     _ => {}
                 }
-                let done_result = if let EngineEvent::Done(result) = &event {
-                    // The turn boundary releases RLM child prompt tasks
-                    // waiting on it (the parent's continuation request is
-                    // in flight before any child's first turn).
-                    engine.on_turn_done();
-                    Some(result.clone())
-                } else {
-                    None
+                let done_result = match &event {
+                    EngineEvent::Done(result) => {
+                        // The turn boundary releases RLM child prompt tasks
+                        // waiting on it (the parent's continuation request
+                        // is in flight before any child's first turn).
+                        engine.on_turn_done();
+                        Some(match result {
+                            Ok(()) => TurnSettle::Completed,
+                            Err(error) => TurnSettle::Failed(error.clone()),
+                        })
+                    }
+                    // The aborted settle carries its classification
+                    // structurally, not through the error text.
+                    EngineEvent::DoneAborted => {
+                        engine.on_turn_done();
+                        Some(TurnSettle::Aborted)
+                    }
+                    _ => None,
                 };
                 // One event may map to several wire frames (a custom row
                 // is a message_start + message_end pair).
@@ -5430,6 +5492,11 @@ impl TurnRunner {
                         vec![json!({ "type": "turn_end", "error": error })]
                     }
                     EngineEvent::Done(Err(_)) => Vec::new(),
+                    EngineEvent::DoneAborted if !engine_turn_ended => vec![json!({
+                        "type": "turn_end",
+                        "error": ABORTED_TURN_SETTLE_ERROR,
+                    })],
+                    EngineEvent::DoneAborted => Vec::new(),
                     EngineEvent::AutoRetryStart {
                         attempt,
                         max_attempts,
@@ -8377,7 +8444,7 @@ mod turn_stream_tests {
             parent_session_id: None,
             child_script: None,
             service_tier: None,
-            steering_mode: "one-at-a-time".to_string(),
+            steering_mode: "all".to_string(),
             follow_up_mode: "one-at-a-time".to_string(),
             forced_all_steering: false,
             scoped_models: Vec::new(),
@@ -8605,8 +8672,58 @@ mod turn_stream_tests {
         );
     }
 
-    /// Queue mode "one-at-a-time" (the TS default): each queued steer is
-    /// its own turn — one reply each, delivered in order.
+    /// The product default: with no explicit mode set, the steering
+    /// lane co-delivers the queued same-class prefix as ONE batched turn
+    /// at the boundary.
+    #[tokio::test]
+    async fn the_default_mode_co_delivers_the_queued_steering_prefix() {
+        let engine: Arc<dyn SessionEngine> = Arc::new(
+            ScriptedEngine::from_value(json!({ "responses": ["batched reply"] }))
+                .unwrap_or_default(),
+        );
+        let runner = burst_runner(Arc::clone(&engine));
+        {
+            let mut core = runner.core.lock().unwrap();
+            assert_eq!(core.steering_mode, "all", "the default is the batched mode");
+            core.steering
+                .push_back(queued_prompt("steer one", TurnPolicy::Queued));
+            core.steering
+                .push_back(queued_prompt("steer two", TurnPolicy::Queued));
+            core.steering
+                .push_back(queued_prompt("steer three", TurnPolicy::Queued));
+        }
+        let mut subscription = runner.events.subscribe();
+        let core = std::sync::Arc::clone(&runner.core);
+        let work_notify = std::sync::Arc::clone(&runner.work_notify);
+        let running = tokio::spawn(async move { runner.run().await });
+        drain_pump(&core, &work_notify).await;
+        running.abort();
+
+        let events = runner_events(&mut subscription);
+        let starts = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("agent_start"))
+            .count();
+        assert_eq!(
+            starts, 1,
+            "the default batches the whole prefix: {events:?}"
+        );
+        let rows = delivered_rows(&events);
+        assert_eq!(
+            rows,
+            vec![
+                ("user".to_string(), "steer one".to_string()),
+                ("user".to_string(), "steer two".to_string()),
+                ("user".to_string(), "steer three".to_string()),
+                ("assistant".to_string(), "batched reply".to_string()),
+            ],
+            "the default mode co-delivers every parked steer: {rows:?}"
+        );
+    }
+
+    /// Queue mode "one-at-a-time" (selectable via the `steeringMode`
+    /// setting; the product default is "all"): each queued steer is its
+    /// own turn — one reply each, delivered in order.
     #[tokio::test]
     async fn one_at_a_time_delivers_each_queued_steer_as_its_own_turn() {
         // The burst harness has no session store, so the scripted engine
@@ -8620,6 +8737,7 @@ mod turn_stream_tests {
         let runner = burst_runner(Arc::clone(&engine));
         {
             let mut core = runner.core.lock().unwrap();
+            core.steering_mode = "one-at-a-time".to_string();
             core.steering
                 .push_back(queued_prompt("steer one", TurnPolicy::Queued));
             core.steering
@@ -8653,8 +8771,9 @@ mod turn_stream_tests {
 
     /// The forced steering batch (TS `abortAndSendQueued`'s
     /// `_forcedAllSteeringActionIds`): the armed prefix co-delivers as ONE
-    /// turn even under queue mode "one-at-a-time"; an item queued after
-    /// the arm stays out of the batch and delivers next.
+    /// turn even under queue mode "one-at-a-time" (pinned explicitly —
+    /// the product default is "all"); an item queued after the arm stays
+    /// out of the batch and delivers next.
     #[tokio::test]
     async fn forced_batch_delivers_the_armed_prefix_as_one_turn() {
         // (The burst harness serves the first scripted response for every
@@ -8665,6 +8784,7 @@ mod turn_stream_tests {
         let runner = burst_runner(Arc::clone(&engine));
         {
             let mut core = runner.core.lock().unwrap();
+            core.steering_mode = "one-at-a-time".to_string();
             core.steering
                 .push_back(queued_prompt("armed one", TurnPolicy::Queued));
             core.steering
@@ -8800,9 +8920,10 @@ mod turn_stream_tests {
     /// abort of a streaming turn, ALL visible queued plain-user steering
     /// messages send together as the next batched turn — the follow-up
     /// lane stays queued behind it (never discarded, never merged), then
-    /// runs in order once the session goes idle; the default queue mode
-    /// ("one-at-a-time") is unchanged, and with nothing armable queued the
-    /// abort runs abort-only (the queue parks behind the suspension).
+    /// runs in order once the session goes idle; the arm co-delivers
+    /// under any mode (the product default is "all"), and with nothing
+    /// armable queued the abort runs abort-only (the queue parks behind
+    /// the suspension).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
     async fn abort_and_send_queued_delivers_the_steering_batch_then_the_follow_ups() {
@@ -8880,7 +9001,8 @@ mod turn_stream_tests {
         assert!(follow.success, "follow_up failed: {follow:?}");
         // The funnel (the wire command's body — #2599's handler calls it):
         // arm the visible plain-user steering, abort the run, resume the
-        // pump. The default queue mode stays "one-at-a-time".
+        // pump. The arm carries the batch under any mode; the default
+        // itself is asserted below (the product default "all").
         let sent = worker.abort_and_send_queued();
         assert!(sent, "the armed steering batch sent with the abort");
         let idle = tokio::time::timeout(
@@ -8973,8 +9095,8 @@ mod turn_stream_tests {
                 "both lanes drained in order"
             );
             assert_eq!(
-                core.steering_mode, "one-at-a-time",
-                "the default mode is untouched"
+                core.steering_mode, "all",
+                "the default mode is the batched-at-the-boundary product default"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -9100,7 +9222,11 @@ mod turn_stream_tests {
         let outcome = settled
             .expect("the waiting prompt never resolved")
             .expect("the waiter sender dropped without an outcome");
-        assert!(outcome.is_ok(), "the settled turn's outcome: {outcome:?}");
+        assert_eq!(
+            outcome,
+            TurnSettle::Completed,
+            "the settled turn's outcome: {outcome:?}"
+        );
         // The idle flip (and the queue projection after it) already
         // happened when the waiter resolved.
         {

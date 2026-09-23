@@ -405,6 +405,52 @@ Reference: `docs/update-flow-state-machine.md` (§3/§4/§7/§9) over the TS
   commit/stop drivers are slices 2-3).
 
 
+## Update artifact selection + direct install hardening (2026-09-23)
+
+Reference: TS `version-check.ts` / `native-update.ts` / `native-installation.ts`
+over `docs/update-flow-state-machine.md` §4. Incident class (the
+`0.10.0-rust-64f66e3d` dogfood train installed over newer code, twice
+corrupting a Mach-O with in-place `cp` during manual installs):
+a hand-named release directory whose binary reports a different version, and
+same-base opaque build tags (`-rust-<gitsha>`) that semver orders by tag
+string — which is not build recency.
+
+- Divergences (recorded):
+  - The update baseline anchors on the release directory the RUNNING binary
+    occupies (`install::running_release`), and the active launcher must name
+    the same release. TS anchors the location the same way but keeps reading
+    the version from the launcher; a launcher that disagrees with the
+    running binary is an inconsistent installation and the Rust plan
+    refuses it outright instead of comparing against the launcher's version.
+    A running binary from an unparseable directory (`0.10.0-rust-<sha>`)
+    is refused as a baseline: the updater never plans "from" a version its
+    binary does not report.
+  - `is_release_update_candidate` refuses same-base candidates whose only
+    ordering evidence is an opaque alphanumeric build-tag comparison
+    (`0.10.0-rust-64f66e3d` vs `0.10.0-rust-4a8bcb15` decides by git-sha
+    string). Numbered nightly trains (`beta.1986.1` < `beta.1987.2`) keep
+    TS semantics; `--force` reinstalls explicitly.
+  - A tagged manifest version on the stable channel is refused (the stable
+    channel publishes untagged releases; TS would install such a version).
+  - `stage_archive` unpacks into `releases/.stage-*` scratch and renames
+    into place after the payload validates, and an existing release with
+    the same name is re-validated before reuse — a damaged or foreign
+    staging is never silently reactivated. The launcher repoint and the
+    `.activation-state` write fsync their directories.
+  - New CLI surface, no TS counterpart: `prime-agent update --archive
+    <path> --source <https-url>` stages a local payload (a release archive
+    or a payload directory) with the version probed from the payload
+    binary's `--version` output — never a hand-typed string — then runs the
+    same staged activation and coordinator rollback as a channel update.
+    The direct install requires the current launcher to already name a
+    valid release (the rollback boot depends on it) and copies the payload
+    into scratch before the atomic rename, so an in-place copy over a
+    running binary is structurally impossible.
+- Ownership: pa-core `update` (`version.rs` guards, `install.rs` anchor +
+  validation helpers, `download.rs` atomic staging + direct stage); pa-cli
+  `update_flow` (plan anchor + guards, the Direct plan arm) and
+  `public_command` (flag parse; the TUI `/update` surface stays TS parity).
+
 ## Update graceful stop + roster (slice 3, 2026-09-19)
 
 The TS-era worker prepare/commit/cancel frames (`worker_prepare_update`/
@@ -486,6 +532,23 @@ divergences from the TS `cli/daemon-ps.ts` shape:
   also the product-default socket dir for a uid-1000 Linux user with `TMPDIR=/tmp`. That
   product-parity trade-off is accepted for this mission sandbox per the operator directive;
   revisit before any release cut of the binary.
+
+Two follow-ups (root-user Linux, 2026-09-23; the uid-0 side of the same directive):
+
+- The uid-0 twins are guarded too. The product-default socket dir is `<tmpdir>/prime-agent-<uid>`,
+  so on a root-user Linux box (uid 0 — the fleet's root-uid gate sandboxes and any root-user
+  mission topology) the ambient mission daemon's sockets live under `/tmp/prime-agent-0` and
+  `/tmp/mission-tmp/prime-agent-0`. Without those entries the whole never-touch protection
+  would silently disappear at uid 0, since the original list only named the uid-1000 paths.
+- The OS census has a dependency-free Linux fallback (`scan_proc_listeners`): when neither
+  `ss` nor `lsof` exists — stock `rust:1-bookworm` and most slim container images ship neither —
+  TS `daemon-ps.ts` returns nothing and every discovery report reads as an empty machine,
+  which fails the three `daemon_discovery_e2e` tests deterministically on uid 0 ("No
+  background services found."). The Rust port instead maps `/proc/net/unix` listening rows
+  to owning pids via `/proc/<pid>/fd` and matches the comm name, so the census works with no
+  external tools. Visibility equals `ss -lxp` in both privilege classes: uid 0 sees every
+  daemon on the machine, an unprivileged user only its own. This is a deliberate divergence
+  from TS (which stays tool-dependent); same operator authority as the containment guard.
 
 
 ## Child-session stream hang (observed in production, 2026-09-16)
@@ -1164,6 +1227,65 @@ batch), `sdk.ts`'s settings-seeded `Agent` queue modes,
   and the arming classification; pa-tui unit tests cover the hint text
   (default + rebound key) and its idle/empty-draft gates.
 
+# Multi-steer batch delivery at the tool boundary — the batched default (lane steer-tool-boundary-batch, 2026-09-23)
+
+Kevin's bug report (2026-09-23, his words): "multi steer works correctly
+where if I abort, all steer queued messages get sent [...]. But the
+actual multi steer part doesn't work: if I have multiple messages in the
+steer queue and then a tool call finishes, we send only the first steer
+message, then wait for the next tool call to finish, then send the next
+steer message [...]. Correct behaviour: if we have many messages in the
+steer queue, then ALL of them should be sent after the next tool call."
+
+- **Root cause**: the mid-turn steer path was correct end-to-end (the
+  `steer` wire command parks on the worker's steering lane; TS
+  `_steeringStopPending`'s stop hook ends the running turn at the next
+  tool-call boundary; `gather_delivery_batch` delivers the parked prefix
+  as the next turn) — but the delivery batched ONLY under queue mode
+  `"all"` or the `abort_and_send_queued` forced arm. The default
+  `steeringMode` was the TS default `"one-at-a-time"` (settings-manager
+  `getSteeringMode()`'s `|| "one-at-a-time"`), so N parked steers
+  drip-fed one per boundary: each delivered steer's own turn hit the
+  still-queued stop hook at ITS next boundary and delivered the next —
+  exactly the reported shape. The abort path already co-delivered (the
+  one-shot armed batch), which is why aborting looked correct.
+- **The fix — the deliberate divergence** (Kevin's explicit product
+  decision): the steering queue's DEFAULT is now `"all"`. The settings
+  default (`SettingsManager::get_steering_mode()`), the worker
+  `SessionCore` placeholders, and the TUI's pre-state placeholder flip
+  to `"all"`; the follow-up default keeps the TS `"one-at-a-time"`
+  (follow-ups drain when the session goes idle, one per turn — the
+  follow-up lane never merges into the steering batch). The TS default
+  `"one-at-a-time"` stays selectable through the same setting surface
+  (`steeringMode` in settings / the `set_steering_mode` wire command /
+  the TUI settings menu); `pa-agent`'s library-level
+  `PendingMessageQueue` default stays TS-faithful — the divergence
+  lives only at the product default, where the decision was made.
+- **Unchanged invariants**: `abort_and_send_queued`'s forced batch and
+  its arming classification; the follow-up lane's when-idle delivery
+  behind the steering batch (its own mode, never merged); injected
+  custom rows (agent-message deliveries, heartbeat steers, minted goal
+  contexts) still deliver solo — `gather_delivery_batch`'s
+  same-turn-execution-class + plain-user-row + non-session-command
+  gates are untouched; a queued session command still delivers solo;
+  the pick-up projection (the queue strip drops the delivered rows
+  before their turn starts) applies to the batch as one update.
+- Verifiers: `steer_boundary_batch_e2e.rs` — the reproducer over the
+  real worker stack (live kernel, a scripted sleep cell parks three
+  steers + a follow-up mid-tool) pins the spec: ONE delivery
+  `agent_start` for the whole batch, the three steer rows chained, ONE
+  assistant reply, the follow-up behind as its own turn. Worker unit
+  tests pin the default-mode batch (`the_default_mode_co_delivers...`),
+  the one-at-a-time mode's one-per-turn shape (pinned explicitly), the
+  forced arm over the pinned one-at-a-time mode, and the abort battery's
+  new default assertion; the settings unit test pins the default flip +
+  the explicit-selection survival. `steer_queue_parity.py` grows the
+  unseeded `default-multi-steer` flow — the recorded per-side evidence
+  of the divergence (the TS binary's default drips one steer per
+  boundary; the rust port's default batches) — plus the seeded
+  `one-at-a-time-multi-steer` flow, which byte-compares on both
+  binaries and keeps the mode surface parity-exact.
+
 ## Daemon model allowlist — `allowedModels` (lane metered-model-guardrail, 2026-09-23)
 
 ### The settings key
@@ -1238,3 +1360,57 @@ allowlist.
   `track_model_refused` telemetry seam.
 - `pa-daemon`: `model_allowlist` (the enforcement helpers + the worker's
   lazy refusal-telemetry client), with the three seams above.
+
+
+## The continue-recent launch safety — `--continue` never blind-resumes (lane continue-recent-safety, 2026-09-23)
+
+The P6 trap: a continue-recent launch resolves "the newest session for the
+cwd" and reopens it silently. On a shared session dir that can be *any*
+session — including a fleet orchestrator's, whose context and scheduled
+jobs then resurrect on the reopened worker. The TS reference does exactly
+that (`SessionManager.continueRecent`, session-manager.ts:2709 → the
+daemon worker's `continueRecent` arm, daemon-mode.ts:2005), and the Rust
+port's wire had drifted the other way: the supervisor only
+existence-checked the candidate (`No recent session found`) and the worker
+ignored `continueRecent` entirely, so `--continue` silently started a
+FRESH session (a parity bug both directions: no resume, no error).
+
+### The design (sanctioned divergence)
+
+- The interactive `--continue` resolves the candidate **client-side**
+  (`pa-core` `find_most_recent_session_for_cwd`) and opens the **agents
+  view preselected on it** — the status line names the session, and the
+  user confirms what continues (or picks another / creates fresh). A
+  launch with no candidate falls through to a fresh session (TS
+  `continueRecent`'s own fallback; the old bogus `No recent session found
+  for <cwd>` error is gone).
+- The daemon refuses `continueRecent: true` outright
+  (`continueRecent is not supported: pass sessionPath to reopen a
+  session, or open one through the agents view`): no client can ask the
+  daemon to pick a session blindly. A plain create (no field) is
+  unaffected. The wire field stays (TS shape); only the semantics change.
+- The continue launch defers to an explicit `--resume` selector and to
+  `--no-session` (the TS flag order), and the agents view's open action
+  waits out the entry anchor while the anchored candidate row still
+  streams in (Enter cannot confirm the rebuild's default row — on a
+  continue launch that can be an unrelated live session). A scoped view
+  never lists its anchor, so its never-resolving wait never blocks opens.
+- `SessionSelection::ContinueRecent` is removed from pa-tui: the typed
+  form of the blind resume had exactly one producer (the CLI flag) and
+  one consumer (the daemon), and both are gone. Print mode's `-c` is
+  unchanged: it resolves client-side like TS print mode (in-process, no
+  daemon-side resurrection).
+
+### Evidence
+
+- `pa-cli` unit tests: the flag mapping (`continue` → fresh), the
+  candidate resolution (newest for the cwd; foreign cwd and empty dir
+  excluded), and the onboarding/flag gates.
+- `interactive_daemon_e2e::tui_bare_launch_opens_a_fresh_session_when_a_newer_saved_one_exists_for_the_cwd`:
+  the bare launch pins fresh — the seeded saved session stays
+  byte-identical, a new file is created.
+- `agents_view_anchor_e2e::continue_recent_view_preselects_the_candidate_and_renders_the_notice`:
+  the view renders the notice and Enter opens the preselected candidate,
+  not the first-listed row.
+- `supervisor_e2e::create_with_continue_recent_is_refused`: the wire
+  refusal + the plain-create pass-through.
