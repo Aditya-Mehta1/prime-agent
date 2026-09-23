@@ -308,7 +308,7 @@ def run_states(session, out_dir, label, verify_branch):
             f"rejected={rejected} kept={kept}",
         )
     else:
-        opened = "Search models" in pane
+        opened = "Enter select" in pane
         check(
             "BASE_model_arg_opens_filtered_picker",
             opened,
@@ -321,7 +321,7 @@ def run_states(session, out_dir, label, verify_branch):
     # (g) /model <partial> + Tab
     send(session, "/model gp")
     send(session, "Tab")
-    frame = wait_or_none(session, "Search models", timeout=8)
+    frame = wait_or_none(session, "Enter select", timeout=8)
     frames[f"{label}_g_model_tab"] = frame or capture(session)
     if verify_branch:
         opened = frame is not None and re.search(
@@ -346,7 +346,7 @@ def run_states(session, out_dir, label, verify_branch):
     # (h) /mcp <partial> + Tab
     send(session, "/mcp lin")
     send(session, "Tab")
-    frame = wait_or_none(session, "Search MCP connections", timeout=8)
+    frame = wait_or_none(session, "navigate", timeout=8)
     frames[f"{label}_h_mcp_tab"] = frame or capture(session)
     if verify_branch:
         opened = frame is not None and re.search(
