@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { formatSessionDisplayId } from "../src/modes/daemon/daemon-session-id.js";
 import type {
 	RemoteAgentHost,
 	RemoteAgentMeshSource,
@@ -211,6 +212,24 @@ describe("RemoteAgentMeshState", () => {
 		await expect(
 			delivering.sendAgentMessage({ target: delivering.findMessageTargets("remote-session")[0]!, message: "hi" }),
 		).rejects.toThrow("Remote agent on milk.tailnet.ts.net is offline");
+	});
+
+	it("resolves an unnamed remote row from the 12-character id the session table prints", async () => {
+		const sessionId = "01a0cba2-0000-7000-8000-abcdef123456";
+		const rowId = { id: sessionId, sessionId, activeSessionId: undefined, sessionName: undefined };
+		const source = mockSource(async () => [host({ sessions: [remoteSession(rowId)] })]);
+		const state = new RemoteAgentMeshState({ source, refreshTtlMs: 0 });
+		await state.refreshIfStale();
+		// An unnamed row has only its ids, and the table prints the 12-character suffix.
+		const printedId = formatSessionDisplayId(sessionId);
+		expect(printedId).toBe("abcdef123456");
+		expect(state.findMessageTargets(printedId).map((target) => target.sessionId)).toEqual([sessionId]);
+		source.listRemoteAgents.mockResolvedValueOnce([
+			host({ sessions: [remoteSession(rowId)] }),
+			host({ tailnetHost: "other.tailnet.ts.net", sessions: [remoteSession(rowId)] }),
+		]);
+		await state.refreshIfStale();
+		expect(state.findMessageTargets(printedId)).toHaveLength(2);
 	});
 
 	it("treats a depth-0 remote session as a sibling and nothing else", async () => {

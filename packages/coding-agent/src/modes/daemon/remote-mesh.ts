@@ -9,6 +9,7 @@ import {
 } from "../../core/agent-messages.js";
 import type { AgentRosterEntry, RosterSessionSummary } from "./agent-roster.js";
 import { sessionSummaryFromRosterEntry } from "./agent-roster.js";
+import { matchesSessionIdSuffix } from "./daemon-session-id.js";
 import { classifySessionRosterStatus, type SessionSummary } from "./daemon-session-list.js";
 
 // Tailnet remote-agent mesh: converts RemoteAgentHost snapshots into
@@ -370,15 +371,31 @@ export class RemoteAgentMeshState {
 	 * resolution fails, so remote rows never shadow or crowd local ones.
 	 * Session names are unique per daemon, not per tailnet: callers must
 	 * treat a two-match result as ambiguous exactly like the local path.
+	 * Selector handling mirrors the local live-session path: an exact id or
+	 * name wins, and the 12-character id a session table prints resolves by
+	 * suffix, so a copied table id reaches a remote row the same way.
 	 */
 	findMessageTargets(selector: string): RemoteAgentMessageTarget[] {
-		const targets: RemoteAgentMessageTarget[] = [];
-		for (const entry of this.entries.values()) {
+		const rows = [...this.entries.values()].map((entry) => {
 			const summary = sessionSummaryFromRosterEntry(entry);
-			const activeSessionId = summary.activeSessionId ?? summary.id;
-			if (activeSessionId !== selector && summary.sessionId !== selector && summary.sessionName !== selector) {
-				continue;
-			}
+			return { summary, activeSessionId: summary.activeSessionId ?? summary.id };
+		});
+		const exact = rows.filter(
+			(row) =>
+				row.activeSessionId === selector ||
+				row.summary.sessionId === selector ||
+				row.summary.sessionName === selector,
+		);
+		const matches =
+			exact.length > 0
+				? exact
+				: rows.filter(
+						(row) =>
+							matchesSessionIdSuffix(row.activeSessionId, selector) ||
+							matchesSessionIdSuffix(row.summary.sessionId, selector),
+					);
+		const targets: RemoteAgentMessageTarget[] = [];
+		for (const { summary } of matches) {
 			const state = this.hosts.get(summary.remoteHost ?? "");
 			if (!state) continue;
 			targets.push({
