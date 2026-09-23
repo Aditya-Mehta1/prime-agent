@@ -395,8 +395,6 @@ impl ActivityPanel {
                     )],
                     row_index == self.selected,
                 ));
-                    row_index == self.selected,
-                ));
             }
             cursor += 1;
             if cursor >= start + visible {
