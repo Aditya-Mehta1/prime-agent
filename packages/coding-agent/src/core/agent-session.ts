@@ -1162,6 +1162,8 @@ const IMAGE_TURN_CHILD_MAX_IMAGES = 8;
 const IMAGE_TURN_CHILD_MAX_IMAGE_BYTES = 8_000_000;
 const IMAGE_TURN_CHILD_MAX_TOTAL_BYTES = 24_000_000;
 const IMAGE_TURN_CHILD_TIMEOUT_MS = 180_000;
+/** Bound on waiting for the read child's session to publish. */
+const IMAGE_TURN_CHILD_PUBLICATION_TIMEOUT_MS = 30_000;
 /** Cap on the question the attach-image skill sends with a delegated read. */
 const VISION_READ_QUESTION_MAX_CHARS = 2000;
 const IMAGE_TURN_READING_MAX_CHARS = 4000;
@@ -2762,6 +2764,26 @@ export class AgentSession {
 		return this._imageModelOverride ?? this.settingsManager.getImageModel();
 	}
 
+	/**
+	 * Wait for the read child's session to publish, bounded: a child that never
+	 * publishes must not block normalization (and the user's turn) forever. The
+	 * read's own deadline still applies once the child is running.
+	 */
+	private async _awaitVisionReadChildPublication(childId: string): Promise<string | undefined> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				this._awaitPendingRlmChildPublication(childId).catch(() => undefined),
+				new Promise<undefined>((resolve) => {
+					timer = setTimeout(() => resolve(undefined), IMAGE_TURN_CHILD_PUBLICATION_TIMEOUT_MS);
+					timer.unref?.();
+				}),
+			]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+
 	/** Remember one read child's session id, bounded so the set cannot grow. */
 	private _rememberVisionReadChildSession(sessionId: string): void {
 		if (this._visionReadChildSessionIds.size >= 8) {
@@ -2867,11 +2889,20 @@ export class AgentSession {
 				writeFileSync(filePath, Buffer.from(image.data, "base64"));
 				return filePath;
 			});
-			const child = await this.runRlmChild(this._imageTurnChildPrompt(paths, text), { model: reference });
+			const child = await this.runRlmChild(
+				this._imageTurnChildPrompt(paths, text),
+				{ model: reference },
+				undefined,
+				{ ignoreDepthLimit: true },
+			);
 			childId = child.rlm_child_id;
+			// The reading is consumed programmatically here, so a terminal notice
+			// would only inject an extra turn into this session after the read.
+			const run = this._activeRlmChildRuns.get(childId);
+			if (run) run.suppressTerminalNotice = true;
 			// Register the read child as soon as its session exists: if it replies
 			// anyway, that message must not be admitted as a turn in this session.
-			const childSessionId = await this._awaitPendingRlmChildPublication(childId).catch(() => undefined);
+			const childSessionId = await this._awaitVisionReadChildPublication(childId);
 			if (childSessionId) this._rememberVisionReadChildSession(childSessionId);
 			const collected = await this.collectRlmChildren([childId], IMAGE_TURN_CHILD_TIMEOUT_MS);
 			const entry = collected.results.find((result) => result.rlm_child_id === childId);
@@ -12952,6 +12983,7 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
+		options: { ignoreDepthLimit?: boolean } = {},
 	): Promise<RlmSpawnHandle> {
 		// Snapshot before any await: the spawning request is the turn whose tool call is
 		// executing now. A spawn arriving outside an active run (a detached kernel task
@@ -12966,7 +12998,11 @@ export class AgentSession {
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
 		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
 		if (requestedSessionName) assertDirectAgentMessageTarget(requestedSessionName);
-		if (this._rlmDepth >= this._rlmMaxDepth) {
+		// The internal image-turn reader is exempt: it is one bounded child with a
+		// focused prompt that is deleted after the read, and it cannot recurse
+		// (its model sees images, and the prompt forbids subagents). Agent-initiated
+		// spawns still respect the session's depth limit.
+		if (!options.ignoreDepthLimit && this._rlmDepth >= this._rlmMaxDepth) {
 			throw new Error(
 				`RLM recursion depth limit reached (RLM_DEPTH=${this._rlmDepth}, RLM_MAX_DEPTH=${this._rlmMaxDepth})`,
 			);
@@ -13543,8 +13579,9 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
+		options: { ignoreDepthLimit?: boolean } = {},
 	): Promise<RlmSpawnHandle> {
-		return this._startRlmChildRun(prompt, kwargs, spawnCode);
+		return this._startRlmChildRun(prompt, kwargs, spawnCode, options);
 	}
 
 	private _isRetryableError(message: AssistantMessage): boolean {
