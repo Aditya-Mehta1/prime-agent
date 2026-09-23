@@ -353,20 +353,19 @@ fn the_lease_owner_names_the_live_worker_not_a_stale_inherited_id() {
     let (worker_id, _created) = create_session(&mut client, "c1", &create_config);
     let session_file = session_file_of(&mut client, &worker_id, "s1");
 
-    // The lease the live worker wrote for the session file.
-    let canonical = std::fs::canonicalize(&session_file).expect("canonical session file");
-    let key: String = {
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(canonical.to_string_lossy().as_bytes());
-        digest.iter().map(|byte| format!("{byte:02x}")).collect()
-    };
-    let owner_path = agent_dir
-        .join("session-leases")
-        .join(format!("{key}.lock"))
-        .join("owner.json");
-    let owner: Value =
-        serde_json::from_str(&std::fs::read_to_string(&owner_path).expect("lease owner.json"))
-            .expect("parse lease owner.json");
+    // The lease the live worker wrote for the session file. The lease key
+    // is a hash of the canonical path, but a file acquired before it
+    // existed is keyed by its raw path (the canonicalize fallback), so the
+    // test locates the lease by the owner's sessionPath instead of
+    // recomputing the key.
+    let leases_dir = agent_dir.join("session-leases");
+    let owner: Value = std::fs::read_dir(&leases_dir)
+        .expect("session-leases directory")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("owner.json")).ok())
+        .map(|content| serde_json::from_str::<Value>(&content).expect("owner.json"))
+        .find(|owner| owner["sessionPath"].as_str() == Some(session_file.as_str()))
+        .unwrap_or_else(|| panic!("no session lease for {session_file}"));
     let named = owner["activeSessionId"]
         .as_str()
         .expect("the lease names its owner session");
