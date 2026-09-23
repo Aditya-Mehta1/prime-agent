@@ -2750,10 +2750,19 @@ export class AgentSession {
 	 * read's own deadline still applies once the child is running.
 	 */
 	private async _awaitVisionReadChildPublication(childId: string): Promise<string | undefined> {
+		// Registration happens inside this promise, not only on its result: a
+		// publication that lands after the bounded wait below still has to be
+		// recorded, or its reply would be admitted as an unsolicited turn.
+		const publication = this._awaitPendingRlmChildPublication(childId)
+			.then((sessionId) => {
+				if (sessionId) this._rememberVisionReadChildSession(sessionId);
+				return sessionId;
+			})
+			.catch(() => undefined);
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			return await Promise.race([
-				this._awaitPendingRlmChildPublication(childId).catch(() => undefined),
+				publication,
 				new Promise<undefined>((resolve) => {
 					timer = setTimeout(() => resolve(undefined), IMAGE_TURN_CHILD_PUBLICATION_TIMEOUT_MS);
 					timer.unref?.();
@@ -2886,8 +2895,7 @@ export class AgentSession {
 			if (run) run.suppressTerminalNotice = true;
 			// Register the read child as soon as its session exists: if it replies
 			// anyway, that message must not be admitted as a turn in this session.
-			const childSessionId = await this._awaitVisionReadChildPublication(childId);
-			if (childSessionId) this._rememberVisionReadChildSession(childSessionId);
+			await this._awaitVisionReadChildPublication(childId);
 			const collected = await this.collectRlmChildren([childId], IMAGE_TURN_CHILD_TIMEOUT_MS);
 			const entry = collected.results.find((result) => result.rlm_child_id === childId);
 			if (!entry?.settled) {
