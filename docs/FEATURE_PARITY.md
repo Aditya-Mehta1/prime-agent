@@ -139,7 +139,7 @@ Paths are relative to the two repo roots.
 | packages/coding-agent/src/modes/interactive/components/injected-prompt-message.ts:136-165 | Heartbeat header: ♥ error pulse, muted label, "every X"/"scheduled" | crates/pa-tui/src/custom_message/injected_prompt.rs — INTENTIONAL DIVERGENCE (operator directive 2026-09-23): the glyph renders ◷ (the unified-activity-dock Heartbeats icon), not the TS ♥; label/schedule/colors unchanged | DIVERGES | heartbeat glyph (TS expected to adopt) |
 | packages/coding-agent/src/modes/interactive/components/injected-prompt-message.ts:61-72,152-175 | Goal header labels + " · <objective>" meta (70-col truncate) | crates/pa-tui/src/custom_message/render.rs:161-167,218-235 | MATCHES | - |
 | packages/coding-agent/src/modes/interactive/components/injected-prompt-message.ts:139-143 | Kernel-state header (◆ Restored/Started fresh, header-only even expanded) | crates/pa-tui/src/custom_message/render.rs:168-180,373-379 | MATCHES | - |
-| packages/coding-agent/src/modes/interactive/components/injected-prompt-message.ts:144-150 | RLM child status header + expandable body | crates/pa-tui/src/custom_message/render.rs:181-192 | MATCHES | - |
+| packages/coding-agent/src/modes/interactive/components/injected-prompt-message.ts:144-150 | RLM child status header + expandable body | crates/pa-tui/src/custom_message/injected_prompt.rs::prompt_header — INTENTIONAL DIVERGENCE (operator directive 2026-09-23): Rust renders the `◆ Subagent <name> finished|failed|cancelled` rows (the failure error / cancellation reason as the expandable body) with the diamond in the row's semantic color (icon-follows-text: success green, error red, cancelled yellow); TS still shows the generic muted `RLM child status` label — expected to adopt the same rows (custom_message_parity.py carries the divergence + icon-color contract) | DIVERGES | — |
 | packages/coding-agent/src/modes/interactive/components/injected-prompt-message.ts:125-132 | Expanded view replaces header with the markdown body | crates/pa-tui/src/custom_message/render.rs:139-152 | MATCHES | - |
 | packages/coding-agent/src/modes/interactive/components/injected-prompt-message.ts:117-121 | async_bash_completion → ShellCompletionComponent (attach-to-card flow, ambiguous marking) | crates/pa-tui/src/custom_message/mod.rs:174-176,317-342; crates/pa-tui/src/custom_message/render.rs:249-290 (standalone row only, never attaches) | PARTIAL | shell-completion-attach (new) |
 | packages/coding-agent/src/modes/interactive/components/ipython-cell.ts:393-446 | Collapsed summary line: status marker, language label, dim preview, counts, duration, error name, exit code | crates/pa-tui/src/tool_card/ipython.rs:136-218 | MATCHES | - |
@@ -212,11 +212,11 @@ Other smaller proposed lanes (not in the top 3): **extension-renderers** (render
 | TS (file:line) | Feature (short) | Rust (file:line) or MISSING | Status | Lane |
 |---|---|---|---|---|
 | packages/coding-agent/src/modes/interactive/components/onboarding-exit.ts:13 | exit keys while onboarding owns the pane (app.clear/app.exit) | crates/pa-tui/src/onboarding.rs:95 + interactive.rs:360 | MATCHES |  |
-| packages/coding-agent/src/modes/interactive/components/onboarding-highlight.ts:41 | washed selected-row background (lift 0.08 toward text, truecolor/256) | crates/pa-tui/src/onboarding.rs:368-397 | PARTIAL |  |
+| packages/coding-agent/src/modes/interactive/components/onboarding-highlight.ts:41 | washed selected-row background (lift 0.08 toward text, truecolor/256) | crates/pa-tui/src/onboarding.rs:521-561 + theme.rs:187-201,394 | MATCHES |  |
 | packages/coding-agent/src/modes/interactive/components/prime-onboarding-splash.ts:63 | splash: brand mark + animated lab field + welcome line | crates/pa-tui/src/onboarding.rs:117-254 + interactive.rs:335-398 | MATCHES |  |
 | packages/coding-agent/src/modes/interactive/components/prime-onboarding-splash.ts:217 | login action row "> Log in with Prime Intellect" + description paragraphs | MISSING | MISSING |  |
 | packages/coding-agent/src/modes/interactive/components/prime-onboarding-splash.ts:103 | panel stack: nested flow panels with heading override, immediate mode | MISSING | MISSING |  |
-| packages/coding-agent/src/modes/interactive/components/onboarding-choice.ts:40 | choice panel: prompt/description/note, up/down/enter/esc, detail subtitle | crates/pa-tui/src/onboarding.rs:88-113,258-312 | PARTIAL |  |
+| packages/coding-agent/src/modes/interactive/components/onboarding-choice.ts:40 | choice panel: prompt/description/note, up/down/enter/esc, detail subtitle | crates/pa-tui/src/onboarding.rs:26-47,128-152,296-501 | MATCHES |  |
 | packages/coding-agent/src/modes/interactive/components/onboarding-picker.ts:36 | searchable provider picker w/ pinned Continue row, connected ✓, scroll viewport | MISSING | MISSING |  |
 | packages/coding-agent/src/modes/interactive/components/modal-back.ts:38 | shouldTreatAsBack: left-arrow closes dialogs when the search cursor is at col 0 | crates/pa-tui/src/model_picker/mod.rs:605-609 | PARTIAL |  |
 | packages/coding-agent/src/modes/interactive/components/countdown-timer.ts:17 | per-second countdown with tick/expire callbacks | crates/pa-tui/src/chat.rs:486-533 (RetryState.seconds_left) | MATCHES |  |
@@ -288,8 +288,6 @@ Other smaller proposed lanes (not in the top 3): **extension-renderers** (render
 | packages/coding-agent/src/modes/interactive/components/mermaid.ts:52 | mermaid code blocks rendered as Unicode diagrams (off/final/streaming) | MISSING | MISSING | mermaid-render |
 
 #### Partial notes
-- packages/coding-agent/src/modes/interactive/components/onboarding-highlight.ts:41 — Rust always blends against the default canvas (16,16,16)/(255,255,255); TS uses the theme's parseable `background` color as the canvas (onboarding.rs:368-397).
-- packages/coding-agent/src/modes/interactive/components/onboarding-choice.ts:40 — Rust implements only the trace-question instance; no `detail` (@identifier) subtitle, no selectedIndex/rowWidth options (onboarding.rs:258-312).
 - packages/coding-agent/src/modes/interactive/components/modal-back.ts:38 — back-guard implemented in the model picker only; the login-dialog and heartbeat-manager uses are missing with those components (model_picker/mod.rs:605-609).
 - packages/coding-agent/src/modes/interactive/components/dynamic-border.ts:16 — TS paints the rule with theme `border`; Rust's config selector paints it `accent` — identical in the prime theme, diverges in dark/light where border ≠ accent (config_selector.rs:443).
 - packages/coding-agent/src/modes/interactive/components/prompt-context-line.ts:22 — Rust renders only the right-aligned detail label; the left "Recap: …" (live compaction recap) half never renders (chrome.rs:337-359).
@@ -855,7 +853,7 @@ Method: every TS method in scope read in full; the Rust implementing code locate
 | interactive-mode.ts:7332 | killTrackedDetachedChildren (detached child kill) | MISSING | MISSING | signal-handlers |
 | interactive-mode.ts:7378 | handleCtrlZ suspend cycle (SIGTSTP/SIGCONT, SIGINT ignored) | crates/pa-tui/src/suspend.rs:56 + session_ui.rs:2771-2778 + interactive.rs:670-688 | MATCHES | — |
 | interactive-mode.ts:7271 | handleAgentsBack/requestAgentsView/returnToAgentsView | crates/pa-tui/src/session_ui.rs:2870-2884 + interactive.rs:1081-1094 | MATCHES | — |
-| interactive-mode.ts:7419 | handleFollowUp (alt+enter queues on follow-up lane) | crates/pa-tui/src/session_ui.rs:2938-2958 | MATCHES | — |
+| interactive-mode.ts:7718 | handleFollowUp (alt+enter: empty follow-up silent no-op, follow-up lane, same submit ladder as Enter) | crates/pa-tui/src/session_ui.rs:6608-6637 | MATCHES | — |
 | interactive-mode.ts:7462 | browseQueueSelection (alt+up/alt+down, draft stash) | crates/pa-tui/src/session_ui.rs:2992-3000 + crates/pa-tui/src/queued.rs:199-300 | MATCHES | — |
 | interactive-mode.ts:7480 | moveQueueSelection (ctrl+alt+arrows reorder + local mirror) | crates/pa-tui/src/session_ui.rs:3038-3077 | MATCHES | — |
 | interactive-mode.ts:7539 | applyQueueSelection (empty deletes, enter steers, failure restore) | crates/pa-tui/src/session_ui.rs:3083-3126 | MATCHES | — |
