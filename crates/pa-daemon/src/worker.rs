@@ -697,6 +697,10 @@ pub struct Worker {
     /// The user-bash slot (`execute_bash` / `execute_bash_and_wait` /
     /// `abort_bash`): one command runs at a time, killed on abort.
     pub(crate) user_bash: std::sync::Arc<crate::user_bash::UserBash>,
+    /// The coalescing roster push queue shared with the turn runner: the
+    /// awaited bash handler enqueues the run-settle flush (TS
+    /// `execute_bash_and_wait`'s `finally` roster flush).
+    pub(crate) roster_pushes: crate::roster_activity::RosterPushQueue,
     /// Agent-message ingestion state (`agent_messages_*` arms): the pause
     /// flag the delivery gate checks.
     pub(crate) agent_messages: crate::agent_message_ingest::AgentMessageIngest,
@@ -861,9 +865,10 @@ impl Worker {
         // The turn runner runs for the whole process lifetime. The command
         // dispatcher keeps the engine handle too (model metadata for the
         // stats commands).
-        let (engine, agent_engine): (
+        let (engine, agent_engine, roster_pushes): (
             std::sync::Arc<dyn SessionEngine>,
             Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
+            crate::roster_activity::RosterPushQueue,
         ) = {
             // Scripted sessions serve the integration harness; sessions
             // without a script run the real agent engine.
@@ -1023,12 +1028,12 @@ impl Worker {
                 engine: std::sync::Arc::clone(&engine),
                 active_session_id,
                 status_notify: status_notify.clone(),
-                roster_pushes,
+                roster_pushes: roster_pushes.clone(),
             };
             tokio::spawn(async move {
                 runner.run().await;
             });
-            (engine, agent_engine)
+            (engine, agent_engine, roster_pushes)
         };
         let side_questions = crate::side_question::SideQuestionManager::new(
             std::sync::Arc::clone(&engine),
@@ -1089,6 +1094,7 @@ impl Worker {
             exports,
             acp_mcp: std::sync::Arc::new(std::sync::Mutex::new(acp_mcp)),
             user_bash,
+            roster_pushes,
             agent_messages: crate::agent_message_ingest::AgentMessageIngest::new(),
             input_pauses,
             navigation,
@@ -8021,12 +8027,10 @@ mod turn_stream_tests {
                 .any(|summary| summary["isRunningTools"] == json!(true)),
             "the tool execution never showed in the feed: {summaries:?}"
         );
-        assert!(
-            working
-                .iter()
-                .any(|summary| summary["isRunningTools"] == json!(false)),
-            "the tool's settle never showed in the feed: {summaries:?}"
-        );
+        // The post-tool intermediate state (streaming, no tools in flight)
+        // is not asserted: the coalescer may collapse it into the turn's
+        // next flush — the feed's contract is the mid-tool live state and
+        // the settled idle row, both asserted above.
         server.abort();
     }
 

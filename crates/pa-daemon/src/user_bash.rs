@@ -86,13 +86,12 @@ impl UserBash {
     }
 
     /// Count one awaited run (`execute_bash_and_wait`) toward
-    /// [`Self::is_running`]; the awaited path owns no exclusive slot.
-    pub(crate) fn begin_awaited(&self) {
+    /// [`Self::is_running`]; the awaited path owns no exclusive slot. The
+    /// returned bracket decrements on drop, so a run future dropped
+    /// mid-await (a task teardown) cannot leave the count stuck on.
+    pub(crate) fn begin_awaited(&self) -> AwaitedRun<'_> {
         self.awaited.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn end_awaited(&self) {
-        self.awaited.fetch_sub(1, Ordering::SeqCst);
+        AwaitedRun { user_bash: self }
     }
 
     /// Kill the in-flight process (TS `abortBash` aborts every
@@ -253,8 +252,9 @@ impl Worker {
         // The awaited run counts toward the session's `isBashRunning` (TS's
         // `executeBash` registers an abort controller, so the flag is true
         // for its whole duration); it owns no exclusive slot, so a streamed
-        // user bash is not blocked by it.
-        user_bash.begin_awaited();
+        // user bash is not blocked by it. The bracket releases the count on
+        // drop, so a dropped run future cannot leave the flag stuck on.
+        let _awaited = user_bash.begin_awaited();
         let end = run_bash(RunBash {
             command: &command,
             cwd: &cwd,
@@ -265,7 +265,13 @@ impl Worker {
             on_chunk: None,
         })
         .await;
-        user_bash.end_awaited();
+        drop(_awaited);
+        // The awaited path emits no session events, so the live roster
+        // feed has no trigger of its own — TS's `execute_bash_and_wait`
+        // flushes in the command's `finally`; the port enqueues the same
+        // flush here (the summary composes fresh, so the settled run reads
+        // idle on the roster).
+        self.roster_pushes.push();
         if let Some(error) = &end.error_message {
             return response_failure(None, "execute_bash_and_wait", error, None);
         }
@@ -314,6 +320,19 @@ fn merge_identity(mut event: Value, identity: &Value) -> Value {
         }
     }
     event
+}
+
+/// The drop-bracket [`UserBash::begin_awaited`] returns: one awaited run's
+/// contribution to the `isBashRunning` flag, released even when the run's
+/// future is dropped mid-await.
+pub(crate) struct AwaitedRun<'a> {
+    user_bash: &'a UserBash,
+}
+
+impl Drop for AwaitedRun<'_> {
+    fn drop(&mut self) {
+        self.user_bash.awaited.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The TS `BashResult` wire shape.
@@ -873,6 +892,23 @@ mod tests {
         assert_eq!(
             response.error.as_deref(),
             Some("execute_bash_and_wait requires a command")
+        );
+    }
+
+    /// The awaited-run bracket releases its count on drop even when the
+    /// run's future never completes (a task teardown mid-await must not
+    /// leave `isBashRunning` stuck on).
+    #[test]
+    fn an_abandoned_awaited_run_releases_the_flag() {
+        let user_bash = UserBash::new();
+        assert!(!user_bash.is_running());
+        {
+            let _awaited = user_bash.begin_awaited();
+            assert!(user_bash.is_running());
+        }
+        assert!(
+            !user_bash.is_running(),
+            "the dropped bracket left the awaited count stuck on"
         );
     }
 
