@@ -8,7 +8,6 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	EventStream,
-	getModel,
 	type ImageContent,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -18,6 +17,7 @@ import { ModelRegistry } from "../src/core/model-registry.js";
 import type { QueuedMessageMutation, SessionActionSnapshot } from "../src/core/session-action-store.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { createTestResourceLoader } from "./utilities.js";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -63,7 +63,7 @@ describe("AgentSession queue mutation", () => {
 	});
 
 	function createSession() {
-		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "Test", tools: [] },

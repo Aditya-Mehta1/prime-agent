@@ -392,6 +392,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,
 	});
+	if (!options.mcpManager) session.registerDisposeCallback(() => mcpManager.dispose());
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {
