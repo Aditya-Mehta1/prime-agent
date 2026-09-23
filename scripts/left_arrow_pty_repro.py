@@ -28,6 +28,16 @@ Kevin ran):
   restore the terminal: the stop-set bytes (paste off, kitty pop,
   modifyOtherKeys reset, mouse off, leave alt screen, cursor show) on
   the stream and a cooked tty (canonical input + echo) after the exit.
+- `quit-normal`: the canonical exit — a faux turn completes, then the
+  Ctrl+C pair (hint, exit). The exit MUST emit the full stop set and
+  leave the pty cooked; both the TS release and this build own the same
+  contract (the exit frame flush is TS parity, not a failure).
+- `quit-poisoned`: the pty enters raw mode BEFORE the client starts (a
+  previous run's broken exit), then the same quit. crossterm's saved
+  "original" is the poisoned raw state, so `disable_raw_mode` restores
+  raw: only the exit's cooked-tty verification/repair (this port's
+  hardening — TS restores its own captured `wasRaw`, the poisoned state)
+  can end cooked. Gates this build; the TS side records the divergence.
 
 Facts per scenario: alive/exited + exit code, the "shutdown stalled"
 message, the kitty push/pop balance, the stop-set presence, the pty
@@ -46,6 +56,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -79,6 +90,13 @@ RUST_BIN = os.environ.get(
     ),
 )
 DOGFOOD_BIN = os.environ.get("PA_DOGFOOD_BINARY", "/usr/local/bin/prime-agent")
+# `os.execve` never resolves PATH: a bare command name (the Mac's `prime-agent`
+# symlink) must resolve to its absolute path or the forked client dies on
+# ENOENT before it ever paints.
+if os.path.sep not in TS_BIN:
+    _resolved = shutil.which(TS_BIN)
+    if _resolved:
+        TS_BIN = _resolved
 
 #: The kitty query answer: flags 1|2|4 (what a terminal supporting all
 #: three pushed modes answers), then the DA1 answer — crossterm's probe
@@ -152,10 +170,14 @@ def side_env(side, sandbox):
 class PtyClient:
     """One TUI client on a raw pty: the harness is the terminal."""
 
-    def __init__(self, side, sandbox, answer_policy):
+    def __init__(self, side, sandbox, answer_policy, poison_raw=False):
         self.side = side
         self.sandbox = sandbox
         self.answer_policy = answer_policy
+        # `quit-poisoned`: the slave termios enters raw mode before the
+        # client forks (a previous run's broken exit), so the client's
+        # saved "original" mode is itself raw.
+        self.poison_raw = poison_raw
         self.master = None
         self.pid = None
         self.stream = bytearray()
@@ -167,6 +189,12 @@ class PtyClient:
 
     def start(self, socket_path):
         self.master, slave = pty_open_raw()
+        if self.poison_raw:
+            attrs = termios.tcgetattr(slave)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+            attrs[1] &= ~(termios.ICRNL | termios.IXON)
+            attrs[3] &= ~termios.IEXTEN
+            termios.tcsetattr(slave, termios.TCSANOW, attrs)
         pid = os.fork()
         if pid == 0:
             os.setsid()
@@ -334,6 +362,8 @@ def visible_text(stream):
 def daemon_pids_for(socket_path):
     """Live `--mode daemon` processes whose argv references this socket."""
     found = []
+    if not os.path.isdir("/proc"):
+        return found  # non-Linux: the pid discovery is VM-only
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -367,6 +397,8 @@ def sandbox_worker_pids(sandbox):
     bare pattern; other daemons on the box are untouched)."""
     agent_marker = sandbox["agent"].encode()
     found = []
+    if not os.path.isdir("/proc"):
+        return found  # non-Linux: the pid discovery is VM-only
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -384,12 +416,21 @@ def run_scenario(side, sandbox, label, answer_policy, wedge=False):
     socket_path = os.path.join(sandbox["agent"], f"daemon-{label}-{side}.sock")
     stopped_workers = []
     facts = {"side": side, "scenario": label}
-    client = PtyClient(side, sandbox, answer_policy)
+    client = PtyClient(side, sandbox, answer_policy, poison_raw=label == "quit-poisoned")
     try:
         client.start(socket_path)
         if label == "left-instant":
             time.sleep(0.3)
             client.send_left()
+        elif label in ("quit-normal", "quit-poisoned"):
+            facts["chat_settled"] = wait_for_needle(client, CHAT_SETTLE, timeout=60)
+            client.send_text("hello\r")
+            facts["reply_streamed"] = wait_for_needle(client, FAUX_REPLY, timeout=60)
+            client.pump(1.0)
+            # The canonical exit gesture: the hint press, then the exit.
+            client.send_ctrl_c()
+            client.pump(0.8)
+            client.send_ctrl_c()
         else:
             facts["chat_settled"] = wait_for_needle(client, CHAT_SETTLE, timeout=60)
             if label == "left-frame":
@@ -496,7 +537,14 @@ def main():
         "dogfood": dogfood_sandbox,
     }
 
-    all_scenarios = ["left-instant", "left-frame", "left-slow-answer", "wedge-force-quit"]
+    all_scenarios = [
+        "left-instant",
+        "left-frame",
+        "left-slow-answer",
+        "wedge-force-quit",
+        "quit-normal",
+        "quit-poisoned",
+    ]
     scenarios = args.scenarios.split(",") if args.scenarios else all_scenarios
 
     results = {}
@@ -522,6 +570,44 @@ def main():
                 failures.append(f"{key}:forced-exit-on-left")
             if facts.get("alive") is False:
                 failures.append(f"{key}:client-died")
+        # The canonical quit owns the same stop-set contract on both the
+        # TS release and this build (parity: TS `TUI.stop` +
+        # `ProcessTerminal.stop`); the cooked-tty repair after a poisoned
+        # start is this port's hardening — TS restores its own captured
+        # `wasRaw` (the poisoned state), so the TS side records the
+        # divergence instead of gating.
+        if label == "quit-normal" and side in ("rust", "ts"):
+            if facts.get("exit_code") != 0:
+                failures.append(f"{key}:exit-code={facts.get('exit_code')}")
+            stop = facts.get("stop_set") or {}
+            # TS writes the modifyOtherKeys reset only when its fallback
+            # armed the mode (kitty answered here, so TS never does); this
+            # port always writes the defensive reset — required on rust,
+            # optional on ts.
+            parts = ("paste_off", "kitty_pop", "mouse_off", "leave_alt", "cursor_show")
+            if side == "rust":
+                parts = parts + ("modify_reset",)
+            for part in parts:
+                if stop.get(part) is not True:
+                    failures.append(f"{key}:missing-{part}")
+            termios_state = facts.get("termios_after") or {}
+            if termios_state.get("icanon") is not True or termios_state.get("echo") is not True:
+                failures.append(f"{key}:tty-not-cooked")
+        if label == "quit-normal" and side == "dogfood":
+            failures.extend(
+                []
+            )  # recorded, not gated (the dogfood stop-set is prior art)
+        if label == "quit-poisoned" and side == "rust":
+            if facts.get("exit_code") != 0:
+                failures.append(f"{key}:exit-code={facts.get('exit_code')}")
+            termios_state = facts.get("termios_after") or {}
+            if termios_state.get("icanon") is not True or termios_state.get("echo") is not True:
+                failures.append(f"{key}:poisoned-start-not-repaired")
+        if label == "quit-poisoned" and side == "ts":
+            # TS restores its captured `wasRaw` (the poisoned raw) on
+            # exit — the divergence is recorded, not gated: it is TS's
+            # own behavior, not this port's regression.
+            pass
         # The wedge stop-set gate holds only for this branch's build:
         # TS has no force-quit watchdog at all (it stays alive), and the
         # dogfood side is the recorded "before" — its missing restore
