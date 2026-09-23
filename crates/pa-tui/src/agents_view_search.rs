@@ -209,8 +209,10 @@ const TIER_STRIDE: f64 = 100_000.0;
 fn token_score(token: &str, targets: &SessionSearchText) -> Option<TokenMatch> {
     contiguous_token_score(token, targets).or_else(|| {
         let score = fuzzy_match(token, &targets.name)?;
-        (score <= STRICT_FUZZY_MAX_TOKEN_SCORE)
-            .then_some(TokenMatch { tier: 4.0, quality: score })
+        (score <= STRICT_FUZZY_MAX_TOKEN_SCORE).then_some(TokenMatch {
+            tier: 4.0,
+            quality: score,
+        })
     })
 }
 
@@ -223,10 +225,16 @@ fn token_score(token: &str, targets: &SessionSearchText) -> Option<TokenMatch> {
 fn contiguous_token_score(token: &str, targets: &SessionSearchText) -> Option<TokenMatch> {
     let needle = normalize(token);
     if needle.is_empty() {
-        return Some(TokenMatch { tier: 0.0, quality: 0.0 });
+        return Some(TokenMatch {
+            tier: 0.0,
+            quality: 0.0,
+        });
     }
     if needle == normalize(&targets.id) {
-        return Some(TokenMatch { tier: 0.0, quality: 0.0 });
+        return Some(TokenMatch {
+            tier: 0.0,
+            quality: 0.0,
+        });
     }
     if let Some(name) = label_score(&needle, &targets.name) {
         return Some(name);
@@ -262,7 +270,10 @@ fn label_score(needle: &str, name: &str) -> Option<TokenMatch> {
         return None;
     }
     if name == needle {
-        return Some(TokenMatch { tier: 1.0, quality: 0.0 });
+        return Some(TokenMatch {
+            tier: 1.0,
+            quality: 0.0,
+        });
     }
     if name.strip_prefix(needle).is_some() {
         return Some(TokenMatch {
@@ -270,11 +281,10 @@ fn label_score(needle: &str, name: &str) -> Option<TokenMatch> {
             quality: (name.chars().count() - needle.chars().count()) as f64,
         });
     }
-    name.find(needle)
-        .map(|found| TokenMatch {
-            tier: 3.0,
-            quality: found as f64,
-        })
+    name.find(needle).map(|found| TokenMatch {
+        tier: 3.0,
+        quality: found as f64,
+    })
 }
 
 /// Lowercase and collapse whitespace (TS `normalizeWhitespaceLower`).
@@ -386,7 +396,10 @@ mod tests {
     fn every_token_must_match_and_phrases_stay_contiguous() {
         let both = score("gatewaywork 01a0");
         assert!(both.is_some(), "tokens may match different targets");
-        assert!(score("gatewaywork zebra").is_none(), "all tokens must match");
+        assert!(
+            score("gatewaywork zebra").is_none(),
+            "all tokens must match"
+        );
         let phrase = parse_search_query(r#""gatewaywork" 01a0"#);
         assert!(score_search(&targets(), &phrase).is_some(), "phrases match");
         let split_phrase = parse_search_query(r#""workgateway""#);
