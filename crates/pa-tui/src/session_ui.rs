@@ -1125,7 +1125,7 @@ impl SessionUi {
         // the goal state itself carries over (seeded at attach).
         self.goal_view.reset_row_tracking();
         self.sync_goal_tray(view);
-        self.sync_heartbeat_tray(view);
+        self.sync_activity_dock(view);
         view.pending_bash = held_bash;
         // The rebuild decides the mounted card's fate: a rebind drops it
         // with the old transcript (TS `resetCurrentSessionRenderState`
@@ -5526,7 +5526,7 @@ impl SessionUi {
                         }
                     }
                 }
-                self.sync_heartbeat_tray(view);
+                self.sync_activity_dock(view);
                 self.spawn_heartbeat_refresh();
                 self.dirty = true;
             }
@@ -5658,7 +5658,7 @@ impl SessionUi {
         if let Some(picker) = view.heartbeats_picker.as_mut() {
             picker.apply_catalog(heartbeats, None);
         }
-        self.sync_heartbeat_tray(view);
+        self.sync_activity_dock(view);
         self.dirty = true;
     }
 
@@ -5682,14 +5682,14 @@ impl SessionUi {
             preselect,
             picker_viewport_rows(view.terminal_rows()),
         ));
-        self.sync_heartbeat_tray(view);
+        self.sync_activity_dock(view);
         self.dirty = true;
     }
 
     /// The activity dock follows the scoped heartbeat catalog (TS
     /// `getTrayHeartbeatLabel` moved into the dock: the tray no longer
     /// carries a heartbeat count beside the model name).
-    pub(crate) fn sync_heartbeat_tray(&mut self, view: &mut AgentView) {
+    pub(crate) fn sync_activity_dock(&mut self, view: &mut AgentView) {
         let previous = view.chrome.activity.clone();
         self.update_subagent_summary(view);
         if previous != view.chrome.activity {
