@@ -146,12 +146,14 @@ fn frame_of(frames: &[String], marker: &str) -> String {
         .clone()
 }
 
-
 /// Writes every captured frame under `PA_SEARCH_FRAMES_DIR` when set: the
 /// before/after evidence capture for the search redesign (run the same
 /// driver against the base tree to diff behavior).
 fn dump_frames(label: &str, frames: &[String]) {
-    let Some(dir) = std::env::var("PA_SEARCH_FRAMES_DIR").ok().filter(|d| !d.is_empty()) else {
+    let Some(dir) = std::env::var("PA_SEARCH_FRAMES_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
         return;
     };
     std::fs::create_dir_all(&dir).expect("frames dir");
