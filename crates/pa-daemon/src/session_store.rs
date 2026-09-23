@@ -129,6 +129,59 @@ pub fn parse_session_entries(content: &str) -> Vec<Value> {
         .collect()
 }
 
+/// `applyChildUsageAttributions` (TS `core/session-manager.ts`): fold each
+/// `child_usage_attributed` entry's `aggregateUsage` into its target
+/// assistant row. TS performs this fold on every session read, so the
+/// daemon's usage walks — which sum assistant rows — must see the same
+/// attributed aggregates the live turn did (`get_session_stats`, the
+/// /context own/total split, and the top-bar cost all read folded rows).
+/// The last attribution per target wins (each aggregate is cumulative),
+/// and a target that never loaded stays untouched. In-memory only: the
+/// file keeps the raw row plus the attribution entries, the same view the
+/// TS loader serves.
+fn fold_child_usage_attributions(entries: &mut [SessionEntry]) {
+    let mut assistant_rows: HashMap<&str, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.type_ == "message"
+            && entry
+                .fields
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant")
+        {
+            assistant_rows.insert(entry.id.as_str(), index);
+        }
+    }
+    let mut folds: Vec<(usize, Value)> = Vec::new();
+    for entry in entries.iter() {
+        if entry.type_ != "child_usage_attributed" {
+            continue;
+        }
+        let Some(row) = entry
+            .fields
+            .get("targetId")
+            .and_then(Value::as_str)
+            .and_then(|id| assistant_rows.get(id))
+        else {
+            continue;
+        };
+        let Some(aggregate) = entry.fields.get("aggregateUsage") else {
+            continue;
+        };
+        folds.push((*row, aggregate.clone()));
+    }
+    for (row, aggregate) in folds {
+        if let Some(usage) = entries[row]
+            .fields
+            .get_mut("message")
+            .and_then(|message| message.get_mut("usage"))
+        {
+            *usage = aggregate;
+        }
+    }
+}
+
 /// Read the first line of a session file and parse it as a header.
 pub fn read_session_header(path: &Path) -> Option<SessionHeader> {
     let file = fs::File::open(path).ok()?;
@@ -184,6 +237,7 @@ impl SessionFile {
                 Err(_) => continue,
             }
         }
+        fold_child_usage_attributions(&mut file.entries);
         Ok(file)
     }
 
@@ -215,6 +269,11 @@ impl SessionFile {
             };
             file.push_index(entry);
         }
+        // The window keeps the retained-target attributions as metadata and
+        // parses them BEFORE the raw retained rows, so the fold runs once
+        // every row is in (the push_index live-fold cannot see a target
+        // that has not joined the index yet).
+        fold_child_usage_attributions(&mut file.entries);
         file.leaf_id = Some(window.leaf_id().to_owned());
         let context = window.context();
         file.window = Some(SessionWindow {
@@ -309,9 +368,42 @@ impl SessionFile {
     }
 
     fn push_index(&mut self, entry: SessionEntry) {
+        // The live-append seam of the attribution fold (TS
+        // `SessionManager.append_child_usage_attribution` folds after the
+        // durable append): an attribution entry joining the index folds its
+        // aggregate into the target assistant row, or the in-memory view
+        // keeps stale usage until a reopen. The end-of-load fold re-applies
+        // idempotently (the fold SETS the aggregate) and also catches forward
+        // references in foreign files.
+        if entry.type_ == "child_usage_attributed" {
+            self.fold_live_attribution(&entry);
+        }
         self.by_id.insert(entry.id.clone(), self.entries.len());
         self.leaf_id = Some(entry.id.clone());
         self.entries.push(entry);
+    }
+
+    /// Fold one attribution entry's aggregate into its already-indexed
+    /// target assistant row, when the row has joined the index.
+    fn fold_live_attribution(&mut self, entry: &SessionEntry) {
+        let Some(row) = entry
+            .fields
+            .get("targetId")
+            .and_then(Value::as_str)
+            .and_then(|id| self.by_id.get(id).copied())
+        else {
+            return;
+        };
+        let Some(aggregate) = entry.fields.get("aggregateUsage") else {
+            return;
+        };
+        if let Some(usage) = self.entries[row]
+            .fields
+            .get_mut("message")
+            .and_then(|message| message.get_mut("usage"))
+        {
+            *usage = aggregate.clone();
+        }
     }
 
     pub fn entries(&self) -> &[SessionEntry] {
@@ -1276,6 +1368,66 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pa-daemon-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The captured-attribution fixture: real devbox session rows
+    /// (content sanitized; ids, timestamps, and usage verbatim) — six
+    /// `child_usage_attributed` entries target one assistant row.
+    fn captured_attribution_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/attribution-fold-captured.jsonl")
+    }
+
+    #[test]
+    fn open_folds_captured_child_usage_attributions() {
+        let store = SessionFile::open(&captured_attribution_fixture()).unwrap();
+        // The raw file row: input 2690 / totalTokens 23032 / cost $0. The
+        // last attribution's cumulative aggregate replaces it (TS
+        // `applyChildUsageAttributions`): input 52898 / totalTokens 23032
+        // (unchanged — the aggregate keeps the row's context size) / cost
+        // $0.0089957. Six entries fold once, never sum.
+        let assistant = store.entry("4f61089a").expect("captured target row");
+        let usage = &assistant.fields["message"]["usage"];
+        assert_eq!(usage["input"], json!(52898));
+        assert_eq!(usage["output"], json!(5863));
+        assert_eq!(usage["cacheRead"], json!(18560));
+        assert_eq!(usage["cacheWrite"], json!(0));
+        assert_eq!(usage["totalTokens"], json!(23032));
+        assert_eq!(usage["cost"]["total"].as_f64(), Some(0.0089957));
+    }
+
+    #[test]
+    fn append_entry_folds_a_live_child_usage_attribution() {
+        let mut store = SessionFile::create("/tmp", None, 0);
+        store.append_message(json!({"role": "user", "content": "hi", "timestamp": 1u64}));
+        let assistant = store.append_message(json!({
+            "role": "assistant", "content": "hello", "provider": "p", "model": "m",
+            "timestamp": 2u64,
+            "usage": {"input": 10, "output": 2, "cacheRead": 0, "cacheWrite": 0,
+                      "totalTokens": 12,
+                      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+        }));
+        store.append_entry(
+            "child_usage_attributed",
+            json!({
+                "targetId": assistant,
+                "origin": "spawn_task",
+                "childUsage": {"input": 5, "output": 1, "cacheRead": 0, "cacheWrite": 0,
+                               "totalTokens": 6,
+                               "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0.01}},
+                "aggregateUsage": {"input": 15, "output": 3, "cacheRead": 0, "cacheWrite": 0,
+                                   "totalTokens": 12,
+                                   "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0.01}},
+            }),
+        );
+        // The live seam folds without a reopen (TS
+        // `SessionManager.append_child_usage_attribution` folds after the
+        // durable append).
+        let row = store.entry(&assistant).unwrap();
+        assert_eq!(row.fields["message"]["usage"]["input"], json!(15));
+        assert_eq!(row.fields["message"]["usage"]["output"], json!(3));
+        assert_eq!(row.fields["message"]["usage"]["totalTokens"], json!(12));
+        assert_eq!(row.fields["message"]["usage"]["cost"]["total"].as_f64(), Some(0.01));
     }
 
     #[test]
