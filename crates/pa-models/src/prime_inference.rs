@@ -201,7 +201,10 @@ struct WireItem {
     #[serde(default)]
     specs: WireSpecs,
     /// The raw `supported_parameters` list: non-strings drop during
-    /// sanitization, so a mixed array must not fail the whole item.
+    /// sanitization, so a mixed array must not fail the whole item. Feeds
+    /// both the tool-capability filter (a declaration without "tools"
+    /// drops the entry: a session always attaches tools) and the reasoning
+    /// controls.
     #[serde(default)]
     supported_parameters: Option<serde_json::Value>,
     /// The raw `reasoning` object (`supported_efforts`, `mandatory`).
@@ -304,6 +307,22 @@ pub fn parse_prime_inference_model_catalog(
         if seen.insert(wire.id.clone(), ()).is_some() {
             return Err(format!("Duplicate Prime Inference model {}", wire.id));
         }
+        let supported_parameters = parse_string_array(wire.supported_parameters.as_ref());
+        // Capability filtering (documented deviation from the TS parser,
+        // which never reads this field): a model that declares its
+        // supported request parameters without "tools" can never serve a
+        // prime-agent turn — the session always attaches its tool set and
+        // the router answers `404 No endpoints found that support tool use`
+        // — so it never enters the selectable catalog. Entries without the
+        // field stay: no signal, historical behavior. The check reads the
+        // sanitized list, so a declaration with mixed junk still keeps its
+        // "tools" (a raw Value iter would drop it).
+        if supported_parameters
+            .as_ref()
+            .is_some_and(|parameters| !parameters.iter().any(|parameter| parameter == "tools"))
+        {
+            continue;
+        }
         let name = wire
             .display_name
             .map(|name| {
@@ -319,7 +338,6 @@ pub fn parse_prime_inference_model_catalog(
             && wire.specs.supports_reasoning.is_some()
             && !wire.specs.modalities.input.is_empty()
             && !wire.specs.modalities.output.is_empty();
-        let supported_parameters = parse_string_array(wire.supported_parameters.as_ref());
         let reasoning_spec = wire
             .reasoning
             .as_ref()
@@ -680,6 +698,24 @@ mod tests {
         assert_eq!(a.len(), 64, "hex sha256");
     }
 
+    /// Capability filtering: a model that declares its supported request
+    /// parameters without "tools" can never serve a session (the router
+    /// answers 404 "No endpoints found that support tool use"), so it
+    /// never enters the catalog. Entries without the declaration stay.
+    #[test]
+    fn parse_filters_entries_without_tool_support() {
+        let mut with_tools = wire_entry("z-ai/glm-5.3", 1.0, 2.0);
+        with_tools["supported_parameters"] =
+            json!(["max_tokens", "temperature", "tools", "tool_choice"]);
+        let mut without_tools = wire_entry("meta-llama/Llama-3.2-1B-Instruct", 1.0, 2.0);
+        without_tools["supported_parameters"] = json!(["max_tokens", "temperature", "top_p"]);
+        let undeclared = wire_entry("qwen/qwen3.8-max", 1.0, 4.0);
+        let value = json!({"data": [with_tools, without_tools, undeclared]});
+        let entries = parse_prime_inference_model_catalog(&value, false).expect("entries");
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec!["z-ai/glm-5.3", "qwen/qwen3.8-max"]);
+    }
+
     #[test]
     fn parse_drops_bad_entries_and_rejects_duplicates() {
         let value = json!({"data": [
@@ -787,14 +823,14 @@ mod tests {
             "id": "z-ai/glm-5.3",
             "display_name": "GLM 5.3",
             "pricing": {"input_usd_per_mtok": 1.4, "output_usd_per_mtok": 4.4},
-            "supported_parameters": ["max_tokens", "reasoning", "reasoning_effort", 42, null],
+            "supported_parameters": ["max_tokens", "reasoning", "reasoning_effort", "tools", 42, null],
             "reasoning": {"supported_efforts": ["low", "high", "max", "high", null], "mandatory": true},
         }]});
         let entries = parse_prime_inference_model_catalog(&value, false).expect("entries");
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].supported_parameters.as_deref(),
-            Some(&["max_tokens", "reasoning", "reasoning_effort"][..])
+            Some(&["max_tokens", "reasoning", "reasoning_effort", "tools"][..])
         );
         assert_eq!(
             entries[0].reasoning_efforts.as_deref(),
