@@ -854,7 +854,14 @@ describe("daemon supervisor remote mesh routing", () => {
 			refreshed = false;
 			return ready;
 		};
-		const targets = [{ sessionId: "r-s", activeSessionId: "r-a", summary: { rlmDepth: 0, rosterStatus: "idle" } }];
+		const targets = [
+			{
+				host: { tailnetHost: "peer.tailnet.ts.net", online: true, daemon: true, sessions: [] },
+				sessionId: "r-s",
+				activeSessionId: "r-a",
+				summary: { rlmDepth: 0, rosterStatus: "idle" },
+			},
+		];
 		return {
 			enabled: () => true,
 			waits,
@@ -936,5 +943,12 @@ describe("daemon supervisor remote mesh routing", () => {
 		await supervisor.handleCommand(client, send("wake the saved local"));
 		expect(vi.mocked(supervisor.createOrReuseWorker).mock.calls[0]?.[1]).toMatchObject({ sessionPath: "/s.jsonl" });
 		expect(deliveries).toHaveLength(1);
+
+		// A peer that reuses the sender's ids is another daemon's session, not the sender.
+		supervisor.catalog.resolve = vi.fn().mockRejectedValue(new Error("No session found matching 'remote-agent'"));
+		mesh.targets.splice(1);
+		mesh.targets[0]!.activeSessionId = "l";
+		await supervisor.handleCommand(client, send("hi twin", true));
+		expect(deliveries.at(-1)).toMatchObject({ message: "hi twin", fromRelationship: "sibling" });
 	});
 });

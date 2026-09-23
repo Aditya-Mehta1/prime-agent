@@ -6009,7 +6009,10 @@ export class AgentDaemon {
 					messageCount: info.messageCount,
 				}),
 			);
-		const byId = new Map<string, AgentFamilyCatalogEntry>(savedRoots.map((entry) => [entry.id, entry]));
+		// Rows key bare session ids, and a peer publishes its own ids: peers merge first
+		// so a local row always wins its own id. A same-id remote row can then never hide
+		// a saved local name from session-name validation.
+		const byId = new Map<string, AgentFamilyCatalogEntry>();
 		// `remote` peers live in another worker: their active id stays routable, while a
 		// local summary's stand-in id for a passive child does not.
 		const addAgent = (agent: AgentSessionMessageAgentSummary, remote = false) => {
@@ -6038,6 +6041,7 @@ export class AgentDaemon {
 			});
 		};
 		for (const peer of remotePeers) addAgent(peer, true);
+		for (const entry of savedRoots) byId.set(entry.id, entry);
 		for (const agent of localAgents) addAgent(agent);
 		for (const state of this.sessions.values()) {
 			const entry = byId.get(state.runtime.session.sessionId);

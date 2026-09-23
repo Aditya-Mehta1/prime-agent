@@ -788,10 +788,16 @@ export function getAgentsViewSummaryIdentity(summary: SessionSummary): string {
 export interface AgentsViewSelectionKey {
 	sessionId: string;
 	activeSessionId?: string;
+	/** MagicDNS host of a remote row: the id fallbacks only match inside that host. */
+	remoteHost?: string;
 }
 
 export function getAgentsViewSelectionKey(summary: SessionSummary): AgentsViewSelectionKey {
-	return { sessionId: summary.sessionId, activeSessionId: summary.activeSessionId };
+	return {
+		sessionId: summary.sessionId,
+		activeSessionId: summary.activeSessionId,
+		remoteHost: summary.remoteHost,
+	};
 }
 
 // Matches by identity, then activeSessionId, then sessionId: a row's identity
@@ -807,6 +813,10 @@ export function resolveAgentsViewSelectionIndex(
 	const selectedSyntheticKind = identity?.startsWith("subagents:") ? "subagent-summary" : undefined;
 	const preservesSelectedKind = (row: AgentsViewRow): boolean =>
 		selectedSyntheticKind === undefined || row.kind === selectedSyntheticKind;
+	// Id fallbacks stay host-scoped, like the row identity: a local session that
+	// reuses a remote row's ids must never take that row's selection.
+	const selectionScope = key?.remoteHost ? `remote:${key.remoteHost}:` : "";
+	const preservesSelectedHost = (row: AgentsViewRow): boolean => identityScope(row.summary) === selectionScope;
 
 	if (identity !== undefined) {
 		const index = findSelectable((row) => row.identity === identity);
@@ -819,7 +829,10 @@ export function resolveAgentsViewSelectionIndex(
 	if (key?.activeSessionId !== undefined) {
 		const activeSessionId = key.activeSessionId;
 		const index = findSelectable(
-			(row) => preservesSelectedKind(row) && (row.summary.activeSessionId ?? row.summary.id) === activeSessionId,
+			(row) =>
+				preservesSelectedKind(row) &&
+				preservesSelectedHost(row) &&
+				(row.summary.activeSessionId ?? row.summary.id) === activeSessionId,
 		);
 		if (index >= 0) {
 			return index;
@@ -833,7 +846,9 @@ export function resolveAgentsViewSelectionIndex(
 	}
 	if (key?.sessionId !== undefined) {
 		const sessionId = key.sessionId;
-		return findSelectable((row) => preservesSelectedKind(row) && row.summary.sessionId === sessionId);
+		return findSelectable(
+			(row) => preservesSelectedKind(row) && preservesSelectedHost(row) && row.summary.sessionId === sessionId,
+		);
 	}
 	return -1;
 }

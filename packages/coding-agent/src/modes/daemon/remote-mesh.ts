@@ -111,9 +111,13 @@ const DEFAULT_REMOTE_MESH_REFRESH_TTL_MS = 30_000;
  */
 const DEFAULT_REMOTE_MESH_OFFLINE_TTL_MS = 24 * 60 * 60_000;
 
-/** Roster ids are namespaced so remote rows can never collide with local ones. */
-export function remoteAgentRosterId(tailnetHost: string, sessionId: string): string {
-	return `remote:${tailnetHost}#${sessionId}`;
+/**
+ * A peer publishes its own session ids, so one id is only unique inside one
+ * daemon. Roster ids and send checks namespace a remote row's ids with its
+ * host; a row with no host is local and keeps the bare id.
+ */
+export function agentMeshIdentity(tailnetHost: string | undefined, sessionId: string): string {
+	return tailnetHost ? `remote:${tailnetHost}#${sessionId}` : sessionId;
 }
 
 /** A host answers with a usable roster only when online, unlocked, and daemon-backed. */
@@ -310,7 +314,7 @@ export class RemoteAgentMeshState {
 		const entries = new Map<string, AgentRosterEntry>();
 		for (const state of this.hosts.values()) {
 			for (const session of state.sessions.values()) {
-				const agentId = remoteAgentRosterId(state.host.tailnetHost, session.sessionId);
+				const agentId = agentMeshIdentity(state.host.tailnetHost, session.sessionId);
 				entries.set(agentId, remoteAgentRosterEntry(state, session));
 			}
 		}
@@ -485,7 +489,7 @@ export function assertRemoteAgentFamilyReach(source: AgentFamilyCatalogEntry, ta
 function remoteAgentRosterEntry(state: RemoteAgentMeshHostState, session: RemoteAgentSessionSummary): AgentRosterEntry {
 	const summary = remoteSessionSummary(state.host, session, state.offline);
 	return {
-		agentId: remoteAgentRosterId(state.host.tailnetHost, session.sessionId),
+		agentId: agentMeshIdentity(state.host.tailnetHost, session.sessionId),
 		summary,
 		status: summary.rosterStatus ?? "idle",
 		// Exceptional labels are the one channel the Activity column renders, so

@@ -173,6 +173,7 @@ import {
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
+	agentMeshIdentity,
 	assertRemoteAgentFamilyReach,
 	type RemoteAgentMeshSource,
 	RemoteAgentMeshState,
@@ -3126,7 +3127,14 @@ export class DaemonSupervisor {
 				assertRemoteAgentFamilyReach(this.familyCatalogEntry(sourceSummary), remoteTarget);
 			}
 			relationship = remoteAgentFamilyRelationship(this.familyCatalogEntry(sourceSummary), remoteTarget);
-			if ((sourceSummary.activeSessionId ?? sourceSummary.id) === remoteTarget.activeSessionId) {
+			// A peer publishes its own session ids, so an id names the sender only inside
+			// one host: a copied session on the peer is a sibling, not this session.
+			const targetActiveSessionId = remoteTarget.activeSessionId;
+			if (
+				targetActiveSessionId !== undefined &&
+				agentMeshIdentity(sourceSummary.remoteHost, sourceSummary.activeSessionId ?? sourceSummary.id) ===
+					agentMeshIdentity(remoteTarget.host.tailnetHost, targetActiveSessionId)
+			) {
 				throw new Error("Agent messaging cannot target the sending session");
 			}
 		}

@@ -1613,6 +1613,33 @@ describe("agents view state", () => {
 			const rows = buildAgentsViewRows([opened, other]);
 			expect(resolveAgentsViewSelectionIndex(rows, undefined, undefined)).toBe(-1);
 		});
+
+		test("keeps a remote row selected while a local session reuses its ids", () => {
+			const sharedId = "01a0cba2-0000-7000-8000-abcdef123456";
+			const localTwin = makeSummary({ id: "local-active", activeSessionId: sharedId, sessionId: sharedId });
+			// The peer re-attached with a fresh active id, so the stored identity no longer matches.
+			const refreshedPeer = makeSummary({
+				id: "remote-active-2",
+				activeSessionId: "remote-active-2",
+				sessionId: sharedId,
+				remoteHost: "peer.tailnet.ts.net",
+			});
+			const rows = buildAgentsViewRows([localTwin, refreshedPeer]);
+			const selected = makeSummary({
+				id: sharedId,
+				activeSessionId: sharedId,
+				sessionId: sharedId,
+				remoteHost: "peer.tailnet.ts.net",
+			});
+
+			expect(
+				resolveAgentsViewSelectionIndex(
+					rows,
+					`remote:peer.tailnet.ts.net:active:${sharedId}`,
+					getAgentsViewSelectionKey(selected),
+				),
+			).toBe(rows.findIndex((row) => row.summary.activeSessionId === "remote-active-2"));
+		});
 	});
 
 	describe("scoped navigation", () => {

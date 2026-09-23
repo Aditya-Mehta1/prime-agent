@@ -6,11 +6,7 @@ import type {
 	RemoteAgentMessageTransport,
 	RemoteAgentSessionSummary,
 } from "../src/modes/daemon/remote-mesh.js";
-import {
-	RemoteAgentMeshState,
-	remoteAgentFamilyRelationship,
-	remoteAgentRosterId,
-} from "../src/modes/daemon/remote-mesh.js";
+import { RemoteAgentMeshState, remoteAgentFamilyRelationship } from "../src/modes/daemon/remote-mesh.js";
 
 function remoteSession(overrides: Partial<RemoteAgentSessionSummary> = {}): RemoteAgentSessionSummary {
 	return {
@@ -62,7 +58,7 @@ describe("RemoteAgentMeshState", () => {
 		await state.refreshIfStale();
 		const entries = state.entriesForClients();
 		expect(entries[0]).toMatchObject({
-			agentId: remoteAgentRosterId("milk.tailnet.ts.net", "remote-session"),
+			agentId: "remote:milk.tailnet.ts.net#remote-session",
 			status: "idle",
 		});
 		expect(entries[0]!.summary).toMatchObject({
@@ -94,7 +90,7 @@ describe("RemoteAgentMeshState", () => {
 		source.listRemoteAgents.mockResolvedValueOnce([host()]);
 		await state.refreshIfStale();
 		expect(state.sessionSummaries().map((summary) => summary.sessionId)).toEqual(["remote-session"]);
-		expect(rosterChanges.at(-1)!.removed).toEqual([remoteAgentRosterId("milk.tailnet.ts.net", "closing-session")]);
+		expect(rosterChanges.at(-1)!.removed).toEqual(["remote:milk.tailnet.ts.net#closing-session"]);
 
 		source.listRemoteAgents.mockResolvedValueOnce([]);
 		await state.refreshIfStale();
@@ -129,7 +125,7 @@ describe("RemoteAgentMeshState", () => {
 		source.listRemoteAgents.mockResolvedValueOnce([]);
 		await state.refreshIfStale();
 		expect(state.sessionSummaries()).toHaveLength(0);
-		expect(removedIds.at(-1)).toEqual([remoteAgentRosterId("milk.tailnet.ts.net", "remote-session")]);
+		expect(removedIds.at(-1)).toEqual(["remote:milk.tailnet.ts.net#remote-session"]);
 	});
 
 	it("bounds scans with the TTL and coalesces concurrent queries onto one scan", async () => {
