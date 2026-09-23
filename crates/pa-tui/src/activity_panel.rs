@@ -18,7 +18,7 @@ use pa_types::daemon::agent_roster::AgentRosterStatus;
 
 const PREFERRED_VISIBLE: usize = 8;
 // rule, title+counts, blank, blank, detail block, blank, hint, rule.
-const RESERVED_ROWS: usize = 8;
+const RESERVED_ROWS: usize = 7;
 /// The detail pane's per-row line budget (a fetched bash tail rides it).
 const MAX_DETAIL_LINES: usize = 5;
 const MAX_TAIL_LINES: usize = 3;
