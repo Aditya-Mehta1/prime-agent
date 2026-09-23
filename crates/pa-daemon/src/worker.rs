@@ -5013,7 +5013,7 @@ impl TurnRunner {
     /// busy flip, so subscribed clients see live status without polling.
     /// Fire-and-forget: a dead link reconnects on the next flip, and a
     /// supervisor restart re-seeds the entry from registration.
-    fn push_roster_delta(&self) {
+    pub(crate) fn push_roster_delta(&self) {
         if std::env::var_os("PA_WORKER_DISABLE_ROSTER_PUSH").is_some() {
             return;
         }
