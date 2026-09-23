@@ -82,11 +82,12 @@ export const DAEMON_SCHEMA_REVISION = 31;
 /**
  * Opaque wire-schema identity the handshake compares: a client replaces a
  * daemon whose id differs, so this moves in lockstep with the revision.
- * Fingerprint = first 12 hex ofsha256("protocol-7|<revision>|<sorted command
- * names from DAEMON_COMMAND_COMPATIBILITY>"). Regenerate with:
- * `python3 -c "import re,hashlib;p=open('packages/coding-agent/src/modes/daemon/daemon-protocol.ts').read();b=p[p.index('export const DAEMON_COMMAND_COMPATIBILITY'):];c=sorted(set(re.findall(r'^\t([a-z_0-9]+):',b,re.M)));print(hashlib.sha256(('protocol-7|31|'+','.join(c)).encode()).hexdigest()[:12])"`
+ * The fingerprint is the first 12 hex of
+ * sha256("protocol-7|<revision>|<sorted `name:` keys after the compatibility
+ * map>"). Regenerate it with this command and paste the output below:
+ * python3 -c "import re,hashlib;p=open('packages/coding-agent/src/modes/daemon/daemon-protocol.ts').read();b=p[p.index('export const DAEMON_COMMAND_COMPATIBILITY'):];c=sorted(set(re.findall(r'^\t([a-z_0-9]+):',b,re.M)));r=str(31);print('protocol-7-schema-'+r+'-'+hashlib.sha256(('protocol-7|'+r+'|'+','.join(c)).encode()).hexdigest()[:12])"
  */
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-0cfe17764281";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-1e7fae2a49e5";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
