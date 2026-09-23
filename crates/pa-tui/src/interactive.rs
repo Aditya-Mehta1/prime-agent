@@ -622,7 +622,29 @@ impl ReconnectLoop {
 
 /// Run the interactive UI until the user exits (terminal) or the plan
 /// completes (headless).
+///
+/// Every error return funnels through the one exit restore: an early `?`
+/// between the surface mount and the deliberate tail teardown (a draw
+/// failure, a key-handler transport error, a suspend/resume failure)
+/// must not hand the shell a terminal still in TUI state — raw mode,
+/// the alternate screen, the enhancement modes armed. The restore is
+/// idempotent, so a return after the tail already ran (the startup
+/// refusal path finishes the surface itself) only re-emits the two
+/// unconditional tail bytes.
 pub async fn run_interactive(
+    options: InteractiveOptions,
+    ui: UiMode,
+) -> Result<InteractiveOutcome> {
+    match run_interactive_surface(options, ui).await {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            crate::exit_restore::restore_terminal();
+            Err(error)
+        }
+    }
+}
+
+async fn run_interactive_surface(
     options: InteractiveOptions,
     ui: UiMode,
 ) -> Result<InteractiveOutcome> {
@@ -689,6 +711,12 @@ pub async fn run_interactive(
     // Headless verification runs capture the OSC 52 clipboard channel
     // instead of writing it to the plain pipes.
     let headless = matches!(ui, UiMode::Headless(_));
+    // A panic anywhere between the mount below and the deliberate
+    // teardown must still hand the terminal back whole: the unwind guard
+    // fires the one exit restore while the frame is dying (a set_hook
+    // cannot carry this — tokio catches task panics and the process
+    // would live on with a half-restored surface).
+    let _surface_restore = crate::exit_restore::SurfaceRestore::armed();
     let mut renderer = Renderer::setup(ui, ui_tx, exit_guard.clone(), options.fullscreen_mouse)?;
     if !headless {
         // TS `ui.start()` renders once before the session loads: the first
@@ -2101,6 +2129,14 @@ impl Renderer {
     /// main screen, show the cursor, restore cooked mode — the resume hint
     /// the composition root prints next lands right below the flushed frame.
     fn finish(mut self, view: &mut AgentView, preserve_alt_screen: bool) -> Vec<String> {
+        // The exit that ends the process stands the kitty probe down
+        // FIRST: an answer landing after the pop below would re-arm
+        // CSI-u reporting on the parent shell (the "escape codes while
+        // typing" leak). A handoff (preserve) keeps the process alive
+        // and the next surface's probe — never released here.
+        if !preserve_alt_screen && self.is_terminal() {
+            crate::enhanced_keys::release_for_exit();
+        }
         // In-flight kitty key releases are consumed before the terminal is
         // restored (TS `drainInput` before `stop`): a release that lands
         // after raw mode is off would leak its escape sequence into the
@@ -2127,8 +2163,11 @@ impl Renderer {
                     crate::input::request_reader_stop();
                 } else {
                     let _ = self.flush_to_main_screen(view);
-                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
-                    let _ = terminal::disable_raw_mode();
+                    // The shared exit tail ends the parity teardown: the
+                    // synchronized-output release, the SGR reset, the
+                    // cursor show, and the cooked-tty verification end in
+                    // the same terminal state every exit path guarantees.
+                    crate::exit_restore::terminal_release_tail(&mut std::io::stdout());
                 }
                 Vec::new()
             }
@@ -2167,6 +2206,39 @@ fn exit_flush_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_error_return_runs_the_one_exit_restore() {
+        // A socket that never listens: the attach fails and the run
+        // returns Err — the wrapper must still fire the one exit restore
+        // (a no-op on the headless pipes, observable through the
+        // attempts counter). The contract: no error path hands the shell
+        // a terminal still in TUI state.
+        let socket =
+            std::env::temp_dir().join(format!("tui-exit-restore-dead-{}.sock", std::process::id()));
+        let mut opts = options(ModelSelection::default());
+        opts.socket_path = socket;
+        let before =
+            crate::exit_restore::RESTORE_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst);
+        let result = run_interactive(
+            opts,
+            UiMode::Headless(HeadlessPlan {
+                steps: Vec::new(),
+                width: 80,
+                height: 24,
+            }),
+        )
+        .await;
+        assert!(result.is_err(), "the dead socket must error the run");
+        // `>` (not exact): the unwind-guard test in `exit_restore` may
+        // fire a restore concurrently (tests run in parallel in this
+        // binary); this run's own restore must be in the count.
+        assert!(
+            crate::exit_restore::RESTORE_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
+                > before,
+            "the error return fired the exit restore"
+        );
+    }
 
     #[test]
     fn flush_rows_write_crlf_and_keep_zone_markers() {

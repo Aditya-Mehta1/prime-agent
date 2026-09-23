@@ -1488,16 +1488,21 @@ impl Renderer {
     fn finish(self, preserve_alt_screen: bool) -> Vec<String> {
         match self {
             Renderer::Terminal(_) => {
-                // The enhanced-key modes release with the raw-mode bracket
-                // (TS `stop` on every exit, handoffs included).
-                let mut out = std::io::stdout();
-                let _ = crate::enhanced_keys::disable(&mut out);
                 if preserve_alt_screen {
+                    // The enhanced-key modes release with the raw-mode
+                    // bracket (TS `stop` on every exit, handoffs included).
+                    let mut out = std::io::stdout();
+                    let _ = crate::enhanced_keys::disable(&mut out);
                     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
                 } else {
-                    let _ = crossterm::terminal::disable_raw_mode();
-                    let _ = crate::altscreen::leave();
-                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+                    // The one exit restore ends the view's real exit: the
+                    // probe standdown, the input drain, the mode releases,
+                    // the alt-screen leave, the sync/SGR tail, and the
+                    // cooked-tty verification — the same whole-terminal
+                    // contract every exit path guarantees. (The view never
+                    // flushes its frame: TS agents-view `finish` passes
+                    // `flushFullscreen: false`.)
+                    crate::exit_restore::restore_terminal();
                 }
                 Vec::new()
             }
@@ -1569,6 +1574,25 @@ pub async fn run_agents_view(
     ui: AgentsViewUiMode,
     link: Option<AgentsViewLink>,
 ) -> Result<AgentsViewRun> {
+    // Every error return funnels through the one exit restore (an early
+    // `?` between the surface mount and the tail teardown must not hand
+    // the shell a terminal still in TUI state); the restore is
+    // idempotent, so the failed-roster release below costing a second
+    // pass only re-emits the two unconditional tail bytes.
+    match run_agents_view_surface(options, ui, link).await {
+        Ok(run) => Ok(run),
+        Err(error) => {
+            crate::exit_restore::restore_terminal();
+            Err(error)
+        }
+    }
+}
+
+async fn run_agents_view_surface(
+    options: AgentsViewOptions,
+    ui: AgentsViewUiMode,
+    link: Option<AgentsViewLink>,
+) -> Result<AgentsViewRun> {
     crossterm::style::force_color_output(true);
     // The connection and its first snapshot precede every surface state:
     // this pane was handed over already in TUI state (raw mode on, the
@@ -1581,7 +1605,7 @@ pub async fn run_agents_view(
         Ok(open) => open,
         Err(error) => {
             if matches!(ui, AgentsViewUiMode::Terminal) {
-                crate::exit_guard::restore_terminal_best_effort();
+                crate::exit_restore::restore_terminal();
             }
             return Err(error);
         }
@@ -1597,6 +1621,10 @@ pub async fn run_agents_view(
     mode.rebuild_rows();
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiInput>();
+    // A panic anywhere between the mount below and the deliberate
+    // teardown must still hand the terminal back whole (the same
+    // unwind-guard contract the session surface arms).
+    let _surface_restore = crate::exit_restore::SurfaceRestore::armed();
     let mut renderer = Renderer::setup(ui, ui_tx.clone(), exit_guard.clone())?;
     // The first frame renders from the live roster the moment the surface
     // mounts (TS `applySessionList(this.rosterStore.summaries(), true)`

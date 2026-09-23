@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{self, EnterAlternateScreen};
 use ratatui::Terminal;
 use std::io::stdout;
 use std::time::{Duration, Instant};
@@ -512,12 +512,34 @@ impl ConfigSelectorOptions {
 
 /// Run the selector until Esc (close) or Ctrl+C (exit): full-screen mode,
 /// redraws on every key and toggle, `on_toggle` persists each flip.
+///
+/// Every error return funnels through the one exit restore: an early `?`
+/// after the mount (a draw failure, a persist error in `on_toggle`) must
+/// not hand the shell a terminal still in TUI state.
 pub fn run_config_selector(
+    selector: ConfigSelector,
+    options: ConfigSelectorOptions,
+    on_toggle: &mut dyn FnMut(&str, bool) -> Result<()>,
+) -> Result<()> {
+    match run_selector_surface(selector, options, on_toggle) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            crate::exit_restore::restore_terminal();
+            Err(error)
+        }
+    }
+}
+
+fn run_selector_surface(
     mut selector: ConfigSelector,
     options: ConfigSelectorOptions,
     on_toggle: &mut dyn FnMut(&str, bool) -> Result<()>,
 ) -> Result<()> {
     crossterm::style::force_color_output(true);
+    // A panic anywhere between the mount below and the deliberate
+    // teardown must still hand the terminal back whole (the same
+    // unwind-guard contract the session surface arms).
+    let _surface_restore = crate::exit_restore::SurfaceRestore::armed();
     terminal::enable_raw_mode()?;
     crossterm::execute!(stdout(), EnterAlternateScreen)?;
     // The selector surface owns the same enhanced-key modes as the session
@@ -555,10 +577,7 @@ pub fn run_config_selector(
             match action {
                 Some(SelectorAction::Close) => break,
                 Some(SelectorAction::Exit) => {
-                    let mut out = stdout();
-                    let _ = crate::enhanced_keys::disable(&mut out);
-                    terminal::disable_raw_mode()?;
-                    crossterm::execute!(stdout(), LeaveAlternateScreen)?;
+                    crate::exit_restore::restore_terminal();
                     std::process::exit(0);
                 }
                 Some(SelectorAction::Toggle { key, enabled }) => {
@@ -573,10 +592,7 @@ pub fn run_config_selector(
             }
         }
     }
-    let mut out = stdout();
-    let _ = crate::enhanced_keys::disable(&mut out);
-    terminal::disable_raw_mode()?;
-    crossterm::execute!(stdout(), LeaveAlternateScreen)?;
+    crate::exit_restore::restore_terminal();
     Ok(())
 }
 
