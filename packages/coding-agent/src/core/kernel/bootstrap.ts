@@ -691,7 +691,8 @@ function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeId
 }
 
 // No-skill callers (postinstall, runtime-bootstrap, bootstrap-cli) never sync skills and only need
-// the base marker; skill callers need every requested skill recorded.
+// the base marker: letting them reach syncPythonSkills would rewrite the marker with an empty list
+// and wipe the recorded skills. Skill callers need every requested skill recorded.
 function bootstrapVersionCurrentForCaller(
 	version: BootstrapVersion | null,
 	runtimeIdentity: string,
