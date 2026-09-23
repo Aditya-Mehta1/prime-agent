@@ -189,13 +189,19 @@ async fn search_matches_names_ids_and_cwd_never_transcripts() {
         &session_dir,
         "gateway-01",
         "gateway worker",
-        &[("deploy the gateway", "done; bumped the backoff ceiling to 30s")],
+        &[(
+            "deploy the gateway",
+            "done; bumped the backoff ceiling to 30s",
+        )],
     );
     let migration_path = write_fixture(
         &session_dir,
         "migration-01",
         "migration runner",
-        &[("run the migrations now", "migration 001 applied; it was fast")],
+        &[(
+            "run the migrations now",
+            "migration 001 applied; it was fast",
+        )],
     );
     write_fixture(
         &session_dir,
@@ -326,8 +332,18 @@ async fn ranked_hits_sort_by_relevance_then_recency() {
     // Three name-prefix hits for "run": two same-length prefixes (tie on
     // tier quality, title breaks the tie) and one longer prefix (worse
     // tier quality ranks it below them).
-    write_fixture(&session_dir, "run-books-01", "run books", &[("start", "done")]);
-    write_fixture(&session_dir, "run-dials-01", "run dials", &[("start", "done")]);
+    write_fixture(
+        &session_dir,
+        "run-books-01",
+        "run books",
+        &[("start", "done")],
+    );
+    write_fixture(
+        &session_dir,
+        "run-dials-01",
+        "run dials",
+        &[("start", "done")],
+    );
     let runway_path = write_fixture(
         &session_dir,
         "runway-01",

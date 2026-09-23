@@ -130,9 +130,15 @@ fn saved_aliases(saved: &Value) -> Vec<String> {
 /// records; saved rows carry the durable name for archived sessions.
 fn daemon_search_text(summary: &Value) -> SessionSearchText {
     SessionSearchText {
-        name: get_str(summary, "sessionName").map(str::to_string).unwrap_or_default(),
-        id: get_str(summary, "sessionId").map(str::to_string).unwrap_or_default(),
-        cwd: get_str(summary, "cwd").map(str::to_string).unwrap_or_default(),
+        name: get_str(summary, "sessionName")
+            .map(str::to_string)
+            .unwrap_or_default(),
+        id: get_str(summary, "sessionId")
+            .map(str::to_string)
+            .unwrap_or_default(),
+        cwd: get_str(summary, "cwd")
+            .map(str::to_string)
+            .unwrap_or_default(),
     }
 }
 
