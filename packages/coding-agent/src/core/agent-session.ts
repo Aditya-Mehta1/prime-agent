@@ -79,6 +79,7 @@ import {
 	addLoginGuidanceToAuthError,
 	formatAuthenticationFailedMessage,
 	formatImageModelReferenceRejectedMessage,
+	formatImageModelRequiredMessage,
 	formatImageModelUnusableMessage,
 	formatImageTurnChildTimeoutMessage,
 	formatNoApiKeyFoundMessage,
@@ -864,6 +865,23 @@ function normalizeMessageContent(content: string | (TextContent | ImageContent)[
  * Whether a delivered message attaches image content. Used to route
  * image-carrying turns off session models without image input.
  */
+/**
+ * Image bytes from a host-request payload, in the shape the attach-image skill
+ * sends: base64 data with its mime type per image. Anything malformed is
+ * dropped, so a bad payload reads as "no image" instead of failing the read.
+ */
+function imageContentsFromPayload(value: unknown): ImageContent[] {
+	if (!Array.isArray(value)) return [];
+	const images: ImageContent[] = [];
+	for (const entry of value) {
+		if (!entry || typeof entry !== "object") continue;
+		const { mime_type: mimeType, data } = entry as { mime_type?: unknown; data?: unknown };
+		if (typeof mimeType !== "string" || typeof data !== "string" || !data) continue;
+		images.push({ type: "image", mimeType, data });
+	}
+	return images;
+}
+
 function messageCarriesImages(message: QueuedAgentMessage | AgentMessage): boolean {
 	const content = (message as { content?: unknown }).content;
 	return Array.isArray(content) && content.some((part: { type?: string }) => part?.type === "image");
@@ -2802,7 +2820,7 @@ export class AgentSession {
 	 * images, or no resolvable image model); every failure throws with the fix
 	 * named, so images never reach a model that would drop them.
 	 */
-	private async _readTurnImagesWithChild(text: string, images: ImageContent[]): Promise<string | undefined> {
+	private async _readImagesWithVisionChild(text: string, images: ImageContent[]): Promise<string | undefined> {
 		if (images.length === 0) return undefined;
 		const sessionModel = this.model;
 		if (!sessionModel || sessionModel.input.includes("image")) return undefined;
@@ -5766,7 +5784,7 @@ export class AgentSession {
 		// follow-up) only await normalization on the prompt path, and a session
 		// that needs no reading must not pay for one.
 		if (!this._needsVisionChildRead(normalized.images)) return normalized;
-		const reading = this._readTurnImagesWithChild(normalized.text, normalized.images).then((result) => {
+		const reading = this._readImagesWithVisionChild(normalized.text, normalized.images).then((result) => {
 			if (!result) return normalized;
 			const text = normalized.text.trim() ? `${normalized.text}\n\n${result}` : result;
 			return { ...normalized, text, images: undefined };
@@ -11280,6 +11298,33 @@ export class AgentSession {
 				provider: this.model?.provider ?? null,
 				input: this.model?.input ?? [],
 			}),
+			/**
+			 * Read image bytes with the image model and return its text. The
+			 * attach-image skill calls this instead of attaching images when the
+			 * session model cannot see them, so the image never enters a
+			 * transcript only the session model serves.
+			 */
+			"vision.read": async (payload) => {
+				const images = imageContentsFromPayload(payload.images);
+				if (images.length === 0) {
+					return { error: "vision.read needs at least one image" };
+				}
+				const question = typeof payload.question === "string" ? payload.question : "";
+				try {
+					const reading = await this._readImagesWithVisionChild(question, images);
+					if (!reading) {
+						const sessionModel = this.model;
+						return {
+							error: formatImageModelRequiredMessage(
+								sessionModel ? `${sessionModel.provider}/${sessionModel.id}` : "the session model",
+							),
+						};
+					}
+					return { text: reading, model: this._imageTurnChildModelReference() ?? null };
+				} catch (error) {
+					return { error: error instanceof Error ? error.message : String(error) };
+				}
+			},
 		};
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {

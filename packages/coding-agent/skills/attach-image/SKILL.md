@@ -46,4 +46,7 @@ gray background. Extremely large images are rejected by pixel count before full
 processing. The original file is left untouched.
 
 Supported formats: PNG, JPEG, GIF, WebP. The skill errors if a file is not a
-supported image, or if the current model is not vision-capable.
+supported image. When the session model cannot see images but the session has an
+image model (`/image-model`, or `imageModel` in settings.json), the image is
+read by that model instead and the skill returns its reading as text; with no
+image model it errors and tells you to switch to a vision-capable model.
