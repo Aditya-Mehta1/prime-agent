@@ -959,14 +959,7 @@ impl AgentView {
         let Some(state) = self.editor.autocomplete_state() else {
             return Vec::new();
         };
-        let styles = crate::autocomplete::SelectListStyles {
-            selected_prefix: self.theme.fg_style(ThemeColor::Accent),
-            selected_text: self.theme.fg_style(ThemeColor::Accent),
-            description: self.theme.fg_style(ThemeColor::Muted),
-            argument_hint: self.theme.fg_style(ThemeColor::MdCode),
-            scroll_info: self.theme.fg_style(ThemeColor::Muted),
-            no_match: self.theme.fg_style(ThemeColor::Muted),
-        };
+        let theme = &self.theme;
         let bg = self.theme.bg_style(ThemeBg::ToolPanelBg);
         let padding_x = 2usize;
         // The overlay anchors against the live prompt prefix (TS
@@ -978,7 +971,7 @@ impl AgentView {
         let mut rows: Vec<Line> = Vec::new();
         let mut overlay = Vec::new();
         overlay.push(Vec::new());
-        overlay.extend(state.render(input_width, &styles));
+        overlay.extend(state.render(theme, input_width));
         overlay.push(Vec::new());
         for line in overlay {
             let used: usize = line.iter().map(|s| str_width(&s.content)).sum();

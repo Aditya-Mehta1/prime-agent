@@ -650,6 +650,60 @@ mod tests {
     }
 
     #[test]
+    fn picker_argument_context_reports_command_and_partial() {
+        let mut e = ed();
+        // The argument position at the prompt start: command + partial.
+        e.set_text("/model gp");
+        assert_eq!(
+            e.picker_argument_context(),
+            Some(("model".to_string(), "gp".to_string()))
+        );
+        e.set_text("/mcp lin ");
+        assert_eq!(
+            e.picker_argument_context(),
+            Some(("mcp".to_string(), "lin ".to_string()))
+        );
+        // The command-name position is not an argument context.
+        e.set_text("/model");
+        assert_eq!(e.picker_argument_context(), None);
+        // A plain token is no context at all.
+        e.set_text("hello there");
+        assert_eq!(e.picker_argument_context(), None);
+        // Other commands report their names; the caller picks the
+        // picker-backed ones.
+        e.set_text("/export ht");
+        assert_eq!(
+            e.picker_argument_context(),
+            Some(("export".to_string(), "ht".to_string()))
+        );
+    }
+
+    #[test]
+    fn tab_on_an_empty_prompt_is_a_noop() {
+        // Tab on an empty prompt must not open a completion menu: the
+        // forced pass would list the whole cwd (junk entries like a
+        // `.claude` directory), with no anchor token to complete.
+        let mut e = ed();
+        e.handle_input("tab");
+        e.materialize_autocomplete();
+        assert!(!e.is_showing_autocomplete(), "no dropdown on empty Tab");
+        // Whitespace-only prompts are the same empty prompt.
+        e.handle_input(" ");
+        e.handle_input(" ");
+        e.handle_input("tab");
+        e.materialize_autocomplete();
+        assert!(!e.is_showing_autocomplete(), "no dropdown on blank Tab");
+        // A typed token still completes on Tab (the slash-name context).
+        e.set_text("/mo");
+        e.handle_input("tab");
+        e.materialize_autocomplete();
+        assert!(
+            e.is_showing_autocomplete(),
+            "typed slash context still opens on Tab"
+        );
+    }
+
+    #[test]
     fn history_navigation() {
         let mut e = ed();
         e.add_to_history("first prompt");

@@ -768,7 +768,10 @@ impl ModelPicker {
                 continue;
             };
             let segments = self.trailing_segments(model);
-            let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+            let refs: Vec<crate::menu_panel::MenuSegment> = segments
+                .iter()
+                .map(|segment| crate::menu_panel::MenuSegment::muted(segment))
+                .collect();
             max_trailing_width =
                 max_trailing_width.max(crate::menu_panel::trailing_width(&refs, width));
         }
@@ -1397,7 +1400,7 @@ mod tests {
             ModelPicker::open(picker_options(Vec::new()), "");
         let rows = frame_text(&mut picker);
         assert_eq!(rows[1], " >  Search models");
-        assert!(rows.iter().any(|row| row == "No matching models"));
+        assert!(rows.iter().any(|row| row == "  No matching models"));
     }
 
     #[test]
@@ -1412,7 +1415,7 @@ mod tests {
         let mut picker = ModelPicker::new(picker_options(battery_catalog()));
         picker.set_query("zzz-no-match");
         let rows = frame_text(&mut picker);
-        assert!(rows.iter().any(|row| row == "No matching models"));
+        assert!(rows.iter().any(|row| row == "  No matching models"));
     }
 
     #[test]

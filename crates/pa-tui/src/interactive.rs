@@ -99,6 +99,14 @@ pub trait InteractionTelemetry: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// An actionable activity group was opened; never includes command or goal text.
     fn activity_opened(&self, kind: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// A menu surface opened (event `tui menu opened`): `menu` names the
+    /// surface (`model`, `mcp`), `source` how it opened (`command` — the
+    /// bare slash submission, `tab` — a typed partial + Tab).
+    fn menu_opened(
+        &self,
+        menu: &'static str,
+        source: &'static str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// An image was pasted into the editor from the clipboard (event
     /// `tui image pasted`); `mime_type` is the attachment's sniffed format.
     fn image_pasted(&self, mime_type: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
@@ -984,24 +992,22 @@ pub async fn run_interactive(
                                 }
                             }
                         }
-                        // A selector that resolved to a client command (the
-                        // `/mcp` view's Enter): dispatch it through the same
-                        // submit path as an editor submission, so the
-                        // terminal-suspending auth flows get the identical
-                        // suspend/resume bracket.
-                        if let Some(command) = session.take_pending_client_command() {
-                            let suspended = session.needs_terminal_suspension(&command);
+                        // The `/mcp` view resolved to an auth request (its
+                        // Enter on a connection, or the inline paste panel):
+                        // run the client auth commands directly — the
+                        // typed-command arg path is gone, so the view never
+                        // resolves through a submitted `/mcp <args>` string.
+                        // A login hands the terminal over (the auth flow
+                        // prompts on the plain terminal), a paste stays
+                        // in-band.
+                        if let Some(args) = session.take_pending_mcp_auth() {
+                            let suspended = session.mcp_auth_needs_terminal(&args);
                             if suspended {
                                 renderer.suspend(&mut view)?;
                             }
-                            let dispatched = session.submit_prompt(&command, &mut view).await;
+                            session.run_mcp_auth(&args, &mut view).await;
                             if suspended {
                                 renderer.resume()?;
-                            }
-                            if let Err(error) = dispatched {
-                                session.error_row(&format!("{error:#}"), &mut view);
-                                view.editor.set_text(&command);
-                                session.dirty = true;
                             }
                         }
                     }
@@ -1025,16 +1031,10 @@ pub async fn run_interactive(
                     }
                     UiInput::Submit(text) => {
                         session.stop_selection_auto_scroll();
-                        // A terminal-suspending client command (`/mcp login`):
-                        // the auth flow prompts on the plain terminal.
-                        let suspended = session.needs_terminal_suspension(&text);
-                        if suspended {
-                            renderer.suspend(&mut view)?;
-                        }
+                        // No submitted text needs the terminal: the
+                        // `/mcp` typed-arg form is gone (its login flow
+                        // resolved through the view's own auth seam above).
                         let dispatched = session.submit_prompt(&text, &mut view).await;
-                        if suspended {
-                            renderer.resume()?;
-                        }
                         if let Err(error) = dispatched {
                             // TS: a rejected submission surfaces the `⚠ Error`
                             // row and keeps the client mounted with the draft

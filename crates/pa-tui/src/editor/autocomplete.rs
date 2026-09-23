@@ -17,6 +17,22 @@ impl Editor {
         )
     }
 
+    /// The `/command <partial>` argument context at the prompt start, when
+    /// the cursor sits in the argument text of a recognized command token:
+    /// the command name plus the typed partial. Tab interception uses this
+    /// to open a picker-command's menu filtered to the partial.
+    pub fn picker_argument_context(&self) -> Option<(String, String)> {
+        match self.current_slash_command_context() {
+            Some(context)
+                if context.kind == crate::autocomplete::SlashKind::Argument
+                    && context.at_prompt_start =>
+            {
+                context.command_name.map(|name| (name, context.prefix))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_slash_name_completion_at_prompt_start(&self) -> bool {
         let ctx = self.current_slash_command_context();
         let kind_slash = self
@@ -53,6 +69,14 @@ impl Editor {
 
     pub(crate) fn handle_tab_completion(&mut self) {
         if self.autocomplete_provider.is_none() {
+            return;
+        }
+        // An empty prompt has nothing to complete: the forced file pass
+        // would otherwise list the whole cwd (`file_suggestions("")`),
+        // a junk menu with no anchor token. Tab on an empty (or
+        // whitespace-only) prompt is a no-op; completion after text is
+        // typed keeps its existing behavior.
+        if self.get_text().trim().is_empty() {
             return;
         }
         if matches!(self.current_slash_command_context(), Some(c) if c.kind == crate::autocomplete::SlashKind::Name)
