@@ -123,6 +123,9 @@ pub struct AgentView {
     /// The `/login` / `/logout` provider selector (TS
     /// `OAuthSelectorComponent` inline): owns the frame while open.
     pub provider_auth: Option<crate::provider_auth::ProviderAuthSelector>,
+    /// The mounted login dialog (TS `LoginDialogComponent`, the auth
+    /// panel's login flow): owns the editor dock while the flow runs.
+    pub login_dialog: Option<crate::login_dialog::LoginDialog>,
     /// The `/fork` user-message selector.
     pub fork_selector: Option<crate::user_message_selector::UserMessageSelector>,
     /// The `/effort` inline picker (TS `ThinkingSelectorComponent` seam):
@@ -251,6 +254,7 @@ impl AgentView {
             tree_selector: None,
             confirm: None,
             provider_auth: None,
+            login_dialog: None,
             fork_selector: None,
             effort_picker: None,
             mcp_view: None,
@@ -1183,6 +1187,7 @@ impl AgentView {
             || self.share_loader.is_some()
             || self.confirm.is_some()
             || self.provider_auth.is_some()
+            || self.login_dialog.is_some()
             || self.reload_box.is_some()
             || self.settings_menu.is_some()
         {
@@ -1200,6 +1205,8 @@ impl AgentView {
                 dock.extend(confirm.render(&self.theme, width));
             } else if let Some(selector) = self.provider_auth.as_mut() {
                 dock.extend(selector.render(&self.theme, width));
+            } else if let Some(dialog) = self.login_dialog.as_ref() {
+                dock.extend(dialog.render(&self.theme, width, self.editor.keybindings()));
             } else if let Some(message) = self.reload_box.as_ref() {
                 dock.extend(self.render_reload_box(message, width));
             } else if let Some(menu) = self.settings_menu.as_ref() {

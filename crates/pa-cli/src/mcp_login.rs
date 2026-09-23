@@ -16,6 +16,7 @@ use pa_core::mcp::{
     McpLoginUi, McpManager, McpManagerOptions, McpServerConfig, OAuthHttp, ReqwestOAuthHttp,
 };
 use pa_tui::client_auth::{AuthFuture, ClientAuthCommands};
+use pa_tui::login_dialog::LoginDialogHandle;
 
 /// `/mcp login` / `/mcp logout` against one daemon's shared directories.
 #[derive(Clone)]
@@ -161,6 +162,25 @@ impl ClientAuthCommands for TerminalMcpAuth {
         Box::pin(async move { auth.login_inner(&server).await })
     }
 
+    /// The mounted-dialog login (TS `runMcpLogin` -> `showLoginDialog`):
+    /// name the panel from the integration's label, then run the existing
+    /// flow against the dialog's UI adapter — the panel owns the prompt
+    /// area while the flow drives it.
+    fn login_dialog(&self, server: &str, dialog: LoginDialogHandle) -> AuthFuture {
+        let (auth, server) = (self.clone(), server.to_string());
+        Box::pin(async move {
+            // TS `runMcpLogin`: the provider lookup names the dialog and
+            // rejects unknown servers with the same wording.
+            let Some(config) = auth.manager().oauth_config(&server) else {
+                return Err(anyhow!("Unknown MCP integration: {server}"));
+            };
+            dialog.set_provider_name(&config.label);
+            let ui = DialogLoginUi::browser_default(dialog);
+            auth.login_with(&server, &ui, &ReqwestOAuthHttp::new())
+                .await
+        })
+    }
+
     fn paste_token(&self, server: &str) -> AuthFuture {
         let (auth, server) = (self.clone(), server.to_string());
         Box::pin(async move { auth.paste_inner(&server).await })
@@ -189,6 +209,71 @@ pub(crate) async fn read_terminal_line() -> Option<String> {
     .await
     .ok()
     .flatten()
+}
+
+/// The browser launcher the auth step hands the URL to (injectable: NO
+/// test may ever open a real browser — PR #2621's rule).
+type BrowserLauncher = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The manual-paste prompt (TS `showLoginDialog`'s `showManualInput` call
+/// for callback-server providers).
+const MANUAL_PASTE_PROMPT: &str = "Paste redirect URL below, or complete login in browser:";
+
+/// The mounted login dialog's UI surface (TS `LoginDialogComponent`'s show*
+/// methods): every login callback forwards to the shared handle; the auth
+/// step shows the URL and hands it to the browser launcher.
+struct DialogLoginUi {
+    dialog: LoginDialogHandle,
+    open_browser: BrowserLauncher,
+}
+
+impl DialogLoginUi {
+    /// The product adapter: the real browser launcher.
+    fn browser_default(dialog: LoginDialogHandle) -> Self {
+        DialogLoginUi {
+            dialog,
+            open_browser: std::sync::Arc::new(pa_core::platform::browser::open_in_browser),
+        }
+    }
+
+    /// A scripted launcher: tests capture the URLs — NO test may ever
+    /// open a real browser (PR #2621's rule).
+    #[cfg(test)]
+    fn with_launcher(dialog: LoginDialogHandle, open_browser: BrowserLauncher) -> Self {
+        DialogLoginUi {
+            dialog,
+            open_browser,
+        }
+    }
+}
+
+impl McpLoginUi for DialogLoginUi {
+    fn on_progress(&self, message: &str) {
+        self.dialog.show_progress(message);
+    }
+
+    fn on_auth(&self, url: &str, instructions: &str) {
+        self.dialog.show_auth(url, Some(instructions));
+        (self.open_browser)(url);
+    }
+
+    fn on_prompt(
+        &self,
+        message: &str,
+        placeholder: &str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
+        self.dialog.show_prompt(message, Some(placeholder))
+    }
+
+    fn on_manual_code_input(
+        &self,
+    ) -> Option<Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>> {
+        let dialog = self.dialog.clone();
+        Some(Box::pin(async move {
+            // A cancelled paste resolves `None` (the surface went away).
+            dialog.show_manual_input(MANUAL_PASTE_PROMPT).await.ok()
+        }))
+    }
 }
 
 /// The terminal login surface while the TUI is suspended: progress lines,
@@ -434,5 +519,120 @@ mod tests {
         let status = hook.logout_inner("linear").await?;
         assert_eq!(status, "linear is not connected.");
         Ok(())
+    }
+
+    /// The mounted-dialog login (`/mcp login`): the flow drives the shared
+    /// dialog handle (progress rows, the auth URL) and hands the URL to
+    /// the browser launcher exactly once — the capture-only recorder
+    /// proves NO real browser was opened.
+    #[tokio::test]
+    async fn dialog_login_runs_the_flow_without_a_real_browser() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let agent_dir = dir.path().join("agent");
+        settings_with_fixture_server(&agent_dir);
+        let auth = TerminalMcpAuth::new(dir.path().to_path_buf(), agent_dir.clone());
+        let http = ScriptedHttp::fixture();
+
+        let handle = pa_tui::login_dialog::LoginDialogHandle::new(
+            pa_tui::login_dialog::LoginDialogOptions::new("fixture"),
+            pa_tui::keybindings::KeybindingsManager::new(),
+            Box::new(|| {}),
+        );
+        let browser_urls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = {
+            let browser_urls = Arc::clone(&browser_urls);
+            Arc::new(move |url: &str| {
+                browser_urls.lock().unwrap().push(url.to_string());
+            }) as BrowserLauncher
+        };
+        let dialog = DialogLoginUi::with_launcher(handle, recorder);
+        // The paste surface: the wrapper resolves the manual redirect
+        // like the panel's field would (the e2e drives the real panel).
+        let ui = ResolvedPasteUi {
+            dialog,
+            auth_url: Arc::new(std::sync::Mutex::new(String::new())),
+        };
+        let status = auth.login_with("fixture", &ui, &http).await?;
+        assert_eq!(
+            status,
+            "Connected fixture. Its skill activates in new sessions (/new)."
+        );
+        assert_eq!(browser_urls.lock().unwrap().len(), 1, "one browser launch");
+        assert!(
+            browser_urls.lock().unwrap()[0].starts_with("https://fixture.example/authorize?"),
+            "the launched URL is the auth URL: {:?}",
+            browser_urls.lock().unwrap()
+        );
+        // The credential persisted (the same endpoint-bound shape).
+        let stored: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_dir.join("auth.json")).expect("auth.json"),
+        )?;
+        assert_eq!(stored["mcp:fixture"]["type"], "oauth");
+        Ok(())
+    }
+
+    /// An unknown server fails the dialog login with the TS wording and
+    /// never reaches the browser.
+    #[tokio::test]
+    async fn dialog_login_rejects_unknown_servers_with_ts_wording() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let auth = TerminalMcpAuth::new(dir.path().to_path_buf(), agent_dir.clone());
+        let handle = pa_tui::login_dialog::LoginDialogHandle::new(
+            pa_tui::login_dialog::LoginDialogOptions::new("nope"),
+            pa_tui::keybindings::KeybindingsManager::new(),
+            Box::new(|| {}),
+        );
+        let error = auth
+            .login_dialog("nope", handle)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "Unknown MCP integration: nope");
+    }
+
+    /// The dialog adapter's forwards over a scripted transport: the
+    /// manual paste resolves through the wrapper's captured auth URL.
+    struct ResolvedPasteUi {
+        dialog: DialogLoginUi,
+        auth_url: Arc<std::sync::Mutex<String>>,
+    }
+
+    impl McpLoginUi for ResolvedPasteUi {
+        fn on_progress(&self, message: &str) {
+            self.dialog.on_progress(message);
+        }
+
+        fn on_auth(&self, url: &str, instructions: &str) {
+            *self.auth_url.lock().unwrap() = url.to_string();
+            self.dialog.on_auth(url, instructions);
+        }
+
+        fn on_prompt(
+            &self,
+            message: &str,
+            placeholder: &str,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
+            self.dialog.on_prompt(message, placeholder)
+        }
+
+        fn on_manual_code_input(
+            &self,
+        ) -> Option<Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>> {
+            let auth_url = Arc::clone(&self.auth_url);
+            Some(Box::pin(async move {
+                let url = url::Url::parse(&auth_url.lock().unwrap()).ok()?;
+                let redirect = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "redirect_uri")
+                    .map(|(_, value)| value.to_string())?;
+                let state = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .map(|(_, value)| value.to_string())?;
+                Some(format!("{redirect}?code=the-code&state={state}"))
+            }))
+        }
     }
 }

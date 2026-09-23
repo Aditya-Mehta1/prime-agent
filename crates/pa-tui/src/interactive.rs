@@ -648,6 +648,10 @@ pub async fn run_interactive(
     // The `/reload` task reports here; the loop folds the client-side
     // re-reads (keybindings, theme) and the outcome row.
     let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<crate::session_ui::ReloadNote>();
+    // The mounted login dialog (`/mcp login`) reports here; the loop
+    // mounts the panel on the flow's first paint request and folds the
+    // settled outcome into the transcript.
+    let (login_tx, mut login_rx) = mpsc::unbounded_channel::<crate::session_ui::LoginDialogNote>();
     // The background model-catalog refresh (`get_model_catalog`) reports
     // here; the loop folds it into the picker catalog and any open picker.
     let (catalog_tx, mut catalog_rx) =
@@ -709,6 +713,7 @@ pub async fn run_interactive(
         compaction_abort_tx,
         share_tx,
         reload_tx,
+        login_tx,
         catalog_tx,
         crate::session_ui::ActivityUpdates {
             heartbeats: heartbeats_tx,
@@ -989,18 +994,10 @@ pub async fn run_interactive(
                         }
                         // A selector that resolved to a client command (the
                         // `/mcp` view's Enter): dispatch it through the same
-                        // submit path as an editor submission, so the
-                        // terminal-suspending auth flows get the identical
-                        // suspend/resume bracket.
+                        // submit path as an editor submission — the login
+                        // mounts its dialog, no terminal handover.
                         if let Some(command) = session.take_pending_client_command() {
-                            let suspended = session.needs_terminal_suspension(&command);
-                            if suspended {
-                                renderer.suspend(&mut view)?;
-                            }
                             let dispatched = session.submit_prompt(&command, &mut view).await;
-                            if suspended {
-                                renderer.resume()?;
-                            }
                             if let Err(error) = dispatched {
                                 session.error_row(&format!("{error:#}"), &mut view);
                                 view.editor.set_text(&command);
@@ -1028,16 +1025,7 @@ pub async fn run_interactive(
                     }
                     UiInput::Submit(text) => {
                         session.stop_selection_auto_scroll();
-                        // A terminal-suspending client command (`/mcp login`):
-                        // the auth flow prompts on the plain terminal.
-                        let suspended = session.needs_terminal_suspension(&text);
-                        if suspended {
-                            renderer.suspend(&mut view)?;
-                        }
                         let dispatched = session.submit_prompt(&text, &mut view).await;
-                        if suspended {
-                            renderer.resume()?;
-                        }
                         if let Err(error) = dispatched {
                             // TS: a rejected submission surfaces the `⚠ Error`
                             // row and keeps the client mounted with the draft
@@ -1147,6 +1135,7 @@ pub async fn run_interactive(
             && !session.dirty
             && !session.share_pending()
             && !session.reload_pending()
+            && !session.login_pending()
         {
             break;
         }
@@ -1297,6 +1286,11 @@ pub async fn run_interactive(
             maybe_reload = reload_rx.recv() => {
                 if let Some(outcome) = maybe_reload {
                     session.apply_reload_outcome(outcome, &mut view).await;
+                }
+            }
+            maybe_login = login_rx.recv() => {
+                if let Some(note) = maybe_login {
+                    session.apply_login_dialog_note(note, &mut view);
                 }
             }
             maybe_catalog = catalog_rx.recv() => {

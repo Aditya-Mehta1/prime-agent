@@ -8,6 +8,8 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::login_dialog::LoginDialogHandle;
+
 /// The boxed-future shape of [`ClientAuthCommands`] methods (the same
 /// contract the pa-core login UI uses for dyn dispatch across crates).
 pub type AuthFuture = Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>;
@@ -18,6 +20,10 @@ pub trait ClientAuthCommands: Send + Sync {
     /// Resolves with the status line to show (TS: `Connected <name>.`) or
     /// the error to surface.
     fn login(&self, server: &str) -> AuthFuture;
+    /// Run the login flow against the mounted login dialog (TS
+    /// `runMcpLogin` -> `showLoginDialog`): the panel owns the prompt area
+    /// while the flow drives it. Resolves with the same status line.
+    fn login_dialog(&self, server: &str, dialog: LoginDialogHandle) -> AuthFuture;
     /// The inline paste panel's client surface: prompt for one pasted
     /// static token, store it bound to the service endpoint, and verify.
     /// Resolves with the status line (TS: `Connected <name>.`).
@@ -92,6 +98,18 @@ mod tests {
             Box::pin(async move { Ok(answer) })
         }
 
+        fn login_dialog(&self, server: &str, dialog: LoginDialogHandle) -> AuthFuture {
+            self.log
+                .lock()
+                .unwrap()
+                .push(("login_dialog".to_string(), server.to_string()));
+            let answer = format!("Connected {server}.");
+            Box::pin(async move {
+                dialog.show_progress("Dialog flow");
+                Ok(answer)
+            })
+        }
+
         fn paste_token(&self, server: &str) -> AuthFuture {
             self.log
                 .lock()
@@ -121,6 +139,11 @@ mod tests {
         }
 
         fn paste_token(&self, server: &str) -> AuthFuture {
+            let error = anyhow::anyhow!("Unknown MCP integration: {server}");
+            Box::pin(async move { Err(error) })
+        }
+
+        fn login_dialog(&self, server: &str, _dialog: LoginDialogHandle) -> AuthFuture {
             let error = anyhow::anyhow!("Unknown MCP integration: {server}");
             Box::pin(async move { Err(error) })
         }

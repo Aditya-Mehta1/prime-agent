@@ -48,6 +48,7 @@ mod input;
 pub mod interactive;
 pub mod keybindings;
 pub mod keys;
+pub mod login_dialog;
 pub mod markdown;
 pub mod markdown_table;
 pub mod mcp_view;

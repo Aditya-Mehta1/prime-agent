@@ -129,8 +129,8 @@ pub(crate) fn search_field_lines(
 }
 
 /// The field row: `" " + "> " + <input render at width-2>` (TS
-/// `MenuSearchInput` inline composition).
-fn render_input_field(
+/// `MenuSearchInput` inline composition, `plain` = no enclosing rules).
+pub(crate) fn render_input_field(
     theme: &Theme,
     width: usize,
     value: &str,

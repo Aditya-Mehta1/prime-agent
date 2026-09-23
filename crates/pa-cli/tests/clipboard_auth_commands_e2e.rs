@@ -338,6 +338,7 @@ fn command_options(
     traces: Option<TracesCommandsHandle>,
     provider_auth: Option<pa_tui::provider_auth::ProviderAuthCommandsHandle>,
     update_commands: Option<UpdateCommandsHandle>,
+    client_auth: Option<pa_tui::client_auth::ClientAuthCommandsHandle>,
 ) -> pa_tui::interactive::InteractiveOptions {
     pa_tui::interactive::InteractiveOptions {
         socket_path: socket.to_path_buf(),
@@ -362,7 +363,7 @@ fn command_options(
         version: "0.0.0".to_string(),
         onboarding: None,
         telemetry_disabled: None,
-        client_auth: None,
+        client_auth,
         traces,
         provider_auth,
         update_commands,
@@ -475,6 +476,7 @@ async fn tui_copy_emits_the_ts_osc52_sequence() {
         None,
         None,
         None,
+        None,
     );
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -557,6 +559,7 @@ async fn tui_import_replaces_the_session_from_a_fixture() {
         None,
         None,
         None,
+        None,
     );
     // The fixture: the live session's exported JSONL branch, plus a copy
     // whose header cwd points at a gone directory (the missing-cwd path).
@@ -634,6 +637,7 @@ async fn tui_import_replaces_the_session_from_a_fixture() {
         None,
         None,
         None,
+        None,
     );
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -703,6 +707,7 @@ async fn tui_import_replaces_the_session_from_a_fixture() {
         None,
         None,
         None,
+        None,
     );
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![pa_tui::interactive::HeadlessStep::Submit(
@@ -762,6 +767,7 @@ async fn tui_traces_renders_status_and_toggles_the_setting() {
         Some(TracesCommandsHandle(
             Arc::clone(&traces) as Arc<dyn TracesCommands>
         )),
+        None,
         None,
         None,
     );
@@ -839,6 +845,7 @@ async fn tui_traces_renders_status_and_toggles_the_setting() {
         Some(no_key.handle()),
         None,
         None,
+        None,
     );
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -902,6 +909,7 @@ async fn tui_login_and_logout_run_the_provider_flows() {
         Some(pa_tui::provider_auth::ProviderAuthCommandsHandle(
             Arc::clone(&auth) as Arc<dyn ProviderAuthCommands>,
         )),
+        None,
         None,
     );
     let plan = pa_tui::interactive::HeadlessPlan {
@@ -971,6 +979,7 @@ async fn tui_login_and_logout_run_the_provider_flows() {
             Arc::clone(&auth) as Arc<dyn ProviderAuthCommands>,
         )),
         None,
+        None,
     );
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -1038,6 +1047,7 @@ async fn tui_update_busy_guard_and_package_child() {
         Some(UpdateCommandsHandle(
             Arc::clone(&update) as Arc<dyn UpdateCommands>
         )),
+        None,
     );
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
@@ -1107,6 +1117,7 @@ async fn tui_logout_with_no_stored_credentials_reports_the_ts_status() {
         None,
         Some(ScriptedProviderAuth::new().handle()),
         None,
+        None,
     );
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![pa_tui::interactive::HeadlessStep::Submit(
@@ -1134,4 +1145,256 @@ async fn tui_logout_with_no_stored_credentials_reports_the_ts_status() {
         !rendered.contains("Saved Credentials"),
         "no selector mounts for an empty store:\n{rendered}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// /mcp login (the mounted login dialog)
+// ---------------------------------------------------------------------------
+
+/// The `/mcp login` flow the scripted hook serves: the dialog panel mounts
+/// over the prompt area (the flow drives it without suspending the TUI),
+/// the typed paste submits through the field, and the settled note lands
+/// as the status row with the panel unmounted.
+struct ScriptedClientAuth {
+    calls: Mutex<Vec<String>>,
+}
+
+impl ScriptedClientAuth {
+    fn new() -> Self {
+        ScriptedClientAuth {
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn handle(self) -> pa_tui::client_auth::ClientAuthCommandsHandle {
+        pa_tui::client_auth::ClientAuthCommandsHandle(Arc::new(self))
+    }
+}
+
+impl pa_tui::client_auth::ClientAuthCommands for ScriptedClientAuth {
+    fn login(&self, server: &str) -> pa_tui::client_auth::AuthFuture {
+        self.calls.lock().unwrap().push(format!("login:{server}"));
+        Box::pin(async move { Ok(format!("Connected {server}.")) })
+    }
+
+    fn login_dialog(
+        &self,
+        server: &str,
+        dialog: pa_tui::login_dialog::LoginDialogHandle,
+    ) -> pa_tui::client_auth::AuthFuture {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("login_dialog:{server}"));
+        Box::pin(async move {
+            dialog.set_provider_name("Fixture");
+            dialog.show_progress("Discovered https://fixture.example");
+            dialog.show_auth("https://fixture.example/authorize?state=abc", None);
+            let pasted = dialog
+                .show_manual_input("Paste redirect URL below, or complete login in browser:")
+                .await?;
+            assert_eq!(
+                pasted, "https://fixture.example/callback?code=the-code",
+                "the field's typed value resolves the flow"
+            );
+            dialog.show_progress("Exchanging authorization code for tokens…");
+            Ok(format!(
+                "Connected {server}. Its skill activates in new sessions (/new)."
+            ))
+        })
+    }
+
+    fn paste_token(&self, server: &str) -> pa_tui::client_auth::AuthFuture {
+        Box::pin(async move { Ok(format!("Connected {server}.")) })
+    }
+
+    fn logout(&self, server: &str) -> pa_tui::client_auth::AuthFuture {
+        Box::pin(async move { Ok(format!("Disconnected {server}.")) })
+    }
+}
+
+/// `/mcp login fixture` mounts the login dialog (the TS panel wording),
+/// routes the typed paste into the field, Enter submits it, and the
+/// settled status unmounts the panel with the TS status note.
+#[tokio::test]
+async fn tui_mcp_login_mounts_the_dialog_and_settles_the_note() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({ "engine": "faux", "responses": [
+        { "text": "ok" },
+    ] });
+    let script_path = dir.path().join("script.json");
+    std::fs::write(&script_path, script.to_string()).expect("write script");
+    let session_id = create_session_via_daemon(
+        &supervisor.socket,
+        &script_path,
+        &script,
+        dir.path(),
+        &session_dir,
+    )
+    .await;
+    let auth = Arc::new(ScriptedClientAuth::new());
+    let auth_calls = Arc::clone(&auth);
+    let options = command_options(
+        &supervisor.socket,
+        dir.path(),
+        &session_dir,
+        &script_path,
+        &session_id,
+        None,
+        None,
+        None,
+        Some(auth.handle()),
+    );
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("/mcp login fixture".to_string()),
+            // The flow task mounts the panel at its first paint request.
+            pa_tui::interactive::HeadlessStep::WaitMs(200),
+            pa_tui::interactive::HeadlessStep::Type(
+                "https://fixture.example/callback?code=the-code".to_string(),
+            ),
+            enter(),
+            // The exchange and the settled note land before the run ends
+            // (the login-pending hold keeps the headless run open).
+            pa_tui::interactive::HeadlessStep::WaitMs(200),
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = rendered_frames(&outcome);
+    assert!(
+        rendered.contains("Login to Fixture"),
+        "the panel titles the provider label:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Preparing authentication"),
+        "the first progress call adds the section title:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Discovered https://fixture.example"),
+        "the progress row renders:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Complete the sign-in in your browser."),
+        "the auth fallback row renders:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Paste redirect URL below, or complete login in browser:"),
+        "the manual-paste prompt renders:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Paste value"),
+        "the paste field's placeholder renders:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Connected fixture. Its skill activates in new sessions (/new)."),
+        "the settled status note renders:\n{rendered}"
+    );
+    assert_eq!(
+        auth_calls.calls.lock().unwrap().clone(),
+        vec!["login_dialog:fixture".to_string()],
+        "the dialog seam ran the flow"
+    );
+    // The frame after the settle: the panel is gone (the editor is back).
+    let last = outcome.frames.last().expect("frames");
+    let last_text = last
+        .lines()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !last_text.contains("Login to Fixture"),
+        "the panel unmounted on settle:\n{last_text}"
+    );
+}
+
+/// A malformed `/mcp login` keeps the TS usage wording (the plain hook
+/// path, no panel); a missing hook reports the TS unavailable note.
+#[tokio::test]
+async fn tui_mcp_login_usage_and_unavailable_notes() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({ "engine": "faux", "responses": [
+        { "text": "ok" },
+    ] });
+    let script_path = dir.path().join("script.json");
+    std::fs::write(&script_path, script.to_string()).expect("write script");
+    let session_id = create_session_via_daemon(
+        &supervisor.socket,
+        &script_path,
+        &script,
+        dir.path(),
+        &session_dir,
+    )
+    .await;
+    // No client-auth hook: the TS unavailable note.
+    let options = command_options(
+        &supervisor.socket,
+        dir.path(),
+        &session_dir,
+        &script_path,
+        &session_id,
+        None,
+        None,
+        None,
+        None,
+    );
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![pa_tui::interactive::HeadlessStep::Submit(
+            "/mcp login fixture".to_string(),
+        )],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = rendered_frames(&outcome);
+    assert!(
+        rendered.contains("/mcp is not available in this client yet"),
+        "the unavailable note renders:\n{rendered}"
+    );
+
+    // A malformed login argument: the TS usage wording, no panel.
+    let auth = Arc::new(ScriptedClientAuth::new());
+    let options = command_options(
+        &supervisor.socket,
+        dir.path(),
+        &session_dir,
+        &script_path,
+        &session_id,
+        None,
+        None,
+        None,
+        Some(auth.handle()),
+    );
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![pa_tui::interactive::HeadlessStep::Submit(
+            "/mcp login a b".to_string(),
+        )],
+        width: 120,
+        height: 36,
+    };
+    let outcome =
+        pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
+            .await
+            .expect("interactive run");
+    let rendered = rendered_frames(&outcome);
+    assert!(
+        rendered.contains("Usage: /mcp login <name> (e.g. /mcp login linear)"),
+        "the usage wording renders:\n{rendered}"
+    );
+    assert!(auth.calls.lock().unwrap().is_empty(), "no flow ran");
 }

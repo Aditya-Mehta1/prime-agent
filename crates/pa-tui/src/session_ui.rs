@@ -91,6 +91,18 @@ pub(crate) type ShareNote = Result<GistOutcome, String>;
 /// inputs, or the failure message (TS `handleReloadCommand`'s outcome).
 pub(crate) type ReloadNote = Result<(), String>;
 
+/// The mounted login dialog's report (the run loop folds these): a paint
+/// request mounts the panel (TS `showAuthPanel` mounts it before the
+/// flow's first callback), and the settled note unmounts it and shows the
+/// flow's status line.
+pub(crate) enum LoginDialogNote {
+    /// A handle method drove the dialog: mount it (first time) and
+    /// repaint.
+    Rendered,
+    /// The login flow settled: unmount the panel and show the note.
+    Settled { note: String },
+}
+
 /// One backgrounded compaction-abort outcome (the abort supervision's UI
 /// recovery): a failed abort request surfaces as the transcript note and
 /// clears the stuck compaction loader locally — when even the abort could
@@ -269,6 +281,12 @@ pub(crate) struct SessionUi {
     reload: Option<tokio::task::JoinHandle<()>>,
     /// Where the reload task reports its outcome.
     reload_notes: mpsc::UnboundedSender<ReloadNote>,
+    /// A login dialog flow in flight (`/mcp login`): the handle the mount
+    /// panel needs while the flow drives it (None once it settles).
+    pending_login_dialog: Option<crate::login_dialog::LoginDialogHandle>,
+    /// Where the login dialog flow reports paint requests and its
+    /// settled outcome.
+    login_notes: mpsc::UnboundedSender<LoginDialogNote>,
     /// Where the background catalog refresh delivers `get_model_catalog`
     /// responses (the run loop folds them into the picker catalog).
     catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
@@ -534,6 +552,7 @@ impl SessionUi {
         compaction_abort_notes: mpsc::UnboundedSender<CompactionAbortNote>,
         share_notes: mpsc::UnboundedSender<ShareNote>,
         reload_notes: mpsc::UnboundedSender<ReloadNote>,
+        login_notes: mpsc::UnboundedSender<LoginDialogNote>,
         catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
         activity_updates: ActivityUpdates,
     ) -> Result<SessionUi> {
@@ -580,6 +599,8 @@ impl SessionUi {
             reload: None,
             reload_notes,
             share_notes,
+            pending_login_dialog: None,
+            login_notes,
             pasted_images: Default::default(),
             next_image_marker_id: 1,
             pending_snapshot: None,
@@ -4599,10 +4620,11 @@ impl SessionUi {
 
     /// `/mcp` (TS `handleMcpCommand`): the bare command opens the inline
     /// connections view over the daemon's roster (TS opens the
-    /// configuration menu's MCP Connections tab); `login`/`logout <name>`
-    /// run the composition root's auth flow (only the login prompts on
-    /// the terminal, so `needs_terminal_suspension` covers it); anything
-    /// else keeps the usage note.
+    /// configuration menu's MCP Connections tab); `login <name>` runs the
+    /// composition root's flow against the mounted login dialog (the
+    /// panel replaces the prompt area, no terminal suspension);
+    /// `logout`/`paste <name>` keep the plain hook and their notes;
+    /// anything else keeps the usage note.
     async fn handle_mcp_command(
         &mut self,
         resolved: &pa_types::slash_commands::ResolvedSlashCommand,
@@ -4616,8 +4638,112 @@ impl SessionUi {
             self.note("/mcp is not available in this client yet", view);
             return Ok(());
         };
+        let argv: Vec<&str> = resolved.args.split_whitespace().collect();
+        if argv.first() == Some(&"login") && argv.len() == 2 {
+            // TS `runMcpLogin` -> `showLoginDialog`: the login runs in the
+            // mounted dialog; the flow's outcome lands through the login
+            // notes channel (the usage wording covers malformed commands
+            // below, like the other subcommands).
+            self.start_login_dialog(&auth, argv[1], view);
+            return Ok(());
+        }
         let note = crate::client_auth::run_mcp_auth_command(auth.0.as_ref(), &resolved.args).await;
         self.note(&note, view);
+        Ok(())
+    }
+
+    /// Mount the login dialog flow for `/mcp login <server>` (TS
+    /// `showLoginDialog`): the panel mounts over the editor dock at the
+    /// flow's first paint request, keys route to it while mounted, and
+    /// the settled note unmounts it. The flow runs as its own task, so
+    /// the input loop keeps serving the dialog.
+    fn start_login_dialog(
+        &mut self,
+        auth: &crate::client_auth::ClientAuthCommandsHandle,
+        server: &str,
+        view: &mut AgentView,
+    ) {
+        let login_notes = self.login_notes.clone();
+        let request_render = Box::new(move || {
+            let _ = login_notes.send(LoginDialogNote::Rendered);
+        });
+        let options = crate::login_dialog::LoginDialogOptions::new(server);
+        let handle = crate::login_dialog::LoginDialogHandle::new(
+            options,
+            view.editor.keybindings().clone(),
+            request_render,
+        );
+        self.pending_login_dialog = Some(handle.clone());
+        let (auth, server) = (auth.0.clone(), server.to_string());
+        let login_notes = self.login_notes.clone();
+        tokio::spawn(async move {
+            let note = match auth.login_dialog(&server, handle).await {
+                Ok(status) => status,
+                Err(error) => format!("{error:#}"),
+            };
+            let _ = login_notes.send(LoginDialogNote::Settled { note });
+        });
+    }
+
+    /// Fold one login-dialog report into the view: the flow's first paint
+    /// request mounts the panel (TS `showAuthPanel` before the flow's
+    /// first callback), later ones repaint, and the settled note unmounts
+    /// the panel and shows the flow's status line.
+    pub(crate) fn apply_login_dialog_note(&mut self, note: LoginDialogNote, view: &mut AgentView) {
+        match note {
+            LoginDialogNote::Rendered => {
+                if view.login_dialog.is_none() {
+                    if let Some(handle) = self.pending_login_dialog.clone() {
+                        let clipboard: crate::login_dialog::ClipboardFn =
+                            std::sync::Arc::new(crate::clipboard::copy_to_clipboard);
+                        view.login_dialog =
+                            Some(crate::login_dialog::LoginDialog::new(handle, clipboard));
+                    }
+                }
+                self.dirty = true;
+            }
+            LoginDialogNote::Settled { note } => {
+                self.pending_login_dialog = None;
+                view.login_dialog = None;
+                self.note(&note, view);
+            }
+        }
+    }
+
+    /// Whether a login-dialog flow is in flight (the headless run holds
+    /// open like an active turn, so the settled note always lands).
+    pub(crate) fn login_pending(&self) -> bool {
+        self.pending_login_dialog.is_some()
+    }
+
+    /// One key press while the login dialog owns the frame (TS
+    /// `LoginDialogComponent.handleInput`): the panel routes the copy,
+    /// field, and resolution keys itself; a cancel aborts the flow (its
+    /// settle unmounts the panel and notes); the armed exit keys quit.
+    async fn handle_login_dialog_key(&mut self, key: KeyEvent, view: &mut AgentView) -> Result<()> {
+        let Some(id) = key_event_to_id(&key) else {
+            return Ok(());
+        };
+        // The dialog consumes Ctrl+C (its cancel binding, not exit):
+        // report the handled press so the force-quit guard stays in sync.
+        if id == "ctrl+c" {
+            self.exit_guard.note_ctrl_c_handled();
+        }
+        let action = {
+            let Some(dialog) = view.login_dialog.as_mut() else {
+                return Ok(());
+            };
+            let kb = view.editor.keybindings();
+            dialog.handle_key(&id, kb, &mut self.osc_sink)
+        };
+        match action {
+            crate::login_dialog::LoginDialogAction::Exit => {
+                self.exit_requested = true;
+            }
+            crate::login_dialog::LoginDialogAction::None
+            | crate::login_dialog::LoginDialogAction::Cancelled => {}
+        }
+        self.dirty = true;
         Ok(())
     }
 
@@ -4653,8 +4779,8 @@ impl SessionUi {
 
     /// One key press while the `/mcp` connections view is open: Esc or
     /// Ctrl+C close it; Enter resolves to the selected connection's login
-    /// (dispatched as a client command after the key returns, so the auth
-    /// flow keeps the terminal-suspension bracket); everything else
+    /// (dispatched as a client command after the key returns, so the
+    /// login mounts the dialog through the command path); everything else
     /// navigates or edits the search field.
     async fn handle_mcp_view_key(&mut self, key: KeyEvent, view: &mut AgentView) -> Result<()> {
         let Some(id) = key_event_to_id(&key) else {
@@ -4693,18 +4819,6 @@ impl SessionUi {
             None => {}
         }
         Ok(())
-    }
-
-    /// Whether dispatching this input needs the terminal handed over
-    /// (raw-mode off, alternate screen left) so the auth flow can prompt.
-    pub(crate) fn needs_terminal_suspension(&self, text: &str) -> bool {
-        let Some((name, args)) = pa_types::slash_commands::parse_slash_command(text) else {
-            return false;
-        };
-        if name != "mcp" || self.client_auth.is_none() {
-            return false;
-        }
-        matches!(args.split_whitespace().next(), Some("login"))
     }
 
     /// `/resume <selector>`: a session file path, an `<id>.jsonl` under the
@@ -6210,6 +6324,11 @@ impl SessionUi {
         // same way (TS's auth panel mounts over the prompt).
         if view.provider_auth.is_some() {
             return self.handle_provider_auth_key(key, view).await;
+        }
+        // The mounted login dialog owns the frame the same way (TS's
+        // auth panel mounts the login flow over the prompt).
+        if view.login_dialog.is_some() {
+            return self.handle_login_dialog_key(key, view).await;
         }
         // The `/settings` menu owns the frame the same way (TS
         // `showSelector`).
