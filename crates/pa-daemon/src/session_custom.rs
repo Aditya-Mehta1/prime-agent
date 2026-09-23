@@ -180,9 +180,10 @@ impl Worker {
             }
             actions.len()
         };
-        // TS records the worker recovery state once per successful restore.
+        // TS records the worker recovery state once per successful restore
+        // with busy=true: restored lanes are undelivered live work.
         if restored > 0 {
-            let _ = self.record_recovery(false, "actions_restored");
+            let _ = self.record_recovery(true, "actions_restored");
             self.work_notify.notify_one();
         }
         response_success(

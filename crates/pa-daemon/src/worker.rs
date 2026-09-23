@@ -2418,6 +2418,9 @@ impl Worker {
         let active_session_id = core.active_session_id.clone();
         drop(core);
         self.persist_queue_snapshot(&active_session_id, &lanes);
+        // The queue-write checkpoint (TS `steer_queued`/`follow_up_queued`,
+        // busy=true): an undelivered lane is live work.
+        let _ = self.record_recovery(true, &format!("{}_queued", lane.as_str()));
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
         let command = if lane == Lane::Steering {

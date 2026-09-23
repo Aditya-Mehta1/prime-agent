@@ -143,6 +143,21 @@ pub struct Supervisor {
     pub(crate) input_pauses: crate::input_pause_lease::SupervisorPauseTable,
 }
 
+/// The boot the descriptor-adoption pass runs under. An update boot
+/// relaunches kept workers from their descriptors before the roster
+/// restore walks the rows (spec §6 step 2's create-or-adopt order). A
+/// plain startup adopts live workers and revives only genuinely
+/// interrupted ones: a supervisor restart must not mass-revive the
+/// historical idle/completed sessions a TS daemon leaves down (their
+/// clients reopen them lazily through a fresh create).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdoptionBoot {
+    /// Update boot: kept workers relaunch eagerly ahead of the roster.
+    UpdateRoster,
+    /// Plain startup: only journal-proven live work revives.
+    PlainStartup,
+}
+
 impl Supervisor {
     pub fn new(options: SupervisorOptions) -> Result<Self> {
         let descriptor_dir =
@@ -262,8 +277,13 @@ impl Supervisor {
         // descriptors first, the roster covers the rest).
         let adoption = {
             let supervisor = Arc::clone(&self);
+            let boot = if roster.is_some() {
+                AdoptionBoot::UpdateRoster
+            } else {
+                AdoptionBoot::PlainStartup
+            };
             tokio::spawn(async move {
-                supervisor.adopt_persisted_workers().await;
+                supervisor.adopt_persisted_workers(boot).await;
             })
         };
         {
@@ -370,13 +390,15 @@ impl Supervisor {
 
     /// Adopt or relaunch persisted workers, concurrently: one dead worker's
     /// relaunch (create replay) must not delay adopting live sessions.
-    async fn adopt_persisted_workers(self: &Arc<Self>) {
+    async fn adopt_persisted_workers(self: &Arc<Self>, boot: AdoptionBoot) {
         let descriptors = load_descriptors(&self.descriptor_dir, &self.options.socket_path);
         let mut tasks = Vec::new();
         for (path, descriptor) in descriptors {
             let supervisor = Arc::clone(self);
             tasks.push(tokio::spawn(async move {
-                supervisor.adopt_persisted_worker(path, descriptor).await;
+                supervisor
+                    .adopt_persisted_worker(path, descriptor, boot)
+                    .await;
             }));
         }
         for task in tasks {
@@ -392,6 +414,7 @@ impl Supervisor {
         self: &Arc<Self>,
         path: PathBuf,
         descriptor: crate::descriptor::WorkerDescriptor,
+        boot: AdoptionBoot,
     ) {
         let worker_id = descriptor.worker_id.clone();
         let guard = self.registry.adoption_guard(&worker_id).await;
@@ -405,12 +428,26 @@ impl Supervisor {
         let socket_path = PathBuf::from(&descriptor.socket_path);
         let alive = socket::can_connect(&socket_path, Duration::from_millis(500)).await;
         let pid = descriptor.pid;
+        let journal_path = PathBuf::from(&descriptor.recovery_journal_path);
         let resident = ResidentWorker::new(worker_id.clone(), descriptor, path);
         let result = if alive {
             self.connect_worker(&resident, worker_connect_deadline())
                 .await
+        } else if boot == AdoptionBoot::PlainStartup
+            && !crate::journal::WorkerRecoveryJournal::read_interrupted(&journal_path)
+        {
+            // Dead worker with no durable busy state: not interrupted
+            // work. Leave it down (the descriptor stays on disk, inert)
+            // — the session reopens lazily through the next client
+            // create, like a TS supervisor that parks dead workers
+            // instead of reviving them.
+            self.log_line(&format!(
+                "session worker {worker_id} was idle at exit; not revived (reopens on the next client open)"
+            ));
+            return;
         } else {
-            // Dead worker: relaunch from the durable create command. The
+            // Dead worker with journal-proven live work (or an update
+            // boot): relaunch from the durable create command. The
             // worker rehydrates the session store, restoring history and
             // the persisted queue snapshot.
             self.relaunch_worker(&resident).await.map(|_| ())

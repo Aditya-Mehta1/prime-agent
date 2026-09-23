@@ -597,3 +597,184 @@ fn supervisor_kill9_restart_sessions_re_register_and_survive() {
         }
     }
 }
+
+/// A plain supervisor boot (no update roster) adopts live workers and
+/// revives only dead ones with durable busy evidence: the session whose
+/// recovery journal settled to `busy: false` (a clean-shutdown record, the
+/// state a long-lived daemon accumulates) stays down, while the
+/// uncleanly-killed worker whose journal still says `busy: true` relaunches
+/// and re-registers.
+#[test]
+fn plain_boot_revives_only_journal_busy_workers() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+
+    let mut daemon = spawn_supervisor(&socket, &agent_dir);
+    wait_socket_ready(&socket);
+    let (mut client, _hello) = Client::connect(&socket);
+
+    // Two scripted sessions, each with one completed turn: afterwards they
+    // differ only in their durable recovery-journal evidence.
+    let mut sessions = Vec::new();
+    for index in 0..2 {
+        let script_path = dir.path().join(format!("journal-{index}.json"));
+        std::fs::write(
+            &script_path,
+            json!({ "responses": [
+                { "text": format!("turn-{index}"), "delayMs": 10 },
+            ] })
+            .to_string(),
+        )
+        .expect("write script");
+        client.send_command(
+            &format!("c{index}"),
+            json!({
+                "type": "create",
+                "config": {
+                    "cwd": dir.path().to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                    "script": script_path.to_string_lossy(),
+                },
+            }),
+        );
+        let created = client.read_response(&format!("c{index}"));
+        assert_eq!(created["success"], true, "create {index} failed: {created}");
+        let session_id = created["data"]["id"]
+            .as_str()
+            .or_else(|| created["data"]["sessionId"].as_str())
+            .expect("session id")
+            .to_string();
+        client.send_command(
+            &format!("p{index}"),
+            json!({
+                "type": "prompt_and_wait",
+                "activeSessionId": session_id,
+                "message": "go",
+            }),
+        );
+        let done = client.read_response(&format!("p{index}"));
+        assert_eq!(done["success"], true, "turn {index} failed: {done}");
+        sessions.push(session_id);
+    }
+
+    // The first session shut down cleanly at some point in its history
+    // (TS journals `shutdown`, busy=false): its journal's latest record
+    // settles to idle, the state of the stale descriptors a plain boot
+    // must not revive.
+    let idle = load_worker_descriptor(&agent_dir, &socket, &sessions[0]);
+    let descriptor_json = std::fs::read_to_string(
+        pa_daemon::descriptor::descriptor_dir(&agent_dir, &socket)
+            .join(format!("{}.json", idle.worker_id)),
+    )
+    .expect("descriptor file");
+    let journal_path = PathBuf::from(
+        serde_json::from_str::<Value>(&descriptor_json).expect("descriptor json")
+            ["recoveryJournalPath"]
+            .as_str()
+            .expect("journal path"),
+    );
+    let mut journal = pa_daemon::journal::WorkerRecoveryJournal::open(&journal_path).unwrap();
+    journal
+        .record(&idle.worker_id, &idle.worker_id, None, false, "shutdown")
+        .unwrap();
+    drop(journal);
+
+    // kill -9 the supervisor, then both workers: the descriptors stay on
+    // disk with dead sockets and the journals keep their last evidence.
+    daemon.child.kill().expect("kill -9 supervisor");
+    let _ = daemon.child.wait();
+    for session_id in &sessions {
+        let descriptor = load_worker_descriptor(&agent_dir, &socket, session_id);
+        std::process::Command::new("kill")
+            .arg("-9")
+            .arg(descriptor.pid.to_string())
+            .status()
+            .expect("kill -9 worker");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for (index, session_id) in sessions.iter().enumerate() {
+        let descriptor = load_worker_descriptor(&agent_dir, &socket, session_id);
+        while process_alive(descriptor.pid) {
+            assert!(Instant::now() < deadline, "worker {index} never died");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Plain boot on the same socket (no update-roster environment).
+    let restart_before = pa_daemon::util::now_iso();
+    let mut daemon2 = spawn_supervisor(&socket, &agent_dir);
+    wait_socket_ready(&socket);
+    let log_path = pa_daemon::paths::daemon_log_path(&socket, &agent_dir);
+
+    // The interrupted session (journal busy=true) relaunches and
+    // re-registers; the idle-at-exit session never does.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let registered = loop {
+        let registered = distinct(workers_registered_since(&log_path, &restart_before));
+        if registered == vec![sessions[1].clone()] {
+            break registered;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "interrupted session did not re-register ({restart_before}): {registered:?}; log: {}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(registered, vec![sessions[1].clone()]);
+
+    // The idle-at-exit session is skipped with a log line and stays off
+    // the roster.
+    let skip_line = format!(
+        "session worker {} was idle at exit; not revived",
+        sessions[0]
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&log_path)
+        .unwrap_or_default()
+        .contains(&skip_line)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "idle session never skipped: {skip_line}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (mut client2, _hello) = Client::connect(&socket);
+    client2.send_command("list1", json!({ "type": "list" }));
+    let list = client2.read_response("list1");
+    assert_eq!(list["success"], true, "list failed: {list}");
+    let listed = list["data"]["sessions"].as_array().expect("sessions");
+    let listed_ids: Vec<String> = listed
+        .iter()
+        .map(|summary| summary["id"].as_str().expect("id").to_string())
+        .collect();
+    assert_eq!(
+        distinct(listed_ids),
+        vec![sessions[1].clone()],
+        "only the interrupted session came back"
+    );
+
+    // Shutdown takes the restarted supervisor and the relaunched worker
+    // down (the relaunch persisted the new pid in the descriptor).
+    client2.send_command("sd", json!({ "type": "shutdown" }));
+    let shutdown = client2.read_response("sd");
+    assert_eq!(shutdown["success"], true, "shutdown failed: {shutdown}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while daemon2.child.try_wait().expect("try wait").is_none() {
+        assert!(Instant::now() < deadline, "restarted supervisor exited");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let relaunched = load_worker_descriptor(&agent_dir, &socket, &sessions[1]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process_alive(relaunched.pid) {
+        assert!(
+            Instant::now() < deadline,
+            "relaunched worker leaked after shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
