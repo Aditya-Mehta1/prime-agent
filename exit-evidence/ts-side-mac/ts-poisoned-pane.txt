@@ -1,0 +1,36 @@
+                                                       shared-cwd  $0.00
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.5-beta.1948.1.298cf40
+  ▗█▛ ▟██▙▄██▛ ▟▛         model faux-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd /private/var/folders/36/0ty7cyts02v4qj723xtysm5h0000gn/T/exit-restore-wgk7nt1h/shared-cwd
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+ Update available: v0.9.5-beta.1986.1.6f413ac. Run /update
+
+
+  echo LITCHECK_OK_7f3a
+
+
+ ⠹ Writing · 0s · ↓ 5 tokens
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                        Details mode (Ctrl+O to expand)
+
+ >
+
+← manage                                                                                                 faux-1 · 5 (0%)

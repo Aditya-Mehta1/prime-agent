@@ -5,9 +5,8 @@
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{self, EnterAlternateScreen};
+use crossterm::terminal::{self};
 use ratatui::Terminal;
-use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use crate::keybindings::{format_key_text, KeybindingsManager};
@@ -541,7 +540,10 @@ fn run_selector_surface(
     // unwind-guard contract the session surface arms).
     let _surface_restore = crate::exit_restore::SurfaceRestore::armed();
     terminal::enable_raw_mode()?;
-    crossterm::execute!(stdout(), EnterAlternateScreen)?;
+    // The alternate screen mounts through the ownership module (the same
+    // `pendingAltScreenHandoff` semantics the session surface uses), so
+    // the surface's alt-screen state is tracked for every exit path.
+    crate::altscreen::enter()?;
     // The selector surface owns the same enhanced-key modes as the session
     // (TS `ProcessTerminal.start`): a pasted filter query arrives as one
     // chunk instead of per-line keystrokes.

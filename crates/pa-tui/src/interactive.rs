@@ -635,10 +635,17 @@ pub async fn run_interactive(
     options: InteractiveOptions,
     ui: UiMode,
 ) -> Result<InteractiveOutcome> {
+    // The headless harness drives the same dispatch on plain pipes: it
+    // never owned the terminal, so its error returns must not run a
+    // restore (the mode gates it — the distinction the headless e2e
+    // binaries observe, not `restore_terminal`'s pipe no-op).
+    let owns_terminal = matches!(ui, UiMode::Terminal);
     match run_interactive_surface(options, ui).await {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
-            crate::exit_restore::restore_terminal();
+            if owns_terminal {
+                crate::exit_restore::restore_terminal();
+            }
             Err(error)
         }
     }
@@ -2209,16 +2216,21 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn every_error_return_runs_the_one_exit_restore() {
+    async fn headless_error_returns_never_touch_the_terminal() {
         // A socket that never listens: the attach fails and the run
-        // returns Err — the wrapper must still fire the one exit restore
-        // (a no-op on the headless pipes, observable through the
-        // attempts counter). The contract: no error path hands the shell
-        // a terminal still in TUI state.
+        // returns Err. The headless harness never owned the terminal —
+        // the wrapper's restore is gated on the terminal ui mode, so a
+        // headless error return must not attempt one (the terminal-mode
+        // restore is the exit-restore e2e's error-exit scenario, driven
+        // on a real terminal).
         let socket =
             std::env::temp_dir().join(format!("tui-exit-restore-dead-{}.sock", std::process::id()));
         let mut opts = options(ModelSelection::default());
         opts.socket_path = socket;
+        // The attempts counter is process-global and the unwind-guard test
+        // also moves it: this reader holds the shared state lock across
+        // its whole read window.
+        let _state = crate::exit_restore::TEST_STATE_LOCK.lock();
         let before =
             crate::exit_restore::RESTORE_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst);
         let result = run_interactive(
@@ -2231,13 +2243,10 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "the dead socket must error the run");
-        // `>` (not exact): the unwind-guard test in `exit_restore` may
-        // fire a restore concurrently (tests run in parallel in this
-        // binary); this run's own restore must be in the count.
-        assert!(
-            crate::exit_restore::RESTORE_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
-                > before,
-            "the error return fired the exit restore"
+        assert_eq!(
+            crate::exit_restore::RESTORE_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "the headless error return did not attempt a restore"
         );
     }
 

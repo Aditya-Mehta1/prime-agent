@@ -416,6 +416,14 @@ def run_scenario(side, sandbox, label, answer_policy, wedge=False):
     socket_path = os.path.join(sandbox["agent"], f"daemon-{label}-{side}.sock")
     stopped_workers = []
     facts = {"side": side, "scenario": label}
+    if wedge and not os.path.isdir("/proc"):
+        # The wedge scenario SIGSTOPs this sandbox's worker by pid:
+        # without /proc (non-Linux dev runs) there is no worker to stop
+        # and no daemon reap — skip LOUDLY instead of silently running a
+        # degenerate scenario that can never fire the force quit.
+        print(f"[skip] {side} {label}: /proc unavailable (run on the Linux VM)")
+        facts["skipped"] = True
+        return facts
     client = PtyClient(side, sandbox, answer_policy, poison_raw=label == "quit-poisoned")
     try:
         client.start(socket_path)
@@ -593,10 +601,6 @@ def main():
             termios_state = facts.get("termios_after") or {}
             if termios_state.get("icanon") is not True or termios_state.get("echo") is not True:
                 failures.append(f"{key}:tty-not-cooked")
-        if label == "quit-normal" and side == "dogfood":
-            failures.extend(
-                []
-            )  # recorded, not gated (the dogfood stop-set is prior art)
         if label == "quit-poisoned" and side == "rust":
             if facts.get("exit_code") != 0:
                 failures.append(f"{key}:exit-code={facts.get('exit_code')}")

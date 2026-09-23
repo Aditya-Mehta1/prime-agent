@@ -1,0 +1,20 @@
+run root: /tmp/exit-restore-ag5_9trj; evidence: /opt/evidence/before
+[exit-restore] before quit: {"side": "before", "scenario": "quit", "stty_baseline": "1376417782 88", "settled": true, "alt_on_while_running": "1", "prompt_back": false, "exit_code": 0, "tty_cksum": "1376417782 88", "alternate_on_after": "0", "stty_matches_sane": true, "typed_visible": true, "leak_free": true, "evidence_pane": "/opt/evidence/before/before-quit-pane.txt", "resume_hint_visible": false}
+[exit-restore] before quit-slash: {"side": "before", "scenario": "quit-slash", "stty_baseline": "1376417782 88", "settled": true, "alt_on_while_running": "1", "prompt_back": false, "exit_code": 0, "tty_cksum": "1376417782 88", "alternate_on_after": "0", "stty_matches_sane": true, "typed_visible": true, "leak_free": true, "evidence_pane": "/opt/evidence/before/before-quit-slash-pane.txt", "resume_hint_visible": false}
+[exit-restore] before agents-exit: {"side": "before", "scenario": "agents-exit", "stty_baseline": "1376417782 88", "settled": true, "alt_on_while_running": "1", "prompt_back": false, "exit_code": 0, "tty_cksum": "1376417782 88", "alternate_on_after": "0", "stty_matches_sane": true, "typed_visible": true, "leak_free": true, "evidence_pane": "/opt/evidence/before/before-agents-exit-pane.txt", "resume_hint_visible": false}
+[exit-restore] before error-exit: {"side": "before", "scenario": "error-exit", "stty_baseline": "1376417782 88", "settled": true, "alt_on_while_running": "1", "workers_found": 6, "error_exited": false, "prompt_back": false, "exit_code": 1, "tty_cksum": "2997995933 87", "alternate_on_after": "1", "stty_matches_sane": false, "typed_visible": true, "leak_free": false, "evidence_pane": "/opt/evidence/before/before-error-exit-pane.txt", "resume_hint_visible": false}
+[exit-restore] before wedge: {"side": "before", "scenario": "wedge", "stty_baseline": "1376417782 88", "settled": true, "alt_on_while_running": "1", "workers_found": 8, "force_exited": false, "prompt_back": false, "exit_code": 0, "tty_cksum": "1376417782 88", "alternate_on_after": "0", "stty_matches_sane": true, "typed_visible": true, "leak_free": true, "evidence_pane": "/opt/evidence/before/before-wedge-pane.txt", "resume_hint_visible": false}
+[exit-restore] before poisoned: {"side": "before", "scenario": "poisoned", "stty_baseline": "1376417782 88", "settled": true, "alt_on_while_running": "1", "prompt_back": false, "exit_code": 0, "tty_cksum": "3298912900 85", "alternate_on_after": "0", "stty_matches_sane": false, "typed_visible": true, "leak_free": false, "evidence_pane": "/opt/evidence/before/before-poisoned-pane.txt", "resume_hint_visible": false}
+RECORDED-BEFORE-FAIL before:quit:prompt-not-back
+RECORDED-BEFORE-FAIL before:quit-slash:prompt-not-back
+RECORDED-BEFORE-FAIL before:agents-exit:prompt-not-back
+RECORDED-BEFORE-FAIL before:error-exit:exit-code=1
+RECORDED-BEFORE-FAIL before:error-exit:prompt-not-back
+RECORDED-BEFORE-FAIL before:error-exit:alt-on=1
+RECORDED-BEFORE-FAIL before:error-exit:tty-state=2997995933 87
+RECORDED-BEFORE-FAIL before:error-exit:escape-leak
+RECORDED-BEFORE-FAIL before:wedge:prompt-not-back
+RECORDED-BEFORE-FAIL before:poisoned:prompt-not-back
+RECORDED-BEFORE-FAIL before:poisoned:tty-state=3298912900 85
+RECORDED-BEFORE-FAIL before:poisoned:escape-leak
+EXIT-RESTORE TMUX E2E: GREEN

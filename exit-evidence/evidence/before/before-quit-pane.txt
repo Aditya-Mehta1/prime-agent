@@ -1,0 +1,36 @@
+bash-5.2# echo BASELINE_MARKER && stty -g | cksum
+BASELINE_MARKER
+1376417782 88
+bash-5.2# HOME=/tmp/exit-restore-ag5_9trj/before/home TMPDIR=/tmp/exit-restore-ag5_9trj/before/tmp PRIME_AGENT_CODING_AG
+ENT_DIR=/tmp/exit-restore-ag5_9trj/before/agent PRIME_AGENT_FAUX_SCRIPT=/tmp/exit-restore-ag5_9trj/faux-script.json PRIM
+E_AGENT_DISABLE_ANALYTICS=1 PI_PACKAGE_DIR=/root/.local/share/prime-agent/releases/vm-runtime /opt/repo/repo/target/rele
+ase/prime-agent --daemon-socket /tmp/exit-restore-ag5_9trj/before/agent/daemon-quit-before.sock --model faux-1 ; printf
+'EXITCODE:%s\r\n' "$?" ; stty -g > /tmp/tty_after_exit ; printf 'TTYCK:%s\r\n' "$(cksum < /tmp/tty_after_exit)"
+Prime Agent sends pseudonymous usage and performance metrics without prompts, responses, tool content, file paths, or re
+pository data. Disable this with telemetry.enabled=false, PRIME_AGENT_TELEMETRY=0, DO_NOT_TRACK=1, or offline mode.
+
+                  ▗▄▄█▀
+    ███▄       ▗▄███▀
+   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.1.0
+  ▗█▛ ▟██▙▄██▛ ▟▛         model faux-1
+  ▗▟▌ ▐███▛▘▗▄█▖          cwd /tmp/exit-restore-ag5_9trj/shared-cwd
+ ▟███▄  ▄▄▟███▀
+ ▜█▛▀▘  ▜█▛▀▘
+
+
+ ⚠ tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and
+ restart tmux.
+
+                                                                                      Collapsed mode (Ctrl+O to expand)
+
+ >
+
+Press Ctrl+C again to exit                                                                               faux-1 · 0 (0%)
+EXITCODE:0
+TTYCK:1376417782 88
+bash-5.2# echo LITCHECK_OK_7f3a
+LITCHECK_OK_7f3a
+bash-5.2#
+
+
+

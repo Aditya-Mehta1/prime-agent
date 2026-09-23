@@ -9,7 +9,7 @@ use crate::theme::Theme;
 use crate::view::AgentView;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{self, EnterAlternateScreen};
+use crossterm::terminal::{self};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::io::stdout;
 use std::time::Duration;
@@ -79,7 +79,10 @@ fn run_app_surface(
     // unwind-guard contract the session surface arms).
     let _surface_restore = crate::exit_restore::SurfaceRestore::armed();
     terminal::enable_raw_mode()?;
-    crossterm::execute!(stdout(), EnterAlternateScreen)?;
+    // The alternate screen mounts through the ownership module (the same
+    // `pendingAltScreenHandoff` semantics the session surface uses), so
+    // the surface's alt-screen state is tracked for every exit path.
+    crate::altscreen::enter()?;
     // The replay surface owns the same enhanced-key modes as the session
     // (TS `ProcessTerminal.start`): bracketed pastes arrive as one chunk.
     crate::enhanced_keys::enable(&mut std::io::stdout())?;

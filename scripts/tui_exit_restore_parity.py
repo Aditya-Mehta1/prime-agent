@@ -252,16 +252,17 @@ def typed_clean(server, timeout=15):
 
 
 def typed_line_clean(capture_text):
-    """The echoed command line must be literal: no CSI sequences (kitty
-    CSI-u reports, SGR mouse reports, paste markers) inside it. tmux's
-    own hyperlink OSC wrapping is stripped first."""
+    """The echoed command line must be literal: after stripping tmux's
+    OSC 8 hyperlink wrappers (the pane's own rendering, not a leak), the
+    line must contain no escape bytes at all — a kitty CSI-u report, an
+    SGR mouse report, or a paste marker inside the echoed input is the
+    leak the scenario exists to catch (stripping CSI classes before the
+    check would hide exactly those)."""
     for line in capture_text.splitlines():
         if "echo LITCHECK_OK_7f3a" not in line:
             continue
-        escaped = re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", "", line)
-        escaped = re.sub(r"\x1b\[[0-9;:<=>?]*[a-zA-Z~]", "", escaped)
-        escaped = re.sub(r"\x1b[>=<][0-9;]*[a-zA-Z~]", "", escaped)
-        return "echo LITCHECK_OK_7f3a" in escaped
+        stripped = re.sub(r"\x1b\]8;;[^\x07\x1b]*(\x07|\x1b\\)", "", line)
+        return "\x1b" not in stripped
     return False
 
 
@@ -503,14 +504,6 @@ def parse_exit_probe(capture_text):
         if m:
             probe["tty_cksum"] = m.group(1)
     return probe
-
-
-def parse_exit_code(capture_text):
-    for line in capture_text.splitlines():
-        m = re.search(r"PANIC_EXIT_CODE:(\d+)", line)
-        if m:
-            return int(m.group(1))
-    return None
 
 
 def scenario_runs(side, label):

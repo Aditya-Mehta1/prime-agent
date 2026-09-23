@@ -50,6 +50,13 @@ const SGR_RESET: &[u8] = b"\x1b[0m";
 pub(crate) static RESTORE_ATTEMPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Serializes the tests that read [`RESTORE_ATTEMPTS`]: the counter is
+/// process-global and the test threads run in parallel, so a reader must
+/// hold this lock across its read window (the unwind-guard test's
+/// catch_unwind and the interactive error-path test's run both take it).
+#[cfg(test)]
+pub(crate) static TEST_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The one best-effort exit restore: the full sequence above, with no
 /// inline flush. Idempotent — every mode release is gated on its own
 /// process-global flag, so a restore after a deliberate teardown only
@@ -66,7 +73,11 @@ pub(crate) fn restore_terminal() {
     crate::enhanced_keys::drain_for_exit(&mut out);
     let _ = crate::mouse_tracking::disable(&mut out);
     let _ = crate::enhanced_keys::disable(&mut out);
-    let _ = crate::altscreen::leave();
+    // The unconditional leave: the restore is the last line of defense,
+    // so it must not trust the ownership flag (a surface that mounted the
+    // screen outside the module — a partial restore, a desynced flag —
+    // would otherwise keep the alt buffer up past the process death).
+    crate::altscreen::force_leave(&mut out);
     terminal_release_tail(&mut out);
 }
 
@@ -131,6 +142,7 @@ mod tests {
 
     #[test]
     fn the_unwind_guard_fires_only_while_unwinding() {
+        let _state = TEST_STATE_LOCK.lock();
         let before = attempts();
         {
             // A normal scope — no unwind — must stay silent: a live
