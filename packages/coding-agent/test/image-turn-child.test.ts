@@ -31,6 +31,8 @@ interface ImageTurnHarness {
 	servedModelIds: string[];
 	requests: Array<{ model: string; content: unknown[] }[]>;
 	spawns: Array<{ prompt: string; kwargs: Record<string, unknown> }>;
+	/** Release the turn that was held open to keep a stream live through the read. */
+	releaseHeldTurn: () => void;
 	spawnChild: (options?: {
 		reading?: string;
 		settled?: boolean;
@@ -59,6 +61,7 @@ function createImageTurnHarness(
 		options.vision ? base : { ...base, id: "claude-opus-4-7-text-only", input: ["text"] }
 	) as typeof base;
 	const servedModelIds: string[] = [];
+	const heldStreams: EventStream<AssistantMessageEvent, AssistantMessage>[] = [];
 	const requests: Array<{ model: string; content: unknown[] }[]> = [];
 	const agent = new Agent({
 		getApiKey: () => "test-key",
@@ -73,10 +76,17 @@ function createImageTurnHarness(
 				(event: any) => event.message,
 			);
 			// "a heartbeat arrived" stands in for a turn that is still streaming while
-			// the image read is awaited: it never finishes on its own.
-			if (!String(context.messages.at(-1)?.content ?? "").includes("a heartbeat arrived")) {
-				stream.push({ type: "done", reason: "stop", message: assistantMsg("ok") });
+			// the image read is awaited: it stays open until the test releases it, so
+			// the race window is deterministic rather than timing-dependent.
+			const lastContent = context.messages.at(-1)?.content;
+			const lastText = Array.isArray(lastContent)
+				? lastContent.map((block) => (block as { text?: string }).text ?? "").join(" ")
+				: String(lastContent ?? "");
+			if (lastText.includes("a heartbeat arrived")) {
+				heldStreams.push(stream);
+				return stream;
 			}
+			stream.push({ type: "done", reason: "stop", message: assistantMsg("ok") });
 			return stream;
 		},
 	});
@@ -156,6 +166,11 @@ function createImageTurnHarness(
 			// The child session publishes right after spawn; the stub binds it here so
 			// the read child's identity is registered before it can reply.
 			children._awaitPendingRlmChildPublication = vi.fn(async () => READ_CHILD_SESSION_ID);
+		},
+		releaseHeldTurn: () => {
+			for (const stream of heldStreams.splice(0)) {
+				stream.push({ type: "done", reason: "stop", message: assistantMsg("ok") });
+			}
 		},
 		dispose: () => {
 			session.dispose();
@@ -378,6 +393,9 @@ describe("image steers and follow-ups", () => {
 			.join("\n");
 		expect(text).toContain("look at this");
 		expect(text).toContain("A red banner.");
-		await harness.session.abort();
+		// Hold the concurrent turn open until now, then release it so the session
+		// idles before teardown.
+		harness.releaseHeldTurn();
+		await harness.session.waitForIdle();
 	});
 });

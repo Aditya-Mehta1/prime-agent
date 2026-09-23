@@ -2784,12 +2784,12 @@ export class AgentSession {
 		}
 	}
 
-	/** Remember one read child's session id, bounded so the set cannot grow. */
+	/**
+	 * Remember one read child's session id for the session's lifetime: a reply can
+	 * land after the child was deleted, and dropping ids would let that late
+	 * message be admitted as an unsolicited turn.
+	 */
 	private _rememberVisionReadChildSession(sessionId: string): void {
-		if (this._visionReadChildSessionIds.size >= 8) {
-			const oldest = this._visionReadChildSessionIds.values().next().value;
-			if (oldest) this._visionReadChildSessionIds.delete(oldest);
-		}
 		this._visionReadChildSessionIds.add(sessionId);
 	}
 
@@ -2861,7 +2861,10 @@ export class AgentSession {
 		let totalBytes = 0;
 		for (const image of images) {
 			if (selected.length >= IMAGE_TURN_CHILD_MAX_IMAGES) break;
-			const bytes = Math.ceil((image.data.length * 3) / 4);
+			// Base64 padding inflates the estimate, so an image exactly at the cap
+			// must not be rejected for it.
+			const padding = image.data.endsWith("==") ? 2 : image.data.endsWith("=") ? 1 : 0;
+			const bytes = Math.floor((image.data.length * 3) / 4) - padding;
 			if (!IMAGE_TURN_CHILD_MIME_TYPES.includes(image.mimeType)) continue;
 			if (bytes > IMAGE_TURN_CHILD_MAX_IMAGE_BYTES) continue;
 			if (totalBytes + bytes > IMAGE_TURN_CHILD_MAX_TOTAL_BYTES) continue;
@@ -2889,12 +2892,19 @@ export class AgentSession {
 				writeFileSync(filePath, Buffer.from(image.data, "base64"));
 				return filePath;
 			});
-			const child = await this.runRlmChild(
-				this._imageTurnChildPrompt(paths, text),
-				{ model: reference },
-				undefined,
-				{ ignoreDepthLimit: true },
-			);
+			let child: RlmSpawnHandle;
+			try {
+				child = await this.runRlmChild(this._imageTurnChildPrompt(paths, text), { model: reference }, undefined, {
+					ignoreDepthLimit: true,
+				});
+			} catch (error) {
+				// The spawn resolves the pin against the executable subagent catalog,
+				// which can reject a model the registry offers: name the image model
+				// and the fix instead of surfacing a bare spawn error.
+				throw new Error(
+					`${formatImageModelUnusableMessage(reference)}\n\n${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 			childId = child.rlm_child_id;
 			// The reading is consumed programmatically here, so a terminal notice
 			// would only inject an extra turn into this session after the read.
@@ -6427,9 +6437,15 @@ export class AgentSession {
 				}
 				const schedule = options?.streamingBehavior ?? "followUp";
 				const prefixMessages = visibleQueued ? this._takePendingNextTurnMessages() : undefined;
-				const content = options?.content
-					? options.content.map((block) => ({ ...block }))
-					: this._buildPromptContent(normalized.text, normalized.images);
+				// A read replaced the submission's images with a text reading, so a
+				// caller-supplied content array must be rebuilt from the normalized
+				// submission: its original image blocks would otherwise reach the
+				// transcript and the provider.
+				const readingReplacedImages = Boolean(options?.images?.length) && !normalized.images?.length;
+				const content =
+					options?.content && !readingReplacedImages
+						? options.content.map((block) => ({ ...block }))
+						: this._buildPromptContent(normalized.text, normalized.images);
 				const suppliedMessage = options?.customMessage;
 				const primaryMessage = suppliedMessage
 					? visibleQueued
