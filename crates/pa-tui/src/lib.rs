@@ -56,6 +56,7 @@ pub mod model_picker;
 pub(crate) mod mouse;
 pub(crate) mod mouse_tracking;
 pub mod onboarding;
+pub mod onboarding_picker;
 pub mod osc133;
 pub mod osc52;
 pub(crate) mod prompt_highlight;

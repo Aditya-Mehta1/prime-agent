@@ -365,7 +365,7 @@ fn render_cells(theme: &Theme, cells: Vec<SplashCell>) -> Line {
 /// `isLightColor` (luma > 128) with the terminal-default text counting as
 /// light; the dark canvas is the TS default because the theme colour
 /// record carries no parseable `background`.
-fn highlight_wash(theme: &Theme) -> Color {
+pub(crate) fn highlight_wash(theme: &Theme) -> Color {
     let text = theme.fg_style(ThemeColor::Text).fg;
     // TS: `onDark = !text || isLightColor(text)` — undefined (empty theme
     // value) or a light colour both mean light text over a dark canvas.
