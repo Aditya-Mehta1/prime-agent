@@ -2273,6 +2273,22 @@ impl Supervisor {
             }
         }
         let type_name = command_type_name(&envelope.command).to_string();
+        // Terminal shutdown admission gate: once the shutdown command has
+        // flipped `shutting_down`, no later client command may reach a
+        // worker (the stop pass may already be retiring it). The command
+        // that started the shutdown passed this point before it set the
+        // gate, so its own response path is unaffected.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return (
+                vec![response_line(&response_failure(
+                    Some(&command_id),
+                    &type_name,
+                    "Supervisor is shutting down",
+                    None,
+                ))],
+                false,
+            );
+        }
         // Update-prepare watchdog on any later command (spec §5): a prepared
         // transaction whose marker expired returns the supervisor to Serving
         // before the command is served.
