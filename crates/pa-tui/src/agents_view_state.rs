@@ -901,7 +901,7 @@ mod tests {
         }
         // Partial words need the fuzzy path on the name (ordered
         // subsequence).
-        assert!(score_search(targets, &parse_search_query("gtwy")).is_some());
+        assert!(score_search(targets, &parse_search_query("rtwr")).is_some());
         // Content fields are gone from the picker: first messages, the
         // capped transcript, the recap summary, and file paths never match.
         for query in [
@@ -975,8 +975,10 @@ mod tests {
                 "messageCount": 1,
             }),
         ];
+        // "child" hits the child row's NAME (the corpus no longer
+        // carries first messages), and the parent stays as its ancestor.
         let records = reconcile_unified_sessions(&[], &saved);
-        let filtered = filter_unified_sessions(&records, &parse_search_query("fibonacci"));
+        let filtered = filter_unified_sessions(&records, &parse_search_query("child"));
         let titles: Vec<&str> = filtered
             .iter()
             .map(|record| {
@@ -987,7 +989,7 @@ mod tests {
         // An unrelated query matches nothing, and the parent alone matches
         // only its own query.
         assert!(filter_unified_sessions(&records, &parse_search_query("zebra")).is_empty());
-        let parent_only = filter_unified_sessions(&records, &parse_search_query("orchestrate"));
+        let parent_only = filter_unified_sessions(&records, &parse_search_query("root"));
         assert_eq!(parent_only.len(), 1);
         assert_eq!(
             get_str(parent_only[0].saved.as_ref().unwrap(), "name"),

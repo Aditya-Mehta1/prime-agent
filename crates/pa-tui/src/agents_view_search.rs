@@ -207,15 +207,16 @@ fn contiguous_token_score(token: &str, targets: &SessionSearchText) -> Option<f6
     if let Some(score) = label_score(&needle, &targets.name) {
         return Some(TIER_STRIDE + score);
     }
-    if let Some(found) = targets.id.find(&needle) {
+    // Targets normalize like the needle (TS lowercased the whole corpus):
+    // ids and paths match case-insensitively.
+    if let Some(found) = normalize(&targets.id).find(&needle) {
         let tier = if found == 0 { 5.0 } else { 6.0 };
         return Some(tier * TIER_STRIDE + found as f64);
     }
-    if let Some(found) = cwd_basename(&targets.cwd).find(&needle) {
+    if let Some(found) = normalize(&cwd_basename(&targets.cwd)).find(&needle) {
         return Some(7.0 * TIER_STRIDE + found as f64);
     }
-    targets
-        .cwd
+    normalize(&targets.cwd)
         .find(&needle)
         .map(|found| 8.0 * TIER_STRIDE + found as f64)
 }
@@ -259,7 +260,8 @@ mod tests {
 
     fn targets() -> SessionSearchText {
         SessionSearchText {
-            name: "Gateway Worker".to_string(),
+            // One word: tier comparisons below stay single-token queries.
+            name: "gatewayworker".to_string(),
             id: "01a0b6b3-2e8d-71ab-b1c2-2a7db1bf8077".to_string(),
             cwd: "/Users/kevin/pi/prime-agent".to_string(),
         }
@@ -271,10 +273,11 @@ mod tests {
 
     #[test]
     fn name_exact_outranks_prefix_outranks_substring_outranks_fuzzy() {
-        let exact = score("gateway worker").expect("exact name matches");
-        let prefix = score("gateway").expect("name prefix matches");
-        let substring = score("worker").expect("name substring matches");
-        let fuzzy = score("gtwy").expect("name fuzzy matches");
+        // Single-token queries: a whitespace query tokenizes and sums.
+        let exact = score("gatewayworker").expect("exact name matches");
+        let prefix = score("gatewaywork").expect("name prefix matches");
+        let substring = score("tewaywor").expect("name substring matches");
+        let fuzzy = score("gtwwr").expect("name fuzzy matches");
         assert!(exact < prefix, "exact {exact} < prefix {prefix}");
         assert!(
             prefix < substring,
@@ -342,12 +345,12 @@ mod tests {
 
     #[test]
     fn every_token_must_match_and_phrases_stay_contiguous() {
-        let both = score("gateway 01a0");
+        let both = score("gatewaywork 01a0");
         assert!(both.is_some(), "tokens may match different targets");
-        assert!(score("gateway zebra").is_none(), "all tokens must match");
-        let phrase = parse_search_query(r#""gateway worker" 01a0"#);
+        assert!(score("gatewaywork zebra").is_none(), "all tokens must match");
+        let phrase = parse_search_query(r#""gatewaywork" 01a0"#);
         assert!(score_search(&targets(), &phrase).is_some(), "phrases match");
-        let split_phrase = parse_search_query(r#""worker gateway""#);
+        let split_phrase = parse_search_query(r#""workgateway""#);
         assert!(
             score_search(&targets(), &split_phrase).is_none(),
             "phrases are contiguous substrings, not fuzzy"
