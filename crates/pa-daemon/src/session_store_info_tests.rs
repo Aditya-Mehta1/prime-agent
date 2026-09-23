@@ -73,12 +73,9 @@ fn legacy_read_session_info(path: &Path) -> Option<SessionInfo> {
             }
             "child_usage_attributed" => {
                 let usage_field = |name: &str| {
-                    entry
-                        .fields
-                        .get(name)
-                        .and_then(|usage| {
-                            serde_json::from_value::<pa_types::ai::Usage>(usage.clone()).ok()
-                        })
+                    entry.fields.get(name).and_then(|usage| {
+                        serde_json::from_value::<pa_types::ai::Usage>(usage.clone()).ok()
+                    })
                 };
                 usage_scan.fold_child_attribution(
                     entry.fields.get("targetId").and_then(Value::as_str),

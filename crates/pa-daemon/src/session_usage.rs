@@ -299,20 +299,32 @@ mod tests {
     #[test]
     fn latest_aggregate_replaces_raw_and_child_usage_accumulates() {
         let summary = scan_summary(&[
-            message("a", "assistant", json!({
-                "input": 100, "output": 10, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 110,
-                "cost": { "input": 0.0, "output": 1.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 1.0 }
-            })),
+            message(
+                "a",
+                "assistant",
+                json!({
+                    "input": 100, "output": 10, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 110,
+                    "cost": { "input": 0.0, "output": 1.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 1.0 }
+                }),
+            ),
             attribution("a", usage(20, 2, 0.2), usage(120, 12, 1.2)),
             attribution("a", usage(30, 3, 0.3), usage(150, 15, 1.5)),
-            message("b", "assistant", json!({
-                "input": 50, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 55,
-                "cost": { "input": 0.0, "output": 0.5, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.5 }
-            })),
+            message(
+                "b",
+                "assistant",
+                json!({
+                    "input": 50, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 55,
+                    "cost": { "input": 0.0, "output": 0.5, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.5 }
+                }),
+            ),
         ]);
         assert_eq!(
             summary,
-            Some(SessionUsageSummary { input_tokens: 150, output_tokens: 15, cost: 1.5 })
+            Some(SessionUsageSummary {
+                input_tokens: 150,
+                output_tokens: 15,
+                cost: 1.5
+            })
         );
     }
 
@@ -321,10 +333,14 @@ mod tests {
     /// one) contributes nothing.
     #[test]
     fn attribution_without_a_present_target_folds_nothing() {
-        let assistant = message("a", "assistant", json!({
-            "input": 40, "output": 4, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 44,
-            "cost": { "input": 0.0, "output": 0.4, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.4 }
-        }));
+        let assistant = message(
+            "a",
+            "assistant",
+            json!({
+                "input": 40, "output": 4, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 44,
+                "cost": { "input": 0.0, "output": 0.4, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.4 }
+            }),
+        );
         let orphan = attribution("a", usage(30, 3, 0.3), usage(70, 7, 0.7));
         let ahead_of_target = attribution("z", usage(1, 1, 0.1), usage(41, 5, 0.5));
 
@@ -332,7 +348,11 @@ mod tests {
         let after = scan_summary(&[assistant, orphan, ahead_of_target]);
         assert_eq!(
             before,
-            Some(SessionUsageSummary { input_tokens: 40, output_tokens: 4, cost: 0.4 })
+            Some(SessionUsageSummary {
+                input_tokens: 40,
+                output_tokens: 4,
+                cost: 0.4
+            })
         );
         assert_eq!(before, after);
     }
@@ -342,10 +362,14 @@ mod tests {
     #[test]
     fn summarization_usage_is_added() {
         let summary = scan_summary(&[
-            message("a", "assistant", json!({
-                "input": 100, "output": 10, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 110,
-                "cost": { "input": 0.0, "output": 1.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 1.0 }
-            })),
+            message(
+                "a",
+                "assistant",
+                json!({
+                    "input": 100, "output": 10, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 110,
+                    "cost": { "input": 0.0, "output": 1.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 1.0 }
+                }),
+            ),
             json!({
                 "type": "compaction", "id": "c",
                 "usage": { "input": 200, "output": 20, "cacheRead": 5, "cacheWrite": 0,
@@ -362,7 +386,11 @@ mod tests {
         // 100 + 200 + 5 + 50 input tokens; 10 + 20 + 5 output; $1.0 + $0.3 + $0.1.
         assert_eq!(
             summary,
-            Some(SessionUsageSummary { input_tokens: 355, output_tokens: 35, cost: 1.4000000000000001 })
+            Some(SessionUsageSummary {
+                input_tokens: 355,
+                output_tokens: 35,
+                cost: 1.4000000000000001
+            })
         );
     }
 
@@ -373,8 +401,16 @@ mod tests {
         assert_eq!(scan_summary(&[]), None);
         assert_eq!(
             scan_summary(&[
-                message("u", "user", json!({ "input": 10, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10, "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 } })),
-                message("a", "assistant", json!({ "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 } })),
+                message(
+                    "u",
+                    "user",
+                    json!({ "input": 10, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10, "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 } })
+                ),
+                message(
+                    "a",
+                    "assistant",
+                    json!({ "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 } })
+                ),
             ]),
             None
         );
@@ -385,14 +421,25 @@ mod tests {
     #[test]
     fn child_attribution_drift_clamps_at_zero() {
         let summary = scan_summary(&[
-            message("a", "assistant", json!({
-                "input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 11,
-                "cost": { "input": 0.0, "output": 0.1, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.1 }
-            })),
+            message(
+                "a",
+                "assistant",
+                json!({
+                    "input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 11,
+                    "cost": { "input": 0.0, "output": 0.1, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.1 }
+                }),
+            ),
             // Drifted child spend larger than the aggregate folds in.
             attribution("a", usage(900, 90, 0.9), usage(10, 1, 0.1)),
         ]);
-        assert_eq!(summary, Some(SessionUsageSummary { input_tokens: 0, output_tokens: 0, cost: 0.0 }));
+        assert_eq!(
+            summary,
+            Some(SessionUsageSummary {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost: 0.0
+            })
+        );
     }
 
     /// The map keeps first-insertion order so the cost sums stay
@@ -400,10 +447,14 @@ mod tests {
     #[test]
     fn cost_sums_follow_insertion_order() {
         let line = |id: &str, cost: f64| {
-            message(id, "assistant", json!({
-                "input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 11,
-                "cost": { "input": 0.0, "output": cost, "cacheRead": 0.0, "cacheWrite": 0.0, "total": cost }
-            }))
+            message(
+                id,
+                "assistant",
+                json!({
+                    "input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 11,
+                    "cost": { "input": 0.0, "output": cost, "cacheRead": 0.0, "cacheWrite": 0.0, "total": cost }
+                }),
+            )
         };
         let summary = scan_summary(&[line("a", 0.1), line("b", 0.2), line("c", 0.3)]);
         let cost = summary.as_ref().map(|summary| summary.cost);
@@ -415,8 +466,7 @@ mod tests {
     /// unparsable lines contribute nothing.
     #[test]
     fn read_own_usage_summary_scans_a_file() {
-        let dir = std::env::temp_dir()
-            .join(format!("session-usage-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("session-usage-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.jsonl");
         std::fs::write(
@@ -431,7 +481,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             read_own_usage_summary(&path),
-            Some(SessionUsageSummary { input_tokens: 100, output_tokens: 10, cost: 1.0 })
+            Some(SessionUsageSummary {
+                input_tokens: 100,
+                output_tokens: 10,
+                cost: 1.0
+            })
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -451,7 +505,11 @@ mod tests {
         let summary = read_own_usage_summary(Path::new(&path));
         assert_eq!(
             summary,
-            Some(SessionUsageSummary { input_tokens: 1_505_509, output_tokens: 14_472, cost: 0.0 })
+            Some(SessionUsageSummary {
+                input_tokens: 1_505_509,
+                output_tokens: 14_472,
+                cost: 0.0
+            })
         );
     }
 }
