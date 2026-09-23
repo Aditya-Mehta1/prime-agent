@@ -333,7 +333,10 @@ mod tests {
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
                     writer
-                        .write_all(br#"{"type":"daemon_hello"}"#)
+                        .write_all(
+                            br#"{"type":"daemon_hello"}
+"#,
+                        )
                         .await
                         .unwrap();
                     let mut lines = BufReader::new(reader);
