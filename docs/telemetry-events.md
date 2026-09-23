@@ -350,6 +350,19 @@ subagent inspection surface; emitted once per open action).
 |---|---|---|
 | `children_total` | number | live RLM descendant count at open time |
 
+### `tui activity opened`
+
+The user opened an activity surface from the session view: the unified
+panel itself (dock Enter, a second Alt+A, or a dock group's Enter) or a
+group's management view from the panel (the scoped agents view, the
+heartbeats view, a bash output tail). The goal indicator is read-only and
+does not emit this event. No command, output, prompt, or goal content is
+collected.
+
+| property | type | notes |
+|---|---|---|
+| `kind` | string | `panel` / `subagents` / `heartbeats` / `bash` |
+
 ### `tui prompt stash`
 
 A prompt-stash transition (adoption of the session-switch draft stash, TS
