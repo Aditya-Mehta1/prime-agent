@@ -262,4 +262,34 @@ describe("image steers and follow-ups", () => {
 		const queued = userContents(harness.session).find((content) => contentText(content).includes("look at this"));
 		expect(queued?.some((block) => block.type === "image")).toBe(true);
 	});
+	it("does not orphan a failing read on an image-carrying steer or follow-up", async () => {
+		const harness = harnessFor(SET);
+		harness.spawnChild({ settled: false });
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await expect(harness.session.steer("look at this", [IMAGE])).rejects.toThrow(/did not finish reading/);
+			await expect(harness.session.followUp("look at this", [IMAGE])).rejects.toThrow(/did not finish reading/);
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
+	it("caps oversized and unsupported images before writing them out", async () => {
+		const harness = harnessFor(SET);
+		harness.spawnChild({ reading: "One small panel." });
+		const huge: typeof IMAGE = { type: "image", mimeType: "image/png", data: "A".repeat(12_000_000) };
+		const pdf: typeof IMAGE = { type: "image", mimeType: "application/pdf", data: "aGk=" };
+		await harness.session.prompt("look at these", { images: [IMAGE, huge, pdf] });
+		expect(harness.spawns).toHaveLength(1);
+		expect(harness.spawns[0]?.prompt).toMatch(/image-1\.png/);
+		expect(harness.spawns[0]?.prompt).not.toMatch(/image-2/);
+		const content = userContents(harness.session).at(-1) ?? [];
+		expect(contentText(content)).toContain("2 image(s) over the per-turn count or size caps were not read");
+	});
 });

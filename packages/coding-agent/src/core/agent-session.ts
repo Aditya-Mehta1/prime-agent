@@ -1140,8 +1140,12 @@ const RLM_REGISTRY_ANSWER_PREVIEW_MAX_LENGTH = 200;
  * bounded; the child itself is bounded by the RLM depth limit.
  */
 const IMAGE_TURN_CHILD_MAX_IMAGES = 8;
+const IMAGE_TURN_CHILD_MAX_IMAGE_BYTES = 8_000_000;
+const IMAGE_TURN_CHILD_MAX_TOTAL_BYTES = 24_000_000;
 const IMAGE_TURN_CHILD_TIMEOUT_MS = 180_000;
 const IMAGE_TURN_READING_MAX_CHARS = 4000;
+/** Types the image readers accept; anything else is left for the routing path. */
+const IMAGE_TURN_CHILD_MIME_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 /** Hard cap for labels carried into kernel roster entries (snapshots keep the full prompt). */
 const RLM_REGISTRY_LABEL_MAX_LENGTH = 200;
 
@@ -2774,12 +2778,28 @@ export class AgentSession {
 		const reference = this._imageTurnChildModelReference();
 		if (!reference) return undefined;
 
+		// Caps come first: a payload that fails them is never written to disk and
+		// never handed to a provider, so a bad paste cannot cost a bounded child.
+		const selected: ImageContent[] = [];
+		let totalBytes = 0;
+		for (const image of images) {
+			if (selected.length >= IMAGE_TURN_CHILD_MAX_IMAGES) break;
+			const bytes = Math.ceil((image.data.length * 3) / 4);
+			if (!IMAGE_TURN_CHILD_MIME_TYPES.includes(image.mimeType)) continue;
+			if (bytes > IMAGE_TURN_CHILD_MAX_IMAGE_BYTES) continue;
+			if (totalBytes + bytes > IMAGE_TURN_CHILD_MAX_TOTAL_BYTES) continue;
+			totalBytes += bytes;
+			selected.push(image);
+		}
+		if (selected.length === 0) return undefined;
+		const skipped = images.length - selected.length;
+
 		const dir = mkdtempSync(join(tmpdir(), "prime-agent-image-turn-"));
 		let childId: string | undefined;
 		try {
 			// Pasted images are inline base64 with no path, so they are materialized
 			// here for the child to open.
-			const paths = images.slice(0, IMAGE_TURN_CHILD_MAX_IMAGES).map((image, index) => {
+			const paths = selected.map((image, index) => {
 				const filePath = join(dir, `image-${index + 1}.${image.mimeType.split("/")[1] ?? "png"}`);
 				writeFileSync(filePath, Buffer.from(image.data, "base64"));
 				return filePath;
@@ -2794,17 +2814,22 @@ export class AgentSession {
 			if (entry.status !== "done") {
 				throw new Error(entry.error ?? formatImageModelUnusableMessage(reference));
 			}
-			const reading = this._rlmChildSessions.get(childId)?.session?.getLastAssistantText()?.trim();
-			const reported = reading || entry.answer_preview?.trim();
+			const answer = this._rlmChildSessions.get(childId)?.session?.getLastAssistantText()?.trim();
+			// A child whose session is gone leaves only its collapsed preview: keep
+			// it, but say so, so a short reading is never mistaken for the answer.
+			const preview = entry.answer_preview?.trim();
+			const reported = answer || preview;
 			if (!reported) throw new Error(formatImageModelUnusableMessage(reference));
-			const omitted = images.length - paths.length;
 			const capped =
 				reported.length > IMAGE_TURN_READING_MAX_CHARS
 					? `${reported.slice(0, IMAGE_TURN_READING_MAX_CHARS)}\n[reading truncated]`
 					: reported;
 			const scope = `${paths.length === 1 ? "image" : `${paths.length} images`} read by ${reference}`;
-			const dropped = omitted > 0 ? `\n[${omitted} image(s) over the per-turn limit were not read]` : "";
-			return `[${scope}]\n${capped}${dropped}`;
+			const notes = [
+				answer ? "" : "[child answer unavailable; preview only]",
+				skipped > 0 ? `[${skipped} image(s) over the per-turn count or size caps were not read]` : "",
+			].filter(Boolean);
+			return `[${scope}]\n${capped}${notes.length > 0 ? `\n${notes.join("\n")}` : ""}`;
 		} finally {
 			// One child per turn, deleted once its reading is in hand: the image turn
 			// leaves no child behind to collect, and the materialized files go with it.
