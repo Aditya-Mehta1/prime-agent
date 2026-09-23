@@ -425,6 +425,33 @@ pub fn filter_empty_sessions(records: &[UnifiedRecord], preserved: &[&str]) -> V
 /// the picker's match algorithm).
 pub use crate::agents_view_search::{parse_search_query, ParsedSearchQuery, SessionSearchText};
 
+/// The keys by which a record's parent is referenced (TS `getParentKeys`).
+fn parent_keys(record: &UnifiedRecord) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(daemon) = &record.daemon {
+        for field in ["parentActiveSessionId", "parentSessionId"] {
+            if let Some(id) = get_str(daemon, field) {
+                let prefix = if field == "parentActiveSessionId" {
+                    "active"
+                } else {
+                    "session"
+                };
+                keys.push(format!("{prefix}:{id}"));
+            }
+        }
+        if let Some(path) = get_str(daemon, "parentSessionPath") {
+            keys.push(file_identity(path));
+        }
+    }
+    if let Some(parent) = record
+        .saved
+        .as_ref()
+        .and_then(|saved| get_str(saved, "parentSessionPath"))
+    {
+        keys.push(file_identity(parent));
+    }
+    keys
+}
 /// TS `filterUnifiedSessions`: keep the matching records plus every
 /// ancestor, so the hierarchy leading to a match stays reachable (a child
 /// hit keeps its parent rows in the set). Catalog order decides nesting;

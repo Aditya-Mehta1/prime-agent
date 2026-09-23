@@ -949,12 +949,12 @@ fn compare_base(a: &BaseRow, b: &BaseRow, anchor: Option<&str>) -> std::cmp::Ord
 
 /// The shared final tiebreaks: title, then session id.
 fn finalize_base(a: &BaseRow, b: &BaseRow) -> std::cmp::Ordering {
-    let session_id = |row: &BaseRow| {
+    fn session_id(row: &BaseRow) -> Option<&str> {
         row.summary
             .get("sessionId")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-    };
+    }
     let title = a.title.cmp(&b.title);
     if title != std::cmp::Ordering::Equal {
         return title;
@@ -1489,7 +1489,10 @@ mod tests {
         ];
         let records = reconcile_unified_sessions(&roster, &[]);
         let filtered =
-            crate::agents_view_state::filter_unified_sessions(&records, &parse_search_query("sweep"));
+            crate::agents_view_state::filter_unified_sessions(
+            &records,
+            &crate::agents_view_state::parse_search_query("sweep"),
+        );
         assert_eq!(filtered.len(), 2);
         let rollups: HashMap<String, Rollup> = HashMap::new();
         let rows = build_rows(&filtered, None, &Default::default(), &rollups, None);
