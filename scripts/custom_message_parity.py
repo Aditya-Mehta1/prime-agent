@@ -51,8 +51,8 @@ adopt).
 
 Third documented divergence (Kevin/Sebastian directive 2026-09-23, product
 improvement BEYOND TS): the expanded refinement outcome hangs on the
-branch grammar — the expanded content carries the dim `\u{2570}\u{2500} `
-gutter on the first row hanging off the `\u{25c6}` header and a
+branch grammar — the expanded content carries the dim `╰─ `
+gutter on the first row hanging off the `◆` header and a
 four-space continuation indent after, instead of the TS
 `ExpandableEventMessage`'s plain one-column chat inset (the same grammar
 the expanded ipython cells and the agent-message bodies use). The diff
