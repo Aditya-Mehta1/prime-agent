@@ -2,10 +2,11 @@ import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
 import type { RlmChildAgentSnapshot } from "../src/core/agent-session.js";
+import type { AgentSessionRuntimeDiagnostic } from "../src/core/agent-session-services.js";
 import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { ContextUsage } from "../src/core/extensions/types.js";
 import type { SessionActionSnapshot } from "../src/core/session-action-store.js";
-import type { SessionInfo } from "../src/core/session-manager.js";
+import type { AgentStatus, SessionInfo } from "../src/core/session-manager.js";
 import type { SessionUsageSummary } from "../src/core/usage.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { passivatedWorkerRosterEntry, workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.js";
@@ -519,6 +520,7 @@ describe("summary compose memoization", () => {
 		// Roster flushes recompose every session each cycle; an unchanged session
 		// must reuse the previous summary instead of recomposing it.
 		expect(summaryForActiveSession(state)).toBe(first);
+		expect(Object.isFrozen(first)).toBe(true);
 	});
 
 	it("recomposes when a message is appended and folds only the new tail", () => {
@@ -594,6 +596,36 @@ describe("summary compose memoization", () => {
 		const second = summaryForActiveSession(state);
 		expect(second).not.toBe(first);
 		expect(second.sessionActions).toMatchObject({ queuedCount: 1, steering: ["revised plan"] });
+
+	it("recomposes when a compose input changes without an append", () => {
+		const state = makeState({ activeSessionId: "inputs", messages: [messageAt("2026-05-01T00:00:00.000Z")] });
+		const session = state.runtime.session as unknown as Record<string, unknown> & { state: Record<string, unknown> };
+		const runtime = state.runtime as unknown as { diagnostics: unknown[]; metadata: Record<string, unknown> };
+		const actions: SessionActionSnapshot = { queuedCount: 1, steering: ["revised plan"], followUps: [] };
+		const usage: SessionUsageSummary = { inputTokens: 120, outputTokens: 40, cost: 0.03 };
+		const model = { provider: "p", id: "m" } as SessionSummary["model"];
+		const streaming = messageAt("2026-05-01T00:00:01.000Z");
+		const diagnostic: AgentSessionRuntimeDiagnostic = { type: "warning", message: "rebuilt" };
+		const verdict: AgentStatus = { summary: "Editing the router", taskState: "completed", basedOnMessageCount: 1 };
+		const mutations: Array<[() => unknown, Partial<SessionSummary>]> = [
+			[() => Object.assign(state, { summaryState: verdict }), { summary: "Editing the router" }],
+			[() => Object.assign(session, { getSessionActionSnapshot: () => actions }), { sessionActions: actions }],
+			[() => Object.assign(session, { getOwnUsageSummary: () => usage }), { usage }],
+			[() => Object.assign(session, { model }), { model }],
+			[() => Object.assign(session.state, { streamingMessage: streaming }), { streamingMessage: streaming }],
+			[() => Object.assign(runtime, { diagnostics: [diagnostic] }), { diagnostics: [diagnostic] }],
+			[() => Object.assign(runtime.metadata, { spawnCode: "rlm.spawn('x')" }), { spawnCode: "rlm.spawn('x')" }],
+			[() => Object.assign(session, { isSessionActive: true }), { activity: "working" }],
+			[() => Object.assign(session, { isStreaming: true }), { isStreaming: true }],
+		];
+		let previous = summaryForActiveSession(state);
+		for (const [mutate, expected] of mutations) {
+			mutate();
+			const next = summaryForActiveSession(state);
+			expect(next).not.toBe(previous);
+			expect(next).toMatchObject(expected);
+			previous = next;
+		}
 	});
 
 	it("recomposes when heartbeat registration flags differ per call site", () => {
