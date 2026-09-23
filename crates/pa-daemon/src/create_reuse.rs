@@ -130,7 +130,7 @@ impl Supervisor {
     pub(crate) async fn opening_guard(
         &self,
         command: &DaemonCommand,
-    ) -> Result<Option<tokio::sync::MutexGuard<'static, ()>>> {
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
         let Some(path) = create_target_file(command)? else {
             return Ok(None);
         };
