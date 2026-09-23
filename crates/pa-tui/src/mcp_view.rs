@@ -562,9 +562,10 @@ impl McpView {
     }
 
     /// Prefill the filter (`/mcp <partial>` + Tab opens the view filtered
-    /// to the typed match).
+    /// to the typed match), the caret at the partial's end so typing
+    /// extends it.
     pub fn set_search(&mut self, query: &str) {
-        self.search.set_value(query);
+        self.search.prefill(query);
         self.refilter();
     }
 
@@ -1228,8 +1229,12 @@ mod tests {
     #[test]
     fn set_search_filters_to_the_typed_partial() {
         let mut view = McpView::from_response(&roster_response(), 19);
-        // The Tab-intercepted partial prefills the view's filter.
+        // The Tab-intercepted partial prefills the view's filter, the
+        // caret at its end so typing extends it.
         view.set_search("lin");
+        assert_eq!(view.search.cursor(), 3, "the caret sits after lin");
+        view.handle_key("e", &kb());
+        assert_eq!(view.search.value(), "line");
         let rows = frame_text(&mut view);
         assert!(
             rows.iter().any(|row| row.contains("Linear")),

@@ -1026,9 +1026,9 @@ pub async fn run_interactive(
                         // run the client auth commands directly — the
                         // typed-command arg path is gone, so the view never
                         // resolves through a submitted `/mcp <args>` string.
-                        // A login hands the terminal over (the auth flow
-                        // prompts on the plain terminal), a paste stays
-                        // in-band.
+                        // A login and a paste both hand the terminal over
+                        // (the OAuth flow and the token prompt read the
+                        // plain terminal's stdin).
                         if let Some(args) = session.take_pending_mcp_auth() {
                             let suspended = session.mcp_auth_needs_terminal(&args);
                             if suspended {

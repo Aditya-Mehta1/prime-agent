@@ -211,6 +211,13 @@ impl Editor {
         self.autocomplete.is_some()
     }
 
+    /// Whether a completion request is parked: Tab or a trigger key
+    /// queued it and the host loop materializes it at the next
+    /// input-idle tick, so the dropdown is about to open.
+    pub fn has_pending_autocomplete(&self) -> bool {
+        self.pending_autocomplete.is_some()
+    }
+
     /// Drain pending editor events (change/submit) for the host loop.
     pub fn take_events(&mut self) -> Vec<EditorEvent> {
         std::mem::take(&mut self.events)
@@ -700,6 +707,31 @@ mod tests {
         assert!(
             e.autocomplete_state().is_none(),
             "no dropdown materializes on the emptied prompt"
+        );
+    }
+
+    /// The session's Esc guard treats the parked-request window (Tab
+    /// queued a request the host loop materializes at the next idle
+    /// tick) as an open menu: no dropdown is visible yet, so
+    /// `has_pending_autocomplete` is what the guard tests, and a cancel
+    /// there must stop the request from ever opening.
+    #[test]
+    fn cancel_clears_a_parked_request_before_it_opens() {
+        let mut e = ed();
+        e.handle_input(".");
+        e.handle_input("/");
+        e.handle_input("tab");
+        assert!(
+            !e.is_showing_autocomplete(),
+            "the dropdown is not visible before the idle tick"
+        );
+        assert!(e.has_pending_autocomplete(), "the request is parked");
+        e.cancel_autocomplete();
+        assert!(!e.has_pending_autocomplete());
+        e.materialize_autocomplete();
+        assert!(
+            e.autocomplete_state().is_none(),
+            "the cancelled request never opens"
         );
     }
 

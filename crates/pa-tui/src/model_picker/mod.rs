@@ -881,9 +881,10 @@ impl ModelPicker {
     }
 
     /// Prefill the filter (`/model <search>`; TS opens the selector with
-    /// the search term applied).
+    /// the search term applied), the caret at the search's end so typing
+    /// extends it.
     pub fn set_query(&mut self, query: &str) {
-        self.search.set_value(query);
+        self.search.prefill(query);
         self.filter_models(query);
     }
 }
@@ -1192,6 +1193,18 @@ mod tests {
                 effort: None,
             }))
         );
+    }
+
+    /// The Tab-intercepted partial keeps the caret at its end, so typing
+    /// extends the filter instead of inserting before it.
+    #[test]
+    fn set_query_prefill_leaves_the_caret_at_the_end() {
+        let mut picker = ModelPicker::new(picker_options(battery_catalog()));
+        picker.set_query("gp");
+        assert_eq!(picker.search.cursor(), 2, "the caret sits after gp");
+        picker.handle_key("t", &kb());
+        assert_eq!(picker.query(), "gpt");
+        assert_eq!(picker.search.cursor(), 3);
     }
 
     #[test]

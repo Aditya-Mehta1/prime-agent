@@ -6719,15 +6719,17 @@ impl SessionUi {
             return Ok(());
         }
         if view.editor.keybindings().matches(&id, "app.input.clear") {
-            // An open menu consumes Esc: the completion dropdown closes and
-            // the key stops there. The abort ladder (the escape-repeat
-            // arming and `interrupt_running_work`) runs only when no menu
-            // is open — closing a menu must never abort a running turn
-            // (the TS base editor consumes `tui.select.cancel` inside the
-            // dropdown; the TS custom-editor overlay propagates Esc to the
-            // interrupt after closing, the behavior this deliberately
-            // removes).
-            if view.editor.is_showing_autocomplete() {
+            // The completion surface consumes Esc: the open dropdown
+            // closes, and a parked request (Tab before the input-idle
+            // tick materializes it) cancels before it can open the menu —
+            // either way the key stops there. The abort ladder (the
+            // escape-repeat arming and `interrupt_running_work`) runs only
+            // when no menu is open or about to open — closing a menu must
+            // never abort a running turn (the TS base editor consumes
+            // `tui.select.cancel` inside the dropdown; the TS
+            // custom-editor overlay propagates Esc to the interrupt after
+            // closing, the behavior this deliberately removes).
+            if view.editor.is_showing_autocomplete() || view.editor.has_pending_autocomplete() {
                 view.editor.cancel_autocomplete();
                 self.clear_ctrl_c_hint();
                 return Ok(());
