@@ -253,7 +253,7 @@ impl Supervisor {
             options,
             descriptor_dir,
             session_bindings: crate::session_bindings::SessionBindingTable::new(),
-            opening_files: std::sync::Mutex::new(HashMap::new()),
+            opening_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             telemetry: std::sync::Mutex::new(None),
             registry: SessionRegistry::new(),
             events,
