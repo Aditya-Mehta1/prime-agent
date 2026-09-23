@@ -109,7 +109,6 @@ pub(crate) struct SessionWindow {
     thinking_level: String,
     service_tier: Option<pa_types::ai::ServiceTier>,
     retained_ids: std::collections::HashSet<String>,
-    pub(crate) older_path_stats: pa_core::session::window::WindowStats,
 }
 
 pub fn session_file_name(session_id: &str) -> String {
@@ -239,7 +238,6 @@ impl SessionFile {
                         .map(|entry| entry.id)
                 })
                 .collect(),
-            older_path_stats: window.older_path_stats().clone(),
         });
         Ok(file)
     }
