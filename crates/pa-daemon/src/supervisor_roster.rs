@@ -282,8 +282,8 @@ fn passivated_summary(summary: Value) -> Value {
 mod tests {
     use super::*;
     use crate::supervisor_roster_seed::tests::{
-        append_family_edge, drain_roster_pushes, live_child_summary, register_root_worker,
-        roster_fixture, roster_row_for_child, write_display_file,
+        append_family_edge, live_child_summary, register_root_worker, roster_fixture,
+        roster_row_for_child, write_display_file,
     };
     use pa_types::daemon::agent_roster::AgentRosterStatus;
 
