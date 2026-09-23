@@ -1024,8 +1024,10 @@ struct SessionInfoMessage {
     model: Option<Value>,
     #[serde(default)]
     timestamp: Option<Value>,
+    /// The lenient scan-side shape ([`crate::session_usage::ScanUsage`]):
+    /// a partial persisted block must not reject the row.
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<crate::session_usage::ScanUsage>,
 }
 
 #[derive(Deserialize)]
@@ -1057,12 +1059,12 @@ struct SessionInfoEntry {
     #[serde(default)]
     target_id: Option<String>,
     #[serde(default)]
-    child_usage: Option<Usage>,
+    child_usage: Option<crate::session_usage::ScanUsage>,
     #[serde(default)]
-    aggregate_usage: Option<Usage>,
+    aggregate_usage: Option<crate::session_usage::ScanUsage>,
     /// `compaction`/`branch_summary`: the summarization call's own usage.
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<crate::session_usage::ScanUsage>,
 }
 
 pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
@@ -1151,18 +1153,18 @@ pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
             "child_usage_attributed" => {
                 usage_scan.fold_child_attribution(
                     entry.target_id.as_deref(),
-                    entry.child_usage.as_ref(),
-                    entry.aggregate_usage.as_ref(),
+                    entry.child_usage.map(Usage::from),
+                    entry.aggregate_usage.map(Usage::from),
                 );
             }
             "compaction" | "branch_summary" => {
-                usage_scan.fold_summarization(entry.usage.as_ref());
+                usage_scan.fold_summarization(entry.usage.map(Usage::from));
             }
             "message" => {
                 message_count += 1;
                 if let Some(message) = entry.message {
                     let role = message.role.as_ref().and_then(Value::as_str);
-                    usage_scan.fold_message(&entry.id, role, message.usage.as_ref());
+                    usage_scan.fold_message(&entry.id, role, message.usage.map(Usage::from));
                     if role == Some("assistant") {
                         if let (Some(provider), Some(model_id)) = (
                             message.provider.as_ref().and_then(Value::as_str),
@@ -1697,6 +1699,40 @@ mod tests {
                 input_tokens: 170,
                 output_tokens: 15,
                 cost: 0.625
+            })
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A persisted partial usage object (`{input, output, totalTokens}`
+    /// without `cacheRead`/`cacheWrite`/`cost`) must not reject the whole
+    /// entry: TS `JSON.parse` keeps the row, so the count, model, search
+    /// text, and every present usage field survive.
+    #[test]
+    fn scan_keeps_messages_with_partial_usage_objects() {
+        let dir = temp_dir();
+        let mut session = SessionFile::create("/tmp", None, 0);
+        let path = dir.join(session_file_name(session.session_id()));
+        session.set_path(path.clone());
+        session.append_message(json!({"role": "user", "content": "run it", "timestamp": 1u64}));
+        session.append_message(json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "done" }],
+            "provider": "p", "model": "m", "timestamp": 2u64,
+            "usage": { "input": 5, "output": 1, "totalTokens": 6 }
+        }));
+        session.rewrite().unwrap();
+
+        let info = read_session_info(&path).unwrap();
+        assert_eq!(info.message_count, 2);
+        assert_eq!(info.model.as_deref(), Some(("p", "m")));
+        assert!(info.all_messages_text.contains("done"));
+        assert_eq!(
+            info.usage,
+            Some(crate::session_usage::SessionUsageSummary {
+                input_tokens: 5,
+                output_tokens: 1,
+                cost: 0.0
             })
         );
         let _ = fs::remove_dir_all(&dir);

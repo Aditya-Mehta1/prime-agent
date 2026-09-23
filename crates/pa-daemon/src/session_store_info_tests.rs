@@ -79,19 +79,15 @@ fn legacy_read_session_info(path: &Path) -> Option<SessionInfo> {
                 };
                 usage_scan.fold_child_attribution(
                     entry.fields.get("targetId").and_then(Value::as_str),
-                    usage_field("childUsage").as_ref(),
-                    usage_field("aggregateUsage").as_ref(),
+                    usage_field("childUsage"),
+                    usage_field("aggregateUsage"),
                 );
             }
             "compaction" | "branch_summary" => {
                 usage_scan.fold_summarization(
-                    entry
-                        .fields
-                        .get("usage")
-                        .and_then(|usage| {
-                            serde_json::from_value::<pa_types::ai::Usage>(usage.clone()).ok()
-                        })
-                        .as_ref(),
+                    entry.fields.get("usage").and_then(|usage| {
+                        serde_json::from_value::<pa_types::ai::Usage>(usage.clone()).ok()
+                    }),
                 );
             }
             "message" => {
@@ -101,12 +97,9 @@ fn legacy_read_session_info(path: &Path) -> Option<SessionInfo> {
                     usage_scan.fold_message(
                         &entry.id,
                         role,
-                        message
-                            .get("usage")
-                            .and_then(|usage| {
-                                serde_json::from_value::<pa_types::ai::Usage>(usage.clone()).ok()
-                            })
-                            .as_ref(),
+                        message.get("usage").and_then(|usage| {
+                            serde_json::from_value::<pa_types::ai::Usage>(usage.clone()).ok()
+                        }),
                     );
                     if role == Some("assistant") {
                         if let (Some(provider), Some(model_id)) = (

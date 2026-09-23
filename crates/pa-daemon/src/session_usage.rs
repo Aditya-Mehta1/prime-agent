@@ -22,7 +22,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use pa_types::ai::Usage;
+use pa_types::ai::{Usage, UsageCost};
+use pa_types::JsNumber;
 use serde::{Deserialize, Serialize};
 
 use pa_core::session_engine::compaction_exec::{add_assistant_usage, subtract_assistant_usage};
@@ -47,7 +48,10 @@ impl Eq for SessionUsageSummary {}
 /// TS `sessionUsageSummaryFrom`: `None` — an absent wire field — when the
 /// session recorded no billable work at all.
 pub fn session_usage_summary_from(usage: &Usage) -> Option<SessionUsageSummary> {
-    let input_tokens = usage.input + usage.cache_read + usage.cache_write;
+    let input_tokens = usage
+        .input
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
     if input_tokens == 0 && usage.output == 0 && usage.cost.total.as_f64() == 0.0 {
         return None;
     }
@@ -60,25 +64,86 @@ pub fn session_usage_summary_from(usage: &Usage) -> Option<SessionUsageSummary> 
 
 /// The per-assistant usage map. TS uses a `Map`: a later write replaces in
 /// place and iteration keeps first-insertion order — the final summary
-/// sums the cost floats in exactly the order TS does.
+/// sums the cost floats in exactly the order TS does. The id index keeps
+/// `set`/`contains` constant-time over that insertion order (a plain
+/// `HashMap` would reorder the sums; a bare vec scan is the O(n²) fold
+/// long sessions would stall on).
 #[derive(Default)]
 struct AssistantUsageById {
     entries: Vec<(String, Usage)>,
+    index: std::collections::HashMap<String, usize>,
 }
 
 impl AssistantUsageById {
     fn contains(&self, id: &str) -> bool {
-        self.entries.iter().any(|(key, _)| key == id)
+        self.index.contains_key(id)
     }
 
     fn set(&mut self, id: &str, usage: Usage) {
-        for (key, value) in &mut self.entries {
-            if key == id {
-                *value = usage;
-                return;
+        match self.index.get(id) {
+            Some(at) => self.entries[*at].1 = usage,
+            None => {
+                self.index.insert(id.to_string(), self.entries.len());
+                self.entries.push((id.to_string(), usage));
             }
         }
-        self.entries.push((id.to_string(), usage));
+    }
+}
+
+/// The scan-side wire shape of a usage block. Persisted files carry
+/// partial objects (`{input, output, totalTokens}` without
+/// `cacheRead`/`cacheWrite`/`cost`), and TS `JSON.parse` never rejects
+/// one — the fold keeps the row and every field it does not find
+/// defaults to zero, instead of dropping the message (its count, model,
+/// and search text) with the block.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScanUsage {
+    #[serde(default)]
+    input: u64,
+    #[serde(default)]
+    output: u64,
+    #[serde(default)]
+    cache_read: u64,
+    #[serde(default)]
+    cache_write: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    cost: ScanUsageCost,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanUsageCost {
+    #[serde(default)]
+    input: JsNumber,
+    #[serde(default)]
+    output: JsNumber,
+    #[serde(default)]
+    cache_read: JsNumber,
+    #[serde(default)]
+    cache_write: JsNumber,
+    #[serde(default)]
+    total: JsNumber,
+}
+
+impl From<ScanUsage> for Usage {
+    fn from(scan: ScanUsage) -> Usage {
+        Usage {
+            input: scan.input,
+            output: scan.output,
+            cache_read: scan.cache_read,
+            cache_write: scan.cache_write,
+            total_tokens: scan.total_tokens,
+            cost: UsageCost {
+                input: scan.cost.input,
+                output: scan.cost.output,
+                cache_read: scan.cost.cache_read,
+                cache_write: scan.cost.cache_write,
+                total: scan.cost.total,
+            },
+        }
     }
 }
 
@@ -107,12 +172,12 @@ pub struct UsageScan {
 impl UsageScan {
     /// TS `foldSessionScanLine`: the raw assistant usage keyed by entry id.
     /// Only an assistant row with a usage block lands in the map.
-    pub(crate) fn fold_message(&mut self, id: &str, role: Option<&str>, usage: Option<&Usage>) {
+    pub(crate) fn fold_message(&mut self, id: &str, role: Option<&str>, usage: Option<Usage>) {
         if role != Some("assistant") {
             return;
         }
         if let Some(usage) = usage {
-            self.assistant_usage_by_id.set(id, *usage);
+            self.assistant_usage_by_id.set(id, usage);
         }
     }
 
@@ -124,8 +189,8 @@ impl UsageScan {
     pub(crate) fn fold_child_attribution(
         &mut self,
         target_id: Option<&str>,
-        child_usage: Option<&Usage>,
-        aggregate_usage: Option<&Usage>,
+        child_usage: Option<Usage>,
+        aggregate_usage: Option<Usage>,
     ) {
         let (Some(target_id), Some(child_usage), Some(aggregate_usage)) =
             (target_id, child_usage, aggregate_usage)
@@ -133,16 +198,16 @@ impl UsageScan {
             return;
         };
         if self.assistant_usage_by_id.contains(target_id) {
-            self.assistant_usage_by_id.set(target_id, *aggregate_usage);
-            add_assistant_usage(&mut self.attributed_child_usage, child_usage);
+            self.assistant_usage_by_id.set(target_id, aggregate_usage);
+            add_assistant_usage(&mut self.attributed_child_usage, &child_usage);
         }
     }
 
     /// TS `foldSessionScanLine`: a `compaction` or `branch_summary`
     /// entry's own usage (the summarization call's billed block).
-    pub(crate) fn fold_summarization(&mut self, usage: Option<&Usage>) {
+    pub(crate) fn fold_summarization(&mut self, usage: Option<Usage>) {
         if let Some(usage) = usage {
-            add_assistant_usage(&mut self.summarization_usage, usage);
+            add_assistant_usage(&mut self.summarization_usage, &usage);
         }
     }
 
@@ -180,13 +245,13 @@ struct ScanEntry {
     #[serde(default)]
     message: Option<ScanMessage>,
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<ScanUsage>,
     #[serde(default)]
     target_id: Option<String>,
     #[serde(default)]
-    child_usage: Option<Usage>,
+    child_usage: Option<ScanUsage>,
     #[serde(default)]
-    aggregate_usage: Option<Usage>,
+    aggregate_usage: Option<ScanUsage>,
 }
 
 #[derive(Deserialize)]
@@ -195,7 +260,7 @@ struct ScanMessage {
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<ScanUsage>,
 }
 
 impl ScanEntry {
@@ -205,16 +270,18 @@ impl ScanEntry {
         match self.type_.as_str() {
             "message" => {
                 let (role, usage) = self.message.as_ref().map_or((None, None), |message| {
-                    (message.role.as_deref(), message.usage.as_ref())
+                    (message.role.as_deref(), message.usage.map(Usage::from))
                 });
                 scan.fold_message(&self.id, role, usage);
             }
             "child_usage_attributed" => scan.fold_child_attribution(
                 self.target_id.as_deref(),
-                self.child_usage.as_ref(),
-                self.aggregate_usage.as_ref(),
+                self.child_usage.map(Usage::from),
+                self.aggregate_usage.map(Usage::from),
             ),
-            "compaction" | "branch_summary" => scan.fold_summarization(self.usage.as_ref()),
+            "compaction" | "branch_summary" => {
+                scan.fold_summarization(self.usage.map(Usage::from));
+            }
             _ => {}
         }
     }
@@ -468,6 +535,56 @@ mod tests {
         let cost = summary.as_ref().map(|summary| summary.cost);
         assert_eq!(cost, Some(0.1 + 0.2 + 0.3));
         assert_eq!(cost, Some(0.6000000000000001));
+    }
+
+    /// A persisted partial usage object (`{input, output, totalTokens}`
+    /// without `cacheRead`/`cacheWrite`/`cost`) folds like TS
+    /// `JSON.parse`: the message keeps its row and every absent field
+    /// counts as zero instead of rejecting the whole entry.
+    #[test]
+    fn partial_usage_objects_keep_the_row() {
+        let summary = scan_summary(&[
+            message("u", "user", json!(null)),
+            message(
+                "a",
+                "assistant",
+                json!({ "input": 5, "output": 1, "totalTokens": 6 }),
+            ),
+        ]);
+        assert_eq!(
+            summary,
+            Some(SessionUsageSummary {
+                input_tokens: 5,
+                output_tokens: 1,
+                cost: 0.0
+            })
+        );
+    }
+
+    /// Token totals saturate at `u64::MAX` (JS `Infinity`): persisted
+    /// overflow must never panic the scan or wrap to an undercount.
+    #[test]
+    fn overflowing_usage_saturates_never_panics() {
+        let line = |id: &str| {
+            message(
+                id,
+                "assistant",
+                json!({
+                    "input": u64::MAX, "output": 1, "cacheRead": 0, "cacheWrite": 0,
+                    "totalTokens": u64::MAX,
+                    "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 }
+                }),
+            )
+        };
+        let summary = scan_summary(&[line("a"), line("b")]);
+        assert_eq!(
+            summary,
+            Some(SessionUsageSummary {
+                input_tokens: u64::MAX,
+                output_tokens: 2,
+                cost: 0.0
+            })
+        );
     }
 
     /// The standalone whole-file scan reads the same fold from disk;
