@@ -4644,7 +4644,7 @@ impl SessionUi {
             // mounted dialog; the flow's outcome lands through the login
             // notes channel (the usage wording covers malformed commands
             // below, like the other subcommands).
-            self.start_login_dialog(&auth, argv[1], view);
+            self.start_login_dialog(&auth, argv[1]);
             return Ok(());
         }
         let note = crate::client_auth::run_mcp_auth_command(auth.0.as_ref(), &resolved.args).await;
@@ -4661,7 +4661,6 @@ impl SessionUi {
         &mut self,
         auth: &crate::client_auth::ClientAuthCommandsHandle,
         server: &str,
-        view: &mut AgentView,
     ) {
         let login_notes = self.login_notes.clone();
         let request_render = Box::new(move || {

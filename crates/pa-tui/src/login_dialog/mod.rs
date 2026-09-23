@@ -486,7 +486,7 @@ mod tests {
         crate::hyperlinks::set_hyperlinks_override(Some(true));
         let (handle, _) = make_handle();
         handle.show_auth("https://fixture.example/authorize", None);
-        let linked = rows(&handle)[1];
+        let linked = rows(&handle)[1].clone();
         assert_eq!(
             linked,
             format!(

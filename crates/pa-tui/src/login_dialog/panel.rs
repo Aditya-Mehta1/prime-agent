@@ -612,7 +612,7 @@ mod tests {
     /// the pending continue.
     #[tokio::test]
     async fn info_and_continue_screens_render_their_hints() {
-        let (dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
+        let (mut dialog, _) = make_dialog(LoginDialogOptions::new("linear"), true);
         dialog
             .handle()
             .show_info(&["Signed in to the browser flow.".to_string()]);
