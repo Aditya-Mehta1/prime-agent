@@ -394,7 +394,13 @@ mod tests {
             output: 1,
             ..Default::default()
         };
-        add_assistant_usage(&mut total, &pa_types::ai::Usage { input: 10, ..Default::default() });
+        add_assistant_usage(
+            &mut total,
+            &pa_types::ai::Usage {
+                input: 10,
+                ..Default::default()
+            },
+        );
         assert_eq!(total.input, u64::MAX);
         assert_eq!(total.output, 1);
     }

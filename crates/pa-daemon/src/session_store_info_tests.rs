@@ -84,11 +84,9 @@ fn legacy_read_session_info(path: &Path) -> Option<SessionInfo> {
                 );
             }
             "compaction" | "branch_summary" => {
-                usage_scan.fold_summarization(
-                    entry.fields.get("usage").and_then(|usage| {
-                        serde_json::from_value::<pa_types::ai::Usage>(usage.clone()).ok()
-                    }),
-                );
+                usage_scan.fold_summarization(entry.fields.get("usage").and_then(|usage| {
+                    serde_json::from_value::<pa_types::ai::Usage>(usage.clone()).ok()
+                }));
             }
             "message" => {
                 message_count += 1;
