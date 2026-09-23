@@ -25,9 +25,10 @@ use std::time::{Duration, Instant};
 use pa_core::kernel::shared::{HostRequestHandlers, HostRequestPayload};
 use pa_core::session_engine::agent_messaging::{
     register_agent_message_host_handlers, AgentFamilyRelationship, AgentMessageController,
+    AgentObserveController,
 };
 use pa_core::session_engine::rlm_host::{RlmSpawnRequest, RlmSubagentHost};
-use pa_daemon::agent_messaging::LinkAgentMessageController;
+use pa_daemon::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
 use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
 use pa_daemon::supervisor_link::SupervisorLink;
 use serde_json::{json, Value};
@@ -514,5 +515,362 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
         parent_messages.matches("kid reply").count(),
         6,
         "the reply bodies rendered in the parent: {parent_messages}"
+    );
+}
+
+/// Verifier (the misroute regression): the family roster derives from
+/// durable parent edges, never from names or runtime kinds. A second
+/// root's identically-named child is NOT addressable from the first
+/// family by role or name, a broadcast reaches only the nuclear family,
+/// the child's parent-reply targets its true parent, and the observe
+/// roster labels only true edges — the daemon-wide sibling bucket and
+/// the "every subagent is a child" labels are gone.
+#[tokio::test]
+async fn family_edges_never_cross_families_end_to_end() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+
+    // Both parents and both children run text-only faux scripts: no
+    // kernel is needed (this verifier runs everywhere, like the other
+    // Linux e2e).
+    let parent_a_script = write_faux_script(
+        dir.path(),
+        "parent-a",
+        json!([
+            { "text": "parent-a turn done" },
+            { "text": "parent-a turn done" },
+            { "text": "parent-a turn done" },
+            { "text": "parent-a turn done" },
+        ]),
+    );
+    let parent_b_script = write_faux_script(
+        dir.path(),
+        "parent-b",
+        json!([{ "text": "parent-b turn done" }]),
+    );
+    let kid_script = write_faux_script(dir.path(), "kid", json!([{ "text": "kid spawned" }]));
+
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+
+    let mut roots = Vec::new();
+    for (name, script) in [("parent-a", parent_a_script), ("parent-b", parent_b_script)] {
+        client.send_command(
+            &format!("create-{name}"),
+            json!({
+                "type": "create",
+                "name": name,
+                "config": {
+                    "cwd": dir.path().to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                    "script": script.to_string_lossy(),
+                },
+            }),
+        );
+        let created = client.read_response(&format!("create-{name}"));
+        assert_eq!(created["success"], true, "create {name} failed: {created}");
+        roots.push((
+            created["data"]["activeSessionId"]
+                .as_str()
+                .or_else(|| created["data"]["id"].as_str())
+                .expect("active session id")
+                .to_string(),
+            created["data"]["sessionId"].as_str().expect("session id").to_string(),
+            created["data"]["sessionFile"]
+                .as_str()
+                .expect("session file")
+                .to_string(),
+        ));
+    }
+    let (parent_a_active, parent_a_session, parent_a_file) = &roots[0];
+    let (parent_b_active, parent_b_session, _) = &roots[1];
+
+    // Each root spawns its own identically-named child ("kid"): the name
+    // collides across the two families — the historical misroute bait.
+    let link = Arc::new(SupervisorLink::new(socket.clone()));
+    let mut kids = Vec::new();
+    for (index, (active, session, file)) in roots.iter().enumerate() {
+        let children = SupervisorChildSessions::new(
+            Arc::clone(&link),
+            agent_dir.clone(),
+            active.clone(),
+            std::sync::Arc::new(pa_daemon::model_allowlist::ModelRefusalTelemetry::new(
+                agent_dir.clone(),
+                /*telemetry_disabled*/ true,
+            )),
+        );
+        children.set_identity(ParentIdentity {
+            rlm_depth: 0,
+            rlm_max_depth: 2,
+            model: Some("faux/faux-1".to_string()),
+            cwd: Some(dir.path().to_string_lossy().to_string()),
+            session_id: Some(session.clone()),
+            session_file: Some(file.clone()),
+            thinking: None,
+            child_script: Some(kid_script.to_string_lossy().to_string()),
+        });
+        let handle = children
+            .spawn(RlmSpawnRequest {
+                prompt: "work on the lane".to_string(),
+                name: Some("kid".to_string()),
+                model: None,
+                thinking: None,
+                cell_source_code: None,
+            })
+            .await
+            .expect("spawn the child");
+        assert_eq!(handle.name, "kid");
+        children.notify_turn_done();
+        // The spawn turn settles once the child goes idle with an answer.
+        loop {
+            let roster = children.list_subagents().await.expect("child roster");
+            let row = roster.first().expect("one child row");
+            if row.status == "completed" || row.status == "error" {
+                assert_eq!(row.status, "completed", "spawn turn: {row:?}");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let roster = children.list_subagents().await.expect("child roster");
+        let row = roster.first().expect("one child row");
+        kids.push((
+            row.active_session_id.clone().expect("child active id"),
+            row.session_id.clone().expect("child session id"),
+            children,
+            index,
+        ));
+    }
+    let (kid_a_active, kid_a_session, registry_a, _) = kids[0].clone();
+    let (kid_b_active, _kid_b_session, _registry_b, _) = kids[1].clone();
+
+    // Parent-a's family view: the other root is its sibling (root
+    // sessions are each other's family), its own "kid" is its Child, and
+    // parent-b's "kid" NEVER appears in any role — the old daemon-wide
+    // sibling bucket listed it.
+    let parent_a_summary = json!({
+        "activeSessionId": parent_a_active,
+        "sessionId": parent_a_session,
+        "sessionName": "parent-a",
+        "runtimeKind": "top-level",
+        "sessionFile": parent_a_file,
+    });
+    let controller = Arc::new(LinkAgentMessageController::new(
+        Arc::clone(&link),
+        parent_a_active.clone(),
+        "no-worker-token".to_string(),
+        Arc::new(std::sync::Mutex::new(Some(parent_a_summary))),
+        Some(Arc::new(registry_a.clone())),
+    ));
+    let family = controller.family().await.expect("family");
+    let roles: Vec<(String, &str)> = family
+        .iter()
+        .map(|member| (member.id.clone(), member.relationship.as_str()))
+        .collect();
+    assert!(
+        roles.contains(&(parent_b_active.clone(), "sibling")),
+        "the other root is a sibling: {family:?}"
+    );
+    assert!(
+        roles.contains(&(kid_a_active.clone(), "child")),
+        "the spawned kid is a child: {family:?}"
+    );
+    assert_eq!(
+        family.len(),
+        2,
+        "no other family's session may enter the family view: {family:?}"
+    );
+
+    // The broadcast ("all") reaches exactly the nuclear family: the
+    // sibling root and the own child — never parent-b's kid.
+    let mut handlers = HostRequestHandlers::default();
+    register_agent_message_host_handlers(Arc::clone(&controller) as Arc<_>, &mut handlers);
+    let broadcast = handlers.get("agent_message.send").expect("send handler");
+    let receipts = broadcast(
+        HostRequestPayload {
+            data: json!({ "message": "family update", "target": "all" }),
+            cell_source_code: None,
+        },
+    )
+    .await
+    .expect("broadcast");
+    let receipt_targets: Vec<String> = receipts["receipts"]
+        .as_array()
+        .expect("receipts")
+        .iter()
+        .map(|receipt| {
+            receipt["target"]["activeSessionId"]
+                .as_str()
+                .or_else(|| receipt["target"].as_str())
+                .expect("receipt target")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(receipt_targets.len(), 2, "receipts: {receipts}");
+    assert!(receipt_targets.contains(&parent_b_active.clone()));
+    assert!(
+        receipt_targets.contains(&kid_a_active.clone()),
+        "the own child is reachable: {receipts}"
+    );
+    assert!(
+        !receipt_targets.contains(&kid_b_active.clone()),
+        "another family's kid must never receive the broadcast: {receipts}"
+    );
+
+    // The child's own family view: its true parent (parent-a) and nothing
+    // else — the identically-named child of parent-b is NOT its sibling.
+    let kid_a_summary = json!({
+        "activeSessionId": kid_a_active,
+        "sessionId": kid_a_session,
+        "sessionName": "kid",
+        "runtimeKind": "subagent",
+        "parentActiveSessionId": parent_a_active,
+        "parentSessionId": parent_a_session,
+        "parentSessionPath": parent_a_file,
+    });
+    let kid_controller = LinkAgentMessageController::new(
+        Arc::clone(&link),
+        kid_a_active.clone(),
+        "no-worker-token".to_string(),
+        Arc::new(std::sync::Mutex::new(Some(kid_a_summary.clone()))),
+        None,
+    );
+    let kid_family = kid_controller.family().await.expect("kid family");
+    assert_eq!(
+        kid_family.len(),
+        1,
+        "the child's family is its parent alone: {kid_family:?}"
+    );
+    assert_eq!(kid_family[0].relationship, AgentFamilyRelationship::Parent);
+    assert_eq!(kid_family[0].id, *parent_a_active);
+
+    // The name collision is unaddressable from the child: a sibling send
+    // for "kid" must fail (the child has no siblings), never deliver to
+    // parent-b's identically-named child (the historical misroute).
+    let mut kid_handlers = HostRequestHandlers::default();
+    register_agent_message_host_handlers(
+        Arc::new(LinkAgentMessageController::new(
+            Arc::clone(&link),
+            kid_a_active.clone(),
+            "no-worker-token".to_string(),
+            Arc::new(std::sync::Mutex::new(Some(kid_a_summary.clone()))),
+            None,
+        )) as Arc<_>,
+        &mut kid_handlers,
+    );
+    let kid_send = kid_handlers.get("agent_message.send").expect("send handler");
+    let crossed = kid_send(
+        HostRequestPayload {
+            data: json!({
+                "message": "hello sibling",
+                "receiver_role": "sibling",
+                "receiver_name": "kid",
+            }),
+            cell_source_code: None,
+        },
+    )
+    .await;
+    let error = crossed.expect_err("a cross-family sibling send must not resolve");
+    assert!(
+        error.to_string().contains("No sibling matches"),
+        "the sibling send must fail closed: {error:#}"
+    );
+
+    // The parent-directed send targets the TRUE parent by its durable
+    // edge — the receipt names parent-a's live id.
+    let parent_reply = kid_send(
+        HostRequestPayload {
+            data: json!({
+                "message": "parent update",
+                "receiver_role": "parent",
+            }),
+            cell_source_code: None,
+        },
+    )
+    .await
+    .expect("parent send");
+    assert_eq!(
+        parent_reply["target"]["activeSessionId"], *parent_a_active,
+        "the parent reply reaches the true parent: {parent_reply}"
+    );
+
+    // The observe roster labels only true edges: the child sees itself
+    // (isCurrent) and its parent; parent-b's kid and parent-b itself are
+    // outside its nuclear family and never labeled "child" of it.
+    let observer = Arc::new(LinkAgentObserveController::new(
+        Arc::clone(&link),
+        kid_a_active.clone(),
+        Arc::new(std::sync::Mutex::new(Some(kid_a_summary))),
+        None,
+    ));
+    let roster = observer.list_agents().await.expect("observe roster");
+    assert_eq!(
+        roster.len(),
+        2,
+        "the observe roster is the nuclear family: {roster:?}"
+    );
+    let current = roster
+        .iter()
+        .find(|summary| summary.is_current)
+        .expect("the caller's own row");
+    assert_eq!(current.active_session_id.as_deref(), Some(kid_a_active.as_str()));
+    let parent_row = roster
+        .iter()
+        .find(|summary| summary.active_session_id.as_deref() == Some(parent_a_active.as_str()))
+        .expect("the parent row");
+    assert_eq!(parent_row.relationship, Some(AgentFamilyRelationship::Parent));
+    assert!(
+        !roster.iter().any(|summary| summary.active_session_id.as_deref()
+            == Some(kid_b_active.as_str())),
+        "another family's subagent is never in the observe roster: {roster:?}"
+    );
+
+    // Parent-a's observe roster: itself, the sibling root, its own child
+    // — with the sibling labeled Sibling and the child labeled Child
+    // (never the daemon-wide runtime-kind labels).
+    let observer = Arc::new(LinkAgentObserveController::new(
+        Arc::clone(&link),
+        parent_a_active.clone(),
+        Arc::new(std::sync::Mutex::new(Some(
+            json!({
+                "activeSessionId": parent_a_active,
+                "sessionId": parent_a_session,
+                "sessionName": "parent-a",
+                "runtimeKind": "top-level",
+                "sessionFile": parent_a_file,
+            }),
+        ))),
+        Some(Arc::new(registry_a.clone())),
+    ));
+    let roster = observer.list_agents().await.expect("observe roster");
+    assert_eq!(
+        roster.len(),
+        3,
+        "the parent's observe roster is its nuclear family: {roster:?}"
+    );
+    let sibling_row = roster
+        .iter()
+        .find(|summary| summary.active_session_id.as_deref() == Some(parent_b_active.as_str()))
+        .expect("the sibling root row");
+    assert_eq!(
+        sibling_row.relationship,
+        Some(AgentFamilyRelationship::Sibling)
+    );
+    let child_row = roster
+        .iter()
+        .find(|summary| summary.active_session_id.as_deref() == Some(kid_a_active.as_str()))
+        .expect("the own child row");
+    assert_eq!(child_row.relationship, Some(AgentFamilyRelationship::Child));
+    assert!(
+        !roster.iter().any(|summary| summary.active_session_id.as_deref()
+            == Some(kid_b_active.as_str())),
+        "another family's subagent is never labeled child here: {roster:?}"
     );
 }

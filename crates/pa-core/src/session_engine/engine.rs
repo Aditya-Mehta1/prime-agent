@@ -545,6 +545,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                     .collect::<Vec<_>>(),
             ),
             allow_recursion: config.allow_recursion,
+            // The session's recursion depth rides the dynamic tail's
+            // session-role section: a spawned child's prompt must read
+            // "depth: N (not root)" with the child-agent reply doctrine,
+            // never the root identity its default (None -> 0) would stamp.
+            rlm_depth: config.rlm_depth,
             generic_mcp_servers,
             prompt_guidelines: Some(prompt_guidelines),
             ..Default::default()
