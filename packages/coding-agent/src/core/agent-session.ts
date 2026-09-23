@@ -2797,11 +2797,14 @@ export class AgentSession {
 			const reading = this._rlmChildSessions.get(childId)?.session?.getLastAssistantText()?.trim();
 			const reported = reading || entry.answer_preview?.trim();
 			if (!reported) throw new Error(formatImageModelUnusableMessage(reference));
+			const omitted = images.length - paths.length;
 			const capped =
 				reported.length > IMAGE_TURN_READING_MAX_CHARS
 					? `${reported.slice(0, IMAGE_TURN_READING_MAX_CHARS)}\n[reading truncated]`
 					: reported;
-			return `[${paths.length === 1 ? "image" : `${paths.length} images`} read by ${reference}]\n${capped}`;
+			const scope = `${paths.length === 1 ? "image" : `${paths.length} images`} read by ${reference}`;
+			const dropped = omitted > 0 ? `\n[${omitted} image(s) over the per-turn limit were not read]` : "";
+			return `[${scope}]\n${capped}${dropped}`;
 		} finally {
 			// One child per turn, deleted once its reading is in hand: the image turn
 			// leaves no child behind to collect, and the materialized files go with it.
