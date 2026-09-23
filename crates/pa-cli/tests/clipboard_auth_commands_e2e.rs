@@ -1166,15 +1166,16 @@ impl ScriptedClientAuth {
         }
     }
 
-    fn handle(self) -> pa_tui::client_auth::ClientAuthCommandsHandle {
-        pa_tui::client_auth::ClientAuthCommandsHandle(Arc::new(self))
+    fn handle(self: Arc<Self>) -> pa_tui::client_auth::ClientAuthCommandsHandle {
+        pa_tui::client_auth::ClientAuthCommandsHandle(self)
     }
 }
 
 impl pa_tui::client_auth::ClientAuthCommands for ScriptedClientAuth {
     fn login(&self, server: &str) -> pa_tui::client_auth::AuthFuture {
         self.calls.lock().unwrap().push(format!("login:{server}"));
-        Box::pin(async move { Ok(format!("Connected {server}.")) })
+        let answer = format!("Connected {server}.");
+        Box::pin(async move { Ok(answer) })
     }
 
     fn login_dialog(
@@ -1186,6 +1187,7 @@ impl pa_tui::client_auth::ClientAuthCommands for ScriptedClientAuth {
             .lock()
             .unwrap()
             .push(format!("login_dialog:{server}"));
+        let server = server.to_string();
         Box::pin(async move {
             dialog.set_provider_name("Fixture");
             dialog.show_progress("Discovered https://fixture.example");
@@ -1205,11 +1207,13 @@ impl pa_tui::client_auth::ClientAuthCommands for ScriptedClientAuth {
     }
 
     fn paste_token(&self, server: &str) -> pa_tui::client_auth::AuthFuture {
-        Box::pin(async move { Ok(format!("Connected {server}.")) })
+        let answer = format!("Connected {server}.");
+        Box::pin(async move { Ok(answer) })
     }
 
     fn logout(&self, server: &str) -> pa_tui::client_auth::AuthFuture {
-        Box::pin(async move { Ok(format!("Disconnected {server}.")) })
+        let answer = format!("Disconnected {server}.");
+        Box::pin(async move { Ok(answer) })
     }
 }
 
