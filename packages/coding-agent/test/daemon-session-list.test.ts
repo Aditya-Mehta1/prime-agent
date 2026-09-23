@@ -538,65 +538,6 @@ describe("summary compose memoization", () => {
 		expect(third.lastActivityAt).toBe("2026-05-02T00:00:00.000Z");
 	});
 
-	it("recomposes when busy-state bits flip without an append", () => {
-		const state = makeState({ activeSessionId: "busy", messages: [messageAt("2026-05-01T00:00:00.000Z")] });
-		const first = summaryForActiveSession(state);
-		expect(first.isStreaming).toBe(false);
-		(state.runtime.session as unknown as { isStreaming: boolean }).isStreaming = true;
-		(state.runtime.session as unknown as { isSessionActive: boolean }).isSessionActive = true;
-		const second = summaryForActiveSession(state);
-		expect(second).not.toBe(first);
-		expect(second).toMatchObject({ isStreaming: true, activity: "working" });
-	});
-
-	it("recomposes when the summarizer verdict is replaced", () => {
-		const state = makeState({
-			activeSessionId: "verdict",
-			messages: [messageAt("2026-05-01T00:00:00.000Z")],
-		});
-		const first = summaryForActiveSession(state);
-		expect(first.summary).toBeUndefined();
-		(state as unknown as { summaryState?: object }).summaryState = {
-			summary: "Editing the router",
-			taskState: "completed",
-			basedOnMessageCount: 1,
-		};
-		const second = summaryForActiveSession(state);
-		expect(second).not.toBe(first);
-		expect(second).toMatchObject({ summary: "Editing the router", taskState: "completed" });
-	});
-
-	it("recomposes when the agent's progress note changes and carries context percent", () => {
-		const state = makeState({
-			activeSessionId: "note",
-			contextUsage: { tokens: 42_000, contextWindow: 100_000, percent: 42 },
-		});
-		const first = summaryForActiveSession(state);
-		expect(first.contextPercent).toBe(42);
-		expect(first.progressNote).toBeUndefined();
-		(state.runtime.session as { rlmProgressNote?: string }).rlmProgressNote = "running tests";
-		const second = summaryForActiveSession(state);
-		expect(second).not.toBe(first);
-		expect(second.progressNote).toBe("running tests");
-	});
-
-	it("recomposes when the visible action snapshot changes", () => {
-		const state = makeState({ activeSessionId: "queued" });
-		const first = summaryForActiveSession(state);
-		expect(first.sessionActions).toMatchObject({ queuedCount: 0 });
-		(
-			state.runtime.session as unknown as {
-				getSessionActionSnapshot: () => SessionActionSnapshot;
-			}
-		).getSessionActionSnapshot = () => ({
-			queuedCount: 1,
-			steering: ["revised plan"],
-			followUps: [],
-		});
-		const second = summaryForActiveSession(state);
-		expect(second).not.toBe(first);
-		expect(second.sessionActions).toMatchObject({ queuedCount: 1, steering: ["revised plan"] });
-
 	it("recomposes when a compose input changes without an append", () => {
 		const state = makeState({ activeSessionId: "inputs", messages: [messageAt("2026-05-01T00:00:00.000Z")] });
 		const session = state.runtime.session as unknown as Record<string, unknown> & { state: Record<string, unknown> };
@@ -626,6 +567,20 @@ describe("summary compose memoization", () => {
 			expect(next).toMatchObject(expected);
 			previous = next;
 		}
+	});
+
+	it("recomposes when the agent's progress note changes and carries context percent", () => {
+		const state = makeState({
+			activeSessionId: "note",
+			contextUsage: { tokens: 42_000, contextWindow: 100_000, percent: 42 },
+		});
+		const first = summaryForActiveSession(state);
+		expect(first.contextPercent).toBe(42);
+		expect(first.progressNote).toBeUndefined();
+		(state.runtime.session as { rlmProgressNote?: string }).rlmProgressNote = "running tests";
+		const second = summaryForActiveSession(state);
+		expect(second).not.toBe(first);
+		expect(second.progressNote).toBe("running tests");
 	});
 
 	it("recomposes when heartbeat registration flags differ per call site", () => {
