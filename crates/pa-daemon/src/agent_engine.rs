@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
+use crate::model_allowlist::DaemonAllowlist;
 use crate::overflow_compaction::{OverflowArmRun, OverflowRecovery};
 use pa_agent::abort::AbortController;
 use pa_agent::types::StopReason;
@@ -165,6 +166,13 @@ pub struct AgentSessionEngine {
     /// abort request from the worker must reach the agent's run controller
     /// without locking it.
     turn_agent: std::sync::Mutex<Option<std::sync::Arc<pa_agent::agent::Agent>>>,
+    /// The session's queue delivery modes (TS `agent.steeringMode` /
+    /// `agent.followUpMode`): seeded from the start config, applied to the
+    /// built session's agent at build time, and switched live by the
+    /// `set_steering_mode`/`set_follow_up_mode` commands (TS
+    /// `setSteeringMode`/`setFollowUpMode` write the live agent). `None`
+    /// keeps the TS default ("one-at-a-time").
+    queue_modes: std::sync::Mutex<(Option<String>, Option<String>)>,
     /// The in-run autonomous consult's deadlock-free mirror (see
     /// [`crate::autonomous_continuation`]): the shared turn-boundary slot,
     /// agent, and compaction settings the consult reads without ever
@@ -328,6 +336,11 @@ pub struct AgentSessionEngine {
     /// run's duration, and [`SessionEngine::abort_auto_compaction`]
     /// aborts whatever run holds it.
     pub(crate) auto_compaction_abort: std::sync::Mutex<Option<std::sync::Arc<AbortController>>>,
+    /// The daemon model-allowlist refusal telemetry (`model refused`),
+    /// shared with the RLM children host so every enforcement seam in
+    /// this worker emits through one lazily-built client.
+    pub(crate) model_refusal_telemetry:
+        std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
 }
 
 impl AgentSessionEngine {
@@ -362,11 +375,17 @@ impl AgentSessionEngine {
                 .map(|link_config| link_config.socket_path.clone())
                 .unwrap_or_default(),
         ));
+        let model_refusal_telemetry =
+            std::sync::Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                config.agent_dir.clone(),
+                config.telemetry_disabled == Some(true),
+            ));
         let children = config.supervisor_link.as_ref().map(|link_config| {
             Arc::new(SupervisorChildSessions::new(
                 Arc::clone(&link),
                 config.agent_dir.clone(),
                 link_config.active_session_id.clone(),
+                std::sync::Arc::clone(&model_refusal_telemetry),
             ))
         });
         let autonomous_driver = std::sync::RwLock::new(std::sync::Arc::new(
@@ -446,6 +465,11 @@ impl AgentSessionEngine {
             std::sync::Arc::new(crate::mcp_login::WorkerMcpLoginUi::from_env()),
             std::sync::Arc::new(pa_core::mcp::ReqwestOAuthHttp::new()),
         );
+        // The queue delivery modes arrive at session create (TS `sdk.ts`
+        // builds the agent with the settings modes; the worker's create
+        // seeds them through `set_queue_modes`), so the engine starts
+        // with the TS default ("one-at-a-time").
+        let queue_modes = std::sync::Mutex::new((None, None));
         Ok(Self {
             runtime,
             config,
@@ -457,6 +481,7 @@ impl AgentSessionEngine {
             goal_admission_sink: std::sync::Mutex::new(None),
             goal_queue_purge: std::sync::Mutex::new(None),
             turn_agent: std::sync::Mutex::new(None),
+            queue_modes,
             autonomous_boundary: std::sync::Mutex::new(None),
             session_file,
             selection: std::sync::RwLock::new(selection.clone()),
@@ -490,6 +515,7 @@ impl AgentSessionEngine {
             faux_model: std::sync::OnceLock::new(),
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
             auto_compaction_abort: std::sync::Mutex::new(None),
+            model_refusal_telemetry,
         })
     }
 
@@ -767,6 +793,22 @@ impl AgentSessionEngine {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Session-scoped kernel shell activity; never builds a new session/kernel.
+    pub async fn bash_activity(
+        &self,
+        action: &str,
+        activity_id: Option<&str>,
+        lines: usize,
+    ) -> anyhow::Result<Value> {
+        let engine = self
+            .session
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Kernel is not running"))?;
+        engine.bash_activity(action, activity_id, lines).await
+    }
+
     /// Build the core session once (same once-only rule as `session_agent`),
     /// through the same guarded funnel.
     pub(crate) fn ensure_core_session(&self, model: &Model) -> anyhow::Result<()> {
@@ -1011,8 +1053,38 @@ impl AgentSessionEngine {
         pa_core::models::resolve_cli_model(Some(&provider), &model_id, registry.get_all()).model
     }
 
-    /// Resolve the model through the composed registry.
+    /// Emit the daemon model-allowlist refusal's adoption event (schema
+    /// v1 `model refused`) from any of this worker's enforcement seams.
+    /// The telemetry binds to the engine's live cwd, so a session that
+    /// moved directories reports through the current project scope.
+    pub(crate) fn note_model_refused(&self, surface: &str, selector: &str) {
+        self.model_refusal_telemetry
+            .note_refused(surface, selector, &self.cwd());
+    }
+
+    /// Resolve the model through the composed registry, then enforce the
+    /// settings `allowedModels` allowlist: a resolution outside the
+    /// allowlist fails loudly here (the silent-fallback guarantee — the
+    /// startup chain never lands a session on a model the daemon may not
+    /// resolve to), and the refusal emits `model refused`.
     fn resolve_registry_model(&self) -> anyhow::Result<Model> {
+        let model = self.resolve_registry_model_unchecked()?;
+        let selector = format!("{}/{}", model.provider, model.id);
+        let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
+        if let Err(refusal) = crate::model_allowlist::assert_allowed(&allowlist, &selector) {
+            if let Some(refusal) = refusal.downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+            {
+                self.note_model_refused("session_start", &refusal.selector);
+            }
+            return Err(refusal);
+        }
+        Ok(model)
+    }
+
+    /// The registry resolution before the allowlist gate: the flagged-model
+    /// arm (TS `resolveCliModel`) or the TS `createAgentSession` startup
+    /// chain.
+    fn resolve_registry_model_unchecked(&self) -> anyhow::Result<Model> {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
@@ -1216,6 +1288,17 @@ impl AgentSessionEngine {
     async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
+        // The live queue-delivery modes (seeded from the start config or
+        // switched by `set_steering_mode`/`set_follow_up_mode`): read
+        // under a scoped lock — a std guard must never ride the build's
+        // awaits below.
+        let (steering_mode, follow_up_mode) = {
+            let modes = self.queue_modes.lock().expect("queue modes");
+            (
+                modes.0.as_deref().and_then(Self::queue_mode),
+                modes.1.as_deref().and_then(Self::queue_mode),
+            )
+        };
 
         // The session's stream reads its target from the engine's live slot:
         // `set_model` swaps the slot so the built session follows without a
@@ -1314,6 +1397,16 @@ impl AgentSessionEngine {
             // the stop hooks (a queued steer cuts the run at the next
             // turn boundary; the runner delivers it as the next turn).
             queued_steering_probe: self.config.queued_steering_probe.clone(),
+            // TS `sdk.ts` seeds the Agent's queue modes from the settings
+            // manager; the worker create reads the same settings (the
+            // engine-level queues drain per the mode at the loop
+            // boundary, mirroring the worker lane's delivery modes). The
+            // live switch (`set_steering_mode`/`set_follow_up_mode`)
+            // updates the same slot ahead of any later build. The lock
+            // is scoped to the read (a guard must never ride the build's
+            // awaits).
+            steering_mode,
+            follow_up_mode,
             // The worker's shared scheduled-jobs store with the session
             // identity the kernel binding needs: the live active session
             // id the supervisor routes commands by, and the durable session
@@ -1326,6 +1419,28 @@ impl AgentSessionEngine {
             }),
         })
         .await
+        .inspect(|engine| {
+            // A queue-mode switch that landed while this build was in
+            // flight wrote only the live slot (the build snapshot above
+            // predates it, and the agent handle did not exist yet): re-
+            // apply the current modes to the freshly built agent so the
+            // first build can never serve a stale mode (TS's agent is
+            // built once per session, so the race does not exist there;
+            // this port's lazy build needs the catch-up).
+            let (steering_mode, follow_up_mode) = {
+                let modes = self.queue_modes.lock().expect("queue modes");
+                (
+                    modes.0.as_deref().and_then(Self::queue_mode),
+                    modes.1.as_deref().and_then(Self::queue_mode),
+                )
+            };
+            if let Some(mode) = steering_mode {
+                engine.session.agent().set_steering_mode(mode);
+            }
+            if let Some(mode) = follow_up_mode {
+                engine.session.agent().set_follow_up_mode(mode);
+            }
+        })
     }
 }
 
@@ -1653,6 +1768,7 @@ impl SessionEngine for AgentSessionEngine {
             let goal_update = self.publish_goal_state(driver.state());
             Some((
                 crate::engine::PromptRequest {
+                    batch: Vec::new(),
                     message: message.content.text().to_string(),
                     images: Vec::new(),
                     source: "user".to_string(),
@@ -1899,6 +2015,21 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn switch_model(&self, selection: EngineModelSelection) -> bool {
+        // The allowlist gate on the switch candidate, before the selection
+        // slot mutates: a refused model must not poison the live selection
+        // (every later resolution would fail at the same gate). The wire
+        // seams (`set_model`, `cycle_model`) check first and own the user
+        // message and refusal event; this is the engine's total guard for
+        // any other caller.
+        if let (Some(provider), Some(model)) =
+            (selection.provider.as_deref(), selection.model.as_deref())
+        {
+            let selector = format!("{provider}/{model}");
+            let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
+            if crate::model_allowlist::assert_allowed(&allowlist, &selector).is_err() {
+                return false;
+            }
+        }
         self.configure_model(selection);
         let Ok(model) = self.resolve_model() else {
             return false;
@@ -1921,6 +2052,14 @@ impl SessionEngine for AgentSessionEngine {
             let _ = self
                 .runtime
                 .block_on(core.session.set_model(&model, &provider, &model_id));
+        }
+        // The children registry's inherited parent model follows the
+        // switch (the build-time stamp alone would go stale): an inherited
+        // `rlm.spawn` resolves the model the session NOW runs, so the
+        // allowlist gate never refuses a stale selector the parent left
+        // behind.
+        if let Some(children) = &self.children {
+            children.set_model(format!("{}/{}", model.provider, model.id));
         }
         true
     }
@@ -2879,11 +3018,46 @@ impl SessionEngine for AgentSessionEngine {
         if !emit(accepted) {
             return;
         }
+        // The batched co-delivery rows (TS `_startPreparedTurnActions`: each
+        // batched action's primary record emits before the run): one accepted
+        // user row per batched message, in delivery order, persisted and
+        // rendered like the primary. The batch only ever rides a plain user
+        // turn (the injected-custom turns deliver solo — the queue never
+        // batches a row that replaces the user row). Each row expands a
+        // leading `/skill:` the same way the primary does, so the accepted
+        // row persists and renders the expanded submission (TS normalizes
+        // every submission at queue time).
+        for row in &request.batch {
+            let text = if row.text.starts_with("/skill:") {
+                self.expand_skill_submission(&row.text)
+            } else {
+                row.text.clone()
+            };
+            let mut content = vec![json!({ "type": "text", "text": text })];
+            for image in &row.images {
+                let mut block = match serde_json::to_value(image) {
+                    Ok(Value::Object(block)) => Value::Object(block),
+                    _ => continue,
+                };
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("type".to_string(), json!("image"));
+                }
+                content.push(block);
+            }
+            if !emit(EngineEvent::UserMessage(json!({
+                "role": "user",
+                "content": content,
+                "timestamp": now_millis(),
+            }))) {
+                return;
+            }
+        }
         let turn_prompt = match injected {
             Some(custom) => TurnPrompt::Injected(custom),
             None => TurnPrompt::User {
                 text: request.message.clone(),
                 images: request.images.clone(),
+                batch: request.batch.clone(),
             },
         };
         self.run_turns(turn_prompt, aborted, &mut emit);
@@ -2900,9 +3074,46 @@ impl SessionEngine for AgentSessionEngine {
             agent.abort();
         }
     }
+
+    /// `set_steering_mode` / `set_follow_up_mode` (TS
+    /// `session.setSteeringMode`/`setFollowUpMode`): the queue delivery
+    /// mode switches live — the slot feeds any later session build, and
+    /// the built session's agent drains by the new mode from the next
+    /// boundary (`this.agent.steeringMode = mode`).
+    fn set_queue_modes(&self, steering: Option<&str>, follow_up: Option<&str>) {
+        {
+            let mut modes = self.queue_modes.lock().expect("queue modes");
+            if let Some(mode) = steering {
+                modes.0 = Some(mode.to_string());
+            }
+            if let Some(mode) = follow_up {
+                modes.1 = Some(mode.to_string());
+            }
+        }
+        let agent = self.turn_agent.lock().expect("turn agent lock").clone();
+        if let Some(agent) = agent {
+            if let Some(mode) = steering.and_then(Self::queue_mode) {
+                agent.set_steering_mode(mode);
+            }
+            if let Some(mode) = follow_up.and_then(Self::queue_mode) {
+                agent.set_follow_up_mode(mode);
+            }
+        }
+    }
 }
 
 impl AgentSessionEngine {
+    /// Map a wire/settings queue mode ("all"/"one-at-a-time") onto the
+    /// agent's `QueueMode`; an unknown value keeps the TS default
+    /// ("one-at-a-time").
+    fn queue_mode(mode: &str) -> Option<pa_agent::agent::QueueMode> {
+        match mode {
+            "all" => Some(pa_agent::agent::QueueMode::All),
+            "one-at-a-time" => Some(pa_agent::agent::QueueMode::OneAtATime),
+            _ => None,
+        }
+    }
+
     /// Drive one admitted prompt through the retry-driver model loop and
     /// emit the turn outcome (provider-failure retries + final-row
     /// surfacing). The user row — or a goal continuation's durable context
@@ -3672,10 +3883,13 @@ impl AgentSessionEngine {
     }
 
     /// The failover chain for `model`: the other auth-configured providers
-    /// serving the same model id, in catalog order after the current one.
-    /// Faux-script sessions never fail over (their failures are
-    /// deterministic test fixtures, and a second provider would only
-    /// reroute the scripted queue).
+    /// serving the same model id, in catalog order after the current one,
+    /// filtered by the daemon model allowlist — a failover must never land
+    /// a turn on a provider the operator pinned out (the same
+    /// `allowedModels` gate as every other resolution). Faux-script
+    /// sessions never fail over (their failures are deterministic test
+    /// fixtures, and a second provider would only reroute the scripted
+    /// queue).
     fn failover_candidates(&self, model: &pa_types::ai::Model) -> Vec<pa_types::ai::Model> {
         if self.config.faux_script.is_some() {
             return Vec::new();
@@ -3686,7 +3900,22 @@ impl AgentSessionEngine {
         registry.load_private_authorization_from_cache();
         let available: Vec<pa_types::ai::Model> =
             registry.get_available().into_iter().cloned().collect();
-        pa_core::models::failover_candidates(model, &available)
+        let candidates = pa_core::models::failover_candidates(model, &available);
+        match crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir) {
+            DaemonAllowlist::Unrestricted => candidates,
+            DaemonAllowlist::Allowed(patterns) => candidates
+                .into_iter()
+                .filter(|candidate| {
+                    pa_core::models::model_allowed(
+                        &format!("{}/{}", candidate.provider, candidate.id),
+                        &patterns,
+                    )
+                })
+                .collect(),
+            // Fail closed on an unreadable policy: no failover candidate
+            // may bypass the configured allowlist.
+            DaemonAllowlist::Unreadable(_) => Vec::new(),
+        }
     }
 
     /// Run one turn, streaming assistant updates through `emit` as they
@@ -4013,11 +4242,31 @@ impl AgentSessionEngine {
                     // context holds ONE representation of the turn —
                     // the custom row — and the provider request carries
                     // its user-role view at the loop boundary).
-                    TurnPrompt::User { text, images } => engine
-                        .session
-                        .prompt_with_images(text, images.clone(), Default::default())
-                        .await
-                        .map(|_| ()),
+                    TurnPrompt::User {
+                        text,
+                        images,
+                        batch,
+                    } => {
+                        // The batched co-delivery rows ride the same
+                        // admission (TS `_startPreparedTurnActions`'s one
+                        // `agent.prompt(preparedMessages)`): one run over
+                        // the primary plus every batched user row.
+                        let options = pa_core::session_engine::PromptOptions {
+                            batch: batch
+                                .iter()
+                                .map(|row| pa_core::session_engine::PromptBatchRow {
+                                    text: row.text.clone(),
+                                    images: row.images.clone(),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        };
+                        engine
+                            .session
+                            .prompt_with_images(text, images.clone(), options)
+                            .await
+                            .map(|_| ())
+                    }
                     TurnPrompt::Injected(message) => engine
                         .session
                         .prompt_injected_message(message)
@@ -4144,10 +4393,13 @@ enum TurnAdmission {
 /// user prompt, or an injected custom row the turn runs on.
 #[derive(Debug, Clone)]
 enum TurnPrompt {
-    /// A user prompt: text plus its image parts.
+    /// A user prompt: text plus its image parts, with the batched
+    /// co-delivery rows (same-lane, same-policy queue actions under mode
+    /// "all") riding the same run after the primary.
     User {
         text: String,
         images: Vec<pa_agent::types::ImageContent>,
+        batch: Vec<crate::engine::PromptBatchRow>,
     },
     /// An injected custom row (TS `_promptInjectedMessage` — goal
     /// continuations, RLM child terminal notices): the loop admission
@@ -4468,6 +4720,7 @@ pub(crate) mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message,
                 source: "user".to_string(),
@@ -5248,6 +5501,7 @@ pub(crate) mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: notice_text.to_string(),
                 source: "user".to_string(),
@@ -6303,6 +6557,7 @@ pub(crate) mod tests {
             engine.run_prompt(
                 0,
                 PromptRequest {
+                    batch: Vec::new(),
                     images: Vec::new(),
                     message,
                     source: "user".to_string(),
@@ -6602,6 +6857,7 @@ pub(crate) mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "a small turn".to_string(),
                 source: "user".to_string(),
@@ -6635,6 +6891,7 @@ pub(crate) mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: vec![pa_agent::types::ImageContent {
                     data: "QUJD".to_string(),
                     mime_type: "image/png".to_string(),
@@ -6886,6 +7143,63 @@ pub(crate) mod tests {
             queued_steering_probe: None,
         })
         .expect("engine")
+    }
+
+    /// The daemon model allowlist enforcement at the startup chain
+    /// (`resolve_registry_model`): a resolution outside settings
+    /// `allowedModels` fails loudly with the typed refusal — the chain
+    /// never lands a session on an off-list model (no silent fallback to
+    /// the featured default) — and an allowing allowlist keeps the
+    /// resolution.
+    #[test]
+    fn the_startup_chain_refuses_models_outside_the_allowlist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["anthropic/*"] }).to_string(),
+        )
+        .unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let error = engine
+            .resolve_registry_model()
+            .expect_err("off-allowlist model refused");
+        let refusal = error
+            .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+            .expect("typed refusal");
+        assert_eq!(refusal.selector, "battery/mock-1");
+        assert!(
+            error
+                .to_string()
+                .contains("blocked by the daemon model allowlist"),
+            "{error}"
+        );
+
+        // An allowing allowlist opens the gate: the same engine resolves.
+        std::fs::write(
+            engine.config.agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["battery/*"] }).to_string(),
+        )
+        .unwrap();
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.provider, "battery");
+        assert_eq!(model.id, "mock-1");
     }
 
     /// The revival race this lane fixes (the 2026-09-23 05:57 fleet kill):
@@ -7383,6 +7697,113 @@ pub(crate) mod tests {
         );
     }
 
+    /// The engine's switch guard: `switch_model` refuses an off-allowlist
+    /// candidate BEFORE the selection mutates, so a refused cycle or switch
+    /// never poisons the live selection (every later resolution would fail
+    /// at the same gate) — the session keeps resolving its current model.
+    #[test]
+    fn switch_model_never_poisons_the_selection_with_a_refused_candidate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["battery/mock-1"] }).to_string(),
+        )
+        .unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.id, "mock-1");
+        // The switched-to model does not match the allowlist: the switch is
+        // refused and the selection keeps the resolvable model.
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-2".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(!switched, "off-allowlist switch refused");
+        let model = engine.resolve_registry_model().expect("still resolvable");
+        assert_eq!(model.id, "mock-1");
+        // The allowed model still switches through.
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(switched, "allowed switch proceeds");
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.id, "mock-1");
+    }
+
+    /// A live model switch propagates to the children registry's parent
+    /// identity: an inherited `rlm.spawn` resolves the model the session
+    /// NOW runs. The build-time stamp alone would go stale after a
+    /// switch, so the allowlist gate would refuse a stale selector the
+    /// parent no longer runs once the allowlist drops it.
+    #[test]
+    fn switch_model_propagates_the_new_model_to_the_child_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: Some(SupervisorLinkConfig {
+                socket_path: dir.path().join("absent-supervisor.sock"),
+                active_session_id: "parent-live".to_string(),
+                worker_token: "test-token".to_string(),
+            }),
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let children = engine
+            .children
+            .as_ref()
+            .expect("the supervisor link wires the children registry")
+            .clone();
+        // The pre-switch identity (the build-time stamp's shape): an
+        // older selector.
+        children.set_model("battery/mock-2".to_string());
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(switched, "the switch proceeds without an allowlist");
+        assert_eq!(
+            children.parent_model().as_deref(),
+            Some("battery/mock-1"),
+            "an inherited spawn must resolve the switched-to model, not the stale build-time selector"
+        );
+    }
+
     #[test]
     fn configure_model_merges_only_present_fields() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -7464,6 +7885,7 @@ pub(crate) mod tests {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "hi".to_string(),
                 source: "user".to_string(),
@@ -7604,6 +8026,7 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
         turn_engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "hello".to_string(),
                 source: "user".to_string(),
@@ -8021,6 +8444,7 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
         turn_engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: "held turn".to_string(),
                 source: "user".to_string(),
@@ -8253,6 +8677,7 @@ fn abort_in_flight_turn_cancels_a_running_kernel_cell() {
             engine.run_prompt(
                 0,
                 PromptRequest {
+                    batch: Vec::new(),
                     images: Vec::new(),
                     message: "run the wedge cell".to_string(),
                     source: "user".to_string(),
@@ -8327,6 +8752,7 @@ fn run_prompts(
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: prompt.to_string(),
                 source: "user".to_string(),
@@ -8653,6 +9079,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
     engine.run_prompt(
         0,
         PromptRequest {
+            batch: Vec::new(),
             images: Vec::new(),
             message: "hi".to_string(),
             source: "user".to_string(),
@@ -8937,6 +9364,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
         engine.run_prompt(
             0,
             PromptRequest {
+                batch: Vec::new(),
                 images: Vec::new(),
                 message: prompt.to_string(),
                 source: "user".to_string(),
@@ -9060,6 +9488,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
     engine.run_prompt(
         0,
         PromptRequest {
+            batch: Vec::new(),
             images: Vec::new(),
             message: "go".to_string(),
             source: "user".to_string(),
@@ -9122,6 +9551,7 @@ fn agent_engine_streams_updates_and_final_message() {
     engine.run_prompt(
         0,
         PromptRequest {
+            batch: Vec::new(),
             images: Vec::new(),
             message: "hi".to_string(),
             source: "user".to_string(),

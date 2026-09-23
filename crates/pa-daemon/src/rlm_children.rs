@@ -228,6 +228,10 @@ struct SupervisorChildSessionsInner {
     /// The parent engine's child-settle hook (goal continuation resume);
     /// `None` until the engine wires it.
     settle_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// The worker's model-allowlist refusal telemetry (`model refused`):
+    /// spawn/create_session refusals emit through the engine's shared
+    /// lazily-built client.
+    model_refusal_telemetry: std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
 }
 
 impl Clone for SupervisorChildSessions {
@@ -244,6 +248,7 @@ impl SupervisorChildSessions {
         link: Arc<SupervisorLink>,
         agent_dir: PathBuf,
         parent_active_session_id: String,
+        model_refusal_telemetry: std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
     ) -> Self {
         Self {
             inner: Arc::new(SupervisorChildSessionsInner {
@@ -254,6 +259,7 @@ impl SupervisorChildSessions {
                 children: Mutex::new(Vec::new()),
                 turn_done: tokio::sync::watch::Sender::new(0),
                 settle_hook: std::sync::Mutex::new(None),
+                model_refusal_telemetry,
             }),
         }
     }
@@ -315,6 +321,22 @@ impl SupervisorChildSessions {
             .lock()
             .expect("identity lock")
             .rlm_max_depth
+    }
+
+    /// The parent identity's model selector — the source an inherited
+    /// spawn resolves; the engine keeps it in step with every live model
+    /// change (the session build stamps it, a switch follows it).
+    /// Test-only read: production spawn resolution reads the identity
+    /// field directly; this accessor exists so the switch-propagation
+    /// regression test can assert the registry's state.
+    #[cfg(test)]
+    pub(crate) fn parent_model(&self) -> Option<String> {
+        self.inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .model
+            .clone()
     }
 
     /// Wire snapshots of the tracked children (TS
@@ -1194,6 +1216,49 @@ fn custom_message_text(message: &pa_types::session::CustomMessage) -> Option<Str
     }
 }
 
+/// Resolve the child model with the daemon `allowedModels` allowlist
+/// enforced (the parent's cwd scopes the settings read), refusing a model
+/// outside the allowlist loudly with the typed error and emitting the
+/// `model refused` adoption event through the worker's shared client. The
+/// settings read (a synchronous file lock under `with_lock`) runs on the
+/// blocking pool, so a contended settings lock never stalls this async
+/// spawn path's Tokio worker.
+async fn resolve_child_model_allowlisted(
+    this: &SupervisorChildSessionsInner,
+    reference: Option<&str>,
+    surface: &'static str,
+    target: &str,
+) -> Result<String> {
+    let identity = this.identity.lock().expect("identity lock").clone();
+    let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
+    let load_cwd = cwd.clone();
+    let agent_dir = this.agent_dir.clone();
+    let allowlist = tokio::task::spawn_blocking(move || {
+        crate::model_allowlist::load(Path::new(&load_cwd), &agent_dir)
+    })
+    .await
+    .context("the allowlist load task join failed")?;
+    match resolve_child_model(
+        &this.agent_dir,
+        reference,
+        identity.model.as_deref(),
+        target,
+        &allowlist,
+    ) {
+        Ok(model) => Ok(model),
+        Err(error) => {
+            if let Some(refusal) = error.downcast_ref::<pa_core::models::ModelAllowlistRefusal>() {
+                this.model_refusal_telemetry.note_refused(
+                    surface,
+                    &refusal.selector,
+                    Path::new(&cwd),
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
@@ -1212,12 +1277,13 @@ impl RlmSubagentHost for SupervisorChildSessions {
             });
             this.assert_name_available(&name, identity.rlm_depth + 1)
                 .await?;
-            let model = resolve_child_model(
-                &this.agent_dir,
+            let model = resolve_child_model_allowlisted(
+                &this,
                 request.model.as_deref(),
-                identity.model.as_deref(),
+                "spawn",
                 "subagent",
-            )?;
+            )
+            .await?;
             assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
             let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
             let child_dir = this.child_session_dir(&child_id, &identity)?;
@@ -1341,12 +1407,13 @@ impl RlmSubagentHost for SupervisorChildSessions {
             if identity.rlm_depth != 0 {
                 bail!("rlm.create_session is available only from a depth-0 session");
             }
-            let model = resolve_child_model(
-                &this.agent_dir,
+            let model = resolve_child_model_allowlisted(
+                &this,
                 request.model.as_deref(),
-                identity.model.as_deref(),
+                "create_session",
                 "top-level session",
-            )?;
+            )
+            .await?;
             assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
             // A depth-0 resident session is created exactly like a client
             // `create`: the shared sessions dir and the requested cwd
@@ -1693,8 +1760,15 @@ mod watch_tests {
         )
         .await;
         let link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
-        let sessions =
-            SupervisorChildSessions::new(link, std::env::temp_dir(), "parent-live".to_string());
+        let sessions = SupervisorChildSessions::new(
+            link,
+            std::env::temp_dir(),
+            "parent-live".to_string(),
+            std::sync::Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                std::env::temp_dir(),
+                /*telemetry_disabled*/ true,
+            )),
+        );
         // A live parent carries its resolved model on the identity; the
         // spawn path resolves the child's model from it.
         sessions.set_identity(ParentIdentity {

@@ -297,10 +297,32 @@ pub struct WorkerQueueItemRecord {
     pub queue_key: Option<String>,
     #[serde(default = "queue_visible_default")]
     pub queue_visible: bool,
+    /// The item's turn-execution class ("queued"/"injected"/"direct", see
+    /// worker::TurnPolicy): the batch gathering's compatibility gate. A
+    /// record written before the field existed restores as "queued" — the
+    /// dominant lane class, and the only one a fresh snapshot can batch.
+    #[serde(default = "queue_policy_default")]
+    pub policy: String,
 }
 
 fn queue_visible_default() -> bool {
     true
+}
+
+fn queue_policy_default() -> String {
+    "queued".to_string()
+}
+
+impl WorkerQueueItemRecord {
+    /// The record's turn-execution class; an unknown value restores as
+    /// the dominant "queued" class.
+    pub(crate) fn policy(&self) -> crate::worker::TurnPolicy {
+        match self.policy.as_str() {
+            "injected" => crate::worker::TurnPolicy::Injected,
+            "direct" => crate::worker::TurnPolicy::Direct,
+            _ => crate::worker::TurnPolicy::Queued,
+        }
+    }
 }
 
 /// A worker queue snapshot record: the pending steering/follow-up lanes so a
@@ -343,6 +365,18 @@ impl WorkerRecoveryJournal {
 
     pub fn read_latest(path: &Path) -> Result<Vec<WorkerRecoveryRecord>> {
         Ok(parse_worker_records(path)?.into_values().collect())
+    }
+
+    /// Does the journal prove live work at the worker's last exit? A plain
+    /// supervisor startup adopts a dead worker only when this holds (a
+    /// restart must not mass-revive historical sessions): a latest `busy`
+    /// record marks an in-flight turn or an admitted-but-undelivered
+    /// prompt/queue lane. An unreadable journal proves nothing —
+    /// uncertainty must not revive a session.
+    pub fn read_interrupted(path: &Path) -> bool {
+        Self::read_latest(path)
+            .map(|records| records.iter().any(|record| record.busy))
+            .unwrap_or(false)
     }
 
     pub fn record(
@@ -503,6 +537,7 @@ fn parse_snapshot_lane(value: Option<&Value>) -> Vec<WorkerQueueItemRecord> {
                         custom_message: None,
                         queue_key: None,
                         queue_visible: true,
+                        policy: queue_policy_default(),
                     }),
                     Value::Object(_) => serde_json::from_value(entry.clone()).ok(),
                     _ => None,
@@ -558,6 +593,39 @@ mod tests {
         assert_eq!(latest.len(), 2);
         let s1 = latest.iter().find(|r| r.active_session_id == "s1").unwrap();
         assert!(!s1.busy);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn worker_journal_interrupted_evidence_tracks_latest_busy() {
+        let path = temp_path("interrupted.recovery.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        // Idle sessions prove nothing: no interrupted work to revive.
+        journal
+            .record("s1", "sess1", None, false, "shutdown")
+            .unwrap();
+        journal.record("s2", "sess2", None, false, "ready").unwrap();
+        assert!(!WorkerRecoveryJournal::read_interrupted(&path));
+        // One busy session is durable evidence of interrupted work.
+        journal
+            .record("s2", "sess2", Some("/b.jsonl"), true, "create")
+            .unwrap();
+        assert!(WorkerRecoveryJournal::read_interrupted(&path));
+        // The latest record per session decides: s2 settles back to idle.
+        journal
+            .record("s2", "sess2", None, false, "shutdown")
+            .unwrap();
+        assert!(!WorkerRecoveryJournal::read_interrupted(&path));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn worker_journal_missing_or_unreadable_file_is_not_interrupted() {
+        let path = temp_path("missing.recovery.jsonl");
+        // No journal: no evidence, so no revival on uncertainty.
+        assert!(!WorkerRecoveryJournal::read_interrupted(&path));
+        std::fs::write(&path, "not json").unwrap();
+        assert!(!WorkerRecoveryJournal::read_interrupted(&path));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

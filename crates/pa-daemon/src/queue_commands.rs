@@ -147,10 +147,12 @@ impl Worker {
         // emits the queue update).
         let core = self.core.lock().unwrap();
         let snapshot = self.snapshot_locked(&core);
-        let lanes = crate::worker::queue_lanes(&core);
-        let active_session_id = core.active_session_id.clone();
         drop(core);
-        self.persist_queue_snapshot(&active_session_id, &lanes);
+        // The edit refreshed the lanes: the verdict follows them (a delete
+        // of the last queued item settles the session back to idle).
+        self.checkpoint_queue(crate::worker::QueueCheckpoint::Settle {
+            operation: "queue_mutated",
+        });
         let _ = self.emit_action_update(&snapshot);
         if mutation_type != "move" {
             self.work_notify.notify_one();
@@ -314,6 +316,8 @@ mod tests {
                 images: Vec::new(),
                 done: None,
                 queue_visible: true,
+                policy: crate::worker::TurnPolicy::Injected,
+                forced_batch: false,
             });
         }
         let queue = worker.dispatch("get_queue", &json!({})).await;
@@ -376,6 +380,8 @@ mod tests {
                 images: Vec::new(),
                 done: None,
                 queue_visible: true,
+                policy: crate::worker::TurnPolicy::Injected,
+                forced_batch: false,
             });
         }
         let expected = "Heartbeat prompt: [heartbeat: every 10m run#0]\n\nnudge the mission";
@@ -592,6 +598,8 @@ mod tests {
                 images: Vec::new(),
                 done: Some(done_tx),
                 queue_visible: true,
+                policy: crate::worker::TurnPolicy::Queued,
+                forced_batch: false,
             });
         }
         let response = worker
@@ -656,6 +664,8 @@ mod tests {
                 images: Vec::new(),
                 done: None,
                 queue_visible: true,
+                policy: crate::worker::TurnPolicy::Queued,
+                forced_batch: false,
             });
 
         let replaced = worker

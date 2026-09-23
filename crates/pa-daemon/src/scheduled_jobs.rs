@@ -68,6 +68,8 @@ pub(crate) struct QueueHooks {
     work_notify: Arc<Notify>,
     user_bash: Arc<crate::user_bash::UserBash>,
     store: Arc<AgentCronJobStore>,
+    /// The worker recovery journal (the fire checkpoint's busy evidence).
+    recovery: Arc<Mutex<Option<crate::journal::WorkerRecoveryJournal>>>,
 }
 
 impl QueueHooks {
@@ -138,6 +140,13 @@ impl AgentCronSchedulerHooks for QueueHooks {
             return Ok(Some("skipped"));
         }
         let (done_tx, done_rx) = oneshot::channel();
+        let heartbeat = is_heartbeat_cron_job(job);
+        let queue_key = heartbeat.then(|| format!("heartbeat:{}", job.id));
+        // A heartbeat rides its delivery-mode lane; a plain cron job
+        // queues on the follow-up lane (the fire checkpoint after the
+        // admission reads the same lane decision).
+        let rides_steering =
+            heartbeat && !matches!(job.delivery_mode, Some(DeliveryMode::FollowUp));
         {
             let mut core = self
                 .core
@@ -151,8 +160,6 @@ impl AgentCronSchedulerHooks for QueueHooks {
             // `resumeIfIdle: true`): a fire on a post-abort/post-compact
             // session is a resume site.
             core.queued_input_suspended = false;
-            let heartbeat = is_heartbeat_cron_job(job);
-            let queue_key = heartbeat.then(|| format!("heartbeat:{}", job.id));
             // The TS `heartbeat:<id>` queue key: a later fire replaces the
             // queued one instead of stacking.
             if let Some(key) = &queue_key {
@@ -161,14 +168,10 @@ impl AgentCronSchedulerHooks for QueueHooks {
                 core.follow_up
                     .retain(|item| item.queue_key.as_deref() != Some(key.as_str()));
             }
-            let lane = match (
-                heartbeat,
-                matches!(job.delivery_mode, Some(DeliveryMode::FollowUp)),
-            ) {
-                // A heartbeat rides its delivery-mode lane; a plain cron
-                // job queues on the follow-up lane.
-                (true, false) => &mut core.steering,
-                _ => &mut core.follow_up,
+            let lane = if rides_steering {
+                &mut core.steering
+            } else {
+                &mut core.follow_up
             };
             // TS `runCronJob`: a heartbeat fire delivers through
             // `promptHeartbeat`, so the turn IS the injected
@@ -210,8 +213,25 @@ impl AgentCronSchedulerHooks for QueueHooks {
                 queue_key,
                 done: Some(done_tx),
                 queue_visible: true,
+                policy: crate::worker::TurnPolicy::Injected,
+                forced_batch: false,
             });
         }
+        // The fire checkpoint (busy=true): a scheduled prompt is admitted
+        // live work, and heartbeats/cron jobs run unattended — no client
+        // reopens a parked session, so a crash mid-fire must revive the
+        // worker to run it. The operation is the lane's TS queue string.
+        crate::worker::checkpoint_queue_recovery(
+            &self.recovery,
+            &self.core,
+            crate::worker::QueueCheckpoint::Admitted {
+                operation: if rides_steering {
+                    "steer_queued"
+                } else {
+                    "follow_up_queued"
+                },
+            },
+        );
         self.work_notify.notify_one();
         match tokio::time::timeout(
             std::time::Duration::from_millis(FIRE_SETTLE_TIMEOUT_MS),
@@ -242,6 +262,7 @@ impl ScheduledJobs {
         work_notify: Arc<Notify>,
         user_bash: Arc<crate::user_bash::UserBash>,
         events: Arc<crate::worker::EventPump>,
+        recovery: Arc<Mutex<Option<crate::journal::WorkerRecoveryJournal>>>,
     ) -> Self {
         let mut store = AgentCronJobStore::for_session_artifacts();
         // TS daemon-mode's `cronStore.onHeartbeatChange` →
@@ -259,6 +280,7 @@ impl ScheduledJobs {
                 work_notify,
                 user_bash,
                 store: Arc::clone(&store),
+                recovery,
             }),
             store,
             scheduler: tokio::sync::Mutex::new(None),
@@ -336,15 +358,28 @@ impl ScheduledJobs {
             return;
         }
         let key = format!("heartbeat:{}", job.id);
-        let mut core = self
-            .hooks
-            .core
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        core.steering
-            .retain(|item| item.queue_key.as_deref() != Some(key.as_str()));
-        core.follow_up
-            .retain(|item| item.queue_key.as_deref() != Some(key.as_str()));
+        {
+            let mut core = self
+                .hooks
+                .core
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            core.steering
+                .retain(|item| item.queue_key.as_deref() != Some(key.as_str()));
+            core.follow_up
+                .retain(|item| item.queue_key.as_deref() != Some(key.as_str()));
+        }
+        // Same settle as the other withdrawals: the mutation withdrew a
+        // queued fire, so the verdict and the snapshot must not keep the
+        // fire's admission busy=true (a revive would replay the deleted
+        // heartbeat's prompt from the stale snapshot).
+        crate::worker::checkpoint_queue_recovery(
+            &self.hooks.recovery,
+            &self.hooks.core,
+            crate::worker::QueueCheckpoint::Settle {
+                operation: "queue_purged",
+            },
+        );
     }
 }
 
@@ -1005,6 +1040,7 @@ mod tests {
             work_notify: Arc::new(Notify::new()),
             user_bash: Arc::new(crate::user_bash::UserBash::new()),
             store: Arc::new(AgentCronJobStore::for_session_artifacts()),
+            recovery: Arc::new(std::sync::Mutex::new(None)),
         };
         // The dead-target cancel registers the artifact partition itself
         // (a fresh store knows nothing of the session yet).
@@ -1049,6 +1085,7 @@ mod tests {
             work_notify: Arc::new(Notify::new()),
             user_bash: Arc::new(crate::user_bash::UserBash::new()),
             store: Arc::new(AgentCronJobStore::for_session_artifacts()),
+            recovery: Arc::new(std::sync::Mutex::new(None)),
         });
         let steer_heartbeat =
             heartbeat_job("hb-1", "steer the mission", DeliveryMode::Steer, &session);

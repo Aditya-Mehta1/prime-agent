@@ -195,6 +195,15 @@ impl Worker {
                         .get("queueVisible")
                         .and_then(Value::as_bool)
                         .unwrap_or(true),
+                    // TS restores the action's execution policy
+                    // (`executionPolicy`): the batch-gathering class maps
+                    // from its shape — `nextTurnContextTiming` "commit"
+                    // is the client-queued policy, "preparation" with a
+                    // preserved empty prompt is injected, "preparation"
+                    // without it is the direct-prompt hand-off. An absent
+                    // policy restores as the dominant queued class.
+                    policy: crate::worker::restored_turn_policy(payload),
+                    forced_batch: false,
                 };
                 if lane_follow_up {
                     core.follow_up.push_back(item);
@@ -204,9 +213,16 @@ impl Worker {
             }
             actions.len()
         };
-        // TS records the worker recovery state once per successful restore.
+        // TS records the worker recovery state once per successful restore
+        // with busy=true: restored lanes are undelivered live work. The
+        // claim must be true — the lane snapshot rides the same locked
+        // read as the verdict (one checkpoint), so a revived worker
+        // replays them and a concurrent queue clear cannot leave a
+        // stale snapshot behind.
         if restored > 0 {
-            let _ = self.record_recovery(false, "actions_restored");
+            self.checkpoint_queue(crate::worker::QueueCheckpoint::Admitted {
+                operation: "actions_restored",
+            });
             self.work_notify.notify_one();
         }
         response_success(
