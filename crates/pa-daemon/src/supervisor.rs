@@ -149,6 +149,11 @@ pub struct Supervisor {
     /// rename of the same name fails the second caller.
     pub(crate) pending_session_names: std::sync::Mutex<std::collections::HashSet<String>>,
     shutting_down: AtomicBool,
+    /// Whether some path has taken ownership of the one terminal stop pass.
+    /// `shutting_down` flips synchronously when the shutdown command is
+    /// accepted; this flag ensures exactly one connection runs
+    /// `begin_shutdown`, even if several clients notice the shutdown.
+    shutdown_started: AtomicBool,
     /// The accept loop's exit flag. `shutting_down` refuses new work the
     /// moment a terminal stop begins, but the loop itself must stay up
     /// until [`Supervisor::begin_shutdown`] has stopped every resident
@@ -268,6 +273,7 @@ impl Supervisor {
             roster: std::sync::Mutex::new(crate::agent_roster::AgentRoster::new()),
             pending_session_names: std::sync::Mutex::new(std::collections::HashSet::new()),
             shutting_down: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
             accept_exit: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
             log,
@@ -2151,7 +2157,14 @@ impl Supervisor {
                 dispatched = dispatch_rx.recv() => {
                     let Some((lines, stop)) = dispatched else { break };
                     for outbound in lines {
-                        write_line(&mut writer, &outbound).await?;
+                        if let Err(error) = write_line(&mut writer, &outbound).await {
+                            // A failed response write must not strand the
+                            // shutdown: the stop pass still has to run.
+                            if stop {
+                                self.ensure_shutdown_started().await;
+                            }
+                            return Err(error);
+                        }
                     }
                     if stop {
                         // The initiating client's response and daemon_closing
@@ -2159,7 +2172,7 @@ impl Supervisor {
                         // end the runtime. The accept loop stays up until
                         // begin_shutdown sets accept_exit, so worker stops
                         // cannot be cut short by another inbound connection.
-                        self.begin_shutdown().await;
+                        self.ensure_shutdown_started().await;
                         break;
                     }
                 }
@@ -2184,6 +2197,13 @@ impl Supervisor {
                     }
                 }
             }
+        }
+        // A shutdown command may have been accepted just before this client
+        // disconnected (or its response write failed). Exactly one connection
+        // must still run the stop pass; `shutdown_started` makes that owner
+        // unique even when several clients observe the shutdown at once.
+        if self.shutting_down.load(Ordering::SeqCst) && !self.accept_exit.load(Ordering::SeqCst) {
+            self.ensure_shutdown_started().await;
         }
         // Detach from every attached session on disconnect (a TUI exit does
         // not stop the session; the worker keeps running).
@@ -4466,6 +4486,20 @@ impl Supervisor {
         // equivalent reseeds it from the ledger here). A tombstoned
         // child no longer has a live edge, so the seed skips it.
         self.seed_roster_ledger().await;
+    }
+
+    /// Run the one terminal stop pass, whichever connection first reaches it.
+    ///
+    /// The shutdown command sets `shutting_down` synchronously, but the stop
+    /// pass still has to start even if its initiating client disconnects or
+    /// the response write fails. `shutdown_started` is the one-owner gate:
+    /// the first caller runs `begin_shutdown`; every later observer returns
+    /// immediately instead of duplicating the worker stops.
+    async fn ensure_shutdown_started(self: &Arc<Self>) {
+        if self.shutdown_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.begin_shutdown().await;
     }
 
     async fn begin_shutdown(self: &Arc<Self>) {
