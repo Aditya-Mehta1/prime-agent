@@ -232,16 +232,18 @@ def run_states(session, out_dir, label, verify_branch):
     send(session, "Escape")
     time.sleep(SETTLE)
 
-    # (d) bare /mcp opens the connections view
+    # (d) bare /mcp opens the connections view (the daemon may serve the
+    # builtin catalog's service rows, so the frame needle is the view's
+    # search field, not the empty-roster row).
     send(session, "/mcp")
     send(session, "Enter")
     frames[f"{label}_d_mcp_menu"] = wait_for(
-        session, "No external services available", timeout=15
+        session, "Search MCP connections", timeout=15
     )
     if verify_branch:
         check(
             "bare_mcp_opens_menu",
-            "No external services available" in frames[f"{label}_d_mcp_menu"],
+            "Search MCP connections" in frames[f"{label}_d_mcp_menu"],
             "connections view frame",
         )
     send(session, "Escape")
@@ -341,10 +343,12 @@ def run_states(session, out_dir, label, verify_branch):
     # (h) /mcp <partial> + Tab
     send(session, "/mcp lin")
     send(session, "Tab")
-    frame = wait_or_none(session, "No external services available", timeout=8)
+    frame = wait_or_none(session, "Search MCP connections", timeout=8)
     frames[f"{label}_h_mcp_tab"] = frame or capture(session)
     if verify_branch:
-        opened = frame is not None
+        opened = frame is not None and re.search(
+            r"> lin\b", frames[f"{label}_h_mcp_tab"]
+        )
         check(
             "mcp_tab_opens_filtered_menu",
             opened,
