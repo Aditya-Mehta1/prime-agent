@@ -785,12 +785,12 @@ mod tests {
     fn fallback_models_never_inherit_the_zai_thinking_format() {
         use pa_ai::types::ModelExt;
         use pa_types::ai::{CompatKind, ThinkingFormat};
-        let mut catalog: Vec<Model> = vec![pa_ai::models_generated::get_model(
-            "prime-inference",
-            "z-ai/glm-5.3",
-        )
-        .expect("the compiled prime-inference default")
-        .clone()];
+        let mut catalog: Vec<Model> =
+            vec![
+                pa_ai::models_generated::get_model("prime-inference", "z-ai/glm-5.3")
+                    .expect("the compiled prime-inference default")
+                    .clone(),
+            ];
         catalog.extend(private_prime_inference_models());
         for model_id in ["z-ai/glm-9", "internal/glm-5.9-turbo"] {
             let fallback = build_fallback_model("prime-inference", model_id, &catalog)

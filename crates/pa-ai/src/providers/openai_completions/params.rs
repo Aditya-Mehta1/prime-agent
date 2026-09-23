@@ -335,7 +335,6 @@ pub(crate) fn build_headers(
     headers
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
