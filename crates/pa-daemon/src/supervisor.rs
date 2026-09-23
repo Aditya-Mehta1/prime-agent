@@ -2154,6 +2154,12 @@ impl Supervisor {
                         write_line(&mut writer, &outbound).await?;
                     }
                     if stop {
+                        // The initiating client's response and daemon_closing
+                        // lines are flushed above; only now may the stop pass
+                        // end the runtime. The accept loop stays up until
+                        // begin_shutdown sets accept_exit, so worker stops
+                        // cannot be cut short by another inbound connection.
+                        self.begin_shutdown().await;
                         break;
                     }
                 }
@@ -2343,25 +2349,14 @@ impl Supervisor {
                     .events
                     .send((ClientRouting::Broadcast, closing.clone()));
                 lines.push(closing);
-                // Answer first, then shut down: the dispatch returns while
-                // the worker stops run on their own task, so the connection
-                // loop always writes this response before the accept loop's
-                // exit path can end the process (awaiting the stop here
-                // held the response in the exit window, where the process
-                // teardown could close the client first — a race the live
-                // roster feed's event traffic makes easy to hit). The stop
-                // itself keeps its ordering: the accept loop still wakes
-                // only after every worker stopped (TS responds before it
-                // begins the shutdown work too). The shutdown gate flips
-                // synchronously — before this dispatch answers and before
-                // the spawned work runs — so no create dispatched after
-                // the shutdown can slip past it and launch a worker the
-                // stop pass would miss.
+                // Answer first, then shut down: the connection loop writes
+                // these lines before it awaits begin_shutdown, so the client
+                // always receives the response and daemon_closing before the
+                // stop pass can end the process. The shutdown gate flips
+                // synchronously here — before the response is written — so
+                // no create dispatched after the shutdown can slip past it
+                // and launch a worker the stop pass would miss.
                 self.shutting_down.store(true, Ordering::SeqCst);
-                let supervisor = Arc::clone(self);
-                tokio::spawn(async move {
-                    supervisor.begin_shutdown().await;
-                });
                 (lines, true)
             }
             DaemonCommand::List {
