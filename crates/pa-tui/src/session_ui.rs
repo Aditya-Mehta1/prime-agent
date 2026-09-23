@@ -348,8 +348,9 @@ pub(crate) struct SessionUi {
     /// subscription, TS `rosterBar`): drives the subagent summary counts.
     roster: Vec<Value>,
     /// The scoped heartbeat catalog (TS `heartbeatCatalog` over
-    /// `getScopedHeartbeats`): drives the tray heartbeat label and seeds
-    /// the `/heartbeats` view; refreshed by `heartbeats_changed`.
+    /// `getScopedHeartbeats`): drives the activity dock's heartbeat
+    /// group and seeds the `/heartbeats` view; refreshed by
+    /// `heartbeats_changed`.
     heartbeat_catalog: Vec<HeartbeatEntry>,
     /// The current Python bash() registry snapshot from the owning kernel.
     bash_activities: Value,
@@ -941,16 +942,21 @@ impl SessionUi {
         self.subagent_counts = counts;
 
         let goal = &self.goal_view.goal;
-        let goal_tokens = (goal.status != pa_types::goal::GoalStatus::Idle).then(|| {
-            (
-                goal.status.slug().to_string(),
-                goal.tokens_used,
-                goal.token_budget,
-            )
-        });
+        // The dock carries the goal only while it is actively being
+        // pursued: a completed goal's token totals are stale bookkeeping,
+        // not a live activity (the tray's TS label still covers the
+        // paused and budget-limited states).
+        let goal_tokens = (goal.status == pa_types::goal::GoalStatus::Active)
+            .then(|| (goal.tokens_used, goal.token_budget));
         let dock = crate::chrome::ActivityDock {
             subagents: counts.total,
+            subagents_running: counts.running,
             heartbeats: self.heartbeat_catalog.len(),
+            heartbeats_paused: self
+                .heartbeat_catalog
+                .iter()
+                .filter(|entry| entry.job.status == "paused")
+                .count(),
             bash_total: crate::activity_panel::parse_bash_activities(&self.bash_activities).len(),
             goal_tokens,
             selected: self.activity_group,
@@ -5499,9 +5505,10 @@ impl SessionUi {
                         if let Some(picker) = view.heartbeats_picker.as_mut() {
                             picker.apply_managed_job(job.clone(), stopped);
                         }
-                        // The tray label follows the same patch the manager
-                        // view applied (TS `manageHeartbeat` rewrites the
-                        // catalog entry, not just the open manager).
+                        // The activity dock follows the same patch the
+                        // manager view applied (TS `manageHeartbeat`
+                        // rewrites the catalog entry, not just the open
+                        // manager).
                         if stopped {
                             self.heartbeat_catalog
                                 .retain(|entry| entry.job.id != job_id);
@@ -5627,7 +5634,7 @@ impl SessionUi {
 
     /// Fold a landed heartbeat-catalog refresh into the session: re-scope
     /// and re-sort, keep the open view's selection, surface the fetch
-    /// error, and re-sync the tray label (TS `applyHeartbeatCatalog` over
+    /// error, and re-sync the activity dock (TS `applyHeartbeatCatalog` over
     /// both the manager and the tray's `getTrayHeartbeatLabel`).
     pub(crate) fn apply_heartbeat_update(
         &mut self,
@@ -5658,7 +5665,7 @@ impl SessionUi {
     /// Fetch the scoped catalog and open the `/heartbeats` view over it
     /// (TS `showHeartbeatManager`): the fetch error opens over the cached
     /// catalog with the failure surfaced inside the view (stale-while-
-    /// revalidate), and the tray label follows the landed catalog.
+    /// revalidate), and the activity dock follows the landed catalog.
     /// `preselect` carries the activity panel's chosen heartbeat row into
     /// the view's selection.
     async fn open_heartbeats_view(&mut self, view: &mut AgentView, preselect: Option<String>) {
@@ -5679,14 +5686,10 @@ impl SessionUi {
         self.dirty = true;
     }
 
-    /// The tray heartbeat label follows the scoped catalog (TS
-    /// `getTrayHeartbeatLabel`): `N heartbeats · M paused (Ctrl+R)`.
+    /// The activity dock follows the scoped heartbeat catalog (TS
+    /// `getTrayHeartbeatLabel` moved into the dock: the tray no longer
+    /// carries a heartbeat count beside the model name).
     pub(crate) fn sync_heartbeat_tray(&mut self, view: &mut AgentView) {
-        let label = tray_heartbeat_label(&self.heartbeat_catalog, &self.keybindings);
-        if view.chrome.heartbeat_label != label {
-            view.chrome.heartbeat_label = label;
-            self.dirty = true;
-        }
         let previous = view.chrome.activity.clone();
         self.update_subagent_summary(view);
         if previous != view.chrome.activity {
@@ -7948,31 +7951,6 @@ pub(crate) fn resume_hint_from_stats(stats: &Value) -> Option<String> {
 /// The picker's viewport row budget (TS `showConfigurationMenu` passes
 /// `min(20, rows - 3)` and `ConfigurationMenuComponent` subtracts one more
 /// row for its hint).
-/// TS `getTrayHeartbeatLabel`: `N heartbeats[ · M paused] (Ctrl+R)` over
-/// the scoped catalog; `None` when no heartbeat is in scope.
-fn tray_heartbeat_label(
-    heartbeats: &[HeartbeatEntry],
-    kb: &crate::keybindings::KeybindingsManager,
-) -> Option<String> {
-    if heartbeats.is_empty() {
-        return None;
-    }
-    let paused = heartbeats
-        .iter()
-        .filter(|entry| entry.job.status == "paused")
-        .count();
-    let plural = if heartbeats.len() == 1 { "" } else { "s" };
-    let mut label = format!("{} heartbeat{plural}", heartbeats.len());
-    if paused > 0 {
-        label.push_str(&format!(" \u{b7} {paused} paused"));
-    }
-    if let Some(key) = kb.first_key("app.heartbeats.open") {
-        let key = crate::keybindings::format_key_text(&key);
-        label.push_str(&format!(" ({key})"));
-    }
-    Some(label)
-}
-
 fn picker_viewport_rows(terminal_rows: u16) -> usize {
     let terminal_rows = terminal_rows as usize;
     let menu_rows = 20.min(terminal_rows.saturating_sub(3).max(1));
@@ -8077,10 +8055,9 @@ mod bash_bang_tests {
 }
 
 #[cfg(test)]
-mod tray_heartbeat_label_tests {
-    use super::{tray_heartbeat_label, HeartbeatEntry};
-    use crate::heartbeats_picker::parse_heartbeat_job;
-    use crate::keybindings::KeybindingsManager;
+mod activity_dock_counts_tests {
+    use crate::heartbeats_picker::{parse_heartbeat_job, HeartbeatEntry};
+    use serde_json::json;
 
     fn entry(job_json: serde_json::Value) -> HeartbeatEntry {
         HeartbeatEntry {
@@ -8091,7 +8068,7 @@ mod tray_heartbeat_label_tests {
     }
 
     fn job(id: &str, status: &str) -> serde_json::Value {
-        serde_json::json!({
+        json!({
             "id": id,
             "status": status,
             "source": "heartbeat",
@@ -8101,39 +8078,26 @@ mod tray_heartbeat_label_tests {
         })
     }
 
-    /// TS `getTrayHeartbeatLabel`: no heartbeat in scope renders no label,
-    /// counts carry the plural and the paused suffix, and the open-shortcut
-    /// hint trails the default binding.
-    #[test]
-    fn label_counts_heartbeats_and_the_paused_suffix() {
-        let kb = KeybindingsManager::new();
-        assert_eq!(tray_heartbeat_label(&[], &kb), None);
-        let active = entry(job("a", "active"));
-        assert_eq!(
-            tray_heartbeat_label(std::slice::from_ref(&active), &kb).as_deref(),
-            Some("1 heartbeat (Ctrl+R)")
-        );
-        let paused = entry(job("b", "paused"));
-        assert_eq!(
-            tray_heartbeat_label(&[active, paused], &kb).as_deref(),
-            Some("2 heartbeats · 1 paused (Ctrl+R)")
-        );
-    }
-
-    /// The tray counts every in-scope heartbeat regardless of labels (the
+    /// The dock counts every in-scope heartbeat regardless of labels (the
     /// dogfood repro: unlabeled agent heartbeats fire on schedule but a
-    /// label-keyed count showed none of them).
+    /// label-keyed count showed none of them), and the paused count
+    /// feeds the dock's `M paused` suffix.
     #[test]
-    fn label_counts_unlabeled_heartbeats_too() {
-        let kb = KeybindingsManager::new();
+    fn dock_counts_heartbeats_and_paused() {
         let labeled = entry(job("labeled", "active"));
         let mut unlabeled = job("unlabeled", "active");
         unlabeled["label"] = serde_json::Value::Null;
         let unlabeled = entry(unlabeled);
+        let paused = entry(job("b", "paused"));
+        let catalog = vec![labeled, unlabeled, paused];
         assert_eq!(
-            tray_heartbeat_label(&[labeled, unlabeled], &kb).as_deref(),
-            Some("2 heartbeats (Ctrl+R)")
+            catalog
+                .iter()
+                .filter(|entry| entry.job.status == "paused")
+                .count(),
+            1
         );
+        assert_eq!(catalog.len(), 3);
     }
 }
 
