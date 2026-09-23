@@ -148,6 +148,7 @@ impl Supervisor {
         worker_token: &str,
         summary: Value,
         removed: Vec<String>,
+        sequence: Option<u64>,
     ) -> DaemonResponse {
         let Some(resident) = self.registry.find_by_token(worker_token).await else {
             return response_failure(
@@ -157,6 +158,16 @@ impl Supervisor {
                 None,
             );
         };
+        // The stale-delta gate: the worker's per-request links deliver
+        // deltas unordered, so a delayed older snapshot must not overwrite
+        // a newer one — the supervisor answers success (the delta is
+        // delivered, just superseded) and skips the write.
+        {
+            let mut roster = self.roster.lock().unwrap();
+            if !roster.accept_delta_sequence(&resident.worker_id, sequence.unwrap_or(0)) {
+                return response_success(Some(command_id), type_name, None);
+            }
+        }
         let mut changed = Vec::new();
         if let Some(entry) = self.write_roster_summary(&summary, Some(&resident.worker_id)) {
             changed.push(entry);
@@ -216,6 +227,7 @@ impl Supervisor {
             for id in &ids {
                 roster.delete(id);
             }
+            roster.forget_worker_sequences(worker_id);
             ids
         };
         self.push_roster_update(Vec::new(), removed);
@@ -416,6 +428,103 @@ mod tests {
             Path::new("/dead/root.jsonl"),
             &roots(&["/gone/c1.jsonl"])
         ));
+    }
+
+/// The stale-delta gate at the handler: the worker's per-request
+    /// supervisor links deliver deltas unordered, so a delayed older
+    /// snapshot (a lower sequence) must not overwrite a newer one — the
+    /// TS worker never has this race (its roster deltas ride one ordered
+    /// supervisor client socket).
+    #[tokio::test]
+    async fn worker_roster_delta_drops_stale_sequences() {
+        let dir = std::env::temp_dir().join(format!("pa-roster-seq-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(crate::supervisor::SupervisorOptions {
+                socket_path: dir.join("supervisor.sock"),
+                agent_dir: dir.join("agent"),
+            })
+            .expect("supervisor"),
+        );
+        let descriptor: pa_types::daemon::DaemonWorkerDescriptor =
+            serde_json::from_value(serde_json::json!({
+                "version": 2,
+                "workerId": "seq-worker",
+                "pid": 0,
+                "socketPath": "/tmp/none.sock",
+                "recoveryJournalPath": "/tmp/none.jsonl",
+                "supervisorSocketPath": "/tmp/none.sock",
+                "authenticationToken": "seq-token",
+                "rootActiveSessionId": "s1",
+                "createdAt": "2026-09-23T00:00:00Z",
+                "updatedAt": "2026-09-23T00:00:00Z",
+                "lifecycle": "ready",
+                "createCommand": {},
+                "consecutiveFailures": 0,
+            }))
+            .expect("descriptor");
+        supervisor
+            .registry
+            .insert(ResidentWorker::new(
+                "seq-worker".to_string(),
+                descriptor,
+                dir.join("descriptor.json"),
+            ))
+            .await;
+        let entry_level = || {
+            supervisor
+                .roster
+                .lock()
+                .unwrap()
+                .get("s1")
+                .map(|entry| entry.summary["thinkingLevel"].clone())
+                .expect("the roster entry")
+        };
+        let summary = |level: &str| {
+            serde_json::json!({
+                "sessionId": "s1",
+                "activeSessionId": "s1",
+                "activity": "idle",
+                "thinkingLevel": level,
+            })
+        };
+        let delta = |token: &str, level: &str, sequence: Option<u64>| {
+            supervisor.handle_worker_roster_delta(
+                "d",
+                "worker_roster_delta",
+                token,
+                summary(level),
+                Vec::new(),
+                sequence,
+            )
+        };
+
+        // In-order deltas apply (the newer level lands).
+        let applied = delta("seq-token", "high", Some(2)).await;
+        assert!(applied.success, "sequence 2 applies: {applied:?}");
+        assert_eq!(entry_level(), serde_json::json!("high"));
+        // The delayed older snapshot (sequence 1, delivered after 2) answers
+        // success but never overwrites the newer state.
+        let stale = delta("seq-token", "low", Some(1)).await;
+        assert!(stale.success, "a stale delta still answers success: {stale:?}");
+        assert_eq!(
+            entry_level(),
+            serde_json::json!("high"),
+            "the stale snapshot never overwrites the newer one"
+        );
+        // A newer sequence applies again.
+        let applied = delta("seq-token", "low", Some(3)).await;
+        assert!(applied.success, "sequence 3 applies: {applied:?}");
+        assert_eq!(entry_level(), serde_json::json!("low"));
+        // An unsequenced delta applies (the authoritative pulls —
+        // registration and create refreshes — never carry a sequence).
+        let unsequenced = delta("seq-token", "off", None).await;
+        assert!(unsequenced.success, "unsequenced applies: {unsequenced:?}");
+        assert_eq!(entry_level(), serde_json::json!("off"));
+        // A wrong token still fails authentication, before the gate.
+        let rejected = delta("wrong-token", "high", Some(9)).await;
+        assert!(!rejected.success, "authentication still gates: {rejected:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -167,6 +167,13 @@ pub enum DaemonCommand {
         summary: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         removed: Option<Vec<String>>,
+        /// The worker's monotonic roster-delta sequence: the per-request
+        /// supervisor links deliver deltas unordered, so the supervisor
+        /// drops a stale delta (a newer one already applied) instead of
+        /// letting a delayed older snapshot overwrite it. Absent means
+        /// unsequenced (always applied).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
         #[serde(flatten)]
         rest: JsonMap,
     },

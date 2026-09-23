@@ -748,6 +748,10 @@ pub struct Worker {
     roster_link: std::sync::Arc<crate::supervisor_link::SupervisorLink>,
     /// The supervisor-issued worker token authenticating roster pushes.
     worker_token: String,
+    /// The monotonic roster-delta counter shared with the turn runner: the
+    /// per-request links deliver pushes unordered, so every delta carries
+    /// the counter's value for the supervisor's stale-delta gate.
+    roster_delta_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(crate) work_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     pub(crate) events: Arc<EventPump>,
@@ -924,6 +928,8 @@ impl Worker {
                 .unwrap_or_default(),
         ));
         let worker_token = std::env::var(WORKER_TOKEN_ENV).unwrap_or_default();
+        let roster_delta_sequence =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         // The session input-pause table (the admission gate): shared by
         // the worker's arms and the turn runner below.
         let input_pauses = crate::session_input_pause::InputPauseTable::new();
@@ -1132,6 +1138,7 @@ impl Worker {
                 status_notify: status_notify.clone(),
                 roster_link: std::sync::Arc::clone(&roster_link),
                 worker_token: worker_token.clone(),
+                roster_delta_sequence: std::sync::Arc::clone(&roster_delta_sequence),
             };
             tokio::spawn(async move {
                 runner.run().await;
@@ -1187,6 +1194,7 @@ impl Worker {
             agent_engine,
             roster_link,
             worker_token,
+            roster_delta_sequence,
             work_notify,
             idle_notify,
             events,
@@ -2624,6 +2632,7 @@ impl Worker {
             &self.engine,
             &self.roster_link,
             &self.worker_token,
+            &self.roster_delta_sequence,
         );
     }
 
@@ -4926,6 +4935,10 @@ struct TurnRunner {
     /// agent-messaging link).
     roster_link: std::sync::Arc<crate::supervisor_link::SupervisorLink>,
     worker_token: String,
+    /// The monotonic roster-delta counter shared with the command arms (one
+    /// counter per worker session, so the supervisor's stale-delta gate
+    /// sees a total order over this worker's pushes).
+    roster_delta_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl TurnRunner {
@@ -5048,6 +5061,7 @@ impl TurnRunner {
             &self.engine,
             &self.roster_link,
             &self.worker_token,
+            &self.roster_delta_sequence,
         );
     }
 
@@ -5753,11 +5767,20 @@ fn active_lifecycle(runtime_kind: &str, messageless: bool, busy: bool) -> &'stat
 /// supervisor's roster refresh still backstops every push, so this stays
 /// fire-and-forget: a dead link reconnects on the next push, and a
 /// supervisor restart re-seeds the entry from registration.
+///
+/// The TS worker flushes its roster deltas over ONE ordered supervisor
+/// client socket (a coalesced window re-reads the current state), so a
+/// delayed older frame can never overwrite a newer one. The Rust
+/// supervisor link dials an independent socket per request — the pushes
+/// arrive unordered — so every delta carries the worker's monotonic
+/// counter and the supervisor's stale-delta gate drops the delayed older
+/// snapshots.
 fn push_roster_delta(
     core: &Arc<Mutex<SessionCore>>,
     engine: &std::sync::Arc<dyn SessionEngine>,
     roster_link: &std::sync::Arc<crate::supervisor_link::SupervisorLink>,
     worker_token: &str,
+    sequence: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     if std::env::var_os("PA_WORKER_DISABLE_ROSTER_PUSH").is_some() {
         return;
@@ -5779,11 +5802,13 @@ fn push_roster_delta(
     let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
     let link = std::sync::Arc::clone(roster_link);
     let worker_token = worker_token.to_string();
+    let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     tokio::spawn(async move {
         let command = serde_json::json!({
             "type": "worker_roster_delta",
             "workerToken": worker_token,
             "summary": summary,
+            "sequence": sequence,
         });
         let _ = link
             .request(command, std::time::Duration::from_secs(10))

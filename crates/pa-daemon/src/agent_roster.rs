@@ -20,6 +20,12 @@ pub(crate) struct AgentRoster {
     entries: HashMap<String, AgentRosterEntry>,
     agent_id_by_active_session_id: HashMap<String, String>,
     agent_id_by_session_file: HashMap<String, String>,
+    /// The newest roster-delta sequence applied per worker: the Rust
+    /// supervisor link dials one socket per request, so deltas arrive
+    /// unordered and the gate drops a delayed older snapshot instead of
+    /// letting it overwrite a newer one. The TS worker never needs this —
+    /// its roster deltas ride one ordered supervisor client socket.
+    delta_sequences: HashMap<String, u64>,
 }
 
 impl AgentRoster {
@@ -28,7 +34,35 @@ impl AgentRoster {
             entries: HashMap::new(),
             agent_id_by_active_session_id: HashMap::new(),
             agent_id_by_session_file: HashMap::new(),
+            delta_sequences: HashMap::new(),
         }
+    }
+
+    /// The stale-delta gate for one worker's `worker_roster_delta`: a
+    /// sequence below or equal to the newest applied one is stale (a
+    /// newer delta already reached the store) and must not write. `0`
+    /// means unsequenced (the caller did not stamp one) and always
+    /// applies — the registration and create refreshes are authoritative
+    /// pulls, not deltas.
+    pub(crate) fn accept_delta_sequence(&mut self, worker_id: &str, sequence: u64) -> bool {
+        if sequence == 0 {
+            return true;
+        }
+        match self.delta_sequences.get(worker_id) {
+            Some(applied) if sequence <= *applied => false,
+            _ => {
+                self.delta_sequences.insert(worker_id.to_string(), sequence);
+                true
+            }
+        }
+    }
+
+    /// Forget one worker's delta sequence: the stop path keeps the map
+    /// bounded, and a (re-)registration resets the gate so a replacement
+    /// process reusing the resident worker id starts its fresh counter
+    /// from an empty gate.
+    pub(crate) fn forget_worker_sequences(&mut self, worker_id: &str) {
+        self.delta_sequences.remove(worker_id);
     }
 
     /// Classify and store one entry from a worker's slim summary. Returns
@@ -341,5 +375,28 @@ mod tests {
         let w1 = roster.entries_for_worker("w1");
         assert_eq!(w1.len(), 1);
         assert_eq!(w1[0].agent_id, "s1");
+    }
+
+    #[test]
+    fn delta_sequence_gate_drops_stale_snapshots() {
+        let roster = locked();
+        let mut roster = roster.lock().unwrap();
+        // In order: applied.
+        assert!(roster.accept_delta_sequence("w1", 1));
+        assert!(roster.accept_delta_sequence("w1", 2));
+        // A delayed older snapshot (delivered after a newer one) is stale:
+        // equal or lower sequences never overwrite the newer state.
+        assert!(!roster.accept_delta_sequence("w1", 1));
+        assert!(!roster.accept_delta_sequence("w1", 2));
+        // The gate is per worker — another worker's counter is independent.
+        assert!(roster.accept_delta_sequence("w2", 1));
+        // Unsequenced (0 / absent) always applies: the registration and
+        // create refreshes are authoritative pulls, not deltas.
+        assert!(roster.accept_delta_sequence("w1", 0));
+        // Forgetting the worker resets its gate: the stop cleanup keeps
+        // the map bounded, and a replacement process that reuses the
+        // resident worker id starts its fresh counter from an empty gate.
+        roster.forget_worker_sequences("w1");
+        assert!(roster.accept_delta_sequence("w1", 1));
     }
 }

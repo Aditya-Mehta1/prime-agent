@@ -2312,6 +2312,7 @@ impl Supervisor {
                 worker_token,
                 summary,
                 removed,
+                sequence,
                 ..
             } => {
                 let response = self
@@ -2321,6 +2322,7 @@ impl Supervisor {
                         worker_token,
                         summary.clone(),
                         removed.clone().unwrap_or_default(),
+                        *sequence,
                     )
                     .await;
                 (vec![response_line(&response)], false)
@@ -3254,6 +3256,14 @@ impl Supervisor {
             }
         };
         let record = self.registry.record_registration(registration).await;
+        // The (re-)registration resets the worker's roster-delta sequence
+        // gate: a replacement process reuses the resident worker id but
+        // starts its monotonic counter over, so the supervisor must not
+        // keep comparing its deltas against the predecessor's sequence.
+        {
+            let mut roster = self.roster.lock().unwrap();
+            roster.forget_worker_sequences(&resident.worker_id);
+        }
         // A restore pass that owns this session's roster row can settle it
         // now (spec §10.4): the live worker serves the row's waiters
         // without queueing behind the rest of the recovery. Covers the
