@@ -128,6 +128,12 @@ pub struct Supervisor {
     /// holding a superseded id resolves to the session's current
     /// resident instead of `Unknown active session`.
     pub(crate) session_bindings: crate::session_bindings::SessionBindingTable,
+    /// Per-session-file single-flight for opens (TS `openingWorkers`):
+    /// one open at a time per file, so a concurrent create reuses (or
+    /// waits out) the first one's worker instead of launching over it
+    /// and losing the runtime session lease. Owned by the create-reuse
+    /// seam (`create_reuse.rs`).
+    pub(crate) opening_files: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Daemon-lifecycle telemetry (`daemon event` schema v1), resolved at
     /// run start (None = opted out); never blocks supervision paths.
     telemetry: std::sync::Mutex<Option<pa_telemetry::TelemetryClient>>,
@@ -247,6 +253,7 @@ impl Supervisor {
             options,
             descriptor_dir,
             session_bindings: crate::session_bindings::SessionBindingTable::new(),
+            opening_files: std::sync::Mutex::new(HashMap::new()),
             telemetry: std::sync::Mutex::new(None),
             registry: SessionRegistry::new(),
             events,
@@ -3729,6 +3736,11 @@ impl Supervisor {
         {
             self.assert_session_name_available(name).await?;
         }
+        // The per-file open single-flight (TS `openingWorkers`): one
+        // create at a time per session file. A concurrent open waits
+        // behind this one and then reuses the worker it launched — both
+        // reaching the launch would race the runtime session lease.
+        let _opening_guard = self.opening_guard(command).await?;
         // TS `createOrReuseWorker`'s reuse seam: an open of a session file
         // a live worker already serves answers the LIVE binding (the
         // client attaches next) instead of launching a second worker over
@@ -3741,6 +3753,10 @@ impl Supervisor {
             return Ok(summary);
         }
         let (resident, create_summary) = self.launch_worker(command, Some(client_id)).await?;
+        // The launch registered its worker (the registry insert precedes
+        // the spawn): the single-flight releases here so a concurrent
+        // open's classification finds the freshly-launched resident.
+        drop(_opening_guard);
         // Spawn admission is the moment the supervisor knows the child's
         // edge firsthand. The ledger is the only topology store, so the
         // append's outcome is load-bearing: admission fails if the spawn

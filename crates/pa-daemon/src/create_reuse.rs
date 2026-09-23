@@ -26,6 +26,7 @@
 //! and the `session_binding` events re-attach the superseded clients
 //! (the #2575 rebind seams; unchanged here).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +49,11 @@ const SETTLED_WAIT_ROUNDS: usize = 2;
 const STOP_SETTLE_WAIT: Duration = Duration::from_secs(10);
 /// The stop-settle poll cadence.
 const STOP_SETTLE_POLL: Duration = Duration::from_millis(50);
+/// How long a concurrent open waits for the per-file single-flight
+/// before it answers the `worker is starting` shape (a sibling's whole
+/// launch — spawn, connect, create replay — holds the lock; the wait
+/// must cover it without parking a wedged client forever).
+const OPENING_LOCK_WAIT: Duration = Duration::from_secs(120);
 
 /// What reusing one resident answered: the live binding's summary, or a
 /// holder whose teardown frees the file (the caller settles it and
@@ -69,6 +75,15 @@ struct ReuseCandidates {
     stopping: Option<Arc<ResidentWorker>>,
 }
 
+/// The single-flight key for one session file (the registry's
+/// comparison rule: canonicalize when the path exists, keep the raw path
+/// otherwise — the file exists by construction here).
+fn canonical_opening_key(path: &Path) -> String {
+    path.canonicalize()
+        .map(|canonical| canonical.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
 /// Whether one resident's process is provably gone. A pid the platform
 /// cannot answer for counts as alive, like the lease's stale-owner rule:
 /// launching under an unverifiable-but-alive holder would surface the
@@ -81,42 +96,89 @@ async fn resident_process_alive(resident: &Arc<ResidentWorker>) -> bool {
     crate::lease::is_process_alive(pid as u32).unwrap_or(true)
 }
 
+/// The create's target session file, resolved once for the whole open:
+/// the single-flight key and the reuse lookup share one resolution.
+/// `Ok(None)` for every create that does not address an existing file (a
+/// no-session create, a `continueRecent` create — the TS session manager
+/// resolves those worker-side — or a path the worker will create).
+fn create_target_file(command: &DaemonCommand) -> Result<Option<PathBuf>> {
+    let DaemonCommand::Create {
+        session_path,
+        no_session,
+        ..
+    } = command
+    else {
+        return Ok(None);
+    };
+    if *no_session == Some(true) {
+        return Ok(None);
+    }
+    let Some(raw_path) = session_path.as_deref() else {
+        return Ok(None);
+    };
+    let path = crate::paths::expand_tilde(raw_path)?;
+    Ok(path.exists().then_some(path))
+}
+
 impl Supervisor {
-    /// TS `createOrReuseWorker`'s reuse half: resolve the create's
-    /// session file, and when a resident already serves it, answer the
-    /// LIVE binding (the resident's root summary — the exact create
-    /// response shape the client's attach consumes) instead of launching.
-    /// `Ok(None)` keeps the launch path (a fresh file, no live resident,
-    /// a no-session create, or a holder whose teardown freed the file).
+    /// The per-file open single-flight (TS `openingWorkers`'s join): one
+    /// create at a time per session file. A concurrent open waits here,
+    /// then its reuse classification finds the first open's freshly
+    /// registered worker and attaches — instead of both reaching the
+    /// launch and one losing the runtime session lease. `Ok(None)` for
+    /// creates that address no existing file (nothing to coordinate).
+    pub(crate) async fn opening_guard(
+        &self,
+        command: &DaemonCommand,
+    ) -> Result<Option<tokio::sync::MutexGuard<'static, ()>>> {
+        let Some(path) = create_target_file(command)? else {
+            return Ok(None);
+        };
+        let key = canonical_opening_key(&path);
+        let lock = {
+            let mut map = self
+                .opening_files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        // A sibling open holds the lock for its whole launch (spawn,
+        // connect, create replay); the wait is bounded so a wedged sibling
+        // answers the TS `worker is starting` shape instead of parking
+        // the client forever.
+        match tokio::time::timeout(OPENING_LOCK_WAIT, lock.lock_owned()).await {
+            Ok(guard) => Ok(Some(guard)),
+            Err(_) => Err(anyhow!(
+                "Session \"{}\" worker is starting",
+                path.to_string_lossy()
+            )),
+        }
+    }
+
+    /// TS `createOrReuseWorker`'s reuse half: when a resident already
+    /// serves the create's session file, answer the LIVE binding (the
+    /// resident's root summary — the exact create response shape the
+    /// client's attach consumes) instead of launching a second worker
+    /// over the same file (a launch the runtime session lease would
+    /// reject). `Ok(None)` keeps the launch path (a fresh file, no live
+    /// resident, or a holder whose teardown freed the file).
+    ///
+    /// The caller holds the per-file opening lock across this seam and
+    /// the launch, so the classification a concurrent open runs is
+    /// serialized behind the first one's launch — never racing it.
     pub(crate) async fn reuse_live_worker_for_create(
         self: &Arc<Self>,
         command: &DaemonCommand,
         client_id: &str,
     ) -> Result<Option<Value>> {
-        let DaemonCommand::Create {
-            session_path,
-            no_session,
-            lifecycle,
-            ..
-        } = command
-        else {
+        let DaemonCommand::Create { lifecycle, .. } = command else {
             return Ok(None);
         };
-        if *no_session == Some(true) {
-            return Ok(None);
-        }
-        let Some(raw_path) = session_path.as_deref() else {
-            // A `continueRecent` create resolves its file worker-side (the
-            // TS session-manager seam); the supervisor never learns the
-            // path, so it cannot resolve a resident for it either.
+        let Some(path) = create_target_file(command)? else {
             return Ok(None);
         };
-        let path = crate::paths::expand_tilde(raw_path)?;
-        if !path.exists() {
-            // The worker create makes the file: nothing has been bound to
-            // a path that does not exist yet.
-            return Ok(None);
-        }
         let path_text = path.to_string_lossy().to_string();
 
         // A settled teardown can hand the file straight to a concurrent
@@ -139,8 +201,12 @@ impl Supervisor {
                 }
             }
 
-            // The live binding answers first: a ready resident is the
-            // session's current worker, and the open is an attach to it.
+            // The live binding answers first: a route-ready resident is
+            // the session's current worker, and the open is an attach to
+            // it. A resident whose replacement is still coming (crash
+            // backoff, create replay) is waited out inside the create's
+            // route budget — the same replacement-aware wait every
+            // client-facing route applies — then reused the same way.
             for class in [&candidates.ready, &candidates.waitable] {
                 let Some(resident) = class else {
                     continue;
@@ -153,8 +219,21 @@ impl Supervisor {
                 match self.reuse_summary_or_holder(resident, &path_text).await? {
                     ReuseAnswer::Summary(summary) => return Ok(Some(summary)),
                     // The routed resident went away with no successor:
-                    // its teardown settles below, then the re-check runs.
-                    ReuseAnswer::HolderGone => break,
+                    // its own teardown must settle (the registry row can
+                    // leave while its process still holds the lease),
+                    // then the fresh classification re-checks the file —
+                    // including any waitable successor this snapshot
+                    // already listed.
+                    ReuseAnswer::HolderGone => {
+                        settled_waits += 1;
+                        if settled_waits > SETTLED_WAIT_ROUNDS {
+                            bail!(
+                                "Session \"{path_text}\" worker is {}",
+                                self.effective_reuse_state(resident).await
+                            );
+                        }
+                        self.await_holder_gone(resident, &path_text).await?;
+                    }
                 }
             }
 
@@ -183,8 +262,8 @@ impl Supervisor {
     /// binding's root state. The route is replacement-aware, so an open
     /// landing mid-replay attaches once the replacement's create replay
     /// completed. A worker that goes away with no successor answers
-    /// [`ReuseAnswer::HolderGone`] (its teardown frees the file); the
-    /// never-ready worker answers the TS `worker is {state}` shape.
+    /// [`ReuseAnswer::HolderGone`] (its teardown settles at the caller);
+    /// the never-ready worker answers the TS `worker is {state}` shape.
     async fn reuse_summary_or_holder(
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
@@ -206,10 +285,10 @@ impl Supervisor {
             }
             // The worker retired with no successor in flight. Its registry
             // row may already be gone while its process still holds the
-            // lease, so the launch waits for the confirmed death — the
-            // caller re-checks the file's residents once the holder is
-            // gone and attaches to any successor a concurrent opener
-            // launched meanwhile.
+            // lease, so the caller waits for the confirmed death and
+            // re-checks the file's residents — attaching to any successor
+            // that took it meanwhile instead of launching over a live
+            // lease holder.
             Err(error) if error.to_string() == WORKER_NOT_CONNECTED => Ok(ReuseAnswer::HolderGone),
             Err(_) => {
                 let state = self.effective_reuse_state(resident).await;
