@@ -142,9 +142,16 @@ pub struct Supervisor {
     /// rename of the same name fails the second caller.
     pub(crate) pending_session_names: std::sync::Mutex<std::collections::HashSet<String>>,
     shutting_down: AtomicBool,
-    /// Wakes the accept loop when [`Supervisor::begin_shutdown`] sets the
-    /// flag: a listening socket blocks in `accept` until a client connects,
-    /// so the shutdown must interrupt it for the process to exit.
+    /// The accept loop's exit flag. `shutting_down` refuses new work the
+    /// moment a terminal stop begins, but the loop itself must stay up
+    /// until [`Supervisor::begin_shutdown`] has stopped every resident
+    /// worker: an inbound connection must not fall it out mid-stop and
+    /// orphan the workers that pass is still shutting down.
+    accept_exit: AtomicBool,
+    /// Wakes the accept loop when [`Supervisor::begin_shutdown`] sets
+    /// [`Self::accept_exit`]: a listening socket blocks in `accept` until
+    /// a client connects, so the completed shutdown must interrupt it for
+    /// the process to exit.
     shutdown_notify: tokio::sync::Notify,
     log: paths::RotatingLog,
     /// Memoized ledger over the default sessions dir (ledgers are per
@@ -253,6 +260,7 @@ impl Supervisor {
             roster: std::sync::Mutex::new(crate::agent_roster::AgentRoster::new()),
             pending_session_names: std::sync::Mutex::new(std::collections::HashSet::new()),
             shutting_down: AtomicBool::new(false),
+            accept_exit: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
             log,
             rlm_ledger: tokio::sync::Mutex::new(None),
@@ -591,7 +599,7 @@ impl Supervisor {
             });
         }
 
-        while !self.shutting_down.load(Ordering::SeqCst) {
+        while !self.accept_exit.load(Ordering::SeqCst) {
             let stream = tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok(accepted) => accepted,
@@ -3145,6 +3153,7 @@ impl Supervisor {
     /// descriptors for a terminal stop.
     fn exit_for_update(self: &Arc<Self>) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.accept_exit.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_one();
     }
 
@@ -4386,8 +4395,10 @@ impl Supervisor {
             let _ = std::fs::remove_file(&resident.descriptor_path);
         }
         self.registry.clear().await;
-        // Wake the accept loop only after the workers stopped, so the process
-        // cannot exit mid-stop and orphan a live worker.
+        // The workers are all stopped now, so the accept loop may exit;
+        // setting the gate alone is not enough — an inbound connection
+        // could otherwise fall the loop out mid-stop.
+        self.accept_exit.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_one();
     }
 }
@@ -4833,6 +4844,29 @@ mod tests {
             refused.to_string(),
             "Supervisor is shutting down",
             "the refusal error: {refused:#}"
+        );
+    }
+
+    /// The shutdown gate and the accept loop's exit flag are separate: the
+    /// gate refuses creates the moment a terminal stop begins, but the
+    /// loop must stay up until begin_shutdown finishes stopping the workers.
+    #[tokio::test]
+    async fn begin_shutdown_sets_the_accept_exit_after_the_stop_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir: dir.path().join("agent"),
+        };
+        let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+        supervisor.shutting_down.store(true, Ordering::SeqCst);
+        assert!(
+            !supervisor.accept_exit.load(Ordering::SeqCst),
+            "the gate alone must not exit the accept loop"
+        );
+        supervisor.begin_shutdown().await;
+        assert!(
+            supervisor.accept_exit.load(Ordering::SeqCst),
+            "the completed stop pass must exit the accept loop"
         );
     }
 }
