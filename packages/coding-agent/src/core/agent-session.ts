@@ -1162,6 +1162,8 @@ const IMAGE_TURN_CHILD_MAX_IMAGES = 8;
 const IMAGE_TURN_CHILD_MAX_IMAGE_BYTES = 8_000_000;
 const IMAGE_TURN_CHILD_MAX_TOTAL_BYTES = 24_000_000;
 const IMAGE_TURN_CHILD_TIMEOUT_MS = 180_000;
+/** Cap on the question the attach-image skill sends with a delegated read. */
+const VISION_READ_QUESTION_MAX_CHARS = 2000;
 const IMAGE_TURN_READING_MAX_CHARS = 4000;
 /** Types the image readers accept; anything else is left for the routing path. */
 const IMAGE_TURN_CHILD_MIME_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
@@ -2849,7 +2851,10 @@ export class AgentSession {
 			// Every image failed the caps: refuse here instead of returning the
 			// originals, which would reach a provider (or the in-place routed turn,
 			// re-sending the whole transcript) after the allowlist rejected them.
-			return `[no image read: all ${images.length} attached image(s) were rejected by the image-turn limits (unsupported type, over 8 MB each, or over 24 MB total)]`;
+			return {
+				reading: `[no image read: all ${images.length} attached image(s) were rejected by the image-turn limits (unsupported type, over 8 MB each, or over 24 MB total)]`,
+				reference,
+			};
 		}
 
 		const dir = mkdtempSync(join(tmpdir(), "prime-agent-image-turn-"));
@@ -11314,7 +11319,12 @@ export class AgentSession {
 				if (images.length === 0) {
 					return { error: "vision.read needs at least one image" };
 				}
-				const question = typeof payload.question === "string" ? payload.question : "";
+				// A malformed entry is dropped by the parser; report it rather than
+				// reading fewer images than the caller asked for.
+				const sentImages = Array.isArray(payload.images) ? payload.images.length : images.length;
+				const droppedImages = Math.max(0, sentImages - images.length);
+				const question =
+					typeof payload.question === "string" ? payload.question.slice(0, VISION_READ_QUESTION_MAX_CHARS) : "";
 				try {
 					const reading = await this._readImagesWithVisionChild(question, images);
 					if (!reading) {
@@ -11325,7 +11335,11 @@ export class AgentSession {
 							),
 						};
 					}
-					return { text: reading.reading, model: reading.reference };
+					const ignored =
+						droppedImages > 0
+							? `\n[${droppedImages} malformed image entr${droppedImages === 1 ? "y" : "ies"} in the request were ignored]`
+							: "";
+					return { text: `${reading.reading}${ignored}`, model: reading.reference };
 				} catch (error) {
 					return { error: error instanceof Error ? error.message : String(error) };
 				}

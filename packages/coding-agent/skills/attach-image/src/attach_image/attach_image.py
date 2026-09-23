@@ -204,6 +204,14 @@ def _emit_attachment(filepath: Path, mime_type: str, size: int, dimensions: tupl
     return resize_note
 
 
+# Focused question for a delegated read: the caller asked to see the image, not
+# for one specific answer, so the child reports what the image shows.
+_DELEGATION_QUESTION = (
+    "Describe what this image shows and transcribe any text it contains, "
+    "including the details that matter for the task it was attached to."
+)
+
+
 async def _delegate_to_image_model(
     validated: list[tuple[Path, str, int, tuple[int, int]]],
 ) -> str | None:
@@ -217,28 +225,43 @@ async def _delegate_to_image_model(
     from rlm import host_request
 
     images = []
+    unavailable = []
     for filepath, mime, size, dimensions in validated:
         try:
             data_b64, emitted_mime, _note = _resize_image(filepath, mime, size, dimensions)
-        except ValueError:
+        except ValueError as error:
+            # Encoded size is the only reason _resize_image gives up, so the image
+            # cannot be sent: say so instead of dropping it silently.
+            unavailable.append(f"{filepath} ({error})")
             continue
         images.append({"mime_type": emitted_mime, "data": data_b64})
     if not images:
+        if unavailable:
+            raise ValueError("no image could be prepared for the image model: " + "; ".join(unavailable))
         return None
 
     try:
-        result = await host_request("vision.read", {"images": images})
+        result = await host_request(
+            "vision.read",
+            {"images": images, "question": _DELEGATION_QUESTION},
+        )
     except Exception:
         # A host without the delegation request (or one that fails it) leaves the
         # caller with the actionable "switch to a vision-capable model" error.
         return None
     if not isinstance(result, dict):
         return None
+    error = result.get("error")
+    if isinstance(error, str) and error.strip():
+        # The host refused with the actionable message (no usable image model, or
+        # an unusable one): surface it instead of the generic capability error.
+        raise RuntimeError(error.strip())
     text = result.get("text")
     if not isinstance(text, str) or not text.strip():
         return None
     reader = result.get("model") or "the image model"
-    return f"{text.strip()}\n\n(Read by {reader}; the session model cannot see images.)"
+    skipped = "\n(skipped, could not be prepared: " + "; ".join(unavailable) + ")" if unavailable else ""
+    return f"{text.strip()}\n\n(Read by {reader}; the session model cannot see images.){skipped}"
 
 
 async def run(*paths: str) -> str:

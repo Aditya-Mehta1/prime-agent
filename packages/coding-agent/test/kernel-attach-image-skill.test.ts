@@ -458,11 +458,15 @@ describe("attach-image delegation to the session image model", () => {
 				>;
 			}
 		)._createKernelHostHandlers();
+		const requests: Array<Record<string, unknown>> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
 			hostHandlers: {
 				"model.info": handlers["model.info"]!,
-				"vision.read": handlers["vision.read"]!,
+				"vision.read": async (payload) => {
+					requests.push(payload);
+					return handlers["vision.read"]!(payload);
+				},
 			},
 		});
 
@@ -477,5 +481,35 @@ describe("attach-image delegation to the session image model", () => {
 		expect(result.attachments).toBeUndefined();
 		expect(spawns).toHaveLength(1);
 		expect(spawns[0]?.kwargs).toEqual({ model: "anthropic/claude-haiku-4-5" });
+		// The delegated read carries a focused question, not just bytes.
+		expect(requests).toHaveLength(1);
+		expect(String(requests[0]?.question ?? "")).toContain("Describe what this image shows");
+	});
+
+	it("surfaces the host's actionable refusal instead of the generic capability error", async () => {
+		const imagePath = join(tempDir, "sample.png");
+		writeFileSync(imagePath, Buffer.from(PNG_BASE64, "base64"));
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "openai/gpt-oss-120b", input: ["text"] }),
+				"vision.read": async () => ({
+					error: "This turn attaches images, but the selected model (openai/gpt-oss-120b) does not accept image input.\n\nPick one:\n- Switch the session model with /model, or\n- Set an image model with /image-model <model>, or imageModel in settings.json",
+				}),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+try:
+    await attach_image(${JSON.stringify(imagePath)})
+except RuntimeError as error:
+    print(f"RuntimeError: {error}")
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("/image-model <model>");
+		expect(result.stdout).not.toContain("does not support vision");
+		expect(result.attachments).toBeUndefined();
 	});
 });
