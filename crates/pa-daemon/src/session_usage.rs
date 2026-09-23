@@ -82,6 +82,16 @@ impl AssistantUsageById {
     }
 }
 
+/// The fold's two billable totals (TS PR #2506's `usageTotal`
+/// projection): `own` subtracts every attributed child block (the child's
+/// own row carries it), `total` keeps the child spend (the session-tree
+/// spend including settled children).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionUsageTotals {
+    pub own: Usage,
+    pub total: Usage,
+}
+
 /// The streaming whole-file own-usage accumulator: feed one entry at a
 /// time in file order, then read [`summary`](Self::summary). Line order is
 /// the fold's authority — an attribution folds only when its target is
@@ -136,17 +146,25 @@ impl UsageScan {
         }
     }
 
-    /// TS `snapshotSessionInfo`'s total: the assistant aggregates plus the
-    /// summarization calls, minus every attributed child block (clamped
-    /// at zero to absorb attribution drift).
-    pub fn summary(&self) -> Option<SessionUsageSummary> {
+    /// The totals behind [`summary`](Self::summary): `own` subtracts the
+    /// attributed child spend, `total` keeps it (the deletion capture reads
+    /// both from the child's frozen file).
+    pub fn totals(&self) -> SessionUsageTotals {
         let mut total = Usage::default();
         for (_, usage) in &self.assistant_usage_by_id.entries {
             add_assistant_usage(&mut total, usage);
         }
         add_assistant_usage(&mut total, &self.summarization_usage);
-        subtract_assistant_usage(&mut total, &self.attributed_child_usage);
-        session_usage_summary_from(&total)
+        let mut own = total;
+        subtract_assistant_usage(&mut own, &self.attributed_child_usage);
+        SessionUsageTotals { own, total }
+    }
+
+    /// TS `snapshotSessionInfo`'s total: the assistant aggregates plus the
+    /// summarization calls, minus every attributed child block (clamped
+    /// at zero to absorb attribution drift).
+    pub fn summary(&self) -> Option<SessionUsageSummary> {
+        session_usage_summary_from(&self.totals().own)
     }
 }
 
@@ -202,11 +220,9 @@ impl ScanEntry {
     }
 }
 
-/// Whole-file own usage ([`UsageScan`] over every parsable line): the
-/// worker's live own-usage summary reads this, so live rows and saved rows
-/// never disagree. Invalid lines contribute nothing, exactly like the
-/// listing scan.
-pub fn read_own_usage_summary(path: &Path) -> Option<SessionUsageSummary> {
+/// Whole-file scan over every parsable line: invalid lines contribute
+/// nothing, exactly like the listing scan.
+fn scan_file(path: &Path) -> Option<UsageScan> {
     let file = fs::File::open(path).ok()?;
     let mut scan = UsageScan::default();
     let mut reader = BufReader::new(file);
@@ -225,7 +241,21 @@ pub fn read_own_usage_summary(path: &Path) -> Option<SessionUsageSummary> {
         };
         entry.fold_into(&mut scan);
     }
-    scan.summary()
+    Some(scan)
+}
+
+/// Whole-file own usage (the saved-row summary): the worker's live
+/// own-usage summary reads this, so live rows and saved rows never
+/// disagree.
+pub fn read_own_usage_summary(path: &Path) -> Option<SessionUsageSummary> {
+    scan_file(path).and_then(|scan| scan.summary())
+}
+
+/// Whole-file own + total usage (the deletion capture reads both from the
+/// child's frozen file: `own` for the child's own row, `total` for the
+/// spend the parent's attribution carries).
+pub fn read_session_usage(path: &Path) -> Option<SessionUsageTotals> {
+    scan_file(path).map(|scan| scan.totals())
 }
 
 #[cfg(test)]
