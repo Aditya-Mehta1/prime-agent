@@ -1357,20 +1357,18 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		// A steer carrying images waits for the image-turn child read, like the
-		// prompt path, so it takes the long-running budget instead of the default:
-		// a client-side timeout would report a failure for a message the daemon
-		// queued anyway.
+		// Only an image-carrying steer waits on an image read; a plain steer keeps
+		// the default transport timeout, so an unresponsive daemon still fails fast.
 		await this.requestData<unknown>(
 			{ type: "steer", activeSessionId: this.activeSessionId, message, images },
-			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+			images?.length ? DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS : undefined,
 		);
 	}
 
 	async followUp(message: string, images?: ImageContent[]): Promise<void> {
 		await this.requestData<unknown>(
 			{ type: "follow_up", activeSessionId: this.activeSessionId, message, images },
-			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+			images?.length ? DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS : undefined,
 		);
 	}
 
