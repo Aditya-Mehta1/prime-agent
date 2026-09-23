@@ -973,7 +973,17 @@ impl AgentView {
         overlay.push(Vec::new());
         overlay.extend(state.render(theme, input_width));
         overlay.push(Vec::new());
-        for line in overlay {
+        for mut line in overlay {
+            // The shared menu rows pad to the full input width with
+            // unstyled spans, so the remaining-width fill below never
+            // lands: the popup background must ride on every span the
+            // row left unstyled (the selected row's selection band
+            // carries its own background and is kept).
+            for span in &mut line {
+                if span.style.bg.is_none() {
+                    span.style = span.style.patch(bg);
+                }
+            }
             let used: usize = line.iter().map(|s| str_width(&s.content)).sum();
             let mut row: Line = vec![Span::styled(" ".repeat(padding_x + prompt_width), bg)];
             row.extend(line);
@@ -1639,6 +1649,28 @@ mod tests {
         assert!(
             joined.contains("!!  echo quiet"),
             "the !! prompt hides its typed prefix:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn autocomplete_dropdown_rows_carry_the_popup_background() {
+        // The dropdown floats on the ToolPanelBg overlay above the editor:
+        // every span of a menu row (the shared menu_panel rows pad to the
+        // full input width with unstyled spans) must carry a background,
+        // so an unselected row does not blend into the transcript behind.
+        let mut v = view();
+        v.editor.handle_input("/");
+        v.editor.handle_input("m");
+        v.editor.materialize_autocomplete();
+        assert!(v.editor.is_showing_autocomplete(), "the dropdown opens");
+        let frame = v.render_dock(80);
+        let marker_row = frame
+            .iter()
+            .find(|line| text_of(line).contains("\u{203a}"))
+            .expect("the dropdown renders its marker row");
+        assert!(
+            marker_row.iter().all(|span| span.style.bg.is_some()),
+            "dropdown row spans the popup background: {marker_row:?}"
         );
     }
 

@@ -22,15 +22,20 @@ impl Editor {
     /// the command name plus the typed partial. Tab interception uses this
     /// to open a picker-command's menu filtered to the partial.
     pub fn picker_argument_context(&self) -> Option<(String, String)> {
-        match self.current_slash_command_context() {
-            Some(context)
-                if context.kind == crate::autocomplete::SlashKind::Argument
-                    && context.at_prompt_start =>
-            {
-                context.command_name.map(|name| (name, context.prefix))
-            }
-            _ => None,
+        let context = self.current_slash_command_context()?;
+        if context.kind != crate::autocomplete::SlashKind::Argument || !context.at_prompt_start {
+            return None;
         }
+        // The context only reports text up to the cursor, so a cursor
+        // inside the argument (`/model g|p`) would filter the picker on
+        // the head and leave the tail behind on accept. Only intercept
+        // when the cursor sits at the argument's end.
+        let line: Vec<char> = self.lines[self.cursor_line].chars().collect();
+        let remainder = &line[self.cursor_col.min(line.len())..];
+        if remainder.iter().any(|c| !c.is_whitespace()) {
+            return None;
+        }
+        context.command_name.map(|name| (name, context.prefix))
     }
 
     pub(crate) fn is_slash_name_completion_at_prompt_start(&self) -> bool {
@@ -209,11 +214,15 @@ impl Editor {
         let has_ctx =
             self.current_slash_command_context().is_some() || ends_with_symbol_token(&before);
 
+        // An edit that empties the prompt cancels both the open menu and
+        // the parked request (a parked request can exist without an open
+        // menu; if it survived, it would materialize a dropdown on an
+        // empty prompt).
+        if self.get_text().trim().is_empty() {
+            self.cancel_autocomplete();
+            return;
+        }
         if self.autocomplete.is_some() {
-            if self.get_text().trim().is_empty() {
-                self.cancel_autocomplete();
-                return;
-            }
             let force = self
                 .autocomplete
                 .as_ref()

@@ -679,6 +679,52 @@ mod tests {
     }
 
     #[test]
+    fn deleting_to_an_empty_prompt_clears_the_parked_request() {
+        // `./` + Tab parks a forced completion request (no menu until the
+        // queue drains). Deleting back to the empty prompt must cancel the
+        // parked request too, not just the open menu: otherwise the parked
+        // request materializes the whole-cwd dropdown on an empty prompt.
+        let mut e = ed();
+        e.handle_input(".");
+        e.handle_input("/");
+        e.handle_input("tab");
+        assert!(e.pending_autocomplete.is_some(), "the request parks");
+        e.handle_input("backspace");
+        e.handle_input("backspace");
+        assert_eq!(e.get_text(), "");
+        assert!(
+            e.pending_autocomplete.is_none(),
+            "the parked request cancels"
+        );
+        e.materialize_autocomplete();
+        assert!(
+            e.autocomplete_state().is_none(),
+            "no dropdown materializes on the emptied prompt"
+        );
+    }
+
+    #[test]
+    fn picker_argument_context_requires_the_cursor_at_the_argument_end() {
+        // A cursor inside the argument would filter the picker on the head
+        // and drop the tail on accept, so the Tab interception only fires
+        // when the cursor sits at the argument's end.
+        let mut e = ed();
+        e.set_text("/model gp");
+        assert_eq!(
+            e.picker_argument_context(),
+            Some(("model".to_string(), "gp".to_string()))
+        );
+        e.handle_input("left");
+        assert_eq!(e.picker_argument_context(), None);
+        // Whitespace after the cursor still counts as the argument end.
+        e.set_text("/mcp lin ");
+        assert_eq!(
+            e.picker_argument_context(),
+            Some(("mcp".to_string(), "lin ".to_string()))
+        );
+    }
+
+    #[test]
     fn tab_on_an_empty_prompt_is_a_noop() {
         // Tab on an empty prompt must not open a completion menu: the
         // forced pass would list the whole cwd (junk entries like a

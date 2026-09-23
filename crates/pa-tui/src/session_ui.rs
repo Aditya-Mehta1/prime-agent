@@ -5044,12 +5044,13 @@ impl SessionUi {
     /// (raw-mode off, alternate screen left) so the auth flow can prompt.
     /// `args` is the auth-args form (the `/mcp` view's internal
     /// resolution, e.g. `login <name>`): a login suspends, a paste
-    /// prompts in-band.
+    /// prompts on the plain terminal too (its token prompt reads
+    /// stdin), so both hand the terminal over.
     pub(crate) fn mcp_auth_needs_terminal(&self, args: &str) -> bool {
         if self.client_auth.is_none() {
             return false;
         }
-        matches!(args.split_whitespace().next(), Some("login"))
+        mcp_auth_args_need_terminal(args)
     }
 
     /// `/resume <selector>`: a session file path, an `<id>.jsonl` under the
@@ -8413,6 +8414,13 @@ async fn create_session(
         .ok_or_else(|| anyhow!("the daemon did not report a session id for the new session"))
 }
 
+/// The auth-args subcommands that prompt on the plain terminal: a login
+/// (OAuth/device flow) and a paste (its token prompt reads stdin from the
+/// terminal). Anything else (logout, malformed args) stays in-band.
+fn mcp_auth_args_need_terminal(args: &str) -> bool {
+    matches!(args.split_whitespace().next(), Some("login" | "paste"))
+}
+
 #[cfg(test)]
 mod streaming_tray_hint_tests {
     use super::streaming_tray_hint;
@@ -8636,5 +8644,27 @@ mod loader_token_tests {
         stats.tokens += 100;
         stats.duration_ms += 500;
         assert_eq!(stats.average_rate(), 200.0);
+    }
+}
+
+#[cfg(test)]
+mod mcp_auth_terminal_tests {
+    use super::mcp_auth_args_need_terminal;
+
+    /// The inline paste panel's `paste <server>` prompts for the token on
+    /// the plain terminal (its read of stdin cannot happen under the raw
+    /// renderer), so it needs the same hand-over as a login.
+    #[test]
+    fn login_and_paste_need_the_terminal() {
+        assert!(mcp_auth_args_need_terminal("login anthropic"));
+        assert!(mcp_auth_args_need_terminal("paste anthropic"));
+    }
+
+    /// A logout and a bare/unknown subcommand stay in-band.
+    #[test]
+    fn logout_and_malformed_args_stay_in_band() {
+        assert!(!mcp_auth_args_need_terminal("logout anthropic"));
+        assert!(!mcp_auth_args_need_terminal(""));
+        assert!(!mcp_auth_args_need_terminal("refresh anthropic"));
     }
 }
