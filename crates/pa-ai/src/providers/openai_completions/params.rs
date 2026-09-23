@@ -139,17 +139,17 @@ pub(crate) fn build_params(
                 } else if options.reasoning_enabled == Some(true) {
                     params.insert("reasoning".into(), json!({ "enabled": true }));
                 } else if options.reasoning_enabled == Some(false) {
-                    let off_null = model
-                        .thinking_level_map_value(ModelThinkingLevel::Off)
-                        .map(|value| value.is_none())
-                        .unwrap_or(false);
-                    if !off_null {
+                    let off = model
+                        .thinking_level_map
+                        .as_ref()
+                        .and_then(|map| map.get(&ModelThinkingLevel::Off));
+                    // TS `thinkingLevelMap?.off !== null`: only an explicit
+                    // null suppresses the disable; a missing key or map still
+                    // disables reasoning.
+                    if !off.is_some_and(|value| value.is_none()) {
                         if compat.supports_reasoning_effort {
-                            let off_value = model
-                                .thinking_level_map_value(ModelThinkingLevel::Off)
-                                .flatten()
-                                .cloned()
-                                .unwrap_or_else(|| "none".to_string());
+                            let off_value =
+                                off.flatten().cloned().unwrap_or_else(|| "none".to_string());
                             params.insert("reasoning".into(), json!({ "effort": off_value }));
                         } else {
                             params.insert("reasoning".into(), json!({ "enabled": false }));
@@ -170,9 +170,14 @@ pub(crate) fn build_params(
                 } else if options.reasoning_enabled == Some(false)
                     && compat.supports_reasoning_effort
                 {
-                    let off = model.thinking_level_map_value(ModelThinkingLevel::Off);
-                    let off_null = off.map(|value| value.is_none()).unwrap_or(false);
-                    if !off_null {
+                    let off = model
+                        .thinking_level_map
+                        .as_ref()
+                        .and_then(|map| map.get(&ModelThinkingLevel::Off));
+                    // TS `thinkingLevelMap?.off !== null`: only an explicit
+                    // null suppresses the disable; a missing key or map still
+                    // sends the off value.
+                    if !off.is_some_and(|value| value.is_none()) {
                         let off_value =
                             off.flatten().cloned().unwrap_or_else(|| "none".to_string());
                         params.insert("reasoning_effort".into(), json!(off_value));
