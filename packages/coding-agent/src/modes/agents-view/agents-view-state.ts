@@ -190,14 +190,18 @@ function fileIdentity(path: string): string {
 }
 
 function summaryIdentityAliases(summary: SessionSummary): string[] {
+	// A remote row publishes a peer's own session ids, so scope them to their
+	// host: a local copy of that same session keeps its own row and stays
+	// attachable instead of merging into the row that refuses attachment.
+	const scope = summary.remoteHost ? `remote:${summary.remoteHost}:` : "";
 	return [
 		summary.runtimeKind === "subagent" && summary.rlmChildId
 			? `agent:${cachedRosterAgentIdForSummary(summary)}`
 			: undefined,
 		summary.sessionFile ? fileIdentity(summary.sessionFile) : undefined,
-		`session:${summary.sessionId}`,
-		summary.activeSessionId ? `active:${summary.activeSessionId}` : undefined,
-		`active:${summary.id}`,
+		`${scope}session:${summary.sessionId}`,
+		summary.activeSessionId ? `${scope}active:${summary.activeSessionId}` : undefined,
+		`${scope}active:${summary.id}`,
 	].filter((identity): identity is string => identity !== undefined);
 }
 

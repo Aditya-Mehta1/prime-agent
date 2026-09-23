@@ -1166,6 +1166,28 @@ describe("agents view state", () => {
 		});
 	});
 
+	test("keeps a local saved session off a remote row that publishes the same ids", () => {
+		const sharedId = "01a0cba2-0000-7000-8000-abcdef123456";
+		const remote = makeSummary({
+			id: sharedId,
+			activeSessionId: sharedId,
+			sessionId: sharedId,
+			sessionName: "copied-worker",
+			remoteHost: "peer.tailnet.ts.net",
+		});
+		const saved = makeSessionInfo({ path: "/tmp/sessions/shared.jsonl", id: sharedId, name: "Local copy" });
+
+		const records = reconcileUnifiedSessions([remote], [saved]);
+		const remoteRecord = records.find((record) => record.daemon?.remoteHost !== undefined);
+		const savedRecord = records.find((record) => record.saved !== undefined);
+		// The remote row must not absorb the local file: remote rows refuse attachment.
+		expect(records).toHaveLength(2);
+		expect(remoteRecord?.saved).toBeUndefined();
+		expect(remoteRecord?.identity).toBe(`remote:peer.tailnet.ts.net:session:${sharedId}`);
+		expect(savedRecord?.daemon).toBeUndefined();
+		expect(summaryForUnifiedRecord(savedRecord!).sessionFile).toBe("/tmp/sessions/shared.jsonl");
+	});
+
 	test("retains the ancestor chain when search matches only a nested subagent", () => {
 		const summaries = [
 			makeSummary({ id: "root", activeSessionId: "root", sessionId: "root-session", sessionName: "Root" }),
