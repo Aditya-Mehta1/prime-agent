@@ -144,9 +144,13 @@ fn daemon_search_text(summary: &Value) -> SessionSearchText {
 
 fn saved_search_text(saved: &Value) -> SessionSearchText {
     SessionSearchText {
-        name: get_str(saved, "name").map(str::to_string).unwrap_or_default(),
+        name: get_str(saved, "name")
+            .map(str::to_string)
+            .unwrap_or_default(),
         id: get_str(saved, "id").map(str::to_string).unwrap_or_default(),
-        cwd: get_str(saved, "cwd").map(str::to_string).unwrap_or_default(),
+        cwd: get_str(saved, "cwd")
+            .map(str::to_string)
+            .unwrap_or_default(),
     }
 }
 
@@ -872,7 +876,7 @@ mod tests {
     }
 
     #[test]
-fn search_matches_the_restricted_corpus_case_insensitively() {
+    fn search_matches_the_restricted_corpus_case_insensitively() {
         // The picker corpus is the session NAME, the durable ID, and the
         // CWD (Kevin's directive); the TS corpus fields — first message,
         // transcript text, recap summary, file paths — no longer match.
