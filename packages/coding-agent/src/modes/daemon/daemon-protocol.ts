@@ -77,8 +77,16 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 28 publishes the last recorded model on saved-session rows.
 // Revision 29 adds the capability-gated abort_and_send_queued command.
 // Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
+// Revision 31 adds the session-scoped set_image_model command.
 export const DAEMON_SCHEMA_REVISION = 31;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-f908f493c9e1";
+/**
+ * Opaque wire-schema identity the handshake compares: a client replaces a
+ * daemon whose id differs, so this moves in lockstep with the revision.
+ * Fingerprint = first 12 hex ofsha256("protocol-7|<revision>|<sorted command
+ * names from DAEMON_COMMAND_COMPATIBILITY>"). Regenerate with:
+ * `python3 -c "import re,hashlib;p=open('packages/coding-agent/src/modes/daemon/daemon-protocol.ts').read();b=p[p.index('export const DAEMON_COMMAND_COMPATIBILITY'):];c=sorted(set(re.findall(r'^\t([a-z_0-9]+):',b,re.M)));print(hashlib.sha256(('protocol-7|31|'+','.join(c)).encode()).hexdigest()[:12])"`
+ */
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-0cfe17764281";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

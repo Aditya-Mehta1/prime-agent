@@ -1357,11 +1357,21 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.requestOk({ type: "steer", activeSessionId: this.activeSessionId, message, images });
+		// A steer carrying images waits for the image-turn child read, like the
+		// prompt path, so it takes the long-running budget instead of the default:
+		// a client-side timeout would report a failure for a message the daemon
+		// queued anyway.
+		await this.requestData<unknown>(
+			{ type: "steer", activeSessionId: this.activeSessionId, message, images },
+			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+		);
 	}
 
 	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.requestOk({ type: "follow_up", activeSessionId: this.activeSessionId, message, images });
+		await this.requestData<unknown>(
+			{ type: "follow_up", activeSessionId: this.activeSessionId, message, images },
+			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+		);
 	}
 
 	async abort(): Promise<void> {

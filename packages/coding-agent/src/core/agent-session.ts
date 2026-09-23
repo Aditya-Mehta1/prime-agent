@@ -49,6 +49,7 @@ import {
 	type AgentSessionMessageController,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessageReceipt,
+	type AgentSessionMessageSender,
 	agentFamilyMemberName,
 	assertAgentMessageQueueCapacity,
 	assertAgentSessionNameAvailable,
@@ -1548,6 +1549,19 @@ export class AgentSession {
 	 * to settings.imageModel. Switching sessions builds a new AgentSession, so
 	 * the override never outlives the session it was set in.
 	 */
+	/**
+	 * Session ids of image-turn read children. Their answer is the reading this
+	 * session consumes, so an agent message from one is noise that would start a
+	 * stray turn while the read is still awaited; late deliveries stay suppressed
+	 * because a child session id is never reused.
+	 */
+	private readonly _visionReadChildSessionIds = new Set<string>();
+
+	/**
+	 * Session-scoped image-model reference set by /image-model; unset falls back
+	 * to settings.imageModel. Switching sessions builds a new AgentSession, so
+	 * the override never outlives the session it was set in.
+	 */
 	private _imageModelOverride: string | undefined;
 
 	private _unsubscribeAgent?: () => void;
@@ -2728,6 +2742,21 @@ export class AgentSession {
 		return this._imageModelOverride ?? this.settingsManager.getImageModel();
 	}
 
+	/** Remember one read child's session id, bounded so the set cannot grow. */
+	private _rememberVisionReadChildSession(sessionId: string): void {
+		if (this._visionReadChildSessionIds.size >= 8) {
+			const oldest = this._visionReadChildSessionIds.values().next().value;
+			if (oldest) this._visionReadChildSessionIds.delete(oldest);
+		}
+		this._visionReadChildSessionIds.add(sessionId);
+	}
+
+	/** Whether an incoming agent message came from an image-turn read child. */
+	private _isVisionReadChildSender(from: AgentSessionMessageSender | undefined): boolean {
+		if (!from?.sessionId || this._visionReadChildSessionIds.size === 0) return false;
+		return this._visionReadChildSessionIds.has(from.sessionId);
+	}
+
 	/**
 	 * Image model the image-turn child is pinned to, as the "provider/id" spawn
 	 * selector. Undefined when nothing resolves, so the caller leaves the images
@@ -2755,6 +2784,9 @@ export class AgentSession {
 			`Read the ${paths.length === 1 ? "image" : `${paths.length} images`} listed below and report what ${paths.length === 1 ? "it shows" : "they show"}, for a reader who cannot see ${paths.length === 1 ? "it" : "them"}.`,
 			"Transcribe the text they contain and describe the data, layout, or state that matters for the request.",
 			"Load each path with the attach_image skill. Do not modify any file.",
+			// A reply would deliver an agent message to the parent and start a
+			// stray turn there while this read is still awaited.
+			"Your final message IS the reading; it is consumed programmatically. Do not send agent messages, do not reply to the parent, and do not spawn subagents.",
 			"",
 			...paths.map((path, index) => `${paths.length === 1 ? "Image" : `Image ${index + 1}`}: ${path}`),
 			"",
@@ -2791,8 +2823,16 @@ export class AgentSession {
 			totalBytes += bytes;
 			selected.push(image);
 		}
-		if (selected.length === 0) return undefined;
 		const skipped = images.length - selected.length;
+		if (selected.length === 0) {
+			// Every image failed the caps: refuse here instead of returning the
+			// originals, which would reach a provider (or the in-place routed turn,
+			// re-sending the whole transcript) after the allowlist rejected them.
+			return {
+				reading: `[no image read: all ${images.length} attached image(s) were rejected by the image-turn limits (unsupported type, over 8 MB each, or over 24 MB total)]`,
+				reference,
+			};
+		}
 
 		const dir = mkdtempSync(join(tmpdir(), "prime-agent-image-turn-"));
 		let childId: string | undefined;
@@ -2806,6 +2846,10 @@ export class AgentSession {
 			});
 			const child = await this.runRlmChild(this._imageTurnChildPrompt(paths, text), { model: reference });
 			childId = child.rlm_child_id;
+			// Register the read child as soon as its session exists: if it replies
+			// anyway, that message must not be admitted as a turn in this session.
+			const childSessionId = await this._awaitPendingRlmChildPublication(childId).catch(() => undefined);
+			if (childSessionId) this._rememberVisionReadChildSession(childSessionId);
 			const collected = await this.collectRlmChildren([childId], IMAGE_TURN_CHILD_TIMEOUT_MS);
 			const entry = collected.results.find((result) => result.rlm_child_id === childId);
 			if (!entry?.settled) {
@@ -2827,7 +2871,9 @@ export class AgentSession {
 			const scope = `${paths.length === 1 ? "image" : `${paths.length} images`} read by ${reference}`;
 			const notes = [
 				answer ? "" : "[child answer unavailable; preview only]",
-				skipped > 0 ? `[${skipped} image(s) over the per-turn count or size caps were not read]` : "",
+				skipped > 0
+					? `[${skipped} image(s) were skipped: unsupported type, over 8 MB each, over 24 MB total, or over the per-turn count of 8]`
+					: "",
 			].filter(Boolean);
 			return `[${scope}]\n${capped}${notes.length > 0 ? `\n${notes.join("\n")}` : ""}`;
 		} finally {
@@ -5905,6 +5951,9 @@ export class AgentSession {
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
+		// A read child answered; its text is the reading this session already
+		// consumed, so delivering it would admit a second, unwanted turn.
+		if (this._isVisionReadChildSender(customMessage?.details.from)) return;
 		const clearEpoch = this._agentMessageClearEpoch;
 		const admissionCommitted = () => {
 			options?.admissionCommitted?.();
@@ -5942,6 +5991,7 @@ export class AgentSession {
 		streamingBehavior: "steer" | "followUp",
 		customMessage?: AgentSessionMessage,
 	): Promise<boolean> {
+		if (this._isVisionReadChildSender(customMessage?.details.from)) return true;
 		const agentMessageId = customMessage?.details.id ?? parseAgentSessionMessagePromptId(text);
 		if (streamingBehavior === "steer") {
 			await this._queuePreparedPrompt("steer", text, undefined, {

@@ -491,10 +491,13 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async setImageModel(reference: string | null): Promise<AgentConnectionModel | undefined> {
-		// Refresh first, like setModel: a provider authenticated moments ago is
-		// not in the available list yet, and the pin would be refused as unusable.
-		await this.session.modelRegistry.refreshAvailableModels();
-		await this.session.modelRegistry.waitForPendingModelRefreshes(IMAGE_MODEL_PIN_READINESS_TIMEOUT_MS);
+		if (reference !== null) {
+			// Refresh first, like setModel: a provider authenticated moments ago is
+			// not in the available list yet, and the pin would be refused as
+			// unusable. Clearing resolves nothing, so it pays no catalog wait.
+			await this.session.modelRegistry.refreshAvailableModels();
+			await this.session.modelRegistry.waitForPendingModelRefreshes(IMAGE_MODEL_PIN_READINESS_TIMEOUT_MS);
+		}
 		return this.session.setImageModelOverride(reference ?? undefined);
 	}
 

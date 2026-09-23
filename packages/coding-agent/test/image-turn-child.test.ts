@@ -10,6 +10,7 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, AssistantMessageEvent, ImageContent } from "@earendil-works/pi-ai";
 import { EventStream } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAgentSessionMessage } from "../src/core/agent-messages.js";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
@@ -19,6 +20,7 @@ import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { assistantMsg, createTestResourceLoader } from "./utilities.js";
 
 const IMAGE: ImageContent = { type: "image", mimeType: "image/png", data: "aGk=" };
+const READ_CHILD_SESSION_ID = "child-session-1";
 const SET = { imageModel: "claude-haiku-4-5" };
 const VISION = "anthropic/claude-haiku-4-5";
 
@@ -29,7 +31,14 @@ interface ImageTurnHarness {
 	servedModelIds: string[];
 	requests: Array<{ model: string; content: unknown[] }[]>;
 	spawns: Array<{ prompt: string; kwargs: Record<string, unknown> }>;
-	spawnChild: (options?: { reading?: string; settled?: boolean; status?: string; error?: string }) => void;
+	spawnChild: (options?: {
+		reading?: string;
+		settled?: boolean;
+		status?: string;
+		error?: string;
+		/** Deliver the child's own reply to the parent while the read is awaited. */
+		replyDuringRead?: string;
+	}) => void;
 	dispose: () => void;
 }
 
@@ -80,6 +89,7 @@ function createImageTurnHarness(
 	const children = session as unknown as {
 		runRlmChild: (prompt: string, kwargs: Record<string, unknown>) => Promise<{ rlm_child_id: string }>;
 		collectRlmChildren: (targets: string[], timeoutMs: number) => Promise<{ results: unknown[] }>;
+		_awaitPendingRlmChildPublication: (selector: string) => Promise<string | undefined>;
 		deleteRlmSubagent: (target: string) => Promise<unknown>;
 		_rlmChildSessions: Map<string, ChildSessionStub>;
 	};
@@ -98,19 +108,37 @@ function createImageTurnHarness(
 						dispose: () => {},
 					},
 				});
-				children.collectRlmChildren = vi.fn(async () => ({
-					results: [
-						{
-							rlm_child_id: id,
-							status: options.status ?? "done",
-							settled: options.settled ?? true,
-							error: options.error,
-						},
-					],
-				}));
+				children.collectRlmChildren = vi.fn(async () => {
+					if (options.replyDuringRead) {
+						// The child replied to the parent the way an RLM child does;
+						// that lands while this read is still awaited.
+						await session.acceptAgentMessagePrompt(options.replyDuringRead, {
+							customMessage: createAgentSessionMessage({
+								id: "agentmsg-read-child",
+								source: "agent_message",
+								target: { activeSessionId: "parent", sessionId: session.sessionId },
+								from: { activeSessionId: "child", sessionId: READ_CHILD_SESSION_ID },
+								message: options.replyDuringRead,
+							}),
+						});
+					}
+					return {
+						results: [
+							{
+								rlm_child_id: id,
+								status: options.status ?? "done",
+								settled: options.settled ?? true,
+								error: options.error,
+							},
+						],
+					};
+				});
 				children.deleteRlmSubagent = vi.fn(async () => ({}));
 				return { rlm_child_id: id };
 			});
+			// The child session publishes right after spawn; the stub binds it here so
+			// the read child's identity is registered before it can reply.
+			children._awaitPendingRlmChildPublication = vi.fn(async () => READ_CHILD_SESSION_ID);
 		},
 		dispose: () => {
 			session.dispose();
@@ -290,6 +318,36 @@ describe("image steers and follow-ups", () => {
 		expect(harness.spawns[0]?.prompt).toMatch(/image-1\.png/);
 		expect(harness.spawns[0]?.prompt).not.toMatch(/image-2/);
 		const content = userContents(harness.session).at(-1) ?? [];
-		expect(contentText(content)).toContain("2 image(s) over the per-turn count or size caps were not read");
+		expect(contentText(content)).toContain("2 image(s) were skipped:");
+	});
+	it("admits the turn when the read child replies to the parent mid-read", async () => {
+		const harness = harnessFor(SET);
+		harness.spawnChild({ reading: "A red banner.", replyDuringRead: "Here is my reading." });
+		await harness.session.prompt("look at this", { images: [IMAGE] });
+		// The reply is suppressed: the parent's own turn is admitted and answered.
+		expect(harness.servedModelIds).toEqual(["claude-opus-4-7-text-only"]);
+		const text = userContents(harness.session)
+			.map((content) => contentText(content))
+			.join("\n");
+		expect(text).toContain("look at this");
+		expect(text).toContain("A red banner.");
+		expect(text).not.toContain("Here is my reading.");
+	});
+
+	it("still admits a reply from a child that is not a read child", async () => {
+		const harness = harnessFor({});
+		harness.spawnChild();
+		await harness.session.acceptAgentMessagePrompt("hello from a subagent", {
+			customMessage: createAgentSessionMessage({
+				id: "agentmsg-other-child",
+				source: "agent_message",
+				target: { activeSessionId: "parent", sessionId: harness.session.sessionId },
+				from: { activeSessionId: "child", sessionId: "some-other-child-session" },
+				message: "hello from a subagent",
+			}),
+			streamingBehavior: "followUp",
+		});
+		await harness.session.waitForIdle();
+		expect(harness.servedModelIds.length).toBeGreaterThan(0);
 	});
 });
