@@ -224,6 +224,7 @@ describe("RemoteAgentMeshState", () => {
 		const printedId = formatSessionDisplayId(sessionId);
 		expect(printedId).toBe("abcdef123456");
 		expect(state.findMessageTargets(printedId).map((target) => target.sessionId)).toEqual([sessionId]);
+		// Two hosts owning that suffix stay ambiguous, exactly like the local selector.
 		source.listRemoteAgents.mockResolvedValueOnce([
 			host({ sessions: [remoteSession(rowId)] }),
 			host({ tailnetHost: "other.tailnet.ts.net", sessions: [remoteSession(rowId)] }),
