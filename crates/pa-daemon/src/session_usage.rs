@@ -261,7 +261,7 @@ pub fn read_session_usage(path: &Path) -> Option<SessionUsageTotals> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn usage(input: u64, output: u64, total: f64) -> Usage {
         serde_json::from_value(json!({
@@ -447,7 +447,7 @@ mod tests {
         let Some(path) = std::env::var_os("SAVED_USAGE_FIXTURE") else {
             return;
         };
-        let summary = read_own_usage_summary(Path::new(&path)).unwrap();
+        let summary = read_own_usage_summary(Path::new(&path));
         assert_eq!(
             summary,
             Some(SessionUsageSummary { input_tokens: 1_505_509, output_tokens: 14_472, cost: 0.0 })
