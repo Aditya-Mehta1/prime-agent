@@ -450,15 +450,16 @@ impl Supervisor {
         // with serving — the accept loop must keep serving hellos so
         // reconnecting clients see the resume contract (§10.3).
         let roster = crate::update_restore::consume_roster_env();
-        self.restore
-            .begin(roster.as_ref().map(|roster| roster.update_id.clone()));
+        self.restore.begin(roster.as_ref());
         crate::update_restore::boot_sweep(&self.options.agent_dir, &self.options.socket_path);
         // Descriptor adoption runs concurrently with the accept loop: a
         // supervisor restarted over live sessions must accept their
         // self-registrations immediately, not behind the whole descriptor
-        // scan. The restore pass awaits this task (spec §6 step 2's
-        // create-or-adopt order: kept workers relaunch from their
-        // descriptors first, the roster covers the rest).
+        // scan. The fan-out is capped (recovery_pacing) so a large
+        // sessions dir cannot starve the control plane. The restore pass
+        // awaits this task (spec §6 step 2's create-or-adopt order: kept
+        // workers relaunch from their descriptors first, the roster covers
+        // the rest).
         let adoption = {
             let supervisor = Arc::clone(&self);
             tokio::spawn(async move {
@@ -568,19 +569,23 @@ impl Supervisor {
     }
 
     /// Adopt or relaunch persisted workers, concurrently: one dead worker's
-    /// relaunch (create replay) must not delay adopting live sessions.
+    /// relaunch (create replay) must not delay adopting live sessions. The
+    /// fan-out is capped ([`crate::recovery_pacing::ADOPTION_CONCURRENCY`]):
+    /// a large sessions dir must not turn the pass into a relaunch storm
+    /// that starves the control plane for its whole duration.
     async fn adopt_persisted_workers(self: &Arc<Self>) {
         let descriptors = load_descriptors(&self.descriptor_dir, &self.options.socket_path);
-        let mut tasks = Vec::new();
-        for (path, descriptor) in descriptors {
-            let supervisor = Arc::clone(self);
-            tasks.push(tokio::spawn(async move {
-                supervisor.adopt_persisted_worker(path, descriptor).await;
-            }));
-        }
-        for task in tasks {
-            let _ = task.await;
-        }
+        let jobs: Vec<_> = descriptors
+            .into_iter()
+            .map(|(path, descriptor)| {
+                let supervisor = Arc::clone(self);
+                move || async move {
+                    supervisor.adopt_persisted_worker(path, descriptor).await;
+                }
+            })
+            .collect();
+        crate::recovery_pacing::run_bounded(jobs, crate::recovery_pacing::ADOPTION_CONCURRENCY)
+            .await;
     }
 
     /// Adopt one persisted worker descriptor. Serialized against worker
@@ -628,6 +633,20 @@ impl Supervisor {
                 self.spawn_monitor(Arc::clone(&resident), None, pid);
                 // The adopted worker joins the roster from its live state.
                 self.refresh_roster_entry(&resident).await;
+                // A restore pass that owns this session's roster row can
+                // settle it now (spec §10.4): the per-target waiters attach
+                // to the live worker instead of queueing behind the rest
+                // of the recovery — unless the row still needs its
+                // continuation prompt (§10.5): those waiters wake only
+                // when the pass routes it. No pass, no roster row: a no-op.
+                if let Some(session_file) = resident.descriptor.lock().await.session_file.clone() {
+                    if let Some(stem) = Path::new(&session_file)
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().to_string())
+                    {
+                        self.restore.settle_adopted(&stem);
+                    }
+                }
                 self.log_line(&format!(
                     "adopted session worker {worker_id} (was alive: {alive})"
                 ));
@@ -2800,7 +2819,15 @@ impl Supervisor {
         };
         // Refresh the durable identity from the live worker (the token was
         // issued by this supervisor; a mismatch is a rogue registration).
-        {
+        // The registration's durable id is optional on the wire: a
+        // re-registering worker that does not report it still owns its
+        // persisted descriptor, whose session-file stem addresses the same
+        // roster row (a fresh create's registration lands before the
+        // create replay assigns the session, so this reads the persisted
+        // path). Both reads share this one lock acquisition - the
+        // create path holds this mutex around its own replay steps, and a
+        // second acquisition here let the two race into a stall.
+        let durable_session_id = {
             let mut descriptor = resident.descriptor.lock().await;
             if token.as_str() != descriptor.authentication_token {
                 return fail("Session worker authentication failed");
@@ -2822,8 +2849,29 @@ impl Supervisor {
                 descriptor.session_file.as_deref(),
             );
             let _ = persist_worker(&resident.descriptor_path, &descriptor);
-        }
+            match registration.session_id.clone() {
+                Some(session_id) => Some(session_id),
+                None => descriptor
+                    .session_file
+                    .clone()
+                    .as_deref()
+                    .and_then(|file| Path::new(file).file_stem())
+                    .map(|stem| stem.to_string_lossy().to_string()),
+            }
+        };
         let record = self.registry.record_registration(registration).await;
+        // A restore pass that owns this session's roster row can settle it
+        // now (spec §10.4): the live worker serves the row's waiters
+        // without queueing behind the rest of the recovery. Covers the
+        // self-registration that beats the descriptor scan (the adoption
+        // early return) and `adopt_registered_worker` alike; a no-op when
+        // no pass owns the row, and never wakes a row still pending its
+        // §10.5 continuation prompt. The settle lands after the
+        // registration is recorded, so a woken waiter's re-resolve cannot
+        // miss it.
+        if let Some(session_id) = durable_session_id {
+            self.restore.settle_adopted(&session_id);
+        }
         let verb = if record.epoch > 1 {
             "re-registered"
         } else {
