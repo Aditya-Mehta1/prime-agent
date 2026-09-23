@@ -690,6 +690,18 @@ function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeId
 	);
 }
 
+// No-skill callers (postinstall, runtime-bootstrap, bootstrap-cli) never sync skills and only need
+// the base marker; skill callers need every requested skill recorded.
+function bootstrapVersionCurrentForCaller(
+	version: BootstrapVersion | null,
+	runtimeIdentity: string,
+	pythonSkills: readonly BootstrapPythonSkill[],
+): boolean {
+	return pythonSkills.length === 0
+		? bootstrapBaseVersionCurrent(version, runtimeIdentity)
+		: bootstrapVersionCurrent(version, runtimeIdentity, pythonSkills);
+}
+
 async function writeBootstrapVersion(
 	venv: string,
 	runtimeIdentity: string,
@@ -933,18 +945,6 @@ async function kernelBaseReady(python: string, venv: string, runtimeIdentity: st
 	);
 }
 
-async function kernelReady(
-	python: string,
-	venv: string,
-	runtimeIdentity: string,
-	pythonSkills: readonly BootstrapPythonSkill[],
-): Promise<boolean> {
-	return (
-		(await hasPrimeAgentRuntime(python)) &&
-		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills)
-	);
-}
-
 function formatBootstrapFailure(error: unknown): Error {
 	return new Error(
 		`Failed to set up the Python kernel runtime. ${errorMessage(error)}\n` +
@@ -995,14 +995,9 @@ async function ensureKernelPythonUncached(
 	const venv = await resolveWritableKernelVenvDir();
 	const python = kernelVenvPython(venv);
 	const runtimeIdentity = resolvedRuntimeIdentity ?? (await resolveRuntimeIdentity());
-	// No-skill callers (postinstall, runtime-bootstrap, bootstrap-cli) never sync skills;
-	// letting them reach syncPythonSkills would rewrite the marker with an empty list,
-	// wiping the recorded skills and forcing the next real session to re-sync every
-	// skill. They only need the base kernel to be ready.
 	const readyForCaller = async (): Promise<boolean> =>
-		pythonSkills.length === 0
-			? kernelBaseReady(python, venv, runtimeIdentity)
-			: kernelReady(python, venv, runtimeIdentity, pythonSkills);
+		(await hasPrimeAgentRuntime(python)) &&
+		bootstrapVersionCurrentForCaller(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills);
 	if (await readyForCaller()) return python;
 
 	const releaseLock = await acquireBootstrapLock(venv);
@@ -1043,16 +1038,15 @@ export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Pro
 	return promise;
 }
 
-// The venv python (bin/python, Scripts/python.exe) sits one level below the venv root; the marker lives
-// next to its parent.
-function bootstrapMarkerPath(python: string): string {
-	return path.join(path.dirname(path.dirname(python)), BOOTSTRAP_VERSION_FILE);
+// The venv python (bin/python, Scripts/python.exe) sits one level below the venv root.
+function kernelVenvDirOf(python: string): string {
+	return path.dirname(path.dirname(python));
 }
 
 async function readBootstrapMarkerIdentity(
-	python: string,
+	venv: string,
 ): Promise<{ markerPath: string; marker: BootstrapMarkerIdentity | null }> {
-	const markerPath = bootstrapMarkerPath(python);
+	const markerPath = path.join(venv, BOOTSTRAP_VERSION_FILE);
 	try {
 		const stats = await stat(markerPath);
 		return {
@@ -1103,7 +1097,17 @@ async function ensureKernelPythonWithSuccessCache(
 	}
 	try {
 		const python = await ensureKernelPythonUncached(options, pythonSkills, runtimeIdentity);
-		kernelPythonSuccess = { key: successKey, python, ...(await readBootstrapMarkerIdentity(python)) };
+		const venv = kernelVenvDirOf(python);
+		const identity = await readBootstrapMarkerIdentity(venv);
+		// syncPythonSkills only warns when a skill install fails and leaves it out of the marker;
+		// caching that venv would stop later starts in this process from retrying the skill.
+		kernelPythonSuccess = bootstrapVersionCurrentForCaller(
+			await readBootstrapVersion(venv),
+			runtimeIdentity,
+			pythonSkills,
+		)
+			? { key: successKey, python, ...identity }
+			: null;
 		return python;
 	} catch (error) {
 		kernelPythonSuccess = null;

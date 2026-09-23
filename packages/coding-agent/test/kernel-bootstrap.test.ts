@@ -318,7 +318,7 @@ describe("kernel bootstrap", () => {
 		expect((await stat(join(venv, ".bootstrap-version"))).mtimeMs).toBe(0);
 	});
 
-	it("retries a busy marker swap before the first install and keeps a failed skill out of the record", async () => {
+	it("retries a busy marker swap before the first install, keeps a failed skill out of the record, and retries it on the next start in the same process", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		const installedSkill = createPythonSkill("agent-a");
@@ -339,6 +339,14 @@ describe("kernel bootstrap", () => {
 		expect(version.pythonSkills.map((skill: { importName: string }) => skill.importName)).toEqual([
 			installedSkill.importName,
 		]);
+		// The partial success must not be cached: the next start in this process retries the failed skill.
+		delete process.env.UV_FAIL_ARG;
+		await expect(ensureKernelPython({ pythonSkills: [installedSkill, brokenSkill] })).resolves.toBe(
+			join(venv, "bin", "python"),
+		);
+		const lines = readFileSync(logPath, "utf8").split("\n");
+		expect(lines.filter((line) => line.includes(`--editable ${brokenSkill.packagePath}`))).toHaveLength(2);
+		expect(lines.filter((line) => line.includes(`--editable ${installedSkill.packagePath}`))).toHaveLength(1);
 	});
 
 	// test-policy: allow explicit-test-timeout -- bounds real killed tsx respawn and resume variance, not the assertion
