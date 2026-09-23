@@ -7,13 +7,13 @@
 //! [`OnboardingPickerAction`], and [`OnboardingPicker::render`] paints the
 //! surface.
 //!
-//! The search field renders through the shared bordered
-//! [`crate::menu_panel::search_field_lines`] primitive — the crate's
-//! `MenuSearchInput` shape, per the family plan — with the same
-//! value/cursor/placeholder/caret semantics the TS field carries.
+//! The search field is the plain `MenuSearchInput` variant
+//! ([`crate::menu_panel::search_field_plain_lines`], TS inline + plain +
+//! hidePrompt): one line, no rules, no `"> "` prompt — the list marks
+//! selection with its own caret, so the field hides the input prompt.
 
 use crate::keybindings::KeybindingsManager;
-use crate::menu_panel::search_field_lines;
+use crate::menu_panel::search_field_plain_lines;
 use crate::onboarding::highlight_wash;
 use crate::search_input::SearchInput;
 use crate::theme::{Theme, ThemeColor};
@@ -87,7 +87,7 @@ pub enum OnboardingPickerAction {
 /// The picker state (TS `OnboardingPickerComponent`): the query field, the
 /// selection index — `0` is the pinned Continue row, `1..` the filtered
 /// entries — and the viewport's first visible entry.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OnboardingPicker {
     items: Vec<OnboardingPickerItem>,
     config: OnboardingPickerConfig,
@@ -138,7 +138,8 @@ impl OnboardingPicker {
             if self.selected_index == 0 {
                 return OnboardingPickerAction::Continue;
             }
-            let Some(item) = self.filtered().get(self.selected_index - 1) else {
+            let filtered = self.filtered();
+            let Some(item) = filtered.get(self.selected_index - 1) else {
                 return OnboardingPickerAction::None;
             };
             return OnboardingPickerAction::Select {
@@ -180,7 +181,7 @@ impl OnboardingPicker {
             ));
             lines.push(blank_line(width));
         }
-        lines.extend(search_field_lines(
+        lines.extend(search_field_plain_lines(
             theme,
             width,
             self.search.value(),
@@ -433,30 +434,35 @@ mod tests {
 
     #[test]
     fn the_query_filters_over_label_and_id_case_insensitively() {
-        let mut picker = OnboardingPicker::new(providers(), OnboardingPickerConfig::default());
+        let mut items = providers();
+        items.push(item("gcp", "Google Cloud", false));
+        let mut picker = OnboardingPicker::new(items, OnboardingPickerConfig::default());
         assert_eq!(
             picker.filtered().len(),
-            4,
+            5,
             "an empty query shows every entry"
         );
+        // Labels match case-insensitively.
         type_text(&mut picker, "OPEN");
         let filtered = picker.filtered();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "openai");
+        // Backspace reopens the list.
+        for _ in 0.."OPEN".len() {
+            picker.handle_key("backspace", &kb());
+        }
+        assert_eq!(picker.filtered().len(), 5);
         // The id matches when the label does not.
-        type_text(&mut picker, "o");
-        type_text(&mut picker, "penai");
-        assert_eq!(picker.filtered()[0].id, "openai");
+        type_text(&mut picker, "gcp");
+        let filtered = picker.filtered();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "gcp");
         // The query trims and lowercases before matching (TS getFiltered).
         let mut spaced = OnboardingPicker::new(providers(), OnboardingPickerConfig::default());
         type_text(&mut spaced, " ope");
-        assert_eq!(spaced.filtered().len(), 1);
-        // Backspace reopens the full list.
-        type_text(&mut picker, "ai");
-        for _ in 0.."openai".len() {
-            picker.handle_key("backspace", &kb());
-        }
-        assert_eq!(picker.filtered().len(), 4);
+        let filtered = spaced.filtered();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "openai");
     }
 
     #[test]
@@ -477,11 +483,11 @@ mod tests {
             !text.iter().any(|row| row.contains("Provider 0")),
             "the window scrolled past the first entries"
         );
-        // Walking back up drags the window with the selection.
-        for _ in 0..3 {
+        // Walking back up drags the window once the selection exits it.
+        for _ in 0..7 {
             picker.handle_key("up", &kb());
         }
-        assert_eq!(picker.selected_index, 5);
+        assert_eq!(picker.selected_index, 1);
         assert_eq!(picker.scroll_top, 0);
         // A typing press rewinds the viewport and clamps the selection into
         // the new filter (TS handleInput fall-through).
@@ -537,7 +543,8 @@ mod tests {
         };
         let labeled = OnboardingPicker::new(providers(), config);
         let text = text_of(&labeled.render(&theme(), 80));
-        assert!(text.iter().any(|row| row.trim_end() == " Done"));
+        // The fresh picker pins selection on Continue, so the caret shows.
+        assert!(text.iter().any(|row| row.trim_end() == "> Done"));
     }
 
     #[test]
@@ -628,7 +635,7 @@ mod tests {
         picker.handle_key("down", &kb());
         let lines = picker.render(&theme, 80);
         let wash = crate::onboarding::highlight_wash(&theme);
-        // Layout: blank, field border, field, border, blank, Continue, rows.
+        // Layout: blank, field, blank, Continue, rows.
         let expected: Line = vec![
             Span::raw(" "),
             Span::styled(
@@ -641,7 +648,7 @@ mod tests {
             Span::styled(" ".repeat(23), theme.fg_style(ThemeColor::Dim).bg(wash)),
             Span::raw(" ".repeat(80 - 35)),
         ];
-        assert_eq!(lines[6], expected);
+        assert_eq!(lines[4], expected);
     }
 
     #[test]
@@ -657,7 +664,7 @@ mod tests {
             theme.fg_span(ThemeColor::Dim, " ".repeat(23)),
             Span::raw(" ".repeat(80 - 35)),
         ];
-        assert_eq!(lines[7], expected);
+        assert_eq!(lines[5], expected);
         // Selected: the mark rides inside the wash.
         let wash = crate::onboarding::highlight_wash(&theme);
         let mut picker = OnboardingPicker::new(providers(), OnboardingPickerConfig::default());
@@ -680,7 +687,7 @@ mod tests {
             Span::styled(" ".repeat(23), theme.fg_style(ThemeColor::Dim).bg(wash)),
             Span::raw(" ".repeat(80 - 35)),
         ];
-        assert_eq!(lines[7], expected);
+        assert_eq!(lines[5], expected);
     }
 
     #[test]
@@ -697,12 +704,13 @@ mod tests {
         assert_eq!(text[0], " ".repeat(80), "the surface opens on a blank row");
         assert!(text[1].starts_with(" Connect a provider"));
         assert!(
-            text[3].trim_end() == "─".repeat(80),
-            "the field keeps its rules"
+            text[3].trim() == "Find a provider",
+            "the plain field, no rules"
         );
-        assert!(text[4].trim_end() == "> Find a provider");
-        // Prompt set: the Continue row lands after the field's blank.
-        assert!(text[7].trim_end() == "  Continue");
+        assert!(!text[2].contains("> "), "no input prompt on the field");
+        // Prompt set: the Continue row lands after the field's blank, and
+        // the fresh picker keeps it selected.
+        assert!(text[5].trim_end() == "> Continue");
         let note_index = text
             .iter()
             .position(|row| row.trim_end() == " Connect later with /login.")
@@ -721,22 +729,30 @@ mod tests {
         let picker = OnboardingPicker::new(providers(), config);
         let text = text_of(&picker.render(&theme(), 80));
         assert!(
-            text[5].trim_end() == "  Continue",
+            text[3].trim_end() == "> Continue",
             "no prompt shifts the rows"
         );
-        assert_eq!(text.len(), 5 + 4, "no hint and no note rows follow");
+        assert_eq!(text.len(), 4 + 4, "no hint and no note rows follow");
     }
 
     #[test]
     fn the_field_edits_the_query_and_renders_it() {
+        let theme = theme();
         let mut picker = OnboardingPicker::new(providers(), OnboardingPickerConfig::default());
         type_text(&mut picker, "op");
         assert_eq!(picker.search.value(), "op");
-        let text = text_of(&picker.render(&theme(), 80));
-        assert!(text[4].trim_end() == "> op", "the field shows the query");
-        // set_focused lights the field's caret (TS focused forwarding).
-        picker.set_focused(true);
-        assert_eq!(picker.focused, true);
+        let text = text_of(&picker.render(&theme, 80));
+        assert!(text[1].trim_end() == " op", "the field shows the query");
+        // set_focused lights the field's caret (TS focused forwarding): an
+        // empty focused field reverses the first placeholder cell.
+        let mut fresh = OnboardingPicker::new(providers(), OnboardingPickerConfig::default());
+        fresh.set_focused(true);
+        let field = &fresh.render(&theme, 80)[1];
+        assert_eq!(field[1].content, "S");
+        assert_eq!(
+            field[1].style,
+            ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+        );
     }
 
     #[test]

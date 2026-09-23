@@ -128,6 +128,75 @@ pub(crate) fn search_field_lines(
     vec![border(), field, border()]
 }
 
+/// The plain inline search field (TS `MenuSearchInput.render`, inline +
+/// plain + hidePrompt): one line — a one-column indent, no rules, no
+/// `"> "` prompt — for surfaces that mark selection with their own caret.
+/// An empty focused field sits the reversed caret on the first placeholder
+/// cell so the text keeps its left edge.
+pub(crate) fn search_field_plain_lines(
+    theme: &Theme,
+    width: usize,
+    value: &str,
+    cursor: usize,
+    focused: bool,
+    placeholder: &str,
+) -> Vec<Line> {
+    vec![plain_input_field(
+        theme,
+        width,
+        value,
+        cursor,
+        focused,
+        placeholder,
+    )]
+}
+
+/// The plain field row (TS `MenuSearchInput` inline + plain + hidePrompt):
+/// `" " + <input render at width-2 with the prompt stripped>`, truncated
+/// and padded to the pane width.
+fn plain_input_field(
+    theme: &Theme,
+    width: usize,
+    value: &str,
+    cursor: usize,
+    focused: bool,
+    placeholder: &str,
+) -> Line {
+    let mut line: Line = vec![Span::raw(" ")];
+    if value.is_empty() {
+        if focused {
+            // TS sits the caret on the first placeholder character.
+            if let Some(first) = placeholder.chars().next() {
+                line.push(Span::styled(
+                    first.to_string(),
+                    ratatui::style::Style::default()
+                        .add_modifier(ratatui::style::Modifier::REVERSED),
+                ));
+                let rest: String = placeholder.chars().skip(1).collect();
+                if !rest.is_empty() {
+                    line.push(theme.fg_span(ThemeColor::Dim, rest));
+                }
+            }
+        } else {
+            line.push(theme.fg_span(ThemeColor::Dim, placeholder.to_string()));
+        }
+    } else {
+        line.extend(input_render(
+            theme,
+            width.saturating_sub(2).max(1),
+            value,
+            cursor,
+            focused,
+        ));
+    }
+    let mut line = truncate_line(&line, width, "");
+    let used = crate::width::spans_width(&line);
+    if used < width {
+        line.push(Span::raw(" ".repeat(width - used)));
+    }
+    line
+}
+
 /// The field row: `" " + "> " + <input render at width-2>` (TS
 /// `MenuSearchInput` inline composition).
 fn render_input_field(
@@ -249,5 +318,62 @@ pub(crate) fn menu_list_layout(
         capacity(extra).min(preferred).max(1)
     } else {
         without_scroll
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn theme() -> Theme {
+        crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor)
+    }
+
+    #[test]
+    fn the_plain_field_hides_the_prompt_and_the_rules() {
+        let theme = theme();
+        // Empty + unfocused: the dim placeholder under the one-column indent.
+        let lines = search_field_plain_lines(&theme, 20, "", 0, false, "Search");
+        assert_eq!(lines.len(), 1, "the plain field renders one line");
+        assert_eq!(
+            lines[0],
+            vec![
+                Span::raw(" "),
+                theme.fg_span(ThemeColor::Dim, "Search".to_string()),
+                Span::raw(" ".repeat(20 - 7)),
+            ]
+        );
+        // Empty + focused: the reversed caret sits on the first placeholder
+        // cell (TS hidePrompt branch), the rest dim.
+        let lines = search_field_plain_lines(&theme, 20, "", 0, true, "Search");
+        assert_eq!(
+            lines[0],
+            vec![
+                Span::raw(" "),
+                Span::styled(
+                    "S".to_string(),
+                    ratatui::style::Style::default()
+                        .add_modifier(ratatui::style::Modifier::REVERSED)
+                ),
+                theme.fg_span(ThemeColor::Dim, "earch".to_string()),
+                Span::raw(" ".repeat(20 - 7)),
+            ]
+        );
+        // A typed value renders through the input, prompt stripped: the
+        // caret rides the cursor cell, then the pane pad.
+        let lines = search_field_plain_lines(&theme, 20, "openai", 6, true, "Search");
+        assert_eq!(
+            lines[0],
+            vec![
+                Span::raw(" "),
+                Span::raw("openai".to_string()),
+                Span::styled(
+                    " ".to_string(),
+                    ratatui::style::Style::default()
+                        .add_modifier(ratatui::style::Modifier::REVERSED)
+                ),
+                Span::raw(" ".repeat(20 - 8)),
+            ]
+        );
     }
 }
