@@ -1988,9 +1988,11 @@ impl Renderer {
     /// Hand the terminal back to the process (raw mode off, alternate
     /// screen left and flushed, cursor visible) so an interactive client
     /// command can prompt on it. Headless verification runs keep their
-    /// plain pipes. The trailing cursor-show leaves the terminal with a
-    /// visible cursor (the TS teardown contract: the shell prompt that
-    /// follows must not sit on a hidden cursor).
+    /// plain pipes. The shared exit tail ends the hand-back — the same
+    /// whole-terminal contract every exit guarantees, so a poisoned
+    /// start cannot leave the client command prompting on a raw tty
+    /// (the TS teardown contract: the shell prompt that follows must
+    /// not sit on a hidden cursor or a broken mode).
     fn suspend(&mut self, view: &mut AgentView) -> Result<()> {
         match self {
             Renderer::Terminal { .. } => {
@@ -2003,8 +2005,7 @@ impl Renderer {
                 // flags popped); `resume` re-enables both.
                 let _ = crate::enhanced_keys::disable(&mut std::io::stdout());
                 self.flush_to_main_screen(view)?;
-                crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
-                terminal::disable_raw_mode()?;
+                crate::exit_restore::terminal_release_tail(&mut std::io::stdout());
                 Ok(())
             }
             Renderer::Headless { .. } => Ok(()),
