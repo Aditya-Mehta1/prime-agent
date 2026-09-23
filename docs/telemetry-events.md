@@ -171,6 +171,24 @@ session's current worker (the stale-id rebind).
 | `exit_reason` | string | only for `worker_exited`: `normal` / `crash` |
 | `count` | number | only for `sessions_archived`, `worker_children_closed`, `catalog_refresh`, and `compaction_abort_declared` (always 1): how many sessions the sweep moved to the archive / how many resident RLM children the supervisor closed with a hard-killed parent worker / how many models the resolved no-cold-start chain serves after the daemon's startup catalog refresh / one wedged-worker compaction the supervisor declared aborted |
 
+### `model refused`
+
+A daemon model resolution refused a model outside the settings
+`allowedModels` allowlist (Rust-only guardrail; the refusal surfaces as an
+error, never a fallback). Seams: the `set_model` and `cycle_model` command
+handlers, the RLM spawn/create_session child-model resolution, and the
+worker's startup model chain. Emitted once per distinct `(surface,
+selector)` per worker — a connection-state getter re-resolving the same
+refused model never repeats the event (the user-facing error still fires
+every time). Categories and surface only — never the refused selector or
+the configured patterns (the `catalog_refresh` rule: no model ids).
+
+| property | type | notes |
+|---|---|---|
+| `surface` | string | `set_model` / `cycle_model` / `spawn` / `create_session` / `session_start` |
+| `provider_category` | string | the refused model's provider category (`prime`, `anthropic`, ...) |
+| `model_category` | string | the refused model's category (`glm`, `claude`, ...) |
+
 ### `mcp connector used`
 
 `mcp.*` host-request activity and the connector install flows. Server name

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
+use crate::model_allowlist::DaemonAllowlist;
 use crate::overflow_compaction::{OverflowArmRun, OverflowRecovery};
 use pa_agent::abort::AbortController;
 use pa_agent::types::StopReason;
@@ -335,6 +336,11 @@ pub struct AgentSessionEngine {
     /// run's duration, and [`SessionEngine::abort_auto_compaction`]
     /// aborts whatever run holds it.
     pub(crate) auto_compaction_abort: std::sync::Mutex<Option<std::sync::Arc<AbortController>>>,
+    /// The daemon model-allowlist refusal telemetry (`model refused`),
+    /// shared with the RLM children host so every enforcement seam in
+    /// this worker emits through one lazily-built client.
+    pub(crate) model_refusal_telemetry:
+        std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
 }
 
 impl AgentSessionEngine {
@@ -369,11 +375,17 @@ impl AgentSessionEngine {
                 .map(|link_config| link_config.socket_path.clone())
                 .unwrap_or_default(),
         ));
+        let model_refusal_telemetry =
+            std::sync::Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                config.agent_dir.clone(),
+                config.telemetry_disabled == Some(true),
+            ));
         let children = config.supervisor_link.as_ref().map(|link_config| {
             Arc::new(SupervisorChildSessions::new(
                 Arc::clone(&link),
                 config.agent_dir.clone(),
                 link_config.active_session_id.clone(),
+                std::sync::Arc::clone(&model_refusal_telemetry),
             ))
         });
         let autonomous_driver = std::sync::RwLock::new(std::sync::Arc::new(
@@ -503,6 +515,7 @@ impl AgentSessionEngine {
             faux_model: std::sync::OnceLock::new(),
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
             auto_compaction_abort: std::sync::Mutex::new(None),
+            model_refusal_telemetry,
         })
     }
 
@@ -1040,8 +1053,38 @@ impl AgentSessionEngine {
         pa_core::models::resolve_cli_model(Some(&provider), &model_id, registry.get_all()).model
     }
 
-    /// Resolve the model through the composed registry.
+    /// Emit the daemon model-allowlist refusal's adoption event (schema
+    /// v1 `model refused`) from any of this worker's enforcement seams.
+    /// The telemetry binds to the engine's live cwd, so a session that
+    /// moved directories reports through the current project scope.
+    pub(crate) fn note_model_refused(&self, surface: &str, selector: &str) {
+        self.model_refusal_telemetry
+            .note_refused(surface, selector, &self.cwd());
+    }
+
+    /// Resolve the model through the composed registry, then enforce the
+    /// settings `allowedModels` allowlist: a resolution outside the
+    /// allowlist fails loudly here (the silent-fallback guarantee — the
+    /// startup chain never lands a session on a model the daemon may not
+    /// resolve to), and the refusal emits `model refused`.
     fn resolve_registry_model(&self) -> anyhow::Result<Model> {
+        let model = self.resolve_registry_model_unchecked()?;
+        let selector = format!("{}/{}", model.provider, model.id);
+        let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
+        if let Err(refusal) = crate::model_allowlist::assert_allowed(&allowlist, &selector) {
+            if let Some(refusal) = refusal.downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+            {
+                self.note_model_refused("session_start", &refusal.selector);
+            }
+            return Err(refusal);
+        }
+        Ok(model)
+    }
+
+    /// The registry resolution before the allowlist gate: the flagged-model
+    /// arm (TS `resolveCliModel`) or the TS `createAgentSession` startup
+    /// chain.
+    fn resolve_registry_model_unchecked(&self) -> anyhow::Result<Model> {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
@@ -1972,6 +2015,21 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn switch_model(&self, selection: EngineModelSelection) -> bool {
+        // The allowlist gate on the switch candidate, before the selection
+        // slot mutates: a refused model must not poison the live selection
+        // (every later resolution would fail at the same gate). The wire
+        // seams (`set_model`, `cycle_model`) check first and own the user
+        // message and refusal event; this is the engine's total guard for
+        // any other caller.
+        if let (Some(provider), Some(model)) =
+            (selection.provider.as_deref(), selection.model.as_deref())
+        {
+            let selector = format!("{provider}/{model}");
+            let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
+            if crate::model_allowlist::assert_allowed(&allowlist, &selector).is_err() {
+                return false;
+            }
+        }
         self.configure_model(selection);
         let Ok(model) = self.resolve_model() else {
             return false;
@@ -1994,6 +2052,14 @@ impl SessionEngine for AgentSessionEngine {
             let _ = self
                 .runtime
                 .block_on(core.session.set_model(&model, &provider, &model_id));
+        }
+        // The children registry's inherited parent model follows the
+        // switch (the build-time stamp alone would go stale): an inherited
+        // `rlm.spawn` resolves the model the session NOW runs, so the
+        // allowlist gate never refuses a stale selector the parent left
+        // behind.
+        if let Some(children) = &self.children {
+            children.set_model(format!("{}/{}", model.provider, model.id));
         }
         true
     }
@@ -3817,10 +3883,13 @@ impl AgentSessionEngine {
     }
 
     /// The failover chain for `model`: the other auth-configured providers
-    /// serving the same model id, in catalog order after the current one.
-    /// Faux-script sessions never fail over (their failures are
-    /// deterministic test fixtures, and a second provider would only
-    /// reroute the scripted queue).
+    /// serving the same model id, in catalog order after the current one,
+    /// filtered by the daemon model allowlist — a failover must never land
+    /// a turn on a provider the operator pinned out (the same
+    /// `allowedModels` gate as every other resolution). Faux-script
+    /// sessions never fail over (their failures are deterministic test
+    /// fixtures, and a second provider would only reroute the scripted
+    /// queue).
     fn failover_candidates(&self, model: &pa_types::ai::Model) -> Vec<pa_types::ai::Model> {
         if self.config.faux_script.is_some() {
             return Vec::new();
@@ -3831,7 +3900,22 @@ impl AgentSessionEngine {
         registry.load_private_authorization_from_cache();
         let available: Vec<pa_types::ai::Model> =
             registry.get_available().into_iter().cloned().collect();
-        pa_core::models::failover_candidates(model, &available)
+        let candidates = pa_core::models::failover_candidates(model, &available);
+        match crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir) {
+            DaemonAllowlist::Unrestricted => candidates,
+            DaemonAllowlist::Allowed(patterns) => candidates
+                .into_iter()
+                .filter(|candidate| {
+                    pa_core::models::model_allowed(
+                        &format!("{}/{}", candidate.provider, candidate.id),
+                        &patterns,
+                    )
+                })
+                .collect(),
+            // Fail closed on an unreadable policy: no failover candidate
+            // may bypass the configured allowlist.
+            DaemonAllowlist::Unreadable(_) => Vec::new(),
+        }
     }
 
     /// Run one turn, streaming assistant updates through `emit` as they
@@ -7061,6 +7145,63 @@ pub(crate) mod tests {
         .expect("engine")
     }
 
+    /// The daemon model allowlist enforcement at the startup chain
+    /// (`resolve_registry_model`): a resolution outside settings
+    /// `allowedModels` fails loudly with the typed refusal — the chain
+    /// never lands a session on an off-list model (no silent fallback to
+    /// the featured default) — and an allowing allowlist keeps the
+    /// resolution.
+    #[test]
+    fn the_startup_chain_refuses_models_outside_the_allowlist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["anthropic/*"] }).to_string(),
+        )
+        .unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let error = engine
+            .resolve_registry_model()
+            .expect_err("off-allowlist model refused");
+        let refusal = error
+            .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+            .expect("typed refusal");
+        assert_eq!(refusal.selector, "battery/mock-1");
+        assert!(
+            error
+                .to_string()
+                .contains("blocked by the daemon model allowlist"),
+            "{error}"
+        );
+
+        // An allowing allowlist opens the gate: the same engine resolves.
+        std::fs::write(
+            engine.config.agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["battery/*"] }).to_string(),
+        )
+        .unwrap();
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.provider, "battery");
+        assert_eq!(model.id, "mock-1");
+    }
+
     /// The revival race this lane fixes (the 2026-09-23 05:57 fleet kill):
     /// a revived session (scheduled wake / update restore / worker
     /// relaunch — a create without model flags) resolves against the cold
@@ -7553,6 +7694,113 @@ pub(crate) mod tests {
             engine.effective_thinking_level().as_deref(),
             Some("high"),
             "the replacement re-clamps the requested level against its restored model"
+        );
+    }
+
+    /// The engine's switch guard: `switch_model` refuses an off-allowlist
+    /// candidate BEFORE the selection mutates, so a refused cycle or switch
+    /// never poisons the live selection (every later resolution would fail
+    /// at the same gate) — the session keeps resolving its current model.
+    #[test]
+    fn switch_model_never_poisons_the_selection_with_a_refused_candidate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "allowedModels": ["battery/mock-1"] }).to_string(),
+        )
+        .unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.id, "mock-1");
+        // The switched-to model does not match the allowlist: the switch is
+        // refused and the selection keeps the resolvable model.
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-2".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(!switched, "off-allowlist switch refused");
+        let model = engine.resolve_registry_model().expect("still resolvable");
+        assert_eq!(model.id, "mock-1");
+        // The allowed model still switches through.
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(switched, "allowed switch proceeds");
+        let model = engine.resolve_registry_model().expect("resolved model");
+        assert_eq!(model.id, "mock-1");
+    }
+
+    /// A live model switch propagates to the children registry's parent
+    /// identity: an inherited `rlm.spawn` resolves the model the session
+    /// NOW runs. The build-time stamp alone would go stale after a
+    /// switch, so the allowlist gate would refuse a stale selector the
+    /// parent no longer runs once the allowlist drops it.
+    #[test]
+    fn switch_model_propagates_the_new_model_to_the_child_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: Some(SupervisorLinkConfig {
+                socket_path: dir.path().join("absent-supervisor.sock"),
+                active_session_id: "parent-live".to_string(),
+                worker_token: "test-token".to_string(),
+            }),
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let children = engine
+            .children
+            .as_ref()
+            .expect("the supervisor link wires the children registry")
+            .clone();
+        // The pre-switch identity (the build-time stamp's shape): an
+        // older selector.
+        children.set_model("battery/mock-2".to_string());
+        let switched = engine.switch_model(EngineModelSelection {
+            provider: Some("battery".to_string()),
+            model: Some("mock-1".to_string()),
+            api_key: None,
+            thinking: None,
+        });
+        assert!(switched, "the switch proceeds without an allowlist");
+        assert_eq!(
+            children.parent_model().as_deref(),
+            Some("battery/mock-1"),
+            "an inherited spawn must resolve the switched-to model, not the stale build-time selector"
         );
     }
 
