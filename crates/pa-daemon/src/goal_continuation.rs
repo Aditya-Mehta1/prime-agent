@@ -127,6 +127,11 @@ impl AgentSessionEngine {
     /// kept while descendants stay unsettled or queued input/suspension
     /// owns the boundary.
     async fn goal_children_settled(&self) {
+        // A closed session (killed/stopped) drops the retry: no mint for a
+        // session that is no longer live (TS `_disposed || _disposing`).
+        if self.session_is_closed() {
+            return;
+        }
         let Some(handles) = self.goal_runtime.lock().expect("goal runtime lock").clone() else {
             return;
         };
@@ -163,7 +168,10 @@ impl AgentSessionEngine {
         };
         // TS `_getContinuationMessages`: new session input arriving
         // during the mint cancels it (the arrival-epoch restore).
-        if self.session_input_queued() {
+        // A close that lands during the mint cancels it the same way:
+        // the owed slot survives (a later resumed session retries), and
+        // the stopped session's durable state stays as the close left it.
+        if self.session_input_queued() || self.session_is_closed() {
             if let Err(error) = driver.rollback_continuation_mint(&mut session) {
                 // The restore hook must not reject: warn and re-owe anyway.
                 eprintln!("pa-daemon: goal mint rollback persist failed: {error:#}");
@@ -173,6 +181,14 @@ impl AgentSessionEngine {
         }
         let goal_update = self.publish_goal_state(driver.state());
         drop(driver);
+        // The close can land while the awaits above ran (the worker's kill
+        // sets the marker before its own children close — each child's
+        // settle fires this retry): a session that closed mid-mint mints
+        // nothing (the driver's owed flag is already taken, so the mint is
+        // consumed — the same TS race, but the zombie never runs).
+        if self.session_is_closed() {
+            return;
+        }
         self.deliver_goal_work(GoalTurnEndWork::Continuation(GoalContinuation {
             request: goal_prompt_request(&message),
             goal_update,
@@ -207,6 +223,12 @@ impl AgentSessionEngine {
     /// mint entirely (TS `queuedActionCount > 0`); an inactive goal
     /// clears any stale deferral and proceeds to the autonomous hook.
     fn mint_goal_continuation(&self) -> GoalBoundary {
+        // A closed session (killed/stopped) never continues: no mint, no
+        // owed-continuation consumption (TS `_disposed || _disposing` in the
+        // goal resume sites; the zombie fix).
+        if self.session_is_closed() {
+            return GoalBoundary::Proceed;
+        }
         let Some(handles) = self.goal_runtime.lock().expect("goal runtime lock").clone() else {
             return GoalBoundary::Proceed;
         };
@@ -284,6 +306,9 @@ impl AgentSessionEngine {
     /// budget transition's `goal_update` already surfaced through the
     /// crossing turn's tracking wrapper, so the mint carries no update.
     fn mint_budget_limit_steer(&self) -> Option<GoalTurnEndWork> {
+        if self.session_is_closed() {
+            return None;
+        }
         let handles = self
             .goal_runtime
             .lock()
@@ -327,6 +352,12 @@ impl AgentSessionEngine {
     /// runner wakes). An unwired sink (engine without a worker) drops the
     /// turn: the mint is durable, a later retry re-consults.
     fn deliver_goal_work(&self, work: GoalTurnEndWork) {
+        // The final gate: a closed session admits no minted goal work (the
+        // worker's kill sets the marker; the runner is parked — this keeps
+        // the queue itself free of zombie rows).
+        if self.session_is_closed() {
+            return;
+        }
         let sink = self
             .goal_admission_sink
             .lock()
