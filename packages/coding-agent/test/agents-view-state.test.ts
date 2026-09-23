@@ -1188,6 +1188,39 @@ describe("agents view state", () => {
 		expect(summaryForUnifiedRecord(savedRecord!).sessionFile).toBe("/tmp/sessions/shared.jsonl");
 	});
 
+	test("scopes a remote row identity so a hidden local copy never hides it", () => {
+		const sharedId = "01a0cba2-0000-7000-8000-abcdef123456";
+		const local = makeSummary({ id: sharedId, activeSessionId: sharedId, sessionId: sharedId });
+		const remote = makeSummary({
+			id: sharedId,
+			activeSessionId: sharedId,
+			sessionId: sharedId,
+			remoteHost: "peer.tailnet.ts.net",
+		});
+		const hidden = new Set([getAgentsViewSummaryIdentity(local)]);
+
+		expect(getAgentsViewSummaryIdentity(remote)).toBe(`remote:peer.tailnet.ts.net:active:${sharedId}`);
+		expect(shouldShowAgentsViewSession(local, hidden.has(getAgentsViewSummaryIdentity(local)))).toBe(false);
+		expect(shouldShowAgentsViewSession(remote, hidden.has(getAgentsViewSummaryIdentity(remote)))).toBe(true);
+	});
+
+	test("keeps a local heartbeat off a remote row that shares the active id", () => {
+		const sharedId = "01a0cba2-0000-7000-8000-abcdef123456";
+		const local = makeSummary({ id: sharedId, activeSessionId: sharedId, sessionId: sharedId });
+		const remote = makeSummary({
+			id: sharedId,
+			activeSessionId: sharedId,
+			sessionId: sharedId,
+			remoteHost: "peer.tailnet.ts.net",
+		});
+
+		const records = reconcileUnifiedSessions([local, remote], [], [heartbeat("shared-job", undefined, sharedId)]);
+		const localRecord = records.find((record) => record.daemon?.remoteHost === undefined);
+		const remoteRecord = records.find((record) => record.daemon?.remoteHost !== undefined);
+		expect(localRecord?.heartbeat?.activeCount).toBe(1);
+		expect(remoteRecord?.heartbeat).toBeUndefined();
+	});
+
 	test("retains the ancestor chain when search matches only a nested subagent", () => {
 		const summaries = [
 			makeSummary({ id: "root", activeSessionId: "root", sessionId: "root-session", sessionName: "Root" }),

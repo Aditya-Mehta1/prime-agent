@@ -189,11 +189,17 @@ function fileIdentity(path: string): string {
 	return `file:${canonicalSessionPath(path)}`;
 }
 
+/**
+ * A remote row publishes a peer's own session ids, so every id-derived key
+ * scopes them to their host: a local session with the same ids keeps its own
+ * row, its own heartbeat, and its own manual-inactive state.
+ */
+function identityScope(summary: SessionSummary): string {
+	return summary.remoteHost ? `remote:${summary.remoteHost}:` : "";
+}
+
 function summaryIdentityAliases(summary: SessionSummary): string[] {
-	// A remote row publishes a peer's own session ids, so scope them to their
-	// host: a local copy of that same session keeps its own row and stays
-	// attachable instead of merging into the row that refuses attachment.
-	const scope = summary.remoteHost ? `remote:${summary.remoteHost}:` : "";
+	const scope = identityScope(summary);
 	return [
 		summary.runtimeKind === "subagent" && summary.rlmChildId
 			? `agent:${cachedRosterAgentIdForSummary(summary)}`
@@ -252,8 +258,10 @@ export function reconcileUnifiedSessions(
 
 	for (const daemon of daemonSummaries) {
 		const aliases = summaryIdentityAliases(daemon);
+		// Heartbeats are local cron jobs owned by bare ids, so a remote row reads its
+		// host-scoped key and never collects a local job that happens to share the id.
 		const heartbeat =
-			heartbeatByActiveId.get(daemon.activeSessionId ?? daemon.id) ??
+			heartbeatByActiveId.get(`${identityScope(daemon)}${daemon.activeSessionId ?? daemon.id}`) ??
 			(daemon.hasActiveHeartbeat ? { activeCount: 1 } : undefined);
 		const record: UnifiedSessionRecord = {
 			daemon:
@@ -770,10 +778,11 @@ export function getAgentsViewSummaryIdentity(summary: SessionSummary): string {
 	if (summary.sessionFile) {
 		return fileIdentity(summary.sessionFile);
 	}
+	const scope = identityScope(summary);
 	if (summary.activeSessionId) {
-		return `active:${summary.activeSessionId}`;
+		return `${scope}active:${summary.activeSessionId}`;
 	}
-	return `session:${summary.sessionId}`;
+	return `${scope}session:${summary.sessionId}`;
 }
 
 export interface AgentsViewSelectionKey {
@@ -1146,9 +1155,10 @@ function buildRowKeyMap(rows: readonly MutableAgentsViewRow[]): Map<string, Muta
 }
 
 function getSummaryKeys(summary: SessionSummary): string[] {
+	const scope = identityScope(summary);
 	return [
-		`active:${summary.activeSessionId ?? summary.id}`,
-		`session:${summary.sessionId}`,
+		`${scope}active:${summary.activeSessionId ?? summary.id}`,
+		`${scope}session:${summary.sessionId}`,
 		summary.sessionFile ? fileIdentity(summary.sessionFile) : undefined,
 	].filter((key): key is string => key !== undefined);
 }
