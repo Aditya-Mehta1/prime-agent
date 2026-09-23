@@ -1,3 +1,5 @@
 - Refresh the catalog-defined default model in the background so a slow or unreachable catalog host never delays model discovery.
 - getExecutableModels() no longer blocks subagent discovery on the provider catalog request while keeping the bounded settlement wait.
 - Disposing a session now releases its session-owned ModelRegistry auth-change subscription and catalog refresh timer, closing a listener leak across repeated session creation.
+- A services container's ModelRegistry is disposed only when the last session sharing the container is disposed, so the first session's dispose no longer clears the shared registry's refresh timer and auth-change subscription.
+- No closure created in the ModelRegistry constructor captures the registry (the auth-change listener keeps its unsubscribe handle in a local closure, and the provider-catalog parse closure references a hoisted local), so a discarded registry is actually garbage-collected instead of staying reachable from AuthStorage's listener set.

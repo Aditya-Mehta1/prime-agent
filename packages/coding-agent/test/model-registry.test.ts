@@ -770,8 +770,7 @@ describe("ModelRegistry", () => {
 			vi.stubGlobal(
 				"fetch",
 				vi.fn((input: string | URL | Request) => {
-					if (String(input).includes("prime-agent-catalog/main/models/catalog.v1.json"))
-						providerCatalogRequests++;
+					if (String(input).includes("prime-agent-catalog/main/models/catalog.v1.json")) providerCatalogRequests++;
 					return new Promise<Response>(() => {});
 				}),
 			);

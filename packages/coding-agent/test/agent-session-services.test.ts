@@ -602,4 +602,52 @@ describe("createAgentSessionFromServices", () => {
 			withMessageController.dispose();
 		}
 	});
+
+	it("disposes the owned registry only when the last sharing session goes away", async () => {
+		const tempDir = join(tmpdir(), `pi-session-shared-registry-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: tempDir,
+			resourceLoaderOptions: { noPromptTemplates: true, noThemes: true },
+		});
+		expect(services.ownsModelRegistry).toBe(true);
+		const registryDispose = vi.spyOn(services.modelRegistry, "dispose");
+
+		// Concurrent sharing: the first session's dispose must not clear the shared
+		// registry's refresh timer and auth-change subscription while the second
+		// session still uses it.
+		const { session: first } = await createAgentSessionFromServices({
+			services,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions-first")),
+		});
+		const { session: second } = await createAgentSessionFromServices({
+			services,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions-second")),
+		});
+		try {
+			first.dispose();
+			expect(registryDispose).not.toHaveBeenCalled();
+			second.dispose();
+			expect(registryDispose).toHaveBeenCalledTimes(1);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+
+		// Sequential reuse of the same container stays safe too: a later lone
+		// session disposes the registry again harmlessly (dispose is idempotent).
+		const { session: third } = await createAgentSessionFromServices({
+			services,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions-third")),
+		});
+		try {
+			third.dispose();
+			expect(registryDispose).toHaveBeenCalledTimes(2);
+		} finally {
+			third.dispose();
+		}
+	});
 });

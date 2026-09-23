@@ -106,7 +106,8 @@ export interface AgentSessionServices {
 	ownsMcpManager: boolean;
 	/**
 	 * True only when this services object created its own ModelRegistry (not an
-	 * injected one); only the owner disposes the registry.
+	 * injected one). The container may serve several sessions; the registry is
+	 * disposed when the last session created from this object is disposed.
 	 */
 	ownsModelRegistry: boolean;
 }
@@ -251,6 +252,14 @@ export async function createAgentSessionServices(
 	};
 }
 
+/**
+ * Live sessions borrowing a services container that owns its ModelRegistry.
+ * ownsModelRegistry belongs to the container, not to any single session: a
+ * container may serve several sessions, so the registry is disposed when the
+ * last borrowing session is disposed, not when the first one is.
+ */
+const servicesRegistrySessions = new WeakMap<AgentSessionServices, number>();
+
 export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
@@ -303,7 +312,18 @@ export async function createAgentSessionFromServices(
 		result.session.registerDisposeCallback(() => options.services.mcpManager.dispose());
 	}
 	if (options.services.ownsModelRegistry) {
-		result.session.registerDisposeCallback(() => options.services.modelRegistry.dispose());
+		const services = options.services;
+		const liveSessions = (servicesRegistrySessions.get(services) ?? 0) + 1;
+		servicesRegistrySessions.set(services, liveSessions);
+		result.session.registerDisposeCallback(() => {
+			const remaining = (servicesRegistrySessions.get(services) ?? 1) - 1;
+			if (remaining > 0) {
+				servicesRegistrySessions.set(services, remaining);
+				return;
+			}
+			servicesRegistrySessions.delete(services);
+			services.modelRegistry.dispose();
+		});
 	}
 	if (result.session.rlmDepth === 0 && !options.telemetryDisabled) {
 		installAgentTelemetry(result.session, {

@@ -483,19 +483,30 @@ export class ModelRegistry {
 		const cachePath = (name: string) => (modelsJsonPath ? join(dirname(modelsJsonPath), "models", name) : undefined);
 		const legacyCachePaths = (name: string) =>
 			modelsJsonPath ? [join(dirname(modelsJsonPath), name), join(dirname(modelsJsonPath), "catalog", name)] : [];
+		// Closures created in this constructor share one V8 context: any one of
+		// them touching `this` makes the registry strongly reachable through the
+		// others (e.g. through the auth-change listener AuthStorage retains).
+		// Hoist what they need instead.
+		const bundledCatalogModels = this.bundledCatalogModels;
 		this.providerCatalog = new CatalogCache(
 			PROVIDER_MODEL_CATALOG_URL,
 			cachePath("provider-model-catalog.v1.json"),
-			(payload) => parseProviderModelCatalog(payload, this.bundledCatalogModels),
+			(payload) => parseProviderModelCatalog(payload, bundledCatalogModels),
 			legacyCachePaths("provider-model-catalog.v1.json"),
 		);
 		this.loadModels();
 		const reference = new WeakRef(this);
+		// Keep the unsubscribe handle in a local closure too: a listener that
+		// reaches through `this` captures the registry strongly, defeats the
+		// WeakRef, and keeps a discarded registry reachable from AuthStorage's
+		// listener set.
+		let unsubscribeAuthChange: (() => void) | undefined;
 		this.unsubscribeAuthChange = authStorage.onChange(() => {
 			const registry = reference.deref();
 			if (registry) void registry.scheduleCatalogRefresh().catch(() => {});
-			else this.unsubscribeAuthChange?.();
+			else unsubscribeAuthChange?.();
 		});
+		unsubscribeAuthChange = this.unsubscribeAuthChange;
 	}
 
 	setOnOAuthProvidersReset(hook: () => void): void {
