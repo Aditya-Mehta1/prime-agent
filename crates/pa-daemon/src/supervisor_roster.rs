@@ -190,7 +190,7 @@ impl Supervisor {
             let mut roster = self.roster.lock().unwrap();
             if !roster.accept_delta_sequence(
                 &resident.worker_id,
-                worker_instance_id.unwrap_or(""),
+                worker_instance_id.as_deref().unwrap_or(""),
                 sequence.unwrap_or(0),
             ) {
                 return response_success(Some(command_id), type_name, None);
