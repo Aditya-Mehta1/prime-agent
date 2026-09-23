@@ -22,6 +22,34 @@ describe("TopBar", () => {
 		expect(stripAnsi(line)).toBe("        demo");
 	});
 
+	it("leads the line with the speed readout, keeping the name and spend on that row", () => {
+		const bar = new TopBar({
+			getChatName: () => "demo",
+			getCostUsd: () => 1.42,
+			getSpeedText: () => "120 tok/s · avg 88.9",
+		});
+		const [line] = bar.render(60);
+		expect(stripAnsi(line)).toBe(`120 tok/s · avg 88.9${" ".repeat(8)}demo  $1.42`);
+	});
+
+	it("keeps the name clear of the speed readout on narrow terminals", () => {
+		const bar = new TopBar({
+			getChatName: () => "demo",
+			getCostUsd: () => undefined,
+			getSpeedText: () => "long-name-speed",
+		});
+		expect(stripAnsi(bar.render(24)[0])).toBe(`long-name-speed  demo`);
+	});
+
+	it("renders the plain name and spend when the speed readout is off", () => {
+		const bar = new TopBar({
+			getChatName: () => "demo",
+			getCostUsd: () => 1.42,
+			getSpeedText: () => undefined,
+		});
+		expect(stripAnsi(bar.render(21)[0])).toBe("        demo  $1.42");
+	});
+
 	it("collapses embedded newlines so the bar stays a single row", () => {
 		const bar = new TopBar({ getChatName: () => "line1\nline2" });
 		const lines = bar.render(21);
