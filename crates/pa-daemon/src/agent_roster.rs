@@ -472,10 +472,12 @@ mod tests {
         // The pull gate: a counter BELOW the watermark is a stale snapshot
         // (a delta stamped after the pull read its state already applied);
         // EQUAL refreshes apply (no delta intervened — an attach-only
-        // change rides through).
+        // change rides through). The watermark sits at 6 (the delta above
+        // applied), so 4 and 5 are stale pulls, 6 refreshes, 7 is newer.
         assert!(!roster.pull_applies("w1", "i1", 4));
-        assert!(roster.pull_applies("w1", "i1", 5));
+        assert!(!roster.pull_applies("w1", "i1", 5));
         assert!(roster.pull_applies("w1", "i1", 6));
+        assert!(roster.pull_applies("w1", "i1", 7));
         assert!(roster.pull_applies("w1", "unknown-instance", 1));
         // A replacement registration saturates the PREDECESSOR instance's
         // watermark: every predecessor delta and late pull still in flight
