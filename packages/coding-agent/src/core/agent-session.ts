@@ -2828,10 +2828,7 @@ export class AgentSession {
 			// Every image failed the caps: refuse here instead of returning the
 			// originals, which would reach a provider (or the in-place routed turn,
 			// re-sending the whole transcript) after the allowlist rejected them.
-			return {
-				reading: `[no image read: all ${images.length} attached image(s) were rejected by the image-turn limits (unsupported type, over 8 MB each, or over 24 MB total)]`,
-				reference,
-			};
+			return `[no image read: all ${images.length} attached image(s) were rejected by the image-turn limits (unsupported type, over 8 MB each, or over 24 MB total)]`;
 		}
 
 		const dir = mkdtempSync(join(tmpdir(), "prime-agent-image-turn-"));
