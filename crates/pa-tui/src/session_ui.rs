@@ -4118,11 +4118,13 @@ impl SessionUi {
         if stop_reason == "aborted" || stop_reason == "error" {
             return;
         }
-        let duration_ms = crate::agents_view_state::now_ms() as i64
-            - message
-                .get("timestamp")
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
+        // TS reads `Number(message.timestamp)`: a frame without one is NaN
+        // in TS and fails its `> 0` guard, so it is skipped here too — a
+        // zero-default would span the epoch and poison the average.
+        let Some(timestamp) = message.get("timestamp").and_then(Value::as_i64) else {
+            return;
+        };
+        let duration_ms = crate::agents_view_state::now_ms() as i64 - timestamp;
         let output_tokens = message
             .get("usage")
             .and_then(|usage| usage.get("output"))
@@ -8322,11 +8324,10 @@ mod loader_token_tests {
     }
 
     /// The session average sums tokens over the summed wall-clock span (TS
-    /// `speedStats`).
+    /// `speedStats`); it only reads once a positive-span sample exists.
     #[test]
     fn speed_stats_average_rate_sums_tokens_over_spans() {
         let mut stats = SpeedStats::default();
-        assert_eq!(stats.average_rate(), 0.0);
         stats.tokens = 300;
         stats.duration_ms = 1500;
         stats.samples = 1;

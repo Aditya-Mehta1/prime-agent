@@ -1222,10 +1222,31 @@ impl AgentView {
             .fullscreen
             .then(|| render_top_bar(&self.chrome, &self.theme, width));
         let top_rows = usize::from(top.is_some());
-        let dock = selector_dock.unwrap_or_else(|| self.render_dock(width));
+        let dock = match selector_dock {
+            // The replacement surfaces swap only the editor part of the
+            // dock; the `/speed` footer stays the dock's last row under
+            // them (TS `footerSlot` renders while `showSelector`/the
+            // pickers own the frame).
+            Some(mut dock) => {
+                if let Some(speed) = &self.chrome.speed_text {
+                    dock.push(crate::chrome::render_speed_footer(
+                        speed,
+                        &self.theme,
+                        width,
+                    ));
+                }
+                dock
+            }
+            None => self.render_dock(width),
+        };
         let dock_height = dock
             .len()
             .min(height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS));
+        let cropped = dock.len().saturating_sub(dock_height);
+        // The hardware cursor rides the dock's rows: a front crop shifts it
+        // down by the cropped count, so the reported cursor stays on the
+        // editor's cursor row at every height.
+        self.dock_cursor = self.dock_cursor.map(|(row, col)| (row + cropped, col));
         let dock: Vec<Line> = if dock.len() > dock_height {
             dock[dock.len() - dock_height..].to_vec()
         } else {
