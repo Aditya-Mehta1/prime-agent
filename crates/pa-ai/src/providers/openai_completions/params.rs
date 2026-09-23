@@ -123,15 +123,19 @@ pub(crate) fn build_params(
                 }
             }
             crate::types::ThinkingFormat::Openrouter => {
-                if let Some(effort) = options.reasoning_effort {
-                    if compat.supports_reasoning_effort {
-                        let mapped = model
-                            .thinking_level_map_value(effort)
-                            .flatten()
-                            .cloned()
-                            .unwrap_or_else(|| effort.wire_name().to_string());
-                        params.insert("reasoning".into(), json!({ "effort": mapped }));
-                    }
+                // OpenRouter distinguishes an omitted reasoning preference (use
+                // the model default), an explicit toggle, and an explicit
+                // effort selection.
+                let declared_effort = options
+                    .reasoning_effort
+                    .filter(|_| compat.supports_reasoning_effort);
+                if let Some(effort) = declared_effort {
+                    let mapped = model
+                        .thinking_level_map_value(effort)
+                        .flatten()
+                        .cloned()
+                        .unwrap_or_else(|| effort.wire_name().to_string());
+                    params.insert("reasoning".into(), json!({ "effort": mapped }));
                 } else if options.reasoning_enabled == Some(true) {
                     params.insert("reasoning".into(), json!({ "enabled": true }));
                 } else if options.reasoning_enabled == Some(false) {
