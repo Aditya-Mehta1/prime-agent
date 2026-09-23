@@ -1186,7 +1186,32 @@ impl SessionEngine for ScriptedEngine {
             emit(cancelled());
             return;
         }
-        let final_message = json!({"role": "assistant", "content": text, "provider": "scripted", "model": "faux-1", "usage": usage, "timestamp": crate::util::now_ms()});
+        let scripted_tools = scripted
+            .as_ref()
+            .and_then(|response| response.get("toolCalls"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // The real engine's assistant message carries its tool calls as
+        // `toolCall` content blocks (session stats count calls from them
+        // and results from the `toolResult` rows); a plain response keeps
+        // the text content unchanged.
+        let final_message = if scripted_tools.is_empty() {
+            json!({"role": "assistant", "content": text, "provider": "scripted", "model": "faux-1", "usage": usage, "timestamp": crate::util::now_ms()})
+        } else {
+            let mut content = vec![json!({ "type": "text", "text": text })];
+            for call in &scripted_tools {
+                if call.get("toolCallId").and_then(Value::as_str).is_some() {
+                    content.push(json!({
+                        "type": "toolCall",
+                        "id": call.get("toolCallId").cloned().unwrap_or(Value::Null),
+                        "name": call.get("toolName").cloned().unwrap_or(json!("scripted_tool")),
+                        "arguments": call.get("args").cloned().unwrap_or(Value::Null),
+                    }));
+                }
+            }
+            json!({"role": "assistant", "content": content, "provider": "scripted", "model": "faux-1", "usage": usage, "timestamp": crate::util::now_ms()})
+        };
         if !emit(EngineEvent::AssistantMessage(final_message.clone())) {
             emit(cancelled());
             return;
@@ -1196,12 +1221,6 @@ impl SessionEngine for ScriptedEngine {
         // `tool_execution_end` with its settled result, then the
         // `toolResult` message the session file records (the roster
         // activity feed keys its `isRunningTools` flag on these frames).
-        let scripted_tools = scripted
-            .as_ref()
-            .and_then(|response| response.get("toolCalls"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
         let mut tool_results = Vec::with_capacity(scripted_tools.len());
         for call in scripted_tools {
             let Some(tool_call_id) = call.get("toolCallId").and_then(Value::as_str) else {
