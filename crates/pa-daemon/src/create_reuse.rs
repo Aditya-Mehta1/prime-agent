@@ -166,7 +166,7 @@ impl Supervisor {
     pub(crate) async fn opening_guard(
         &self,
         command: &DaemonCommand,
-    ) -> Result<Option<OpeningGuard>> {
+    ) -> Result<Option<OpeningGuard<'_>>> {
         let Some(path) = create_target_file(command)? else {
             return Ok(None);
         };
