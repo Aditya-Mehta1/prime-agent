@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-	COMMAND_RESULT_TTL_MS,
 	invalidateCommandTtlCacheEntry,
 	resolveConfigValue,
 	resolveConfigValueAsync,
@@ -63,7 +62,7 @@ describe("resolveConfigValueAsync command TTL", () => {
 
 		writeFileSync(valueFile, "value-2");
 		const nowSpy = vi.spyOn(Date, "now");
-		nowSpy.mockReturnValue(Date.now() + COMMAND_RESULT_TTL_MS + 1);
+		nowSpy.mockReturnValue(Date.now() + 60_000); // well past the command TTL
 		expect(await resolveConfigValueAsync(config)).toBe("value-2");
 
 		writeFileSync(valueFile, "value-3");

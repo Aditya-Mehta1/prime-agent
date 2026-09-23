@@ -8,7 +8,6 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { getBundledModels } from "../src/core/bundled-model-catalog.js";
 import { ModelRegistry, type ProviderConfigInput } from "../src/core/model-registry.js";
-import { COMMAND_RESULT_TTL_MS } from "../src/core/resolve-config-value.js";
 
 describe("ModelRegistry", () => {
 	let tempDir: string;
@@ -1156,7 +1155,7 @@ describe("ModelRegistry", () => {
 
 			const nowSpy = vi.spyOn(Date, "now");
 			const base = Date.now();
-			nowSpy.mockReturnValue(base + COMMAND_RESULT_TTL_MS + 1);
+			nowSpy.mockReturnValue(base + 60_000); // well past the command TTL
 			try {
 				await expect(registry.getApiKeyAndHeaders(commandModel!)).resolves.toEqual({
 					ok: true,

@@ -10,7 +10,7 @@ const commandResultCache = new Map<string, string>();
 
 // Rotation commands change their output between requests; a short TTL plus
 // auth-failure invalidation bounds staleness while removing the per-request shell spawn.
-export const COMMAND_RESULT_TTL_MS = 10_000;
+const COMMAND_RESULT_TTL_MS = 10_000;
 
 interface CommandTtlEntry {
 	value: string;
