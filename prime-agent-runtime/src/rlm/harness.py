@@ -1,10 +1,10 @@
 """Persistent harness-state helpers for Prime Agent's RLM kernel.
 
 The state model is intentionally small: it records prompt notes, memory,
-skills, subagent specs, and engine-recorded refinement events in the
-session-local harness store by default; pass ``global_=True`` for the
-cross-session global store. Execution still belongs to Prime Agent's
-TypeScript host and the existing ``rlm.spawn`` recursion bridge.
+skills, subagent specs, and refinement events in the session-local harness
+store by default; pass ``global_=True`` for the cross-session global store.
+Execution still belongs to Prime Agent's TypeScript host and the existing
+``rlm.spawn`` recursion bridge.
 """
 
 from __future__ import annotations
@@ -27,12 +27,6 @@ HarnessScope = Literal["local", "global"]
 _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
 _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
-_REMOVED_METHOD_GUIDANCE = {
-    "record_refinement": (
-        "record_refinement was removed; refinement events are recorded automatically when refinements run"
-    ),
-    "plan_refinement": "plan_refinement was removed; use await refine.run() to schedule a refinement",
-}
 _REMOVED_WRAPPER_KINDS: dict[str, HarnessKind] = {
     "prompt_note": "prompt",
     "skill": "skill",
@@ -200,7 +194,7 @@ class HarnessEntry:
 
 @dataclass
 class RefinementEvent:
-    """A refinement pass recorded by the refinement engine; ``changes`` is empty when no edit applied."""
+    """A recorded online harness-refinement pass."""
 
     id: str
     trigger: str
@@ -331,6 +325,26 @@ def _validate_entry_shape(
                 raise ValueError(f"skill entry {entry_name!r} rejected: skill entries require a Python reference")
         else:
             _validate_python_skill_reference(reference, entry_name)
+
+
+def _validate_refinement_event(trigger: Any, changes: Any, *, evidence: Any, outcome: Any) -> None:
+    """Reject a refinement event whose persisted shape would break the digest."""
+    if not isinstance(trigger, str) or not trigger:
+        raise ValueError(f"refinement event rejected: trigger must be a non-empty string, got {_type_name(trigger)}")
+    if isinstance(changes, str):
+        if not changes:
+            raise ValueError("refinement event rejected: changes must be a non-empty string or a list of strings")
+    elif isinstance(changes, list):
+        if not all(isinstance(change, str) and change for change in changes):
+            raise ValueError("refinement event rejected: changes must be a list of non-empty strings")
+    else:
+        raise ValueError(
+            f"refinement event rejected: changes must be a string or a list of strings, got {_type_name(changes)}"
+        )
+    if not isinstance(evidence, str):
+        raise ValueError(f"refinement event rejected: evidence must be a string when provided, got {_type_name(evidence)}")
+    if not isinstance(outcome, str):
+        raise ValueError(f"refinement event rejected: outcome must be a string when provided, got {_type_name(outcome)}")
 
 
 class HarnessState:
@@ -778,13 +792,61 @@ class HarnessState:
     def __getattr__(self, name: str) -> Any:
         # Kernels and transcripts still carry the removed names, so name the
         # replacement instead of a bare AttributeError.
-        if guidance := _REMOVED_METHOD_GUIDANCE.get(name):
-            raise AttributeError(guidance)
         action, _, suffix = name.partition("_")
         kind = _REMOVED_WRAPPER_KINDS.get(suffix)
         if kind and action in ("create", "update", "delete"):
             raise AttributeError(f"{name} was removed; use rlm.harness.{action}_memory(..., kind={kind!r})")
         raise AttributeError(name)
+
+    def record_refinement(
+        self,
+        trigger: str,
+        changes: list[str] | str,
+        *,
+        evidence: str = "",
+        outcome: str = "",
+        id: str | None = None,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> RefinementEvent:
+        if target := self._global_target(global_, kwargs):
+            return target.record_refinement(trigger, changes, evidence=evidence, outcome=outcome, id=id)
+        self._ensure_local_writable()
+        self._sync_from_disk()
+        _validate_refinement_event(trigger, changes, evidence=evidence, outcome=outcome)
+        if id is not None and (not isinstance(id, str) or not id):
+            raise ValueError(
+                f"refinement event rejected: id must be a non-empty string when provided, got {_type_name(id)}"
+            )
+        event_id = id or f"refine_{len(self.refinements) + 1:04d}"
+        normalized_changes = [changes] if isinstance(changes, str) else list(changes)
+        event = RefinementEvent(
+            id=event_id,
+            trigger=trigger,
+            changes=normalized_changes,
+            evidence=evidence,
+            outcome=outcome,
+        )
+        self.refinements.append(event)
+        self.save()
+        return event
+
+    def plan_refinement(
+        self,
+        observation: str,
+        *,
+        failing_component: str = "",
+        next_step: str = "",
+    ) -> list[str]:
+        target = f" for {failing_component}" if failing_component else ""
+        plan = [
+            f"Diagnose the repeated failure or opportunity{target}: {observation}",
+            "Update the smallest useful prompt note, memory item, skill, or subagent spec.",
+            "Run the next action with the changed harness state, then record the outcome.",
+        ]
+        if next_step:
+            plan.append(f"Immediate validation step: {next_step}")
+        return plan
 
     def overview(self, *, max_entries_per_kind: int = 20, global_: bool = False, **kwargs: Any) -> str:
         if target := self._global_target(global_, kwargs):
