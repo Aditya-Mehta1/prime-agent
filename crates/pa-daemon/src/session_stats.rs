@@ -16,24 +16,28 @@ use crate::session_store::{SessionEntry, SessionFile};
 /// `context_window` is the engine model's context window; `None` (or zero)
 /// omits `contextUsage`, matching TS sessions without a model.
 ///
-/// The token/cost totals walk the gap-bridged branch
-/// ([`SessionFile::branch_bridged`]): they are deliberately cumulative
-/// ("what the session spent"), so a ghost-parent gap (one lost append)
-/// must not zero them out. `contextUsage` keeps the strict branch — the
-/// context estimate mirrors what the model actually sees.
+/// TS `getSessionStats` sums `state.messages` — the in-memory
+/// conversation, which after a compaction holds only what the latest
+/// compaction kept (the session reloads at the boundary, so the
+/// pre-boundary ancestry is gone from the active transcript; the
+/// saved-list rows and the `/context` totals stay whole-file cumulative
+/// on their own walks). The token/cost totals therefore walk every
+/// message entry from the latest compaction's `firstKeptEntryId`
+/// onward, in file order: a ghost-parent gap (one lost append) never
+/// drops spend the session really logged, and side-question subtrees
+/// inside the kept region count exactly as they do in TS's in-memory
+/// list. The summarizer's own usage rides the `compaction` entry, never
+/// a message, so it stays out of the active totals. `contextUsage`
+/// keeps the strict branch — the context estimate mirrors what the
+/// model actually sees.
 pub fn session_stats(store: &SessionFile, context_window: Option<u64>) -> Value {
     let branch = store.branch();
-    let bridged = store.branch_bridged();
     let messages: Vec<&Value> = branch
         .iter()
         .filter(|entry| entry.type_ == "message")
         .filter_map(|entry| entry.fields.get("message"))
         .collect();
-    let durable_messages: Vec<&Value> = bridged
-        .iter()
-        .filter(|entry| entry.type_ == "message")
-        .filter_map(|entry| entry.fields.get("message"))
-        .collect();
+    let durable_messages = kept_region_messages(store);
     let mut user_messages = 0u64;
     let mut assistant_messages = 0u64;
     let mut tool_results = 0u64;
@@ -42,11 +46,7 @@ pub fn session_stats(store: &SessionFile, context_window: Option<u64>) -> Value 
     let mut output = 0u64;
     let mut cache_read = 0u64;
     let mut cache_write = 0u64;
-    let mut cost = store
-        .window
-        .as_ref()
-        .map(|window| window.older_path_stats.cost)
-        .unwrap_or(0.0);
+    let mut cost = 0.0;
     for message in &durable_messages {
         match message.get("role").and_then(Value::as_str) {
             Some("user") => user_messages += 1,
@@ -81,19 +81,7 @@ pub fn session_stats(store: &SessionFile, context_window: Option<u64>) -> Value 
             _ => {}
         }
     }
-    let mut total_messages = durable_messages.len() as u64;
-    if let Some(window) = &store.window {
-        let older = &window.older_path_stats;
-        user_messages += older.user_messages;
-        assistant_messages += older.assistant_messages;
-        tool_results += older.tool_results;
-        tool_calls += older.tool_calls;
-        total_messages += older.total_messages;
-        input += older.input;
-        output += older.output;
-        cache_read += older.cache_read;
-        cache_write += older.cache_write;
-    }
+    let total_messages = durable_messages.len() as u64;
     let mut stats = json!({
         "sessionFile": store.path.display().to_string(),
         "sessionId": store.session_id(),
@@ -115,6 +103,37 @@ pub fn session_stats(store: &SessionFile, context_window: Option<u64>) -> Value 
         stats["contextUsage"] = usage;
     }
     stats
+}
+
+/// The messages TS `state.messages` holds after the latest compaction:
+/// every message entry from the boundary row (`firstKeptEntryId`) onward,
+/// in file order — without a compaction, every message entry.
+fn kept_region_messages(store: &SessionFile) -> Vec<&Value> {
+    let entries = store.entries();
+    // The latest compaction bounds the kept region; its `firstKeptEntryId`
+    // names the first row the post-compaction reload keeps. A torn write
+    // that lost the boundary row falls back to the compaction entry
+    // itself: the rows after it are the post-compaction transcript.
+    let boundary = entries
+        .iter()
+        .rposition(|entry| entry.type_ == "compaction")
+        .map(|compaction| {
+            entries[compaction]
+                .fields
+                .get("firstKeptEntryId")
+                .and_then(Value::as_str)
+                .and_then(|id| entries.iter().position(|entry| entry.id == id))
+                .unwrap_or(compaction)
+        });
+    let region = match boundary {
+        Some(boundary) => &entries[boundary..],
+        None => entries,
+    };
+    region
+        .iter()
+        .filter(|entry| entry.type_ == "message")
+        .filter_map(|entry| entry.fields.get("message"))
+        .collect()
 }
 
 /// `contextUsage` for one whole store (the `get_context_tree` root node):
@@ -444,5 +463,142 @@ mod tests {
         // getSessionStats does not filter on stopReason).
         assert_eq!(stats["tokens"]["total"], 17);
         assert_eq!(stats["contextUsage"]["tokens"], 128);
+    }
+
+    /// Captured devbox session (TS-written), sanitized: content stripped;
+    /// ids, parentIds, timestamps, roles, usage, and the compaction row
+    /// verbatim. One compaction at the audit-captured boundary: the
+    /// pre-cut ancestry carries 952 assistant turns / $0.2900872 /
+    /// 154,979,520 cacheRead that TS drops from the active stats, and the
+    /// kept region is the 2622 turns / $3.921395 TS reports
+    /// post-compaction. Two minted-but-never-persisted parent ids are
+    /// repaired to their file predecessor (the exact bridge the bridged
+    /// walk applies; the kept-region totals are invariant under it) so the
+    /// fixture also exercises the windowed reader.
+    #[test]
+    fn captured_compaction_boundary_matches_ts_active_stats() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/active-stats-compaction-captured.jsonl");
+        let full = SessionFile::open(&path).expect("fixture opens");
+        let windowed = SessionFile::open_windowed(&path).expect("windowed open");
+        assert!(
+            windowed.window.is_some(),
+            "fixture must exercise the windowed reader"
+        );
+        let expected = json!({
+            "sessionFile": path.display().to_string(),
+            "sessionId": "01a0a7fa-3d00-773b-bd1e-a97597d89476",
+            "userMessages": 348,
+            "assistantMessages": 2622,
+            "toolCalls": 748,
+            "toolResults": 748,
+            "totalMessages": 3718,
+            "tokens": {
+                "input": 3_667_340,
+                "output": 142_884,
+                "cacheRead": 219_856_050,
+                "cacheWrite": 269_974,
+                "total": 223_936_248,
+            },
+            "cost": 3.921395,
+            "contextUsage": {
+                "tokens": 53_519,
+                "contextWindow": 200_000,
+                "percent": 26.759500000000003,
+            },
+        });
+        assert_eq!(session_stats(&full, Some(200_000)), expected);
+        // The windowed store (retained region) and the full store walk the
+        // same kept region and must serve identical active numbers.
+        assert_eq!(session_stats(&windowed, Some(200_000)), expected);
+    }
+
+    /// The compaction boundary in miniature: the pre-cut ancestry is spend
+    /// the active stats must not report; the kept region — kept rows
+    /// before the compaction entry, a side-question subtree, and a
+    /// ghost-parent row whose parent was minted but never persisted — is
+    /// what they must. The summarizer's own usage rides the compaction
+    /// entry and stays out.
+    #[test]
+    fn compaction_boundary_drops_the_pre_cut_ancestry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("boundary.jsonl");
+        let assistant = |id: &str, parent: Option<&str>, cost: f64| {
+            json!({
+                "type": "message", "id": id, "parentId": parent,
+                "timestamp": "2026-09-23T00:00:00.000Z",
+                "message": {
+                    "role": "assistant",
+                    "provider": "prime-inference", "model": "internal/glm-5.3-fast",
+                    "content": [{ "type": "text", "text": "hi" }],
+                    "stopReason": "stop",
+                    "usage": { "input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0,
+                               "totalTokens": 15, "cost": { "total": cost } },
+                },
+            })
+            .to_string()
+        };
+        let user = |id: &str, parent: Option<&str>| {
+            json!({
+                "type": "message", "id": id, "parentId": parent,
+                "timestamp": "2026-09-23T00:00:00.000Z",
+                "message": { "role": "user", "content": "hi" },
+            })
+            .to_string()
+        };
+        let lines = [
+            json!({"type": "session", "version": 3, "id": "s1", "timestamp": "2026-09-23T00:00:00.000Z", "cwd": "/tmp"}).to_string(),
+            user("u1", None),
+            assistant("a1", Some("u1"), 0.125),
+            user("u2", Some("a1")),
+            assistant("a2", Some("u2"), 0.25),
+            // The kept region starts at u3 (firstKeptEntryId); the kept
+            // rows precede the compaction entry in file order, as in a
+            // real compacted file.
+            user("u3", Some("a2")),
+            assistant("a3", Some("u3"), 0.25),
+            json!({
+                "type": "compaction", "id": "c1", "parentId": "a3",
+                "timestamp": "2026-09-23T00:00:00.000Z",
+                "summary": "summary", "firstKeptEntryId": "u3", "tokensBefore": 100,
+                "usage": { "input": 999, "output": 9, "cacheRead": 0, "cacheWrite": 0,
+                           "totalTokens": 1008, "cost": { "total": 0.75 } },
+            })
+            .to_string(),
+            json!({
+                "type": "custom_message", "id": "cm1", "parentId": "c1",
+                "timestamp": "2026-09-23T00:00:00.000Z",
+                "customType": "agent_message", "content": "side", "display": true,
+            })
+            .to_string(),
+            assistant("a4", Some("cm1"), 0.5),
+            user("u4", Some("c1")),
+            assistant("a5", Some("u4"), 0.25),
+            user("u5", Some("a5")),
+            assistant("a6", Some("ghost01"), 0.5),
+        ];
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let full = SessionFile::open(&path).unwrap();
+        let windowed = SessionFile::open_windowed(&path).unwrap();
+        // The ghost parent dangles the windowed reader's chain-following,
+        // so it falls back to the full reader: both stores must still
+        // serve the same kept-region numbers.
+        assert!(windowed.window.is_none());
+        let expected = json!({
+            "sessionFile": path.display().to_string(),
+            "sessionId": "s1",
+            "userMessages": 3,
+            "assistantMessages": 4,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "totalMessages": 7,
+            "tokens": { "input": 40, "output": 20, "cacheRead": 0, "cacheWrite": 0, "total": 60 },
+            "cost": 1.5,
+            // The strict branch truncates at the ghost parent, so the
+            // context estimate anchors on the last row alone.
+            "contextUsage": { "tokens": 15, "contextWindow": 1000, "percent": 1.5 },
+        });
+        assert_eq!(session_stats(&full, Some(1000)), expected);
+        assert_eq!(session_stats(&windowed, Some(1000)), expected);
     }
 }
