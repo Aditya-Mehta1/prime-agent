@@ -184,20 +184,12 @@ impl Supervisor {
         // connect, create replay); the wait is bounded so a wedged sibling
         // answers the TS `worker is starting` shape instead of parking
         // the client forever.
-        let guard = match tokio::time::timeout(OPENING_LOCK_WAIT, lock.lock_owned()).await {
-            Ok(guard) => guard,
-            Err(_) => {
-                // The abandoned wait keeps its map reference only until
-                // here: the map entry retires when its last referrer
-                // drops (the release path checks), so a timed-out waiter
-                // must not pin it.
-                drop(lock);
-                return Err(anyhow!(
-                    "Session \"{}\" worker is starting",
-                    path.to_string_lossy()
-                ));
-            }
-        };
+        // A timed-out wait drops its Arc with the timeout future, so it
+        // never pins the map entry (the release path retires it once the
+        // last referrer drops).
+        let guard = tokio::time::timeout(OPENING_LOCK_WAIT, lock.lock_owned())
+            .await
+            .map_err(|_| anyhow!("Session \"{}\" worker is starting", path.to_string_lossy()))?;
         Ok(Some(OpeningGuard {
             supervisor: self,
             key,
