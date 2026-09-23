@@ -239,7 +239,7 @@ fn create_over_a_live_worker_answers_the_live_binding() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     let _daemon = spawn_daemon(&socket, &agent_dir, None);
 
-    let script_path = write_script(&dir, &["first scripted", "second scripted"]);
+    let script_path = write_script(dir.path(), &["first scripted", "second scripted"]);
     let create_config = json!({
         "cwd": dir.path().to_string_lossy(),
         "sessionDir": agent_dir.join("sessions").to_string_lossy(),
@@ -343,7 +343,7 @@ fn the_lease_owner_names_the_live_worker_not_a_stale_inherited_id() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     let _daemon = spawn_daemon(&socket, &agent_dir, Some("stale-owner-245ddb974b6d"));
 
-    let script_path = write_script(&dir, &["one scripted"]);
+    let script_path = write_script(dir.path(), &["one scripted"]);
     let create_config = json!({
         "cwd": dir.path().to_string_lossy(),
         "sessionDir": agent_dir.join("sessions").to_string_lossy(),
@@ -388,7 +388,7 @@ fn create_over_a_dead_workers_file_launches_and_rebinds() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     let _daemon = spawn_daemon(&socket, &agent_dir, None);
 
-    let script_path = write_script(&dir, &["first scripted", "second scripted"]);
+    let script_path = write_script(dir.path(), &["first scripted", "second scripted"]);
     let create_config = json!({
         "cwd": dir.path().to_string_lossy(),
         "sessionDir": agent_dir.join("sessions").to_string_lossy(),
