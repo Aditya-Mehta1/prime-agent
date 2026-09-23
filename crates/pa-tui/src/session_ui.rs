@@ -74,7 +74,7 @@ const EXIT_STATS_TIMEOUT_MS: u64 = 500;
 
 /// How a submitted prompt travels to the session (TS `streamingBehavior`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubmitBehavior {
+pub(crate) enum SubmitBehavior {
     /// Plain Enter: mid-turn input parks on the steering lane (TS "steer").
     Steer,
     /// The follow-up key (`alt+enter`): parks on the follow-up lane and
@@ -304,9 +304,10 @@ pub(crate) struct SessionUi {
     pub(crate) turn_active: bool,
     /// The session's queue delivery mode (TS `steeringMode`, the state's
     /// `steeringMode`): `all` delivers the queued steering prefix as one
-    /// batched turn at the boundary; `one-at-a-time` (the TS default) one
-    /// per turn. Cached at every connection-state read so the queued-input
-    /// adoption event reports the mode without a synchronous fetch.
+    /// batched turn at the boundary; `one-at-a-time` one per turn. The
+    /// product default is `all`. Cached at every connection-state read
+    /// so the queued-input adoption event reports the mode without a
+    /// synchronous fetch.
     pub(crate) steering_mode: String,
     /// The chat index of the assistant message still streaming.
     streaming_index: Option<usize>,
@@ -615,7 +616,7 @@ impl SessionUi {
             cost_usd: None,
             list_rows: Vec::new(),
             turn_active: false,
-            steering_mode: "one-at-a-time".to_string(),
+            steering_mode: "all".to_string(),
             streaming_index: None,
             working_tokens: LoaderTokenTracker::default(),
             turn_error_shown: false,
@@ -974,7 +975,7 @@ impl SessionUi {
         // not a live activity (the tray's TS label still covers the
         // paused and budget-limited states).
         let goal_tokens = (goal.status == pa_types::goal::GoalStatus::Active)
-            .then(|| (goal.tokens_used, goal.token_budget));
+            .then_some((goal.tokens_used, goal.token_budget));
         // The dock's bash indicator counts only runs actively running
         // right now (operator scoping): finished runs stay as dimmed rows
         // inside the panel, never in the indicator. The feed itself is the
@@ -1737,8 +1738,15 @@ impl SessionUi {
 
     /// Submit a prompt (the Enter path). The user message arrives back as a
     /// `message_start` session event (no local echo), and prompts sent while
-    /// a turn is active queue on the daemon side.
-    pub(crate) async fn submit_prompt(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
+    /// a turn is active queue on the daemon side. `behavior` selects the
+    /// lane (TS `handleFollowUp` routes the follow-up key through this
+    /// same ladder with the `followUp` behavior).
+    pub(crate) async fn submit_prompt(
+        &mut self,
+        text: &str,
+        behavior: SubmitBehavior,
+        view: &mut AgentView,
+    ) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(());
@@ -1794,12 +1802,12 @@ impl SessionUi {
             return Ok(());
         }
         if text.starts_with('/') {
-            return self.handle_slash(text, view).await;
+            return self.handle_slash(text, behavior, view).await;
         }
         // TS `clearShortcutGuide`: every prompt submission dismisses the
         // `?` quick-shortcut guide (slash commands keep it).
         view.shortcut_guide = None;
-        self.send_prompt(text, SubmitBehavior::Steer, view).await
+        self.send_prompt(text, behavior, view).await
     }
 
     // ------------------------------------------------------------------
@@ -2227,6 +2235,18 @@ impl SessionUi {
                             continue;
                         }
                     }
+                    if crate::daemon_client::is_daemon_rejection(&error) {
+                        // TS `onSubmit`'s prompt catch: the daemon answered
+                        // with a refusal for THIS request (admission, queue
+                        // capacity, a superseded session the rebind could
+                        // not recover, ...) — the connection is healthy, so
+                        // the `⚠ Error` row surfaces the refusal and the
+                        // draft returns to the editor; a refused prompt
+                        // never exits the UI.
+                        self.error_row(&rendered, view);
+                        view.editor.set_text(text);
+                        return Ok(());
+                    }
                     return Err(anyhow!("{rendered}"));
                 }
             }
@@ -2389,7 +2409,18 @@ impl SessionUi {
     /// commands (`compact`/`refine`/`goal`/`autonomous`) forward to the
     /// session, and unknown commands get the TS suggestion error — anything
     /// without a suggestion passes through as a prompt.
-    async fn handle_slash(&mut self, text: &str, view: &mut AgentView) -> Result<()> {
+    ///
+    /// `behavior` is TS `onSubmit`'s captured `streamingBehavior`: the
+    /// submit lane that carried the text (alt+enter = followUp), passed
+    /// through to every fallthrough prompt — TS sends the fallthrough with
+    /// the submit's own lane, so a slash-prefixed follow-up keeps parking
+    /// on the follow-up lane (Bugbot's lost-lane finding).
+    async fn handle_slash(
+        &mut self,
+        text: &str,
+        behavior: SubmitBehavior,
+        view: &mut AgentView,
+    ) -> Result<()> {
         let registry = SlashCommandRegistry::builtin();
         let (name, args) = pa_types::slash_commands::parse_slash_command(text)
             .unwrap_or_else(|| (String::new(), String::new()));
@@ -2427,7 +2458,7 @@ impl SessionUi {
             // bails out before fuzzy matching). Close typos get the exact TS
             // error; everything else passes through to the model.
             if name.chars().count() > 64 {
-                return self.send_prompt(text, SubmitBehavior::Steer, view).await;
+                return self.send_prompt(text, behavior, view).await;
             }
             let candidates = registry.suggestion_candidates();
             return match pa_types::slash_commands::find_slash_command_suggestion(&name, &candidates)
@@ -2439,7 +2470,7 @@ impl SessionUi {
                     );
                     Ok(())
                 }
-                None => self.send_prompt(text, SubmitBehavior::Steer, view).await,
+                None => self.send_prompt(text, behavior, view).await,
             };
         };
 
@@ -2447,9 +2478,7 @@ impl SessionUi {
             .get(resolved.name)
             .expect("resolved name is builtin");
         match command.execution {
-            SlashCommandExecution::Session => {
-                self.send_prompt(text, SubmitBehavior::Steer, view).await
-            }
+            SlashCommandExecution::Session => self.send_prompt(text, behavior, view).await,
             SlashCommandExecution::Client => {
                 self.dispatch_client_command(&resolved, text, view).await
             }
@@ -2679,6 +2708,82 @@ impl SessionUi {
             "traces" => {
                 self.track_command_used("traces");
                 self.handle_traces_command(resolved, view).await?;
+            }
+            // `/nightly [on|off|status]` (TS `interactive-mode.ts`
+            // 5455-5484): status resolves the effective channel,
+            // off/stable pins the settings channel to stable, and on (or
+            // bare) hands a `--self --nightly` update to the same parked
+            // plan `/update` builds (the update command owns the nightly
+            // warning, the channel switch, and the relaunch).
+            "nightly" => {
+                self.track_command_used("nightly");
+                let arg = resolved.args.trim().to_lowercase();
+                if arg == "status" {
+                    // The effective channel resolves through the
+                    // client-settings seam (pa-tui cannot reach the
+                    // update flow's resolver); a surface without the
+                    // seam never claims a channel.
+                    let Some(settings) = &self.client_settings else {
+                        self.note("/nightly is not available in this client yet", view);
+                        return Ok(());
+                    };
+                    let preferred = settings.update_channel();
+                    let channel = settings.effective_update_channel(&view.chrome.version);
+                    let source = if preferred.is_some() {
+                        "set in settings"
+                    } else {
+                        "inferred from the running version"
+                    };
+                    self.note(
+                        &format!(
+                            "Updates follow the {channel} channel ({source}). v{} installed.",
+                            view.chrome.version
+                        ),
+                        view,
+                    );
+                    return Ok(());
+                }
+                if arg == "off" || arg == "stable" {
+                    // The pin persists through the client-settings seam; a
+                    // surface without the seam never claims the pin (TS
+                    // always has a settings manager, so the gate is this
+                    // client's honesty guard).
+                    let Some(settings) = &self.client_settings else {
+                        self.note("/nightly is not available in this client yet", view);
+                        return Ok(());
+                    };
+                    if let Err(error) = settings.set_update_channel("stable") {
+                        self.error_row(&format!("{error:#}"), view);
+                        return Ok(());
+                    }
+                    self.note(
+                        "Updates now follow the stable channel. Run /update to install the latest stable release.",
+                        view,
+                    );
+                    return Ok(());
+                }
+                if !arg.is_empty() && arg != "on" {
+                    self.error_row("Usage: /nightly [on|off|status]", view);
+                    return Ok(());
+                }
+                // TS guards on compacting/streaming/bash: `turn_active`
+                // carries the streaming and compaction arms, and the
+                // user-bash slot (`!` runs) is its own state — a relaunch
+                // mid-run would interrupt either.
+                if self.turn_active || self.user_bash_running {
+                    self.note_as(
+                        "Wait for the current work to finish before updating.",
+                        StatusKind::Warning,
+                        view,
+                    );
+                    return Ok(());
+                }
+                let plan = crate::update_command::parse_update_args(&[
+                    "--self".to_string(),
+                    "--nightly".to_string(),
+                ]);
+                view.editor.set_text("");
+                self.pending_update = Some(plan);
             }
             // `/update [source|--self|--extensions|--extension <source>
             // |--force|--rollback|--nightly|--stable]` (TS
@@ -3439,6 +3544,13 @@ impl SessionUi {
         let mut args = vec!["update".to_string()];
         args.extend(plan.flags.clone());
         let child_result = update.0.run_cli_child(args).await;
+        // TS skips the relaunch when the interactive child exits with the
+        // not-attempted code (75): a declined confirmation or a no-change
+        // skip keeps the running client as-is, so the session is not torn
+        // down and restarted for nothing.
+        if matches!(child_result, Ok(75)) {
+            return Ok(());
+        }
         match child_result {
             Err(error) => {
                 eprintln!("Update failed: {error}");
@@ -3594,7 +3706,7 @@ impl SessionUi {
             steering_mode: state
                 .get("steeringMode")
                 .and_then(Value::as_str)
-                .unwrap_or("one-at-a-time")
+                .unwrap_or("all")
                 .to_string(),
             follow_up_mode: state
                 .get("followUpMode")
@@ -5741,8 +5853,8 @@ impl SessionUi {
     fn scope_heartbeats(&self, heartbeats: Vec<HeartbeatEntry>) -> Vec<HeartbeatEntry> {
         scope_heartbeats(
             heartbeats,
-            (!self.active_session_id.is_empty()).then(|| self.active_session_id.as_str()),
-            (!self.session_id.is_empty()).then(|| self.session_id.as_str()),
+            (!self.active_session_id.is_empty()).then_some(self.active_session_id.as_str()),
+            (!self.session_id.is_empty()).then_some(self.session_id.as_str()),
             &[],
         )
     }
@@ -6781,25 +6893,29 @@ impl SessionUi {
             }
         }
         // The follow-up key (TS `app.message.followUp`, default alt+enter):
-        // the same submit path as Enter, but the message parks on the
+        // the same submit ladder as Enter, but the message parks on the
         // follow-up lane and delivers when the run goes idle. While a
         // queued message is selected, the edit re-parks it there instead
-        // (TS `handleFollowUp`'s browsing branch).
+        // (TS `handleFollowUp`'s browsing branch). An empty follow-up is
+        // TS `handleFollowUp`'s silent no-op: never submitted, never
+        // dispatched to the daemon.
         if view
             .editor
             .keybindings()
             .matches(&id, "app.message.followUp")
         {
-            view.editor.submit();
-            for event in view.editor.take_events() {
-                if let crate::editor::EditorEvent::Submitted(text) = event {
-                    if self.queue_selection.is_browsing() {
-                        self.apply_queue_selection(&text, QueueLane::FollowUp, view)
-                            .await?;
-                    } else {
-                        view.editor.add_to_history(&text);
-                        self.send_prompt(&text, SubmitBehavior::FollowUp, view)
-                            .await?;
+            if self.queue_selection.is_browsing() || !view.editor.get_text().trim().is_empty() {
+                view.editor.submit();
+                for event in view.editor.take_events() {
+                    if let crate::editor::EditorEvent::Submitted(text) = event {
+                        if self.queue_selection.is_browsing() {
+                            self.apply_queue_selection(&text, QueueLane::FollowUp, view)
+                                .await?;
+                        } else {
+                            view.editor.add_to_history(&text);
+                            self.submit_prompt(&text, SubmitBehavior::FollowUp, view)
+                                .await?;
+                        }
                     }
                 }
             }
@@ -6841,7 +6957,8 @@ impl SessionUi {
                         .await?;
                 } else {
                     view.editor.add_to_history(&text);
-                    self.submit_prompt(&text, view).await?;
+                    self.submit_prompt(&text, SubmitBehavior::Steer, view)
+                        .await?;
                 }
             }
         }
@@ -8407,10 +8524,11 @@ mod loader_token_tests {
     /// `speedStats`); it only reads once a positive-span sample exists.
     #[test]
     fn speed_stats_average_rate_sums_tokens_over_spans() {
-        let mut stats = SpeedStats::default();
-        stats.tokens = 300;
-        stats.duration_ms = 1500;
-        stats.samples = 1;
+        let mut stats = SpeedStats {
+            tokens: 300,
+            duration_ms: 1500,
+            samples: 1,
+        };
         assert_eq!(stats.average_rate(), 200.0);
         stats.tokens += 100;
         stats.duration_ms += 500;
