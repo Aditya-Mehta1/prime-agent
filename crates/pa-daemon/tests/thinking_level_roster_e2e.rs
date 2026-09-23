@@ -166,7 +166,7 @@ impl Client {
     where
         F: Fn(&Value) -> bool,
     {
-        if let Some(index) = self.roster_updates.iter().position(|line| accept(line)) {
+        if let Some(index) = self.roster_updates.iter().position(&accept) {
             return self.roster_updates.remove(index);
         }
         // Poll (not block in read_line): the deadline assertion is the
@@ -281,7 +281,8 @@ fn setup(name: &str) -> Harness {
     let created = client.request("c1");
     assert_eq!(created["success"], true, "create failed: {created}");
     assert_eq!(
-        created["data"]["thinkingLevel"], json!("low"),
+        created["data"]["thinkingLevel"],
+        json!("low"),
         "the parent starts at low: {created}"
     );
     let session_id = created["data"]["id"]
@@ -361,7 +362,8 @@ fn thinking_level_changes_reach_the_roster_push() {
         "subagent create failed: {child_created}"
     );
     assert_eq!(
-        child_created["data"]["thinkingLevel"], json!("low"),
+        child_created["data"]["thinkingLevel"],
+        json!("low"),
         "the child spawns at low: {child_created}"
     );
     let child_id = child_created["data"]["id"]
@@ -379,9 +381,14 @@ fn thinking_level_changes_reach_the_roster_push() {
     assert_eq!(probed["success"], true, "child get_state failed: {probed}");
 
     // Subscribe: the snapshot carries both rows at low.
-    harness.client.send_command("rs", json!({ "type": "roster_subscribe" }));
+    harness
+        .client
+        .send_command("rs", json!({ "type": "roster_subscribe" }));
     let subscribed = harness.client.request("rs");
-    assert_eq!(subscribed["success"], true, "subscribe failed: {subscribed}");
+    assert_eq!(
+        subscribed["success"], true,
+        "subscribe failed: {subscribed}"
+    );
     let child_row = subscribed["data"]["roster"]
         .as_array()
         .cloned()
@@ -390,7 +397,8 @@ fn thinking_level_changes_reach_the_roster_push() {
         .find(|entry| entry["summary"]["rlmChildId"] == json!("child-1"))
         .expect("the child row in the roster snapshot");
     assert_eq!(
-        child_row["summary"]["thinkingLevel"], json!("low"),
+        child_row["summary"]["thinkingLevel"],
+        json!("low"),
         "the snapshot child row is at low: {child_row}"
     );
     let parent_row = subscribed["data"]["roster"]
@@ -401,7 +409,8 @@ fn thinking_level_changes_reach_the_roster_push() {
         .find(|entry| entry["summary"]["activeSessionId"] == parent_id.as_str())
         .expect("the parent row in the roster snapshot");
     assert_eq!(
-        parent_row["summary"]["thinkingLevel"], json!("low"),
+        parent_row["summary"]["thinkingLevel"],
+        json!("low"),
         "the snapshot parent row is at low: {parent_row}"
     );
 
@@ -418,14 +427,12 @@ fn thinking_level_changes_reach_the_roster_push() {
         "child set_thinking_level failed: {raised}"
     );
     let update = harness.client.next_roster_update(|line| {
-        line["changed"]
-            .as_array()
-            .is_some_and(|entries| {
-                entries.iter().any(|entry| {
-                    entry["summary"]["rlmChildId"] == json!("child-1")
-                        && entry["summary"]["thinkingLevel"] == json!("high")
-                })
+        line["changed"].as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["summary"]["rlmChildId"] == json!("child-1")
+                    && entry["summary"]["thinkingLevel"] == json!("high")
             })
+        })
     });
     assert!(
         update["changed"]
@@ -448,14 +455,12 @@ fn thinking_level_changes_reach_the_roster_push() {
         "parent set_thinking_level failed: {raised}"
     );
     harness.client.next_roster_update(|line| {
-        line["changed"]
-            .as_array()
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry["summary"]["activeSessionId"] == parent_id.as_str()
-                        && entry["summary"]["thinkingLevel"] == json!("high"))
+        line["changed"].as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["summary"]["activeSessionId"] == parent_id.as_str()
+                    && entry["summary"]["thinkingLevel"] == json!("high")
             })
+        })
     });
 
     // A model switch that clamps the level flushes the roster too: the
@@ -473,15 +478,13 @@ fn thinking_level_changes_reach_the_roster_push() {
     let switched = harness.client.request("sm");
     assert_eq!(switched["success"], true, "set_model failed: {switched}");
     let update = harness.client.next_roster_update(|line| {
-        line["changed"]
-            .as_array()
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry["summary"]["activeSessionId"] == parent_id.as_str()
-                        && entry["summary"]["model"]["id"] == json!("mock-2")
-                        && entry["summary"]["thinkingLevel"] == json!("off"))
+        line["changed"].as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["summary"]["activeSessionId"] == parent_id.as_str()
+                    && entry["summary"]["model"]["id"] == json!("mock-2")
+                    && entry["summary"]["thinkingLevel"] == json!("off")
             })
+        })
     });
     assert!(
         update["changed"]
@@ -516,9 +519,14 @@ fn unchanged_thinking_level_answers_without_a_roster_push() {
     let mut harness = setup("thinking-roster-quiet");
     let parent_id = harness.session_id.clone();
 
-    harness.client.send_command("rs", json!({ "type": "roster_subscribe" }));
+    harness
+        .client
+        .send_command("rs", json!({ "type": "roster_subscribe" }));
     let subscribed = harness.client.request("rs");
-    assert_eq!(subscribed["success"], true, "subscribe failed: {subscribed}");
+    assert_eq!(
+        subscribed["success"], true,
+        "subscribe failed: {subscribed}"
+    );
 
     // low again: no change, success, and no push inside the quiet window.
     harness.client.send_command(
