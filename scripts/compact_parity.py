@@ -22,6 +22,16 @@ Both sides run the same token-paced faux provider script; the sandbox
 settings.json pins compaction.keepRecentTokens=10 so the kept tail after
 the cut is a few rows and the summary row lands on screen in the default
 bottom-follow view on both sides (no keybinding-dependent scrolling).
+One documented divergence (Kevin/Sebastian directive 2026-09-23, product
+improvement BEYOND TS): the expanded compaction block hangs on the branch
+grammar — the markdown body carries the dim `\u{2570}\u{2500} ` gutter on
+its first row hanging off the `\u{25c6}` header, every row after the
+four-space continuation indent, the metadata row on the continuation
+indent — instead of the TS `ExpandableEventMessage`'s plain one-column
+chat inset. The diff drops the expanded block's rows from BOTH frames
+(the collapsed loader/summary rows keep byte-parity) and the run
+separately asserts the Rust expanded rows carry the branch and the TS
+frames keep the plain-inset baseline.
 Frames are normalized for volatile content (versions, session ids,
 durations, spinners) and diffed; the exit code is non-zero when any state
 differs.
@@ -151,6 +161,56 @@ def normalize(frame, root):
     # the focus text are the parity claim; the number is per-implementation).
     frame = re.sub(r"Compacted from [0-9,]+ tokens", "Compacted from <N> tokens", frame)
     return frame
+
+
+# The expanded compaction block's rows (the carried divergence, see the
+# module docstring). The body needle matches the collapsed summary's
+# whitespace-collapsed text too, so the strip only ever runs on the
+# expanded state.
+COMPACTION_EXPANSION_NEEDLES = [
+    "the session story of the compacted parity session",
+    "Padding sentence to pace the stream",
+    "Compacted from",
+]
+
+
+def strip_compaction_expansion(frame, state):
+    """Drop the compaction block's expanded rows from BOTH frames (the
+    expanded-state divergence; the collapsed states are untouched)."""
+    if state != "d_expanded":
+        return frame
+    kept = []
+    for line in frame.split("\n"):
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        stripped = plain.strip()
+        if any(needle in plain for needle in COMPACTION_EXPANSION_NEEDLES):
+            continue
+        # The `## Summary` heading renders as its own row: the TS plain
+        # inset, the Rust branch gutter.
+        if stripped in ("Summary", "\u{2570}\u{2500} Summary"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def assert_compaction_branch(ts_expanded, rust_expanded):
+    """The carried divergence: the Rust expanded block hangs on the branch
+    grammar (`\u{2570}\u{2500} ` gutter off the `\u{25c6}` header, the
+    four-space continuation indent); the TS binary keeps the plain
+    one-column chat inset (the baseline)."""
+    gutter = "\u{2570}\u{2500} "
+    assert " " + gutter + "Summary" in rust_expanded, (
+        "rust: the expanded heading row missing the branch gutter"
+    )
+    assert " " + gutter + "the session story" in rust_expanded, (
+        "rust: the expanded body missing the branch gutter on its first row"
+    )
+    assert "    Compacted from" in rust_expanded, (
+        "rust: the metadata row missing the continuation indent"
+    )
+    assert " Summary" in ts_expanded, "ts: expanded heading missing (baseline)"
+    assert gutter + "Summary" not in ts_expanded, "ts: unexpectedly renders the branch"
+    assert " Compacted from" in ts_expanded, "ts: metadata row missing (baseline)"
 
 
 def diff_lines(left, right):
@@ -353,11 +413,16 @@ def main():
             return 0
         ts_frames = launch("ts", sandboxes["ts"], shared_cwd, script_path, out_dir)
         rust_frames = launch("rust", sandboxes["rust"], shared_cwd, script_path, out_dir)
+        if "d_expanded" in ts_frames and "d_expanded" in rust_frames:
+            assert_compaction_branch(
+                capture_plain_text(ts_frames["d_expanded"]),
+                capture_plain_text(rust_frames["d_expanded"]),
+            )
         for state, _ in STATES:
             if state not in ts_frames or state not in rust_frames:
                 continue
-            ts_norm = normalize(ts_frames[state], base)
-            rust_norm = normalize(rust_frames[state], base)
+            ts_norm = normalize(strip_compaction_expansion(ts_frames[state], state), base)
+            rust_norm = normalize(strip_compaction_expansion(rust_frames[state], state), base)
             name = f"{state}-{WIDTH}x{HEIGHT}"
             if ts_norm == rust_norm:
                 print(f"PASS {name}")

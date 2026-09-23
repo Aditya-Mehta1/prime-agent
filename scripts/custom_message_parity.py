@@ -49,6 +49,18 @@ present (collapsed labels, expanded reason bodies, no preview) and the TS
 frames show the old generic label (the baseline the TS team is expected to
 adopt).
 
+Third documented divergence (Kevin/Sebastian directive 2026-09-23, product
+improvement BEYOND TS): the expanded refinement outcome hangs on the
+branch grammar — the expanded content carries the dim `\u{2570}\u{2500} `
+gutter on the first row hanging off the `\u{25c6}` header and a
+four-space continuation indent after, instead of the TS
+`ExpandableEventMessage`'s plain one-column chat inset (the same grammar
+the expanded ipython cells and the agent-message bodies use). The diff
+drops the refinement row's expanded rows from BOTH frames (the collapsed
+row keeps byte-parity) and the run separately asserts the Rust expanded
+rows carry the branch and the TS frames keep the plain-inset baseline
+(the shape the TS team is expected to adopt).
+
 tmux rules: default socket only (`env -u TMUX`), cmparity-* session names,
 no kill-server; sessions are killed individually at the end.
 """
@@ -539,6 +551,64 @@ def assert_skill_reach(side, collapsed, expanded):
     assert SKILL_ARGS in expanded, f"{side}: skill args missing expanded"
 
 
+# The refinement row's expanded content (the third carried divergence, see
+# the module docstring): the needles cover the expanded block's rows —
+# the expanded summary, the meta, the edit section (label, fields, diff
+# content) — all unique to the expanded state; the collapsed rows carry no
+# branch geometry and stay in the diff.
+REFINEMENT_EXPANSION_NEEDLES = [
+    "Create one local memory.",  # the expanded summary (branch-guttered Rust)
+    "Refinement refine_cmparity",  # the meta row
+    "cmparity-memory",  # the edit-section label
+    "Parity memory",  # the Title diff content
+    "The harness stays green.",  # the Description value
+]
+
+
+def strip_refinement_expansion(frame, state):
+    """Drop the refinement row's expanded rows from BOTH frames (the
+    expanded-state divergence; the collapsed state is untouched)."""
+    if state != "b_expanded":
+        return frame
+    kept = []
+    for line in frame.split("\n"):
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        if any(needle in plain for needle in REFINEMENT_EXPANSION_NEEDLES):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def assert_refinement_branch(side, collapsed, expanded):
+    """The third carried divergence: the Rust expanded refinement block
+    hangs on the branch grammar (the `\u{2570}\u{2500} ` gutter off the
+    `\u{25c6}` header, four-space continuation indent); the TS binary keeps
+    the plain one-column chat inset (the baseline)."""
+    summary = "Create one local memory."
+    meta = "Harness refined \u{b7} 1 memory created \u{b7} Refinement refine_cmparity \u{b7} local"
+    gutter = "\u{2570}\u{2500} "
+    indent = "    "
+    if side == "rust":
+        # Collapsed keeps the TS shape: plain inset, no branch.
+        assert " " + summary in collapsed, f"rust: summary missing collapsed"
+        assert gutter + summary not in collapsed, "rust: branch rendered collapsed"
+        # Expanded hangs the summary on the gutter, the meta on the
+        # continuation indent, the edit section re-branches.
+        assert " " + gutter + summary in expanded, "rust: expanded summary missing the branch gutter"
+        assert indent + meta in expanded, "rust: meta missing the continuation indent"
+        assert " " + gutter + "Created local memory `cmparity-memory`" in expanded, (
+            "rust: edit-section label missing the branch gutter"
+        )
+        assert indent + "Compacted" not in expanded
+    else:
+        assert " " + summary in expanded, "ts: summary missing expanded (baseline)"
+        assert gutter + summary not in expanded, "ts: unexpectedly renders the branch"
+        assert " " + meta in expanded, "ts: meta missing expanded (baseline)"
+        assert " " + "Created local memory `cmparity-memory`" in expanded, (
+            "ts: edit-section label missing expanded (baseline)"
+        )
+
+
 def diff_lines(left, right):
     return "\n".join(
         difflib.unified_diff(left.split("\n"), right.split("\n"), fromfile="ts", tofile="rust", lineterm="", n=1)
@@ -688,10 +758,17 @@ def main():
                 assert_sent_reach(side, collapsed, expanded)
                 assert_rlm_child_rows(side, collapsed, expanded)
                 assert_skill_reach(side, collapsed, expanded)
+                assert_refinement_branch(side, collapsed, expanded)
             for state in ("a_collapsed", "b_expanded"):
-                ts_norm = normalize(strip_rlm_child_rows(ts_frames[state]), base)
+                ts_norm = normalize(
+                    strip_refinement_expansion(strip_rlm_child_rows(ts_frames[state]), state),
+                    base,
+                )
                 rust_norm = normalize(
-                    strip_rlm_child_rows(strip_rust_agent_message_preview(rust_frames[state])),
+                    strip_refinement_expansion(
+                        strip_rlm_child_rows(strip_rust_agent_message_preview(rust_frames[state])),
+                        state,
+                    ),
                     base,
                 )
                 # The carried divergence: the Rust header shows the

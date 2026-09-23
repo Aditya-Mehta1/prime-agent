@@ -224,8 +224,13 @@ fn visit_summary(
     // The expanded view: the raw summary through the markdown renderer
     // (TS passes `this.message.summary` untrimmed — the final paragraph row
     // keeps its trailing space), then the dim token metadata with the
-    // optional focus.
-    let content_width = width.saturating_sub(2).max(1);
+    // optional focus. The expanded block hangs on the branch grammar
+    // (Kevin/Sebastian product improvement beyond TS: the TS expansion
+    // keeps the plain one-column chat inset): the first markdown row
+    // carries the dim `\u{2570}\u{2500} ` gutter hanging off the `\u{25c6}`
+    // header, every row after the matching indent, the metadata row on the
+    // continuation indent.
+    let content_width = crate::branch::branch_content_width(width);
     let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
     md.body = body;
     match rows {
@@ -233,9 +238,8 @@ fn visit_summary(
             *count += crate::markdown::markdown_row_count(summary, content_width, &md)
         }
         SummaryRows::Paint(output) => {
-            for line in crate::markdown::render_markdown(summary, content_width, &md) {
-                let mut row = vec![Span::raw(" ".to_string())];
-                row.extend(line);
+            let painted = crate::markdown::render_markdown(summary, content_width, &md);
+            for row in crate::branch::branch_rows(painted, theme) {
                 output.push(crate::chat::pad_to(
                     row,
                     width,
@@ -253,11 +257,45 @@ fn visit_summary(
         SummaryRows::Paint(output) => output.push(Vec::new()),
         SummaryRows::Count(count) => *count += 1,
     }
-    rows.text(
+    continuation_text_rows(
         &format!("Compacted from {} tokens{focus}", grouped(tokens_before)),
         theme.fg_style(ThemeColor::Dim),
         width,
+        rows,
     );
+}
+
+/// One row set on the branch continuation indent (the chat margin plus
+/// the gutter depth): content wrapped at the branch content width, every
+/// row prefixed with four plain spaces, padded to the full width.
+fn continuation_text_rows(
+    text: &str,
+    style: ratatui::style::Style,
+    width: usize,
+    rows: &mut SummaryRows,
+) {
+    let content_width = crate::branch::branch_content_width(width);
+    if let SummaryRows::Count(count) = rows {
+        if !text.trim().is_empty() {
+            *count += crate::width::wrapped_text_count(text, content_width);
+        }
+        return;
+    }
+    let wrapped = crate::width::wrap_text(text, content_width);
+    let painted = wrapped
+        .into_iter()
+        .map(|line| {
+            let mut row = vec![Span::raw(crate::branch::BRANCH_INDENT.to_string())];
+            row.extend(
+                line.into_iter()
+                    .map(|span| Span::styled(span.content, style)),
+            );
+            crate::chat::pad_to(row, width, ratatui::style::Style::default())
+        })
+        .collect::<Vec<Line>>();
+    if let SummaryRows::Paint(output) = rows {
+        output.extend(painted);
+    }
 }
 
 /// The collapsed summary (TS `EventSummary`): whitespace collapsed, wrapped
@@ -435,6 +473,12 @@ mod tests {
             .iter()
             .position(|row| row.trim() == "Compacted from 1,234 tokens \u{b7} focus: tests")
             .expect("the metadata row");
+        // The metadata row sits on the branch continuation indent (the
+        // chat margin plus the three-column gutter depth).
+        assert!(
+            text[meta].starts_with(crate::branch::BRANCH_INDENT),
+            "{text:?}"
+        );
         // TS `Spacer(1)` between the markdown body and the metadata.
         assert!(
             text[meta - 1].trim().is_empty(),
@@ -444,9 +488,12 @@ mod tests {
 
     #[test]
     fn summary_row_expanded_renders_markdown_body() {
-        // TS `new Markdown(summary, 1, 0, markdownTheme, { color:
-        // refinementSummary })`: the heading renders on its own row in the
-        // summary color, not flattened like the collapsed `EventSummary`.
+        // The expanded block hangs on the branch grammar (the
+        // Kevin/Sebastian product improvement beyond TS: the TS `new
+        // Markdown(summary, 1, 0, ...)` keeps the plain one-column chat
+        // inset): the first markdown row carries the dim `\u{2570}\u{2500} `
+        // gutter hanging off the `\u{25c6}` header, every row after the
+        // matching indent, the metadata row on the continuation indent.
         let rows = render_compaction_summary(
             "## Summary\nthe session story",
             100,
@@ -457,20 +504,33 @@ mod tests {
         );
         let text = plain(&rows);
         assert_eq!(text[0].trim(), "\u{25c6} Context compacted");
-        assert_eq!(text[1].trim(), "Summary", "the heading row: {text:?}");
+        assert_eq!(
+            text[1],
+            format!(" {}Summary", crate::branch::BRANCH_GUTTER),
+            "the guttered heading row: {text:?}"
+        );
         // TS markdown pushes a blank row between adjacent blocks (the
         // heading and the paragraph share no blank source line, but
         // `renderToken` still separates them); the TS expanded frame shows
         // exactly this seam.
         assert_eq!(text[2].trim(), "", "the heading/paragraph seam: {text:?}");
-        assert_eq!(text[3].trim(), "the session story");
+        assert_eq!(
+            text[3],
+            format!("{}the session story", crate::branch::BRANCH_INDENT)
+        );
         assert_eq!(text[4].trim(), "", "the Spacer(1) row: {text:?}");
         assert_eq!(
-            text[5].trim(),
-            "Compacted from 100 tokens",
+            text[5],
+            format!("{}Compacted from 100 tokens", crate::branch::BRANCH_INDENT),
             "the metadata row: {text:?}"
         );
         assert_eq!(text.len(), 6, "no extra rows: {text:?}");
+        // The gutter is dim; the markdown rows keep their own block
+        // styles (headings the heading color, paragraphs the summary
+        // body color); the continuation indent stays plain.
+        assert_eq!(rows[1][1].style, theme().fg_style(ThemeColor::Dim));
+        assert_eq!(rows[3][0].style, ratatui::style::Style::default());
+        assert_eq!(rows[5][0].style, ratatui::style::Style::default());
     }
 
     #[test]
