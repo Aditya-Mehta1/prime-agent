@@ -7,7 +7,7 @@
 //! arrays, with or without explicit block `type` tags, covering the shapes
 //! the scripted harness and the real engine both emit.
 
-use crate::chat::{AssistantMessage, ChatEntry, MessageBlock, ToolCallCard};
+use crate::chat::{AssistantMessage, ChatEntry, MessageBlock, ToolCallCard, ToolResultView};
 use pa_types::daemon::{DaemonEventCursor, DaemonReplayInfo};
 use serde::Deserialize;
 use serde_json::Value;
@@ -842,7 +842,11 @@ fn compaction_summary_entries(message: &Value) -> Vec<ChatEntry> {
 /// fall through to the generic panel, and render the raw arguments JSON
 /// instead of the tool's own card. An existing card refreshes from the
 /// latest frame — the newest streamed name and arguments win (TS builds the
-/// component against the latest streaming call).
+/// component against the latest streaming call). A card settled by a failed
+/// frame is not an existing card for this purpose: a reused id re-arms as a
+/// fresh card, the way TS's empty `pendingTools` map forces a new component
+/// (`resetPendingToolState` cleared it) while the old aborted component keeps
+/// its sweep-written result in the transcript.
 pub fn apply_streamed_tool_card(
     view: &mut crate::view::AgentView,
     id: &str,
@@ -852,10 +856,9 @@ pub fn apply_streamed_tool_card(
     if id.is_empty() || name.is_empty() {
         return;
     }
-    let card_index = view
-        .chat
-        .iter()
-        .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == id));
+    let card_index = view.chat.iter().rposition(
+        |entry| matches!(entry, ChatEntry::Tool(card) if card.id == id && !card.aborted),
+    );
     match card_index {
         Some(index) => {
             view.prepare_entry_mutation(index);
@@ -875,22 +878,64 @@ pub fn apply_streamed_tool_card(
     }
 }
 
+/// TS `message_end`'s failed-frame sweep: every still-pending tool card
+/// settles with the failure text as an error result, and the card drops the
+/// tool's late result frames (`resetPendingToolState` cleared the pending
+/// map the same way — a late `tool_execution_end` finds no component there).
+pub fn settle_pending_tool_cards(
+    view: &mut crate::view::AgentView,
+    pending: &mut std::collections::HashSet<String>,
+    aborted: &mut std::collections::HashSet<String>,
+    text: &str,
+) {
+    for tool_call_id in pending.drain() {
+        // Every drained id records as aborted — late frames for a call that
+        // never created a card land on nothing the same way (TS removed the
+        // pending-map entry, and a late `tool_execution_start` finds no
+        // component to re-create).
+        aborted.insert(tool_call_id.clone());
+        // The settle targets the newest card carrying the id: a re-armed
+        // invocation pushed its own card, and the older settled card keeps
+        // the previous sweep's result (TS's pending map only ever holds the
+        // current component).
+        if let Some(index) = view
+            .chat
+            .iter()
+            .rposition(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == tool_call_id))
+        {
+            view.prepare_entry_mutation(index);
+            if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
+                card.result = Some(ToolResultView {
+                    content: vec![serde_json::json!({ "type": "text", "text": text })],
+                    details: serde_json::Value::Null,
+                    is_error: true,
+                });
+                card.result_partial = false;
+                card.ended_at = Some(std::time::Instant::now());
+                card.aborted = true;
+                view.mark_entry_stale(index);
+            }
+        }
+    }
+}
+
 /// `tool_execution_start` folded into the live transcript: mark the matching
 /// card running, or create it when the assistant-message frames have not
 /// arrived yet. The daemon-reported tool name is authoritative — it
 /// backfills a card still carrying an empty streamed name, so the card
 /// routes to its tool-specific renderer (TS creates missing components with
-/// `event.toolName`).
+/// `event.toolName`). A card settled by a failed frame is not a match: a
+/// reused id gets a fresh card for its new invocation, exactly like TS's
+/// empty pending map.
 pub fn apply_tool_execution_start(
     view: &mut crate::view::AgentView,
     tool_call_id: &str,
     tool_name: &str,
     args: Value,
 ) {
-    let card_index = view
-        .chat
-        .iter()
-        .position(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == tool_call_id));
+    let card_index = view.chat.iter().rposition(
+        |entry| matches!(entry, ChatEntry::Tool(card) if card.id == tool_call_id && !card.aborted),
+    );
     if let Some(index) = card_index {
         view.prepare_entry_mutation(index);
         if let Some(ChatEntry::Tool(card)) = view.chat.get_mut(index) {
@@ -1074,6 +1119,16 @@ mod tests {
         })
     }
 
+    fn cards_of(view: &crate::view::AgentView) -> Vec<ToolCallCard> {
+        view.chat
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Tool(card) => Some((**card).clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn rendered_card_text(view: &crate::view::AgentView) -> Vec<String> {
         let Some(card) = card_of(view) else {
             return Vec::new();
@@ -1226,6 +1281,154 @@ mod tests {
             rows.iter()
                 .all(|row| !row.contains("\"code\"") && !row.contains('{')),
             "the raw arguments JSON must not render: {rows:?}"
+        );
+    }
+
+    /// TS `message_end`'s failed-frame sweep: every still-pending card
+    /// settles with the failure text as an error result, the pending set
+    /// drains, and the card flags the abort so the tool's late result
+    /// frames land on nothing.
+    #[test]
+    fn failed_frame_sweep_settles_pending_tool_cards() {
+        let mut view = test_view();
+        apply_streamed_tool_card(
+            &mut view,
+            "call-1",
+            "bash",
+            &json!({ "command": "sleep 10" }),
+        );
+        apply_tool_execution_start(&mut view, "call-1", "bash", Value::Null);
+        let mut pending = std::collections::HashSet::from(["call-1".to_string()]);
+        let mut aborted = std::collections::HashSet::new();
+        settle_pending_tool_cards(
+            &mut view,
+            &mut pending,
+            &mut aborted,
+            "Operation aborted \u{00b7} 3s",
+        );
+        assert!(pending.is_empty(), "the sweep drains the pending set");
+        // Every drained id records as aborted - late frames for a call
+        // that never created a card land on nothing the same way.
+        assert_eq!(
+            aborted,
+            std::collections::HashSet::from(["call-1".to_string()]),
+            "the sweep records the settled ids"
+        );
+        let card = card_of(&view).expect("the streamed card");
+        assert!(card.aborted, "the settled card flags the abort");
+        let result = card.result.as_ref().expect("the settle result");
+        assert!(result.is_error, "the settle result is an error");
+        assert_eq!(result.text_output(false), "Operation aborted \u{00b7} 3s");
+        assert!(!card.result_partial, "the settle result is final");
+        assert!(card.ended_at.is_some(), "the settle stamps the card ended");
+    }
+
+    /// A reused id after a failed run re-arms as a fresh card (TS's cleared
+    /// pending map forces a new component for the new invocation); the old
+    /// settled card keeps its sweep-written abort result in the transcript.
+    #[test]
+    fn reused_id_after_abort_re_arms_as_a_fresh_card() {
+        let mut view = test_view();
+        apply_streamed_tool_card(
+            &mut view,
+            "call-1",
+            "bash",
+            &json!({ "command": "sleep 10" }),
+        );
+        apply_tool_execution_start(&mut view, "call-1", "bash", Value::Null);
+        let mut pending = std::collections::HashSet::from(["call-1".to_string()]);
+        let mut aborted = std::collections::HashSet::new();
+        settle_pending_tool_cards(
+            &mut view,
+            &mut pending,
+            &mut aborted,
+            "Operation aborted \u{00b7} 3s",
+        );
+        let settled = cards_of(&view);
+        // The re-armed invocation's streamed frame: a fresh card, not a
+        // refresh of the settled one.
+        apply_streamed_tool_card(
+            &mut view,
+            "call-1",
+            "bash",
+            &json!({ "command": "echo ready" }),
+        );
+        let cards = cards_of(&view);
+        assert_eq!(cards.len(), 2, "two cards: {cards:?}");
+        assert!(cards[0].aborted, "the old card keeps its abort");
+        assert_eq!(
+            cards[0]
+                .result
+                .as_ref()
+                .expect("the settle result")
+                .text_output(false),
+            "Operation aborted \u{00b7} 3s"
+        );
+        assert!(!cards[1].aborted, "the new card starts fresh");
+        assert_eq!(cards[1].result, None, "the new card has no result");
+        assert_eq!(cards[1].args.get("command"), Some(&json!("echo ready")));
+        // The execution start marks the new invocation's card; the old
+        // settled card stays untouched.
+        apply_tool_execution_start(&mut view, "call-1", "bash", Value::Null);
+        let cards = cards_of(&view);
+        assert_eq!(cards[0], settled[0], "the settled card is untouched");
+        assert!(cards[1].started, "the fresh card runs");
+    }
+
+    /// A second failed run settles the re-armed invocation's own card — the
+    /// newest card carrying the id — so the older card keeps the first
+    /// sweep's result (TS's pending map only ever holds the current
+    /// component).
+    #[test]
+    fn sweep_settles_the_re_armed_card_not_the_settled_one() {
+        let mut view = test_view();
+        apply_streamed_tool_card(
+            &mut view,
+            "call-1",
+            "bash",
+            &json!({ "command": "sleep 10" }),
+        );
+        let mut pending = std::collections::HashSet::from(["call-1".to_string()]);
+        let mut aborted = std::collections::HashSet::new();
+        settle_pending_tool_cards(
+            &mut view,
+            &mut pending,
+            &mut aborted,
+            "Operation aborted \u{00b7} 3s",
+        );
+        apply_streamed_tool_card(
+            &mut view,
+            "call-1",
+            "bash",
+            &json!({ "command": "echo ready" }),
+        );
+        let mut pending = std::collections::HashSet::from(["call-1".to_string()]);
+        let mut aborted = std::collections::HashSet::new();
+        settle_pending_tool_cards(
+            &mut view,
+            &mut pending,
+            &mut aborted,
+            "Aborted after 1 retry attempt \u{00b7} 8s",
+        );
+        let cards = cards_of(&view);
+        assert_eq!(cards.len(), 2, "two cards: {cards:?}");
+        assert_eq!(
+            cards[0]
+                .result
+                .as_ref()
+                .expect("the first settle")
+                .text_output(false),
+            "Operation aborted \u{00b7} 3s",
+            "the older card keeps its own sweep result"
+        );
+        assert!(cards[1].aborted, "the re-armed card settled");
+        assert_eq!(
+            cards[1]
+                .result
+                .as_ref()
+                .expect("the second settle")
+                .text_output(false),
+            "Aborted after 1 retry attempt \u{00b7} 8s"
         );
     }
 
