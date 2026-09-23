@@ -711,7 +711,14 @@ mod tests {
         assert_eq!(tree["ownUsage"]["output"], json!(2934));
         assert_eq!(tree["ownUsage"]["cacheRead"], json!(17408));
         assert_eq!(tree["ownUsage"]["totalTokens"], json!(0));
-        assert_eq!(tree["ownUsage"]["cost"]["total"].as_f64(), Some(0.0));
+        // The six sequential per-entry subtractions leave float-order noise
+        // in the last ulps (TS `subtractAssistantUsage` walks the same
+        // order), so own cost pins at ~0, not bit-exact zero.
+        assert!(
+            tree["ownUsage"]["cost"]["total"].as_f64().unwrap().abs() < 1e-12,
+            "own cost {} is not ~0",
+            tree["ownUsage"]["cost"]["total"]
+        );
         assert_eq!(tree["totalUsage"]["input"], json!(52898));
         assert_eq!(tree["totalUsage"]["output"], json!(5863));
         assert_eq!(tree["totalUsage"]["cacheRead"], json!(18560));
