@@ -125,7 +125,6 @@ import {
 import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
 import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
-import { dispatchKernelOptions } from "./dispatch/kernel.js";
 import type { DispatchBinding } from "./dispatch/types.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
@@ -4625,13 +4624,12 @@ export class AgentSession {
 	 * the latest state reaches disk instead of racing process exit.
 	 */
 	async disposeAsync(options?: { kernelSnapshot?: boolean }): Promise<void> {
-		if (this._disposed) {
-			return this._disposeCallbacksPromise;
-		}
-		// Concurrent callers await the same in-flight teardown so none resolves before
-		// the kernel snapshot flush finishes.
+		// Preserve remote cleanup failures on repeated disposal as well as concurrent calls.
 		if (this._disposeAsyncPromise) {
 			return this._disposeAsyncPromise;
+		}
+		if (this._disposed) {
+			return this._disposeCallbacksPromise;
 		}
 		const kernelSnapshot = options?.kernelSnapshot ?? true;
 		this._disposeAsyncPromise = (async () => {
@@ -4813,11 +4811,10 @@ export class AgentSession {
 		this._deletedRlmChildIds.clear();
 		try {
 			await this._ipythonKernelProvisioner?.dispose({ snapshot: kernelSnapshot });
-		} catch {
-			// a failed kernel startup already cleaned up after itself
+		} finally {
+			this.dispose();
+			await this._disposeCallbacksPromise;
 		}
-		this.dispose();
-		await this._disposeCallbacksPromise;
 	}
 
 	private _startDisposeCallbacks(): Promise<void> {
@@ -10414,7 +10411,7 @@ export class AgentSession {
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
-				...(this.dispatchBinding ? dispatchKernelOptions(this.dispatchBinding) : {}),
+				dispatchBinding: this.dispatchBinding,
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
@@ -11991,10 +11988,11 @@ export class AgentSession {
 		spawnCode?: string,
 		dispatch?: RlmDispatchOptions,
 	): Promise<RlmSpawnHandle> {
-		if (dispatch && !this._subagentRuntimeHost?.supportsDispatch) {
-			throw new Error("rlm.dispatch requires the daemon runtime");
-		}
 		const operation = dispatch ? "rlm.dispatch" : "rlm.spawn";
+		const remote = !!(dispatch || this.dispatchBinding);
+		if (remote && !this._subagentRuntimeHost?.supportsDispatch) {
+			throw new Error(`${operation} requires the daemon runtime for remote execution`);
+		}
 		// Snapshot before any await: the spawning request is the turn whose tool call is
 		// executing now. A spawn arriving outside an active run (a detached kernel task
 		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
@@ -12035,9 +12033,9 @@ export class AgentSession {
 			modelSelection = await this._resolveRlmSubagentModel(
 				requestedModel ?? this.settingsManager.getSubagentDefaultModel(),
 			);
-			if (dispatch && (modelSelection.model.provider !== "sail" || modelSelection.model.api !== "sail-responses")) {
+			if (remote && (modelSelection.model.provider !== "sail" || modelSelection.model.api !== "sail-responses")) {
 				throw new Error(
-					"rlm.dispatch requires a Sail Flex model; set model or the subagent default to a sail model",
+					`${operation} requires a Sail Flex model; set model or the subagent default to a sail model`,
 				);
 			}
 			if (requestedThinkingLevel !== undefined) {
@@ -12587,12 +12585,7 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
-		return this._startRlmChildRun(
-			prompt,
-			kwargs,
-			spawnCode,
-			this.dispatchBinding ? { inputs: {}, sourceBinding: this.dispatchBinding } : undefined,
-		);
+		return this._startRlmChildRun(prompt, kwargs, spawnCode);
 	}
 
 	async dispatchRlmChild(
@@ -12603,7 +12596,6 @@ export class AgentSession {
 		const { inputs, ...spawnKwargs } = kwargs;
 		return this._startRlmChildRun(prompt, spawnKwargs, spawnCode, {
 			inputs: normalizeRlmDispatchInputs(inputs),
-			sourceBinding: this.dispatchBinding,
 		});
 	}
 

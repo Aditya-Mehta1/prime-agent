@@ -6,24 +6,17 @@ import { getBundledSkillsDir } from "../../config.js";
 import { spawnHidden } from "../../utils/child-process.js";
 import type { KernelManagerOptions } from "../kernel/shared.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
-import type { IpythonToolOptions } from "../tools/ipython.js";
 import type { SailRelayConfig } from "./relay.js";
 import { SailClient } from "./sail-client.js";
 import type { DispatchBinding } from "./types.js";
 import { shellQuote } from "./workspace.js";
-
-export function dispatchKernelOptions(binding: DispatchBinding): Partial<IpythonToolOptions> {
-	return {
-		dispatchBinding: binding,
-		snapshotDir: binding.guestStateDir,
-	};
-}
 
 export async function prepareDispatchPythonSkills(
 	binding: DispatchBinding,
 	skills: readonly PythonSkillRuntimeInfo[],
 	signal?: AbortSignal,
 ): Promise<void> {
+	if (!binding.ownsBox) return;
 	const packages = new Set<string>();
 	for (const skill of skills) {
 		const bundled = relative(getBundledSkillsDir(), skill.packagePath);
@@ -47,8 +40,12 @@ export async function prepareDispatchPythonSkills(
 		);
 }
 
-/** A box cannot receive a new kernel until the previous exec is known to be stopped. */
-const activeBoxes = new Map<string, symbol>();
+/** A session cannot replace its kernel until the previous exec is known stopped. */
+const activeKernels = new Map<string, { boxId: string }>();
+
+export function hasDispatchKernels(boxId: string): boolean {
+	return [...activeKernels.values()].some((kernel) => kernel.boxId === boxId);
+}
 
 export function createDispatchKernelLauncher(
 	binding: DispatchBinding,
@@ -61,12 +58,13 @@ export function createDispatchKernelLauncher(
 	>();
 	return {
 		spawn() {
-			if (activeBoxes.has(binding.boxId))
+			const key = `${binding.boxId}:${binding.guestStateDir}`;
+			if (activeKernels.has(key))
 				throw new Error("Previous Sail kernel termination is unverified; cannot start another kernel");
-			const owner = Symbol(binding.boxId);
-			activeBoxes.set(binding.boxId, owner);
+			const owner = { boxId: binding.boxId };
+			activeKernels.set(key, owner);
 			const release = () => {
-				if (activeBoxes.get(binding.boxId) === owner) activeBoxes.delete(binding.boxId);
+				if (activeKernels.get(key) === owner) activeKernels.delete(key);
 			};
 			const compiled = fileURLToPath(new URL("./relay.js", import.meta.url));
 			const entry = existsSync(compiled) ? compiled : fileURLToPath(new URL("./relay.ts", import.meta.url));

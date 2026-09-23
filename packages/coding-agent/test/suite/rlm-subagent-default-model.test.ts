@@ -2,10 +2,28 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { AgentSessionRuntime, createAgentSessionServices } from "../../src/core/agent-session-runtime.js";
+import type { DispatchBinding } from "../../src/core/dispatch/types.js";
 import type { CreateRlmSubagentRuntimeOptions } from "../../src/core/rlm-runtime.js";
 import { createHarness } from "./harness.js";
 
 const provider = "faux-eng-subagent-default-model";
+
+const remoteBinding: DispatchBinding = {
+	version: 2,
+	ownsBox: true,
+	appId: "app",
+	boxId: "box",
+	guestRepoDir: "/repo",
+	guestCwd: "/repo",
+	guestStateDir: "/state",
+	guestPython: "/python",
+	guestSkillsDir: "/skills",
+	hostResourceDir: "/captured",
+	sourceHead: "head",
+	baselineCommit: "baseline",
+	initialBranch: "main",
+	inputs: {},
+};
 
 describe("subagent default model setting", () => {
 	it("prevents host-only native tools from executing in a dispatched session", async () => {
@@ -39,22 +57,7 @@ describe("subagent default model setting", () => {
 					});
 				},
 			],
-			dispatchBinding: {
-				version: 1,
-				appId: "app",
-				boxId: "box",
-				guestRepoDir: "/repo",
-				guestCwd: "/repo",
-				guestStateDir: "/state",
-				guestPython: "/python",
-				guestSkillsDir: "/skills",
-				hostResourceDir: "/captured",
-				sourceHead: "head",
-				baselineCommit: "baseline",
-				initialBranch: "main",
-				inputs: {},
-				model: { provider: "sail", id: "worker" },
-			},
+			dispatchBinding: remoteBinding,
 		});
 		try {
 			await expect(harness.session.executeBash("printf probe")).rejects.toThrow("ipython bash()");
@@ -105,46 +108,50 @@ describe("subagent default model setting", () => {
 		}
 	});
 
-	it("admits dispatch before preparation and cancels preparation through the existing child handle", async () => {
-		let started!: (options: CreateRlmSubagentRuntimeOptions) => void;
-		const preparing = new Promise<CreateRlmSubagentRuntimeOptions>((resolve) => {
-			started = resolve;
-		});
-		const harness = await createHarness({
-			api: "sail-responses",
-			provider: "sail",
-			models: [{ id: "worker" }],
-			subagentRuntimeHost: {
-				supportsDispatch: true,
-				deleteRlmSubagentRuntime: async () => {},
-				createRlmSubagentRuntime: async (options) => {
-					started(options);
-					return new Promise((_resolve, reject) => {
-						options.preparationSignal!.addEventListener(
-							"abort",
-							() => reject(new Error("preparation cancelled")),
-							{ once: true },
-						);
-					});
-				},
-			},
-		});
-		try {
-			const handle = await harness.session.dispatchRlmChild("work", {
-				name: "worker",
-				inputs: { notes: "notes.txt" },
+	it.each(["dispatch", "spawn"] as const)(
+		"admits remote %s and cancels through the existing child handle",
+		async (operation) => {
+			let started!: (options: CreateRlmSubagentRuntimeOptions) => void;
+			const preparing = new Promise<CreateRlmSubagentRuntimeOptions>((resolve) => {
+				started = resolve;
 			});
-			const options = await preparing;
-			expect(handle.model).toBe("sail/worker");
-			expect(options.dispatch?.inputs).toEqual({ notes: "notes.txt" });
-			expect(harness.session.getRlmChildRunStatus(handle.rlm_child_id)).toBe("queued");
-			await harness.session.deleteRlmSubagent(handle.rlm_child_id);
-			expect(options.preparationSignal!.aborted).toBe(true);
-			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
-		} finally {
-			harness.cleanup();
-		}
-	});
+			const harness = await createHarness({
+				dispatchBinding: remoteBinding,
+				api: "sail-responses",
+				provider: "sail",
+				models: [{ id: "worker" }],
+				subagentRuntimeHost: {
+					supportsDispatch: true,
+					deleteRlmSubagentRuntime: async () => {},
+					createRlmSubagentRuntime: async (options) => {
+						started(options);
+						return new Promise((_resolve, reject) => {
+							options.preparationSignal!.addEventListener(
+								"abort",
+								() => reject(new Error("preparation cancelled")),
+								{ once: true },
+							);
+						});
+					},
+				},
+			});
+			try {
+				const handle =
+					operation === "dispatch"
+						? await harness.session.dispatchRlmChild("work", { name: "worker", inputs: { notes: "notes.txt" } })
+						: await harness.session.runRlmChild("work", { name: "worker" });
+				const options = await preparing;
+				expect(handle.model).toBe("sail/worker");
+				expect(options.dispatch).toEqual(operation === "dispatch" ? { inputs: { notes: "notes.txt" } } : undefined);
+				expect(harness.session.getRlmChildRunStatus(handle.rlm_child_id)).toBe("queued");
+				await harness.session.deleteRlmSubagent(handle.rlm_child_id);
+				expect(options.preparationSignal!.aborted).toBe(true);
+				expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+			} finally {
+				harness.cleanup();
+			}
+		},
+	);
 
 	it("requires the daemon dispatch capability before admitting a child", async () => {
 		const harness = await createHarness();

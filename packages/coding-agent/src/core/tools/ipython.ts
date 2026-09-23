@@ -470,8 +470,8 @@ export class IpythonKernelProvisioner {
 					startupSignal,
 				);
 			}
-			const snapshotDir = this.options?.snapshotDir;
 			const binding = this.options?.dispatchBinding;
+			const snapshotDir = binding?.guestStateDir ?? this.options?.snapshotDir;
 			const snapshotPath = snapshotDir
 				? binding
 					? posix.join(snapshotDir, "kernel-state.dill")

@@ -2,18 +2,31 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { dispatchKernelOptions } from "../src/core/dispatch/kernel.js";
+import { hasDispatchKernels } from "../src/core/dispatch/kernel.js";
 import type { DispatchBinding } from "../src/core/dispatch/types.js";
+import {
+	inheritDispatchWorkspace,
+	sleepDispatchWorkspace,
+	terminateDispatchWorkspace,
+} from "../src/core/dispatch/workspace.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
+import { createHarness } from "./suite/harness.js";
 
 async function fixture() {
 	const dir = await mkdtemp(join(tmpdir(), "sail-relay-"));
-	let output: ServerResponse | undefined;
-	let buffered = "";
-	let offset = 0;
-	let sequence = 0;
-	let activeId = "";
+	const executions = new Map<
+		string,
+		{
+			output: ServerResponse;
+			buffered: string;
+			offset: number;
+			sequence: number;
+			activeId: string;
+			hostSequence: number;
+		}
+	>();
 	let rejectCancel = false;
 	let waitResponse: ServerResponse | undefined;
 	let waitStarted!: () => void;
@@ -24,19 +37,22 @@ async function fixture() {
 	const frames: Record<string, unknown>[] = [];
 	const writes: { offset: number; data: Buffer }[] = [];
 	const cancellations: string[] = [];
+	const boxActions: string[] = [];
 	const waitBodyLengths: number[] = [];
 	let disconnected!: () => void;
 	const disconnect = new Promise<void>((resolve) => {
 		disconnected = resolve;
 	});
-	const event = (value: object) => output?.write(`${JSON.stringify(value)}\n`);
-	const protocol = (value: object) => {
+	const event = (exec: NonNullable<ReturnType<typeof executions.get>>, value: object) =>
+		exec.output.write(`${JSON.stringify(value)}\n`);
+	const protocol = (exec: NonNullable<ReturnType<typeof executions.get>>, value: object) => {
 		const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
 		const middle = Math.floor(bytes.length / 2);
 		for (const chunk of [bytes.subarray(0, middle), bytes.subarray(middle)])
-			event({ type: "stdout", seq: sequence++, data: chunk.toString("base64") });
+			event(exec, { type: "stdout", seq: exec.sequence++, data: chunk.toString("base64") });
 	};
-	const done = (id: unknown, extra: object = {}) => protocol({ event: "done", id, status: "ok", ...extra });
+	const done = (exec: NonNullable<ReturnType<typeof executions.get>>, id: unknown, extra: object = {}) =>
+		protocol(exec, { event: "done", id, status: "ok", ...extra });
 	const server = createServer(async (request, response) => {
 		const chunks = [];
 		for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -51,22 +67,27 @@ async function fixture() {
 					.end(`${JSON.stringify({ type: "exit", return_code: 0, status: "succeeded" })}\n`);
 				return;
 			}
-			output = response;
-			offset = 0;
-			buffered = "";
+			const exec = { output: response, offset: 0, buffered: "", sequence: 0, activeId: "", hostSequence: 0 };
+			executions.set(`exec-${commands.length}`, exec);
 			response.writeHead(200, { "Content-Type": "application/x-ndjson" });
-			event({ type: "started", exec_request_id: `exec-${commands.length}` });
-			protocol({ event: "ready", protocol: 3 });
+			event(exec, { type: "started", exec_request_id: `exec-${commands.length}` });
+			protocol(exec, { event: "ready", protocol: 3 });
 			response.once("close", disconnected);
 			return;
 		}
+		if (url.pathname.endsWith("/sleep") || url.pathname.endsWith("/terminate")) {
+			boxActions.push(url.pathname);
+			response.writeHead(200, { "Content-Type": "application/json" }).end("{}");
+			return;
+		}
+		const exec = executions.get(url.searchParams.get("exec_request_id")!)!;
 		if (url.pathname.endsWith("/cancel")) {
 			cancellations.push(url.searchParams.get("exec_request_id")!);
 			response.writeHead(rejectCancel ? 503 : 200, { "Content-Type": "application/json" });
 			response.end("{}");
 			if (!rejectCancel) {
-				event({ type: "exit", return_code: 0, status: "cancelled" });
-				output?.end();
+				event(exec, { type: "exit", return_code: 0, status: "cancelled" });
+				exec.output.end();
 			}
 			return;
 		}
@@ -81,30 +102,36 @@ async function fixture() {
 			return;
 		}
 		writes.push({ offset: Number(url.searchParams.get("offset")), data });
-		offset += data.length;
-		response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ accepted_through: offset }));
-		buffered += data.toString();
-		let newline = buffered.indexOf("\n");
+		exec.offset += data.length;
+		response
+			.writeHead(200, { "Content-Type": "application/json" })
+			.end(JSON.stringify({ accepted_through: exec.offset }));
+		exec.buffered += data.toString();
+		let newline = exec.buffered.indexOf("\n");
 		while (newline >= 0) {
-			const frame = JSON.parse(buffered.slice(0, newline)) as Record<string, unknown>;
-			buffered = buffered.slice(newline + 1);
+			const frame = JSON.parse(exec.buffered.slice(0, newline)) as Record<string, unknown>;
+			exec.buffered = exec.buffered.slice(newline + 1);
 			frames.push(frame);
-			newline = buffered.indexOf("\n");
+			newline = exec.buffered.indexOf("\n");
 			if (frame.type === "execute" && frame.code === "needs-host") {
-				activeId = String(frame.id);
-				protocol({ event: "host_request", id: "host-1", data: { type: "rlm.run", prompt: "remote child" } });
+				exec.activeId = String(frame.id);
+				protocol(exec, {
+					event: "host_request",
+					id: `host-${++exec.hostSequence}`,
+					data: { type: "rlm.run", prompt: "remote child" },
+				});
 			} else if (frame.type === "host_reply") {
-				protocol({ event: "result", id: activeId, text: "λ remote result" });
-				done(activeId);
+				protocol(exec, { event: "result", id: exec.activeId, text: "λ remote result" });
+				done(exec, exec.activeId);
 			} else if (frame.type === "execute" && frame.code === "drop-transport") {
-				output?.destroy();
-			} else if (frame.type === "restore") done(frame.id, { restored: ["counter"], failed: [] });
-			else if (frame.type === "snapshot") done(frame.id, { saved: ["counter"], skipped: [], bytes: 12 });
+				exec.output.destroy();
+			} else if (frame.type === "restore") done(exec, frame.id, { restored: ["counter"], failed: [] });
+			else if (frame.type === "snapshot") done(exec, frame.id, { saved: ["counter"], skipped: [], bytes: 12 });
 			else if (frame.type === "shutdown") {
-				done(frame.id);
-				event({ type: "exit", return_code: 0, status: "completed" });
-				output?.end();
-			} else done(frame.id);
+				done(exec, frame.id);
+				event(exec, { type: "exit", return_code: 0, status: "completed" });
+				exec.output.end();
+			} else done(exec, frame.id);
 		}
 	});
 	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -115,7 +142,8 @@ async function fixture() {
 	vi.stubEnv("GITHUB_TOKEN", "fixture-github-token");
 	vi.stubEnv("PRIME_AGENT_SAILBOX_URL", `http://127.0.0.1:${address.port}/v1`);
 	const binding: DispatchBinding = {
-		version: 1,
+		version: 2,
+		ownsBox: true,
 		appId: "test-app",
 		boxId: dir,
 		guestRepoDir: "/state/repo",
@@ -128,7 +156,6 @@ async function fixture() {
 		baselineCommit: "def",
 		initialBranch: "main",
 		inputs: {},
-		model: { provider: "sail", id: "deepseek-ai/DeepSeek-V4-Flash-0731" },
 	};
 	return {
 		dir,
@@ -137,6 +164,7 @@ async function fixture() {
 		commands,
 		writes,
 		cancellations,
+		boxActions,
 		waitBodyLengths,
 		waiting,
 		finishWait() {
@@ -150,7 +178,7 @@ async function fixture() {
 			rejectCancel = value;
 		},
 		async close() {
-			output?.destroy();
+			for (const exec of executions.values()) exec.output.destroy();
 			server.closeAllConnections();
 			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 			await rm(dir, { recursive: true, force: true });
@@ -166,7 +194,7 @@ describe("Sail kernel relay", () => {
 		const f = await fixture();
 		const hostRequests: Record<string, unknown>[] = [];
 		const provisioner = new IpythonKernelProvisioner(f.dir, {
-			...dispatchKernelOptions(f.binding),
+			dispatchBinding: f.binding,
 			pythonSkills: [
 				{
 					name: "project-skill",
@@ -234,9 +262,55 @@ describe("Sail kernel relay", () => {
 		}
 	});
 
+	it("isolates kernels and cancellation while children share the owner's box and workspace", async () => {
+		const f = await fixture();
+		const binding = await inheritDispatchWorkspace(f.binding, join(f.dir, "child"));
+		const calls: string[] = [];
+		const make = (b: DispatchBinding) =>
+			new IpythonKernelProvisioner(f.dir, {
+				dispatchBinding: b,
+				hostHandlers: {
+					"rlm.run": async () => {
+						calls.push(b.guestStateDir);
+						return {};
+					},
+				},
+			});
+		const owner = make(f.binding),
+			child = make(binding);
+		try {
+			expect(binding.guestStateDir).not.toBe(f.binding.guestStateDir);
+			const parentKernel = await owner.ensure(),
+				childKernel = await child.ensure();
+			await Promise.all([parentKernel.execute("needs-host"), childKernel.execute("needs-host")]);
+			expect(calls.sort()).toEqual([binding.guestStateDir, f.binding.guestStateDir].sort());
+			expect(f.commands.map((c) => c.cwd)).toEqual([f.binding.guestCwd, f.binding.guestCwd]);
+			expect(f.frames.filter((frame) => frame.type === "restore").map((frame) => frame.path)).toEqual([
+				`${f.binding.guestStateDir}/kernel-state.dill`,
+				`${binding.guestStateDir}/kernel-state.dill`,
+			]);
+			await sleepDispatchWorkspace(binding);
+			await terminateDispatchWorkspace(binding);
+			expect(f.boxActions).toEqual([]);
+			const stopped = child.kill();
+			await f.waiting;
+			f.finishWait();
+			await stopped;
+			expect(f.cancellations).toEqual(["exec-2"]);
+			expect(hasDispatchKernels(f.binding.boxId)).toBe(true);
+			expect((await parentKernel.execute("needs-host")).status).toBe("ok");
+			await owner.dispose();
+			expect(hasDispatchKernels(f.binding.boxId)).toBe(false);
+		} finally {
+			f.finishWait();
+			await Promise.allSettled([owner.dispose(), child.dispose()]);
+			await f.close();
+		}
+	});
+
 	it("waits for verified cancellation before an explicit kernel replacement", async () => {
 		const f = await fixture();
-		const provisioner = new IpythonKernelProvisioner(f.dir, dispatchKernelOptions(f.binding));
+		const provisioner = new IpythonKernelProvisioner(f.dir, { dispatchBinding: f.binding });
 		try {
 			await provisioner.ensure();
 			let killed = false;
@@ -261,10 +335,30 @@ describe("Sail kernel relay", () => {
 		}
 	});
 
+	it("keeps failed remote session disposal visible on a repeated delete", async () => {
+		const f = await fixture();
+		f.setRejectCancel(true);
+		const harness = await createHarness({ dispatchBinding: { ...f.binding, ownsBox: false } });
+		try {
+			harness.setResponses([
+				fauxAssistantMessage([fauxToolCall("ipython", { code: "drop-transport" })], { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			await harness.session.prompt("work");
+			await f.disconnect;
+			await expect(harness.session.disposeAsync({ kernelSnapshot: false })).rejects.toThrow("503");
+			await expect(harness.session.disposeAsync({ kernelSnapshot: false })).rejects.toThrow("503");
+			expect(hasDispatchKernels(f.binding.boxId)).toBe(true);
+		} finally {
+			harness.cleanup();
+			await f.close();
+		}
+	});
+
 	it("latches transport loss and a failed remote cancellation without starting or replaying another kernel", async () => {
 		const f = await fixture();
 		f.setRejectCancel(true);
-		const provisioner = new IpythonKernelProvisioner(f.dir, dispatchKernelOptions(f.binding));
+		const provisioner = new IpythonKernelProvisioner(f.dir, { dispatchBinding: f.binding });
 		try {
 			const manager = await provisioner.ensure();
 			await expect(manager.execute("drop-transport")).rejects.toThrow();

@@ -453,7 +453,6 @@ export interface RlmSubagentRuntime {
 
 export interface RlmDispatchOptions {
 	inputs: Record<string, string>;
-	sourceBinding?: DispatchBinding;
 }
 
 export function normalizeRlmDispatchInputs(value: unknown): Record<string, string> {

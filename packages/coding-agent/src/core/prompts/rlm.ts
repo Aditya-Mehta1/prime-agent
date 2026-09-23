@@ -164,7 +164,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"",
 			"An `rlm` object is already in your global namespace. `await rlm.spawn('sub-task', name='api-reviewer')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.",
 			"`name` is required: choose a stable child name that is unique among siblings.",
-			"Use `await rlm.dispatch('task', name='worker', model='sail/model-id', inputs={'notes': 'path'})` to start a child in its own Sailbox with a copy of the current workspace. Use a Sail Flex model. `spawn` inherits your execution location.",
+			"Use `await rlm.dispatch('task', name='worker', model='sail/model-id', inputs={'notes': 'path'})` to start a child in its own Sailbox with a copy of the current workspace. Use a Sail Flex model. `spawn` shares your workspace (and your Sailbox when remote), with a separate Python kernel and variables.",
 			"A child inherits your model. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`. Children also inherit your thinking level; the `thinking` option overrides it with any level the resolved child model supports, and an unsupported level fails spawn.",
 		);
 		parts.push(

@@ -197,7 +197,6 @@ export interface PrepareDispatchOptions {
 	sessionDir: string;
 	inputs?: Record<string, string>;
 	sourceBinding?: DispatchBinding;
-	model: { provider: string; id: string };
 	signal?: AbortSignal;
 }
 
@@ -231,12 +230,13 @@ export async function prepareDispatchWorkspace(options: PrepareDispatchOptions):
 		// Do not abort the create response: retain its ID and terminate a late allocation.
 		const box = await client.createBox(app.id, `prime-${basename(options.sessionDir)}`);
 		binding = {
-			version: 1,
+			version: 2,
+			ownsBox: true,
 			appId: app.id,
 			boxId: box.sailbox_id,
 			guestRepoDir: GUEST_REPO,
 			guestCwd: `${GUEST_REPO}${capture.cwdRelative && capture.cwdRelative !== "." ? `/${capture.cwdRelative.split(sep).join("/")}` : ""}`,
-			guestStateDir: GUEST_STATE,
+			guestStateDir: `${GUEST_STATE}/${basename(options.sessionDir)}`,
 			guestPython: `${GUEST_INSTALL}/venv/bin/python`,
 			guestSkillsDir: `${GUEST_INSTALL}/skills`,
 			hostResourceDir: options.sourceBinding?.hostResourceDir ?? resolve(options.sourceCwd),
@@ -244,7 +244,6 @@ export async function prepareDispatchWorkspace(options: PrepareDispatchOptions):
 			baselineCommit: "",
 			initialBranch: branch,
 			inputs,
-			model: options.model,
 		};
 		await mkdir(options.sessionDir, { recursive: true });
 		await writeFile(join(options.sessionDir, "dispatch.json"), JSON.stringify(binding, null, 2));
@@ -301,16 +300,28 @@ git -C ${GUEST_REPO} rev-parse HEAD
 	}
 }
 
+export async function inheritDispatchWorkspace(parent: DispatchBinding, sessionDir: string): Promise<DispatchBinding> {
+	const binding: DispatchBinding = {
+		...parent,
+		ownsBox: false,
+		guestStateDir: `${parent.guestStateDir}/${basename(sessionDir)}`,
+	};
+	await mkdir(sessionDir, { recursive: true });
+	await writeFile(join(sessionDir, "dispatch.json"), JSON.stringify(binding, null, 2));
+	return binding;
+}
+
 export function loadDispatchBinding(sessionDir: string): DispatchBinding | undefined {
 	const path = join(sessionDir, "dispatch.json");
 	if (!existsSync(path)) return undefined;
 	const binding = JSON.parse(readFileSync(path, "utf8")) as DispatchBinding;
-	if (binding.version !== 1 || !binding.boxId || !binding.guestCwd)
+	if (binding.version !== 2 || typeof binding.ownsBox !== "boolean" || !binding.boxId || !binding.guestCwd)
 		throw new Error(`Invalid dispatch binding: ${path}`);
 	return binding;
 }
 
 export async function terminateDispatchWorkspace(binding: DispatchBinding): Promise<void> {
+	if (!binding.ownsBox) return;
 	try {
 		await new SailClient().terminateBox(binding.boxId);
 	} catch (error) {
@@ -319,6 +330,7 @@ export async function terminateDispatchWorkspace(binding: DispatchBinding): Prom
 }
 
 export async function sleepDispatchWorkspace(binding: DispatchBinding): Promise<void> {
+	if (!binding.ownsBox) return;
 	const client = new SailClient();
 	try {
 		await client.sleepBox(binding.boxId);

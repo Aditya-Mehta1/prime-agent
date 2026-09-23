@@ -87,8 +87,10 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
+import { hasDispatchKernels } from "../../core/dispatch/kernel.js";
 import type { DispatchBinding } from "../../core/dispatch/types.js";
 import {
+	inheritDispatchWorkspace,
 	loadDispatchBinding,
 	prepareDispatchWorkspace,
 	sleepDispatchWorkspace,
@@ -2935,13 +2937,15 @@ export class AgentDaemon {
 			options.preparationSignal?.throwIfAborted();
 			if (options.dispatch) {
 				dispatchBinding = await prepareDispatchWorkspace({
-					sourceCwd: options.dispatch.sourceBinding?.guestCwd ?? options.parentSession.sessionManager.getCwd(),
+					sourceCwd:
+						options.parentSession.dispatchBinding?.guestCwd ?? options.parentSession.sessionManager.getCwd(),
 					sessionDir: options.sessionDir,
 					inputs: options.dispatch.inputs,
-					sourceBinding: options.dispatch.sourceBinding,
-					model: { provider: options.model.provider, id: options.model.id },
+					sourceBinding: options.parentSession.dispatchBinding,
 					signal: options.preparationSignal,
 				});
+			} else if (options.parentSession.dispatchBinding) {
+				dispatchBinding = await inheritDispatchWorkspace(options.parentSession.dispatchBinding, options.sessionDir);
 			}
 			options.preparationSignal?.throwIfAborted();
 			return await this.admitRlmSubagentRuntime(parentState, { ...options, dispatchBinding });
@@ -3191,8 +3195,11 @@ export class AgentDaemon {
 			}
 			try {
 				await this.closeSession(state, "shutdown", true, false);
-				if (state.runtime.session.dispatchBinding) {
-					await sleepDispatchWorkspace(state.runtime.session.dispatchBinding);
+				const binding = state.runtime.session.dispatchBinding;
+				if (binding && binding.ownsBox) {
+					if (hasDispatchKernels(binding.boxId))
+						throw new Error(`Sailbox ${binding.boxId} still has an unconfirmed kernel; refusing to sleep`);
+					await sleepDispatchWorkspace(binding);
 				}
 			} catch (error) {
 				if (

@@ -1,5 +1,6 @@
 export interface DispatchBinding {
-	version: 1;
+	version: 2;
+	ownsBox: boolean;
 	appId: string;
 	boxId: string;
 	guestRepoDir: string;
@@ -12,5 +13,4 @@ export interface DispatchBinding {
 	baselineCommit: string;
 	initialBranch: string;
 	inputs: Record<string, string>;
-	model: { provider: string; id: string };
 }
