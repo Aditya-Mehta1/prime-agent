@@ -71,6 +71,17 @@ describe("TopBar", () => {
 		expect(bar.render(21)).toEqual([""]);
 	});
 
+	it("still shows the speed readout when the chat name is empty", () => {
+		// A session launched from a path with no basename (POSIX `/`) has no name;
+		// the readout must not disappear with it.
+		const bar = new TopBar({
+			getChatName: () => undefined,
+			getCostUsd: () => 1.42,
+			getSpeedText: () => "120 tok/s · avg 88.9",
+		});
+		expect(stripAnsi(bar.render(40)[0])).toBe("120 tok/s · avg 88.9");
+	});
+
 	it("truncates to the terminal width", () => {
 		const bar = new TopBar({ getChatName: () => "a-very-long-chat-name-that-overflows", getCostUsd: () => 9.99 });
 		const [line] = bar.render(12);

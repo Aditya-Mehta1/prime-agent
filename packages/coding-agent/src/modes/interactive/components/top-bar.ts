@@ -36,23 +36,27 @@ export class TopBar implements Component {
 			.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
 			.replace(/\s+/g, " ")
 			.trim();
-		if (!name) {
-			return [""];
-		}
 		// The name stays centered; the cost trails it with a small gap. The speed
 		// readout, when on, leads the line in the cost's dim style, so it reads as
 		// telemetry on the bar rather than part of the title. The name is pushed
 		// right only when centering would collide with that leading readout.
-		const nameWidth = visibleWidth(name);
 		const speedText = this.options.getSpeedText?.();
 		const speed = speedText ? theme.fg("dim", speedText) : "";
+		// A chat with no name (no session name, no cwd basename) shows the readout
+		// alone; with neither, the bar stays a blank row rather than a padded one.
+		if (!name && !speed) {
+			return [""];
+		}
+		const nameWidth = visibleWidth(name);
 		const speedWidth = speedText ? visibleWidth(speedText) : 0;
 		const cost = this.options.getCostUsd?.();
 		const costText =
 			typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? theme.fg("dim", `$${cost.toFixed(2)}`) : "";
 		const centered = Math.max(0, Math.floor((safeWidth - nameWidth) / 2));
 		const nameStart = Math.max(centered, speedWidth ? speedWidth + 2 : 0);
-		const line = `${speed}${" ".repeat(Math.max(0, nameStart - speedWidth))}${theme.fg("text", name)}${costText ? `  ${costText}` : ""}`;
+		const title = name ? `${" ".repeat(Math.max(0, nameStart - speedWidth))}${theme.fg("text", name)}` : "";
+		// The spend only trails a name: without one, the readout stands alone.
+		const line = `${speed}${title}${name && costText ? `  ${costText}` : ""}`;
 		return [truncateToWidth(line, safeWidth, "")];
 	}
 }
