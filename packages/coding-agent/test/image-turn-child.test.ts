@@ -38,6 +38,8 @@ interface ImageTurnHarness {
 		error?: string;
 		/** Deliver the child's own reply to the parent while the read is awaited. */
 		replyDuringRead?: string;
+		/** Start another agent message turn that keeps streaming through the read. */
+		concurrentTurnDuringRead?: boolean;
 	}) => void;
 	dispose: () => void;
 }
@@ -70,7 +72,11 @@ function createImageTurnHarness(
 				(event) => event.type === "done",
 				(event: any) => event.message,
 			);
-			stream.push({ type: "done", reason: "stop", message: assistantMsg("ok") });
+			// "a heartbeat arrived" stands in for a turn that is still streaming while
+			// the image read is awaited: it never finishes on its own.
+			if (!String(context.messages.at(-1)?.content ?? "").includes("a heartbeat arrived")) {
+				stream.push({ type: "done", reason: "stop", message: assistantMsg("ok") });
+			}
 			return stream;
 		},
 	});
@@ -109,6 +115,17 @@ function createImageTurnHarness(
 					},
 				});
 				children.collectRlmChildren = vi.fn(async () => {
+					if (options.concurrentTurnDuringRead) {
+						await session.acceptAgentMessagePrompt("a heartbeat arrived", {
+							customMessage: createAgentSessionMessage({
+								id: "agentmsg-heartbeat",
+								source: "agent_message",
+								target: { activeSessionId: "parent", sessionId: session.sessionId },
+								from: { activeSessionId: "other", sessionId: "another-session" },
+								message: "a heartbeat arrived",
+							}),
+						});
+					}
 					if (options.replyDuringRead) {
 						// The child replied to the parent the way an RLM child does;
 						// that lands while this read is still awaited.
@@ -349,5 +366,18 @@ describe("image steers and follow-ups", () => {
 		});
 		await harness.session.waitForIdle();
 		expect(harness.servedModelIds.length).toBeGreaterThan(0);
+	});
+	it("admits the prompt when another turn starts streaming during the read", async () => {
+		const harness = harnessFor(SET);
+		harness.spawnChild({ reading: "A red banner.", concurrentTurnDuringRead: true });
+		await harness.session.prompt("look at this", { images: [IMAGE] });
+		// The prompt the user submitted while idle is admitted instead of being
+		// rejected because a turn started inside the read's await window.
+		const text = userContents(harness.session)
+			.map((content) => contentText(content))
+			.join("\n");
+		expect(text).toContain("look at this");
+		expect(text).toContain("A red banner.");
+		await harness.session.abort();
 	});
 });

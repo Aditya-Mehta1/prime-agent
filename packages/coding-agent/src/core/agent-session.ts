@@ -6290,6 +6290,11 @@ export class AgentSession {
 				options?.admissionCommitted?.();
 				const isInternalPrompt = options?.internalPrompt === true;
 				const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
+				// Decide the streaming state BEFORE normalization: an awaited image
+				// read (or any async input handler) can take seconds, and a turn that
+				// starts in that window must not make a prompt the user submitted
+				// while idle look like one typed into a running agent.
+				const streamingBeforeNormalization = this.isStreaming;
 				const normalizationResult = this._normalizeSubmission(text, options?.images, {
 					parseSessionCommands: !isInternalPrompt && !options?.skipPrePromptWork,
 					extensionCommands: expandPromptTemplates ? "execute" : "ignore",
@@ -6352,7 +6357,7 @@ export class AgentSession {
 					return;
 				}
 
-				const queueForStreaming = this.isStreaming;
+				const queueForStreaming = streamingBeforeNormalization;
 				const queueForBusy = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
 				const visibleQueued = queueForStreaming || queueForBusy;
 				if (visibleQueued && !options?.streamingBehavior) {
