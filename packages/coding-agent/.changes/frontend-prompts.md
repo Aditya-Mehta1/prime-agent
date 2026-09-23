@@ -1,3 +1,4 @@
 - Added foreground-managed project notes in `PROJECT.md` and `project/`, with project context copied to dispatched workers.
 - Clarified that workers handle substantial tasks and report findings while the foreground maintains shared project context.
 - Clarified that project notes may start empty and should be filled in as the user's goal and decisions become clear.
+- Clarified that dispatched workers have separate workspaces and project context copies, with no automatic syncing of later edits.
