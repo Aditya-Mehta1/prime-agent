@@ -510,6 +510,7 @@ mod tests {
                 "recoveryJournalPath": "/tmp/none.jsonl",
                 "supervisorSocketPath": "/tmp/none.sock",
                 "authenticationToken": "seq-token",
+                "workerInstanceId": "i1",
                 "rootActiveSessionId": "s1",
                 "createdAt": "2026-09-23T00:00:00Z",
                 "updatedAt": "2026-09-23T00:00:00Z",
