@@ -389,6 +389,31 @@ def normalize(frame, root):
     # glyph.
     frame = frame.replace("\u2665", "<HBICON>")
     frame = frame.replace("\u25f7", "<HBICON>")
+    # The TS product's ripgrep notice (a startup environment notice when
+    # rg is missing under PI_OFFLINE; the Rust build has no equivalent
+    # row yet) is box environment, not transcript parity.
+    kept = []
+    notice = False
+    for line in frame.split("\n"):
+        if any(
+            needle in line
+            for needle in (
+                "ripgrep (rg) is an optional search helper",
+                "Install it with: brew install ripgrep",
+                "Automatic installation was skipped because PI_OFFLINE",
+                "and subagents remain available.",
+            )
+        ):
+            # The notice's trailing blank row drops with it (the block
+            # is notice + one blank on the TS side).
+            notice = True
+            continue
+        if notice and line.strip() == "":
+            notice = False
+            continue
+        notice = False
+        kept.append(line)
+    frame = "\n".join(kept)
     pulses = "".join("\u25f4\u25f7\u25f6\u25f5\u25cb\u25f8\u25fb\u25fc")
     frame = re.sub("[" + pulses + "]", "<PULSE>", frame)
     frame = re.sub("\x1b\[39m\n", "\n", frame)
@@ -602,7 +627,9 @@ REFINEMENT_EXPANSION_NEEDLES = [
 
 def strip_refinement_expansion(frame, state):
     """Drop the refinement row's expanded rows from BOTH frames (the
-    expanded-state divergence; the collapsed state is untouched)."""
+    expanded-state divergence; the collapsed state is untouched). The
+    field-label rows match by exact stripped text (an indented `Title`
+    on the Rust side, a plain-inset `Title` on the TS side)."""
     if state != "b_expanded":
         return frame
     kept = []
@@ -610,18 +637,20 @@ def strip_refinement_expansion(frame, state):
         plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
         if any(needle in plain for needle in REFINEMENT_EXPANSION_NEEDLES):
             continue
+        if plain.strip() in ("Title", "Description"):
+            continue
         kept.append(line)
     return "\n".join(kept)
 
 
 def assert_refinement_branch(side, collapsed, expanded):
     """The third carried divergence: the Rust expanded refinement block
-    hangs on the branch grammar (the `\u{2570}\u{2500} ` gutter off the
-    `\u{25c6}` header, four-space continuation indent); the TS binary keeps
+    hangs on the branch grammar (the `╰─ ` gutter off the
+    `◆` header, four-space continuation indent); the TS binary keeps
     the plain one-column chat inset (the baseline)."""
     summary = "Create one local memory."
-    meta = "Harness refined \u{b7} 1 memory created \u{b7} Refinement refine_cmparity \u{b7} local"
-    gutter = "\u{2570}\u{2500} "
+    meta = "Harness refined · 1 memory created · Refinement refine_cmparity · local"
+    gutter = "╰─ "
     indent = "    "
     if side == "rust":
         # Collapsed keeps the TS shape: plain inset, no branch.
@@ -644,6 +673,32 @@ def assert_refinement_branch(side, collapsed, expanded):
         )
 
 
+def align_frame_tops(left, right):
+    """Trim each frame's leading rows down to the first row both frames
+    show.
+
+    The compared frames are bottom-pinned viewport windows; a row-count
+    delta anywhere in the expanded content (a carried divergence, a
+    strip's unequal removal) shifts one window's top over the other's —
+    the tops leak rows the other side scrolled off, which is a window
+    artifact, not a row-shape divergence. Real divergences below the
+    first shared row still diff."""
+    def first_shared_index(a, b):
+        for i, row in enumerate(a):
+            if not row.strip():
+                continue
+            if any(row == other for other in b):
+                return i
+        return None
+
+    left_rows, right_rows = left.split("\n"), right.split("\n")
+    i = first_shared_index(left_rows, right_rows)
+    j = first_shared_index(right_rows, left_rows)
+    if i is not None and j is not None:
+        return "\n".join(left_rows[i:]), "\n".join(right_rows[j:])
+    return left, right
+
+
 def diff_lines(left, right):
     return "\n".join(
         difflib.unified_diff(left.split("\n"), right.split("\n"), fromfile="ts", tofile="rust", lineterm="", n=1)
@@ -657,6 +712,28 @@ def wait_for(session, needle, timeout):
             return
         time.sleep(0.3)
     raise TimeoutError(f"session {session} never showed {needle!r}")
+
+
+def mode_label(session):
+    """The conversation-detail label in the prompt-context row
+    (Collapsed / Details / Expanded)."""
+    match = re.search(r"(Collapsed|Details|Expanded) mode \(Ctrl\+O", capture_plain(session))
+    return match.group(1) if match else None
+
+
+def press_until_mode(session, target, max_presses=4):
+    """Ctrl+O until the conversation-detail label reads `target`.
+
+    The two products' resume detail levels differ (the TS resume starts
+    at details, the Rust replay at overview), so fixed press counts
+    desync the compared states: drive both sides to the same label
+    instead."""
+    for _ in range(max_presses):
+        if mode_label(session) == target:
+            return True
+        tmux("send-keys", "-t", session, "C-o")
+        time.sleep(1.2)
+    return mode_label(session) == target
 
 
 def find_runtime_package_dir():
@@ -674,7 +751,24 @@ def find_runtime_package_dir():
 def run_ts(session_path, sandbox, size, out_dir):
     session = f"cmparity-ts-{size[0]}x{size[1]}"
     tmux("kill-session", "-t", session, check=False)
-    tmux("new-session", "-d", "-s", session, "-x", size[0], "-y", size[1], "-c", sandbox["cwd"])
+    tmux(
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-x",
+        size[0],
+        "-y",
+        size[1],
+        "-c",
+        sandbox["cwd"],
+        # A plain shell: the box tmux default-shell is herdr's prime-agent
+        # launcher (every new pane boots a live agent TUI, hijacking the
+        # harness's send-keys contract). herdr's documented opt-out keeps
+        # the pane a plain interactive shell.
+        "-e",
+        "HERDR_PLAIN_SHELL=1",
+    )
     env = (
         f"HOME={sandbox['home']} "
         f"TMPDIR={sandbox['tmp']} "
@@ -691,11 +785,15 @@ def run_ts(session_path, sandbox, size, out_dir):
     tmux("send-keys", "-t", session, command, "Enter")
     wait_for(session, MARKER_TEXT, timeout=60)
     time.sleep(1.5)
+    # Label-driven states: both sides park at Collapsed for the first
+    # capture, then drive to Expanded for the second (fixed press counts
+    # desync: the TS resume starts at details, the Rust at overview).
+    if not press_until_mode(session, "Collapsed"):
+        raise TimeoutError(f"session {session} never reached Collapsed mode")
     frames = {"a_collapsed": capture(session)}
-    # Ctrl+O twice: all mode (expanded bodies and shell output).
-    tmux("send-keys", "-t", session, "C-o")
-    tmux("send-keys", "-t", session, "C-o")
-    time.sleep(1.5)
+    if not press_until_mode(session, "Expanded"):
+        raise TimeoutError(f"session {session} never reached Expanded mode")
+    time.sleep(0.5)
     frames["b_expanded"] = capture(session)
     tmux("kill-session", "-t", session, check=False)
     for state, frame in frames.items():
@@ -707,7 +805,24 @@ def run_ts(session_path, sandbox, size, out_dir):
 def run_rust(session_path, sandbox, size, out_dir):
     session = f"cmparity-rust-{size[0]}x{size[1]}"
     tmux("kill-session", "-t", session, check=False)
-    tmux("new-session", "-d", "-s", session, "-x", size[0], "-y", size[1], "-c", sandbox["cwd"])
+    tmux(
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-x",
+        size[0],
+        "-y",
+        size[1],
+        "-c",
+        sandbox["cwd"],
+        # A plain shell: the box tmux default-shell is herdr's prime-agent
+        # launcher (every new pane boots a live agent TUI, hijacking the
+        # harness's send-keys contract). herdr's documented opt-out keeps
+        # the pane a plain interactive shell.
+        "-e",
+        "HERDR_PLAIN_SHELL=1",
+    )
     rust = os.environ.get(
         "PA_RUST_REPLAY",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "debug", "pa-tui-replay"),
@@ -717,10 +832,12 @@ def run_rust(session_path, sandbox, size, out_dir):
     tmux("send-keys", "-t", session, command, "Enter")
     wait_for(session, MARKER_TEXT, timeout=60)
     time.sleep(1.5)
+    if not press_until_mode(session, "Collapsed"):
+        raise TimeoutError(f"session {session} never reached Collapsed mode")
     frames = {"a_collapsed": capture(session)}
-    tmux("send-keys", "-t", session, "C-o")
-    tmux("send-keys", "-t", session, "C-o")
-    time.sleep(1.5)
+    if not press_until_mode(session, "Expanded"):
+        raise TimeoutError(f"session {session} never reached Expanded mode")
+    time.sleep(0.5)
     frames["b_expanded"] = capture(session)
     tmux("kill-session", "-t", session, check=False)
     for state, frame in frames.items():
@@ -817,6 +934,7 @@ def main():
                     ts_frames[state]
                 ), f"ts unexpectedly renders the preview in {state}"
                 name = f"{state}-{size[0]}x{size[1]}"
+                ts_norm, rust_norm = align_frame_tops(ts_norm, rust_norm)
                 if ts_norm == rust_norm:
                     print(f"PASS {name}")
                 else:

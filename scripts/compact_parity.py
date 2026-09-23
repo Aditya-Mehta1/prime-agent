@@ -139,6 +139,31 @@ def normalize(frame, root):
     frame = re.sub(r"\b\d+s\b", "<S>", frame)
     spinners = "".join("\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f")
     frame = re.sub("[" + spinners + "]", "<SPIN>", frame)
+    # The TS product's ripgrep notice (a startup environment notice when
+    # rg is missing under PI_OFFLINE; the Rust build has no equivalent
+    # row yet) is box environment, not transcript parity.
+    kept = []
+    notice = False
+    for line in frame.split("\n"):
+        if any(
+            needle in line
+            for needle in (
+                "ripgrep (rg) is an optional search helper",
+                "Install it with: brew install ripgrep",
+                "Automatic installation was skipped because PI_OFFLINE",
+                "and subagents remain available.",
+            )
+        ):
+            # The notice's trailing blank row drops with it (the block
+            # is notice + one blank on the TS side).
+            notice = True
+            continue
+        if notice and line.strip() == "":
+            notice = False
+            continue
+        notice = False
+        kept.append(line)
+    frame = "\n".join(kept)
     pulses = "".join("\u25f4\u25f7\u25f6\u25f5\u25cb\u25f8\u25fb\u25fc")
     frame = re.sub("[" + pulses + "]", "<PULSE>", frame)
     # tmux places trailing resets (foreground 39m, background 49m) at either
@@ -213,6 +238,32 @@ def assert_compaction_branch(ts_expanded, rust_expanded):
     assert " Compacted from" in ts_expanded, "ts: metadata row missing (baseline)"
 
 
+def align_frame_tops(left, right):
+    """Trim each frame's leading rows down to the first row both frames
+    show.
+
+    The compared frames are bottom-pinned viewport windows; a row-count
+    delta anywhere in the expanded content (a carried divergence, a
+    strip's unequal removal) shifts one window's top over the other's —
+    the tops leak rows the other side scrolled off, which is a window
+    artifact, not a row-shape divergence. Real divergences below the
+    first shared row still diff."""
+    def first_shared_index(a, b):
+        for i, row in enumerate(a):
+            if not row.strip():
+                continue
+            if any(row == other for other in b):
+                return i
+        return None
+
+    left_rows, right_rows = left.split("\n"), right.split("\n")
+    i = first_shared_index(left_rows, right_rows)
+    j = first_shared_index(right_rows, left_rows)
+    if i is not None and j is not None:
+        return "\n".join(left_rows[i:]), "\n".join(right_rows[j:])
+    return left, right
+
+
 def diff_lines(left, right):
     return "\n".join(
         difflib.unified_diff(left.split("\n"), right.split("\n"), fromfile="ts", tofile="rust", lineterm="", n=1)
@@ -268,6 +319,27 @@ def wait_for(session, needle, timeout):
     raise TimeoutError(f"session {session} never showed {needle!r}")
 
 
+def mode_label(session):
+    """The conversation-detail label in the prompt-context row
+    (Collapsed / Details / Expanded)."""
+    match = re.search(r"(Collapsed|Details|Expanded) mode \(Ctrl\+O", capture_plain(session))
+    return match.group(1) if match else None
+
+
+def press_until_mode(session, target, max_presses=4):
+    """Ctrl+O until the conversation-detail label reads `target`.
+
+    The two products' resume detail levels differ (the TS resume starts
+    at details, the Rust at overview), so fixed press counts desync the
+    compared states: drive both sides to the same label instead."""
+    for _ in range(max_presses):
+        if mode_label(session) == target:
+            return True
+        tmux("send-keys", "-t", session, "C-o")
+        time.sleep(1.2)
+    return mode_label(session) == target
+
+
 # The ts-identity guard (refuse when the PATH `prime-agent` is this repo's
 # Rust product) is shared with every PATH-driven parity harness: see
 # scripts/battery/ts_identity.py.
@@ -277,7 +349,24 @@ def launch(binary, sandbox, shared_cwd, script_path, out_dir):
     """Drive the whole compaction scenario; return the captured states."""
     session = f"cpparity-{binary}-{WIDTH}x{HEIGHT}"
     tmux("kill-session", "-t", session, check=False)
-    tmux("new-session", "-d", "-s", session, "-x", WIDTH, "-y", HEIGHT, "-c", shared_cwd)
+    tmux(
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-x",
+        WIDTH,
+        "-y",
+        HEIGHT,
+        "-c",
+        shared_cwd,
+        # A plain shell: the box tmux default-shell is herdr's prime-agent
+        # launcher (every new pane boots a live agent TUI, hijacking the
+        # harness's send-keys contract). herdr's documented opt-out keeps
+        # the pane a plain interactive shell.
+        "-e",
+        "HERDR_PLAIN_SHELL=1",
+    )
     env = (
         f"HOME={sandbox['home']} "
         f"TMPDIR={sandbox['tmp']} "
@@ -301,8 +390,12 @@ def launch(binary, sandbox, shared_cwd, script_path, out_dir):
     tmux("send-keys", "-t", session, f"{env} {command}", "Enter")
 
     frames = {}
-    wait_for(session, "Collapsed mode", timeout=60)
+    wait_for(session, "mode (Ctrl+O", timeout=60)
     time.sleep(1.0)
+    # Park both sides at Collapsed: the TS resume starts at details, the
+    # Rust at overview — fixed press counts desync the compared states.
+    if not press_until_mode(session, "Collapsed"):
+        raise TimeoutError(f"session {session} never reached Collapsed mode")
 
     # a_skip_warning: /compact on the fresh session skips (warning row).
     tmux("send-keys", "-t", session, COMPACT_COMMAND.split()[0], "Enter")
@@ -330,7 +423,9 @@ def launch(binary, sandbox, shared_cwd, script_path, out_dir):
         time.sleep(0.5)
     time.sleep(1.0)
 
-    # b_loader: the compaction loader while the summarizer streams.
+    # b_loader: the compaction loader while the summarizer streams (the
+    # collapsed pane; Ctrl+O reaches `all` only after the run settles on
+    # the Rust side, so this state stays the TS-parity spinner row).
     tmux("send-keys", "-t", session, COMPACT_COMMAND, "Enter")
     deadline = time.time() + 60
     while time.time() < deadline:
@@ -354,12 +449,12 @@ def launch(binary, sandbox, shared_cwd, script_path, out_dir):
     if "history history" in pane:
         raise AssertionError("the compacted-away filler still renders post-compaction")
 
-    # d_expanded: the Ctrl+O detail cycle (overview -> details -> all)
-    # expands the compaction block (TS `applyChatExpansion` fans
-    # `toolOutputExpanded` into `CompactionSummaryMessageComponent`).
-    tmux("send-keys", "-t", session, "C-o")
-    time.sleep(0.5)
-    tmux("send-keys", "-t", session, "C-o")
+    # d_expanded: the Ctrl+O detail cycle expands the compaction block
+    # (TS `applyChatExpansion` fans `toolOutputExpanded` into
+    # `CompactionSummaryMessageComponent`); drive to the Expanded label so
+    # both sides reach it from wherever their cycle sits.
+    if not press_until_mode(session, "Expanded"):
+        raise TimeoutError(f"session {session} never reached Expanded mode")
     wait_for(session, "Compacted from", timeout=60)
     time.sleep(1.0)
     for _ in range(20):
@@ -368,15 +463,15 @@ def launch(binary, sandbox, shared_cwd, script_path, out_dir):
         time.sleep(0.5)
     frames["d_expanded"] = capture(session)
     # The expanded metadata rides below the markdown summary body, and the
-    # block collapses again on the third press (all -> overview).
+    # block collapses again on the cycle back to Collapsed.
     pane = capture_plain(session)
     if "Context compacted" not in pane:
         raise AssertionError("the expanded state lost the compaction header")
-    tmux("send-keys", "-t", session, "C-o")
-    time.sleep(1.0)
+    if not press_until_mode(session, "Collapsed"):
+        raise TimeoutError(f"session {session} never re-collapsed")
     pane = capture_plain(session)
     if "Compacted from" in pane:
-        raise AssertionError("the detail cycle back to overview did not re-collapse the block")
+        raise AssertionError("the detail cycle back to Collapsed did not re-collapse the block")
 
     tmux("send-keys", "-t", session, "C-c")
     time.sleep(0.5)
@@ -424,6 +519,7 @@ def main():
             ts_norm = normalize(strip_compaction_expansion(ts_frames[state], state), base)
             rust_norm = normalize(strip_compaction_expansion(rust_frames[state], state), base)
             name = f"{state}-{WIDTH}x{HEIGHT}"
+            ts_norm, rust_norm = align_frame_tops(ts_norm, rust_norm)
             if ts_norm == rust_norm:
                 print(f"PASS {name}")
             else:
