@@ -465,20 +465,127 @@ mod tests {
         assert_eq!(stats["contextUsage"]["tokens"], 128);
     }
 
-    /// Captured devbox session (TS-written), sanitized: content stripped;
-    /// ids, parentIds, timestamps, roles, usage, and the compaction row
-    /// verbatim. One compaction at the audit-captured boundary: the
-    /// pre-cut ancestry carries 952 assistant turns / $0.2900872 /
-    /// 154,979,520 cacheRead that TS drops from the active stats, and the
-    /// kept region is the 2622 turns / $3.921395 TS reports
-    /// post-compaction. Two minted-but-never-persisted parent ids are
-    /// repaired to their file predecessor (the exact bridge the bridged
-    /// walk applies; the kept-region totals are invariant under it) so the
-    /// fixture also exercises the windowed reader.
+    /// The compaction boundary against the windowed reader, on a minimal
+    /// synthetic compacted session (real transcripts are never committed;
+    /// the `#[ignore]` test below re-verifies against the local capture).
+    /// The pre-cut ancestry, the kept rows that precede the compaction
+    /// entry in file order, the summarizer's own usage riding the
+    /// compaction entry, and the post-compaction tail all pin their own
+    /// numbers, and the parent chain stays intact from leaf to root so the
+    /// windowed reader serves a real window that retains only the kept
+    /// region - the parity claim is non-trivial: the windowed store never
+    /// loads the pre-cut ancestry and must still report the same active
+    /// numbers as the full store.
     #[test]
+    fn compaction_boundary_serves_the_windowed_reader() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("windowed-boundary.jsonl");
+        let usage = |input: u64, output: u64, cache_read: u64, total: u64, cost: f64| {
+            json!({
+                "input": input, "output": output, "cacheRead": cache_read,
+                "cacheWrite": 0, "totalTokens": total,
+                "cost": { "total": cost },
+            })
+        };
+        let row = |id: &str, parent: Option<&str>, value: Value| {
+            json!({
+                "type": "message", "id": id, "parentId": parent,
+                "timestamp": "2026-09-23T00:00:00.000Z",
+                "message": value,
+            })
+            .to_string()
+        };
+        let user = |id: &str, parent: Option<&str>| {
+            row(id, parent, message("user", json!({ "content": "hi" })))
+        };
+        let assistant = |id: &str, parent: Option<&str>, spent: Value| {
+            row(
+                id,
+                parent,
+                message(
+                    "assistant",
+                    json!({
+                        "content": [{ "type": "text", "text": "hi" }],
+                        "stopReason": "stop",
+                        "usage": spent,
+                    }),
+                ),
+            )
+        };
+        let lines = [
+            json!({"type": "session", "version": 3, "id": "s1", "timestamp": "2026-09-23T00:00:00.000Z", "cwd": "/tmp"}).to_string(),
+            // Pre-cut ancestry: spend the active stats must not report.
+            user("u1", None),
+            assistant("a1", Some("u1"), usage(1000, 200, 5000, 6200, 0.75)),
+            user("u2", Some("a1")),
+            assistant("a2", Some("u2"), usage(800, 150, 3000, 3950, 1.25)),
+            // The kept region starts at u3 (firstKeptEntryId); the kept
+            // rows precede the compaction entry in file order, as in a
+            // real compacted file.
+            user("u3", Some("a2")),
+            assistant("a3", Some("u3"), usage(600, 120, 2000, 2720, 0.25)),
+            json!({
+                "type": "compaction", "id": "c1", "parentId": "a3",
+                "timestamp": "2026-09-23T00:00:00.000Z",
+                "summary": "summary", "firstKeptEntryId": "u3", "tokensBefore": 100,
+                "usage": usage(9999, 99, 0, 10098, 0.5),
+            })
+            .to_string(),
+            // Post-compaction tail; a5 is the leaf the window follows.
+            user("u4", Some("c1")),
+            assistant("a4", Some("u4"), usage(400, 80, 1000, 1480, 0.125)),
+            user("u5", Some("a4")),
+            assistant("a5", Some("u5"), usage(500, 100, 2500, 3100, 0.5)),
+        ];
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let full = SessionFile::open(&path).unwrap();
+        let windowed = SessionFile::open_windowed(&path).unwrap();
+        assert!(
+            windowed.window.is_some(),
+            "the intact ancestry must serve a real window"
+        );
+        assert!(
+            windowed.by_id.contains_key("u3") && !windowed.by_id.contains_key("a2"),
+            "the window loads the kept region only, without the pre-cut ancestry"
+        );
+        let expected = json!({
+            "sessionFile": path.display().to_string(),
+            "sessionId": "s1",
+            "userMessages": 3,
+            "assistantMessages": 3,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "totalMessages": 6,
+            "tokens": {
+                "input": 1_500, "output": 300, "cacheRead": 5_500,
+                "cacheWrite": 0, "total": 7_300,
+            },
+            "cost": 0.875,
+            "contextUsage": {
+                "tokens": 3_100, "contextWindow": 1_000, "percent": 310.0,
+            },
+        });
+        assert_eq!(session_stats(&full, Some(1_000)), expected);
+        // The windowed store (retained region) and the full store walk the
+        // same kept region and must serve identical active numbers.
+        assert_eq!(session_stats(&windowed, Some(1_000)), expected);
+    }
+
+    /// The audit's captured devbox session (TS-written, sanitized: content
+    /// stripped; ids, parentIds, timestamps, roles, usage, and the
+    /// compaction row verbatim): one compaction at the audit-captured
+    /// boundary where the pre-cut ancestry carries 952 assistant turns /
+    /// $0.2900872 / 154,979,520 cacheRead that TS drops from the active
+    /// stats, and the kept region is the 2622 turns / $3.921395 TS
+    /// reports post-compaction. Real captured transcripts are never
+    /// committed; point `PA_ACTIVE_STATS_CAPTURED_FIXTURE` at a local
+    /// copy to run it.
+    #[test]
+    #[ignore = "set PA_ACTIVE_STATS_CAPTURED_FIXTURE to the captured session path"]
     fn captured_compaction_boundary_matches_ts_active_stats() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/active-stats-compaction-captured.jsonl");
+        let fixture = std::env::var("PA_ACTIVE_STATS_CAPTURED_FIXTURE")
+            .expect("set PA_ACTIVE_STATS_CAPTURED_FIXTURE to the captured session path");
+        let path = std::path::PathBuf::from(fixture);
         let full = SessionFile::open(&path).expect("fixture opens");
         let windowed = SessionFile::open_windowed(&path).expect("windowed open");
         assert!(
