@@ -41,7 +41,7 @@ use crate::protocol::{
     DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
 };
 use crate::registry::{ResidentWorker, SessionRegistry, WorkerRegistration, WorkerRequest};
-use crate::session_store::{find_most_recent_session_for_cwd, list_sessions};
+use crate::session_store::list_sessions;
 use crate::snapshot_stream::{attach_client_capabilities, stream_attach, wants_chunked};
 use crate::update_prepare::{
     marker_expires_at_iso, update_gate_refuses, write_prepared_artifacts, AbortOutcome,
@@ -1763,15 +1763,16 @@ impl Supervisor {
                 "Session cannot be both no-session and session-pathed"
             ));
         }
-        let session_dir_path = match session_dir.as_deref() {
-            Some(dir) => paths::expand_tilde(dir)?,
-            None => paths::sessions_dir(&self.options.agent_dir)?,
-        };
+        // `continueRecent` is refused: a create must name its session
+        // (`sessionPath`) or open one through the agents view. The daemon
+        // never picks a session blindly — a shared session dir can hold any
+        // session, and reopening one revives its context and scheduled jobs
+        // (a sanctioned divergence from the TS worker's continueRecent
+        // arm, which resolves the newest saved session for the cwd).
         if *continue_recent == Some(true) {
-            let recent = find_most_recent_session_for_cwd(&session_dir_path, &cwd_value);
-            if recent.is_none() {
-                return Err(anyhow!("No recent session found for {}", cwd_value));
-            }
+            return Err(anyhow!(
+                "continueRecent is not supported: pass sessionPath to reopen a session, or open one through the agents view"
+            ));
         }
         let worker_id = util::new_display_id();
         let worker_socket = socket::worker_socket_path(&self.options.socket_path, &worker_id);

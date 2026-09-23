@@ -540,7 +540,7 @@ impl SessionUi {
         let active_session_id = match &options.session {
             SessionSelection::New => create_session(&client, options, None).await?,
             SessionSelection::Attach(id) => id.clone(),
-            SessionSelection::ContinueRecent | SessionSelection::Resume(_) => {
+            SessionSelection::Resume(_) => {
                 create_session(&client, options, Some(&options.session)).await?
             }
         };
@@ -7984,7 +7984,6 @@ async fn create_session(
     options: &InteractiveOptions,
     selection: Option<&SessionSelection>,
 ) -> Result<String> {
-    let continue_recent = matches!(selection, Some(SessionSelection::ContinueRecent));
     let session_path = match selection {
         Some(SessionSelection::Resume(path)) => Some(path.to_string_lossy().to_string()),
         _ => None,
@@ -7993,7 +7992,10 @@ async fn create_session(
         .request_ok(DaemonCommand::Create {
             id: None,
             session_path,
-            continue_recent: continue_recent.then_some(true),
+            // A create names its session (`sessionPath`) or opens one
+            // through the agents view; `continueRecent` stays absent
+            // (TS wire shape — the supervisor refuses it).
+            continue_recent: None,
             no_session: options.no_session.then_some(true),
             name: None,
             config: Some(options.create_config()),
