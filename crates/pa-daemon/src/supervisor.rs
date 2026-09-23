@@ -981,12 +981,7 @@ impl Supervisor {
                 // a stop (a subagent under a surviving root passivates and
                 // keeps its model/thinking/cwd; everything else is
                 // removed). No ledger reseed, no transcript read.
-                let ephemeral = resident
-                    .descriptor
-                    .lock()
-                    .await
-                    .owner_client_id
-                    .is_some();
+                let ephemeral = resident.descriptor.lock().await.owner_client_id.is_some();
                 self.passivate_roster_worker(&resident.worker_id, ephemeral)
                     .await;
                 self.log_line(&format!(
@@ -4887,9 +4882,7 @@ mod tests {
             .unwrap()
             .entries()
             .into_iter()
-            .find(|entry| {
-                entry.summary.get("rlmChildId").and_then(Value::as_str) == Some("sub-9")
-            })
+            .find(|entry| entry.summary.get("rlmChildId").and_then(Value::as_str) == Some("sub-9"))
             .expect("the boot seed hydrated the family");
         assert_eq!(row.summary["cwd"], "/the/real/cwd");
         assert_eq!(

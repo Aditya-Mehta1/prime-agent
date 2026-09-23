@@ -244,7 +244,9 @@ fn passivated_summary(summary: Value) -> Value {
     let Some(object) = summary.as_object_mut() else {
         return summary;
     };
-    let keep_heartbeat = object.get("hasRegisteredHeartbeat").and_then(Value::as_bool)
+    let keep_heartbeat = object
+        .get("hasRegisteredHeartbeat")
+        .and_then(Value::as_bool)
         == Some(true);
     let keep_cron = object.get("hasRegisteredCronJob").and_then(Value::as_bool) == Some(true);
     for key in [
@@ -296,7 +298,13 @@ mod tests {
         let (dir, supervisor, root_file, child_file) = roster_fixture().await;
         register_root_worker(&supervisor, "w-root", &root_file).await;
         let agent_dir = dir.join("agent");
-        append_family_edge(&agent_dir, &agent_dir.join("sessions"), "sub-9", &root_file, &child_file);
+        append_family_edge(
+            &agent_dir,
+            &agent_dir.join("sessions"),
+            "sub-9",
+            &root_file,
+            &child_file,
+        );
         let mut events = supervisor.events.subscribe();
         // The root's live row is the only roster row.
         let mut root_summary = live_child_summary(&root_file, &child_file);
@@ -305,7 +313,10 @@ mod tests {
         root_summary["id"] = json!("root-persisted");
         root_summary["sessionFile"] = json!(root_file.to_string_lossy());
         root_summary.as_object_mut().unwrap().remove("rlmChildId");
-        root_summary.as_object_mut().unwrap().remove("parentSessionPath");
+        root_summary
+            .as_object_mut()
+            .unwrap()
+            .remove("parentSessionPath");
         supervisor.write_roster_summary(&root_summary, Some("w-root"));
         let _ = drain_roster_pushes(&mut events);
 
@@ -320,7 +331,10 @@ mod tests {
         // A pure snapshot is stable: subscribing again answers the same.
         let second = supervisor.handle_roster_subscribe("s2", "roster_subscribe");
         assert_eq!(second.data.expect("roster snapshot")["roster"], roster);
-        assert!(drain_roster_pushes(&mut events).is_empty(), "subscribe never pushes");
+        assert!(
+            drain_roster_pushes(&mut events).is_empty(),
+            "subscribe never pushes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -333,9 +347,18 @@ mod tests {
         let (dir, supervisor, root_file, child_file) = roster_fixture().await;
         register_root_worker(&supervisor, "w-root", &root_file).await;
         let agent_dir = dir.join("agent");
-        append_family_edge(&agent_dir, &agent_dir.join("sessions"), "sub-9", &root_file, &child_file);
+        append_family_edge(
+            &agent_dir,
+            &agent_dir.join("sessions"),
+            "sub-9",
+            &root_file,
+            &child_file,
+        );
         let mut events = supervisor.events.subscribe();
-        supervisor.write_roster_summary(&live_child_summary(&root_file, &child_file), Some("w-child"));
+        supervisor.write_roster_summary(
+            &live_child_summary(&root_file, &child_file),
+            Some("w-child"),
+        );
         let _ = drain_roster_pushes(&mut events);
 
         supervisor.passivate_roster_worker("w-child", false).await;
@@ -374,22 +397,40 @@ mod tests {
         append_family_edge(&agent_dir, &sessions_dir, "sub-9", &root_file, &child_file);
         let ledger = crate::rlm_ledger::RlmSpawnLedger::new(&agent_dir, &sessions_dir, |_| {});
         ledger
-            .append_delete("sub-9", &child_file.to_string_lossy(), crate::rlm_ledger::RlmLedgerDeleteReason::User)
+            .append_delete(
+                "sub-9",
+                &child_file.to_string_lossy(),
+                crate::rlm_ledger::RlmLedgerDeleteReason::User,
+            )
             .expect("append delete");
         register_root_worker(&supervisor, "w-root", &root_file).await;
-        supervisor.write_roster_summary(&live_child_summary(&root_file, &child_file), Some("w-child"));
+        supervisor.write_roster_summary(
+            &live_child_summary(&root_file, &child_file),
+            Some("w-child"),
+        );
         let _ = drain_roster_pushes(&mut events);
         supervisor.passivate_roster_worker("w-child", false).await;
         let pushes = drain_roster_pushes(&mut events);
-        let removed: Vec<String> = pushes[0]["removed"].as_array().cloned().unwrap_or_default()
-            .iter().filter_map(|id| id.as_str().map(str::to_string)).collect();
+        let removed: Vec<String> = pushes[0]["removed"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect();
         assert_eq!(removed.len(), 1, "the tombstoned row dies: {pushes:?}");
         assert!(supervisor.roster.lock().unwrap().get(&removed[0]).is_none());
 
         // A live edge but no resident root: no surviving root, no row.
         let orphan_file = sessions_dir.join("sub-orphan.jsonl");
         write_display_file(&orphan_file, "/the/orphan/cwd");
-        append_family_edge(&agent_dir, &sessions_dir, "sub-orphan", &root_file, &orphan_file);
+        append_family_edge(
+            &agent_dir,
+            &sessions_dir,
+            "sub-orphan",
+            &root_file,
+            &orphan_file,
+        );
         let mut orphan_summary = live_child_summary(&root_file, &orphan_file);
         orphan_summary["rlmChildId"] = json!("sub-orphan");
         supervisor.write_roster_summary(&orphan_summary, Some("w-orphan"));
@@ -401,7 +442,9 @@ mod tests {
         supervisor.passivate_roster_worker("w-orphan", false).await;
         let pushes = drain_roster_pushes(&mut events);
         assert!(
-            pushes[0]["removed"].as_array().is_some_and(|ids| !ids.is_empty()),
+            pushes[0]["removed"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty()),
             "an unanchored row dies: {pushes:?}"
         );
 
@@ -413,13 +456,18 @@ mod tests {
         top_summary["id"] = json!("root-persisted");
         top_summary["sessionFile"] = json!(root_file.to_string_lossy());
         top_summary.as_object_mut().unwrap().remove("rlmChildId");
-        top_summary.as_object_mut().unwrap().remove("parentSessionPath");
+        top_summary
+            .as_object_mut()
+            .unwrap()
+            .remove("parentSessionPath");
         supervisor.write_roster_summary(&top_summary, Some("w-top"));
         let _ = drain_roster_pushes(&mut events);
         supervisor.passivate_roster_worker("w-top", false).await;
         let pushes = drain_roster_pushes(&mut events);
         assert!(
-            pushes[0]["removed"].as_array().is_some_and(|ids| ids.len() == 1),
+            pushes[0]["removed"]
+                .as_array()
+                .is_some_and(|ids| ids.len() == 1),
             "the top-level row dies: {pushes:?}"
         );
 
@@ -429,20 +477,34 @@ mod tests {
         queued_summary["queuedChild"] = json!(true);
         let queued_child_file = sessions_dir.join("sub-queued.jsonl");
         write_display_file(&queued_child_file, "/the/queued/cwd");
-        append_family_edge(&agent_dir, &sessions_dir, "sub-queued", &root_file, &queued_child_file);
+        append_family_edge(
+            &agent_dir,
+            &sessions_dir,
+            "sub-queued",
+            &root_file,
+            &queued_child_file,
+        );
         queued_summary["sessionFile"] = json!(queued_child_file.to_string_lossy());
         supervisor.write_roster_summary(&queued_summary, Some("w-queued"));
         let _ = drain_roster_pushes(&mut events);
         supervisor.passivate_roster_worker("w-queued", true).await;
         let pushes = drain_roster_pushes(&mut events);
         assert!(
-            pushes[0]["removed"].as_array().is_some_and(|ids| ids.len() == 1),
+            pushes[0]["removed"]
+                .as_array()
+                .is_some_and(|ids| ids.len() == 1),
             "the queued/ephemeral row dies: {pushes:?}"
         );
-        assert!(
-            supervisor.roster.lock().unwrap().entries().iter()
-                .all(|entry| entry.summary.get("rlmChildId").and_then(Value::as_str) != Some("sub-queued"))
-        );
+        assert!(supervisor
+            .roster
+            .lock()
+            .unwrap()
+            .entries()
+            .iter()
+            .all(
+                |entry| entry.summary.get("rlmChildId").and_then(Value::as_str)
+                    != Some("sub-queued")
+            ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -491,9 +553,15 @@ mod tests {
         ] {
             assert!(passivated.get(key).is_none(), "{key} is live-only");
         }
-        assert_eq!(passivated["hasRegisteredHeartbeat"], true, "the mark survives");
+        assert_eq!(
+            passivated["hasRegisteredHeartbeat"], true,
+            "the mark survives"
+        );
         assert_eq!(passivated["cwd"], "/the/live/cwd");
-        assert_eq!(passivated["model"], json!({ "provider": "live", "modelId": "lm" }));
+        assert_eq!(
+            passivated["model"],
+            json!({ "provider": "live", "modelId": "lm" })
+        );
         assert_eq!(passivated["thinkingLevel"], "low");
     }
 
@@ -505,9 +573,18 @@ mod tests {
         let (dir, supervisor, root_file, child_file) = roster_fixture().await;
         register_root_worker(&supervisor, "w-root", &root_file).await;
         let agent_dir = dir.join("agent");
-        append_family_edge(&agent_dir, &agent_dir.join("sessions"), "sub-9", &root_file, &child_file);
+        append_family_edge(
+            &agent_dir,
+            &agent_dir.join("sessions"),
+            "sub-9",
+            &root_file,
+            &child_file,
+        );
         let mut events = supervisor.events.subscribe();
-        supervisor.write_roster_summary(&live_child_summary(&root_file, &child_file), Some("w-child"));
+        supervisor.write_roster_summary(
+            &live_child_summary(&root_file, &child_file),
+            Some("w-child"),
+        );
         let _ = drain_roster_pushes(&mut events);
         supervisor.passivate_roster_worker("w-child", false).await;
         let _ = drain_roster_pushes(&mut events);

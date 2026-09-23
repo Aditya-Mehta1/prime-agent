@@ -307,7 +307,6 @@ impl SeededRosterEntry {
         }
         self
     }
-
 }
 
 /// The one lazy display read behind both hydration paths (TS
@@ -538,7 +537,13 @@ pub(crate) mod tests {
 
     /// The ledger edge parent -> child over the supervisor's own sessions
     /// dir (`rlm_spawn_ledger_for` reads exactly this ledger).
-    pub(crate) fn append_family_edge(agent_dir: &Path, sessions_dir: &Path, child_id: &str, parent: &Path, child: &Path) {
+    pub(crate) fn append_family_edge(
+        agent_dir: &Path,
+        sessions_dir: &Path,
+        child_id: &str,
+        parent: &Path,
+        child: &Path,
+    ) {
         let ledger = crate::rlm_ledger::RlmSpawnLedger::new(agent_dir, sessions_dir, |_| {});
         ledger
             .append_spawn(crate::rlm_ledger::RlmSpawnInput {
@@ -554,7 +559,11 @@ pub(crate) mod tests {
     /// One resident root worker carrying the given session file (the seed
     /// roots' source). Registration alone - the roster row is whatever
     /// the test writes.
-    pub(crate) async fn register_root_worker(supervisor: &Supervisor, worker_id: &str, session_file: &Path) {
+    pub(crate) async fn register_root_worker(
+        supervisor: &Supervisor,
+        worker_id: &str,
+        session_file: &Path,
+    ) {
         let descriptor = pa_types::daemon::DaemonWorkerDescriptor {
             version: 1,
             worker_id: worker_id.to_string(),
@@ -651,7 +660,10 @@ pub(crate) mod tests {
     }
 
     /// The one seeded child row (by ledger child id).
-    pub(crate) fn roster_row_for_child(supervisor: &Supervisor, child_id: &str) -> AgentRosterEntry {
+    pub(crate) fn roster_row_for_child(
+        supervisor: &Supervisor,
+        child_id: &str,
+    ) -> AgentRosterEntry {
         supervisor
             .roster
             .lock()
@@ -670,7 +682,13 @@ pub(crate) mod tests {
         let (dir, supervisor, root_file, child_file) = roster_fixture().await;
         register_root_worker(&supervisor, "w-root", &root_file).await;
         let agent_dir = dir.join("agent");
-        append_family_edge(&agent_dir, &agent_dir.join("sessions"), "sub-9", &root_file, &child_file);
+        append_family_edge(
+            &agent_dir,
+            &agent_dir.join("sessions"),
+            "sub-9",
+            &root_file,
+            &child_file,
+        );
         let mut events = supervisor.events.subscribe();
 
         supervisor.spawn_roster_boot_seed().await;
@@ -693,7 +711,10 @@ pub(crate) mod tests {
         let pushes = drain_roster_pushes(&mut events);
         assert!(pushes.is_empty(), "present rows skip: {pushes:?}");
         let row_again = roster_row_for_child(&supervisor, "sub-9");
-        assert_eq!(row_again.summary, row.summary, "no rewrite of a present row");
+        assert_eq!(
+            row_again.summary, row.summary,
+            "no rewrite of a present row"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -705,9 +726,16 @@ pub(crate) mod tests {
         let (dir, supervisor, root_file, child_file) = roster_fixture().await;
         register_root_worker(&supervisor, "w-root", &root_file).await;
         let agent_dir = dir.join("agent");
-        append_family_edge(&agent_dir, &agent_dir.join("sessions"), "sub-9", &root_file, &child_file);
+        append_family_edge(
+            &agent_dir,
+            &agent_dir.join("sessions"),
+            "sub-9",
+            &root_file,
+            &child_file,
+        );
         let mut events = supervisor.events.subscribe();
-        supervisor.write_roster_summary(&live_child_summary(&root_file, &child_file), Some("w-live"));
+        supervisor
+            .write_roster_summary(&live_child_summary(&root_file, &child_file), Some("w-live"));
         let _ = drain_roster_pushes(&mut events);
 
         supervisor.spawn_roster_boot_seed().await;
@@ -715,7 +743,10 @@ pub(crate) mod tests {
         assert!(pushes.is_empty(), "a present row never reseeds: {pushes:?}");
         let row = roster_row_for_child(&supervisor, "sub-9");
         assert_eq!(row.worker_id.as_deref(), Some("w-live"));
-        assert_eq!(row.summary["cwd"], "/the/live/cwd", "the worker row is untouched");
+        assert_eq!(
+            row.summary["cwd"], "/the/live/cwd",
+            "the worker row is untouched"
+        );
         assert_eq!(row.summary["model"]["provider"], "live");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -729,13 +760,23 @@ pub(crate) mod tests {
     async fn family_seed_renders_edges_then_hydrates_in_the_background() {
         let (dir, supervisor, root_file, child_file) = roster_fixture().await;
         let agent_dir = dir.join("agent");
-        append_family_edge(&agent_dir, &agent_dir.join("sessions"), "sub-9", &root_file, &child_file);
+        append_family_edge(
+            &agent_dir,
+            &agent_dir.join("sessions"),
+            "sub-9",
+            &root_file,
+            &child_file,
+        );
         let mut events = supervisor.events.subscribe();
 
         let seeded = supervisor.seed_roster_family_edges(&root_file).await;
         assert_eq!(seeded.len(), 1);
         let immediate = &seeded[0];
-        assert_eq!(immediate.seeded_cwd, Some(true), "the event path never read the file");
+        assert_eq!(
+            immediate.seeded_cwd,
+            Some(true),
+            "the event path never read the file"
+        );
         assert_eq!(
             immediate.summary["cwd"],
             child_file.parent().unwrap().to_string_lossy().to_string(),
@@ -771,13 +812,20 @@ pub(crate) mod tests {
     async fn hydration_loses_to_a_newer_worker_write() {
         let (dir, supervisor, root_file, child_file) = roster_fixture().await;
         let agent_dir = dir.join("agent");
-        append_family_edge(&agent_dir, &agent_dir.join("sessions"), "sub-9", &root_file, &child_file);
+        append_family_edge(
+            &agent_dir,
+            &agent_dir.join("sessions"),
+            "sub-9",
+            &root_file,
+            &child_file,
+        );
         let mut events = supervisor.events.subscribe();
         let seeded = supervisor.seed_roster_family_edges(&root_file).await;
         let _ = drain_roster_pushes(&mut events);
 
         // A worker write lands between the seed and the hydration.
-        supervisor.write_roster_summary(&live_child_summary(&root_file, &child_file), Some("w-live"));
+        supervisor
+            .write_roster_summary(&live_child_summary(&root_file, &child_file), Some("w-live"));
         let _ = drain_roster_pushes(&mut events);
 
         // The stale snapshot's hydration pass loses the identity gate.
@@ -793,5 +841,4 @@ pub(crate) mod tests {
         assert_eq!(row.status, AgentRosterStatus::Running);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }
